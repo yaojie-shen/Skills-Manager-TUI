@@ -58,6 +58,7 @@ pub fn parse_ref(input: &str, branch: Option<&str>, subpath: Option<&str>) -> Re
         || input.starts_with("https://")
         || input.starts_with("git@")
         || input.starts_with("ssh://")
+        || input.starts_with("file://")
         || input.ends_with(".git")
     {
         url = input.to_string();

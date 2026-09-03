@@ -330,3 +330,121 @@ fn adopt_from_agent_dir() {
         f.root.join("local-only")
     );
 }
+
+/// Git-sourced install, check, and update with a local conflict, using a bare repo on disk.
+#[test]
+fn git_install_check_update_conflict() {
+    use skills::ops::update::{self, FileChange, Take};
+    let f = Fixture::new("git");
+    let ws = f.ws();
+    let git = |args: &[&str], cwd: &Path| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    // Upstream repo with skills/up/SKILL.md.
+    let up = f.base.join("upstream");
+    std::fs::create_dir_all(up.join("skills/up")).unwrap();
+    git(&["init", "-q", "-b", "main"], &up);
+    git(&["config", "user.email", "t@example.com"], &up);
+    git(&["config", "user.name", "t"], &up);
+    std::fs::write(
+        up.join("skills/up/SKILL.md"),
+        "---\nname: up\ndescription: v1\n---\nbody v1\n",
+    )
+    .unwrap();
+    std::fs::write(up.join("skills/up/extra.md"), "extra v1\n").unwrap();
+    git(&["add", "."], &up);
+    git(&["commit", "-q", "-m", "v1"], &up);
+    let rev1 = git(&["rev-parse", "HEAD"], &up);
+
+    let url = format!("file://{}", up.display());
+    let r = install::parse_ref(&url, Some("main"), Some("skills/up")).unwrap();
+    let key = install::install(&ws, &r, None).unwrap();
+    assert_eq!(key, "up");
+    let snap = ws.scan().unwrap();
+    let rec = snap.get("up").unwrap();
+    assert_eq!(rec.status, SkillStatus::Managed { no_baseline: false });
+    match &rec.source {
+        Some(skills::meta::Source::Git {
+            revision,
+            subpath,
+            branch,
+            ..
+        }) => {
+            assert_eq!(revision.as_deref(), Some(rev1.as_str()));
+            assert_eq!(subpath.as_deref(), Some("skills/up"));
+            assert_eq!(branch.as_deref(), Some("main"));
+        }
+        other => panic!("unexpected source {other:?}"),
+    }
+
+    // No update yet.
+    let c = update::check(&ws, "up").unwrap();
+    assert!(!c.update_available);
+
+    // Upstream changes SKILL.md; local changes extra.md -> both sides touched different files.
+    std::fs::write(
+        up.join("skills/up/SKILL.md"),
+        "---\nname: up\ndescription: v2\n---\nbody v2\n",
+    )
+    .unwrap();
+    git(&["commit", "-qam", "v2"], &up);
+    let rev2 = git(&["rev-parse", "HEAD"], &up);
+    std::fs::write(f.root.join("up/extra.md"), "extra local\n").unwrap();
+
+    let c = update::check(&ws, "up").unwrap();
+    assert!(c.update_available);
+    assert_eq!(c.remote, rev2);
+
+    let snap = ws.scan().unwrap();
+    assert_eq!(snap.get("up").unwrap().status, SkillStatus::Modified);
+    let prepared = update::prepare(&ws, &snap, "up").unwrap();
+    assert!(prepared.needs_resolution());
+    assert_eq!(prepared.files["SKILL.md"], FileChange::UpstreamChanged);
+    assert_eq!(prepared.files["extra.md"], FileChange::LocalChanged);
+
+    // Take upstream by default but keep the local extra.md.
+    let mut per_file = std::collections::BTreeMap::new();
+    per_file.insert("extra.md".to_string(), Take::Local);
+    update::apply(&ws, &prepared, Take::Upstream, &per_file).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("up/SKILL.md")).unwrap(),
+        "---\nname: up\ndescription: v2\n---\nbody v2\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("up/extra.md")).unwrap(),
+        "extra local\n"
+    );
+    let snap = ws.scan().unwrap();
+    let rec = snap.get("up").unwrap();
+    assert_eq!(
+        rec.status,
+        SkillStatus::Managed { no_baseline: false },
+        "baseline refreshed after update"
+    );
+    match &rec.source {
+        Some(skills::meta::Source::Git { revision, .. }) => {
+            assert_eq!(revision.as_deref(), Some(rev2.as_str()))
+        }
+        _ => unreachable!(),
+    }
+    assert!(
+        !ws.meta
+            .dir
+            .join(".staging")
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false),
+        "staging cleaned"
+    );
+}

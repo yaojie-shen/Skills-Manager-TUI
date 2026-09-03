@@ -38,9 +38,15 @@ impl Action {
         match self {
             Action::Mkdir { agent, path } => format!("mkdir  {agent}: {}", path.display()),
             Action::Link {
-                agent, skill, path, ..
+                agent,
+                skill,
+                target,
+                ..
             } => {
-                format!("link   {agent}/{skill} -> {}", path.display())
+                format!(
+                    "link   {agent}/{skill} -> {}",
+                    crate::paths::contract_tilde(target)
+                )
             }
             Action::Unlink { agent, skill, path } => {
                 format!("unlink {agent}/{skill} ({})", path.display())
