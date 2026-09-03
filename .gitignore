@@ -1,0 +1,19 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Editors / OS
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# NFS / temp
+.nfs*
+*.tmp
+
+# Local agent state
+.claude/
+.codex/
