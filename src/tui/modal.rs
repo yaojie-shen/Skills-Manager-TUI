@@ -103,6 +103,9 @@ pub enum Modal {
         title: String,
         input: Input,
         items: Vec<PickItem>,
+        /// Whether typing edits the filter rather than operating on results.
+        input_focus: bool,
+        input_rect: Rect,
         /// Indices into `items` currently on.
         chosen: std::collections::BTreeSet<usize>,
         /// Indices matching the filter, in display order.
@@ -496,6 +499,8 @@ impl Modal {
         Modal::Picker {
             title,
             input: Input::default(),
+            input_focus: true,
+            input_rect: Rect::default(),
             items,
             chosen,
             shown,
@@ -581,8 +586,13 @@ impl Modal {
                 &[("Enter/y", "apply"), ("Esc/n", "cancel"), ("←→", "buttons")]
             }
             Modal::Input { .. } => &[("Enter", "save"), ("Esc", "cancel")],
+            Modal::Picker {
+                action,
+                input_focus: true,
+                ..
+            } if action.multi() => &[("type", "filter"), ("↓/Tab", "results"), ("Esc", "done")],
             Modal::Picker { action, .. } if action.multi() => &[
-                ("type", "filter"),
+                ("/", "filter"),
                 ("Space", "toggle"),
                 ("↑↓", "move"),
                 ("Esc", "done"),
@@ -726,6 +736,7 @@ impl Modal {
             }
             Modal::Picker {
                 input,
+                input_focus,
                 items,
                 chosen,
                 shown,
@@ -736,13 +747,23 @@ impl Modal {
                 let multi = action.multi();
                 match k.code {
                     KeyCode::Esc => return vec![Action::CloseModal],
+                    KeyCode::Tab if multi => *input_focus = !*input_focus,
+                    KeyCode::Char('/') if multi && !*input_focus => *input_focus = true,
                     KeyCode::Down | KeyCode::Char('n') if k.code == KeyCode::Down || ctrl => {
-                        list.move_by(1, shown.len())
+                        if multi && *input_focus {
+                            *input_focus = false;
+                        } else {
+                            list.move_by(1, shown.len());
+                        }
                     }
                     KeyCode::Up | KeyCode::Char('p') if k.code == KeyCode::Up || ctrl => {
-                        list.move_by(-1, shown.len())
+                        if multi && (*input_focus || list.selected() == Some(0)) {
+                            *input_focus = true;
+                        } else {
+                            list.move_by(-1, shown.len());
+                        }
                     }
-                    KeyCode::Char(' ') if multi => {
+                    KeyCode::Char(' ') if multi && !*input_focus => {
                         if let Some(i) = list.selected().and_then(|i| shown.get(i)).copied() {
                             let on = !chosen.contains(&i);
                             if on {
@@ -769,7 +790,7 @@ impl Modal {
                         }
                     }
                     _ => {
-                        if input.handle_key(k) {
+                        if (!multi || *input_focus) && input.handle_key(k) {
                             refilter(input.value(), items, shown);
                             list.clamp(shown.len());
                         }
@@ -945,6 +966,9 @@ impl Modal {
                 vec![]
             }
             Modal::Picker {
+                input,
+                input_focus,
+                input_rect,
                 items,
                 chosen,
                 shown,
@@ -959,9 +983,15 @@ impl Modal {
                     if !rect.contains(at) {
                         return vec![Action::CloseModal];
                     }
+                    if input_rect.contains(at) {
+                        *input_focus = true;
+                        input.click(m.column);
+                        return vec![];
+                    }
                     if let Some((row, double)) = list.click(m.row, shown.len())
                         && let Some(i) = shown.get(row).copied()
                     {
+                        *input_focus = false;
                         if action.multi() {
                             let on = !chosen.contains(&i);
                             if on {
@@ -1186,6 +1216,8 @@ impl Modal {
             Modal::Picker {
                 title,
                 input,
+                input_focus,
+                input_rect,
                 items,
                 chosen,
                 shown,
@@ -1210,7 +1242,8 @@ impl Modal {
                     height: 1,
                     ..inner
                 };
-                input.render(f, field, true, "type to filter…", th);
+                *input_rect = field;
+                input.render(f, field, !multi || *input_focus, "type to filter…", th);
                 let list_area = Rect {
                     y: inner.y + 2,
                     height: inner.height.saturating_sub(2),
@@ -1244,7 +1277,11 @@ impl Modal {
                     })
                     .collect();
                 let w = List::new(rows)
-                    .highlight_style(th.selected())
+                    .highlight_style(if multi && *input_focus {
+                        th.dim()
+                    } else {
+                        th.selected()
+                    })
                     .highlight_symbol("▸ ");
                 f.render_stateful_widget(w, list_area, &mut list.state);
                 if shown.is_empty() {
@@ -1718,3 +1755,128 @@ Global
   Ctrl-Z  Ctrl-Y    undo and redo the last change
   1-5  Tab          switch tabs (Alt+1..5 while typing in the search box)
   /                 back to search      Ctrl-R  rescan      Ctrl-C  quit";
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+    use crate::tui::theme::Theme;
+    use ratatui::{Terminal, backend::TestBackend};
+    use skills::{Workspace, config::Config, preset::Preset};
+
+    #[test]
+    fn searching_with_spaces_never_changes_membership() {
+        let root = std::env::temp_dir().join(format!(
+            "skills-picker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        ws.presets
+            .save(&Preset {
+                name: "reading".into(),
+                ..Preset::default()
+            })
+            .unwrap();
+        let before = std::fs::read(ws.presets.path("reading")).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut modal = Modal::picker(
+            "members".into(),
+            vec![PickItem {
+                id: "printer".into(),
+                label: "printer".into(),
+                sub: "network tools".into(),
+            }],
+            Default::default(),
+            PickAction::PresetMembers {
+                preset: "reading".into(),
+            },
+        );
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for c in "network tools".chars() {
+            assert!(modal.handle_key(key(KeyCode::Char(c)), &ctx).is_empty());
+        }
+        let Modal::Picker {
+            input,
+            chosen,
+            shown,
+            ..
+        } = &modal
+        else {
+            unreachable!()
+        };
+        assert_eq!(input.value(), "network tools");
+        assert!(chosen.is_empty());
+        assert_eq!(shown, &[0]);
+        assert_eq!(std::fs::read(ws.presets.path("reading")).unwrap(), before);
+        assert!(modal.handle_key(key(KeyCode::Down), &ctx).is_empty());
+        let mut actions = modal.handle_key(key(KeyCode::Char(' ')), &ctx);
+        assert_eq!(actions.len(), 1);
+        let Action::WriteMeta(write) = actions.remove(0) else {
+            panic!("expected membership write")
+        };
+        write(&ws).unwrap();
+        assert_eq!(
+            ws.presets.load("reading").unwrap().unwrap().skills,
+            ["printer"]
+        );
+        assert!(modal.handle_key(key(KeyCode::Char('/')), &ctx).is_empty());
+        assert!(modal.handle_key(key(KeyCode::Char(' ')), &ctx).is_empty());
+        let Modal::Picker { input, chosen, .. } = &modal else {
+            unreachable!()
+        };
+        assert_eq!(input.value(), "network tools ");
+        assert_eq!(chosen.len(), 1);
+
+        // Clicking the input restores typing focus and places the cursor.
+        modal.handle_key(key(KeyCode::Tab), &ctx);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| modal.draw(f, f.area(), &ctx)).unwrap();
+        let Modal::Picker { input_rect, .. } = &modal else {
+            unreachable!()
+        };
+        let at = *input_rect;
+        assert!(
+            modal
+                .handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: at.x,
+                        row: at.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &ctx
+                )
+                .is_empty()
+        );
+        assert!(modal.handle_key(key(KeyCode::Char(' ')), &ctx).is_empty());
+        let Modal::Picker {
+            input, input_focus, ..
+        } = &modal
+        else {
+            unreachable!()
+        };
+        assert!(*input_focus);
+        assert_eq!(input.value(), " network tools ");
+        assert_eq!(
+            ws.presets.load("reading").unwrap().unwrap().skills,
+            ["printer"]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
