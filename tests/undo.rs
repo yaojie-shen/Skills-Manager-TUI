@@ -328,6 +328,53 @@ fn renaming_a_tag_across_skills_comes_back_as_one_step() {
 }
 
 #[test]
+fn undoing_a_tag_rename_carries_the_colour_entry_back() {
+    let fx = Fixture::new("tag-entry");
+    let ws = fx.ws();
+    let mut log = History::default();
+
+    tag_set(&ws, &mut log, "printer", &["paper"]);
+    Config::set_tag_color(&ws.root, "paper", Some("blue")).unwrap();
+    let (_, intent) = history::tag_edit(&ws, |ws| {
+        edit::tag_rename(ws, "paper", "stationery").map(|n| n.to_string())
+    })
+    .unwrap();
+    log.record(intent.expect("a rename"));
+    let names = |ws: &Workspace| -> Vec<String> {
+        Config::load(&ws.root)
+            .unwrap()
+            .tags
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    };
+    assert_eq!(names(&ws), ["stationery"], "the entry followed the rename");
+
+    // Undo puts the skill's tag back and the entry with it; redo moves both on again.
+    step(&ws, &mut log, true);
+    assert_eq!(tags(&ws, "printer"), ["paper"]);
+    assert_eq!(names(&ws), ["paper"]);
+    step(&ws, &mut log, false);
+    assert_eq!(names(&ws), ["stationery"]);
+
+    // A merge into a tag that already has an entry is not a move: the target
+    // keeps its own, so undoing must not hand it to the old name.
+    Config::set_tag_color(&ws.root, "office", Some("red")).unwrap();
+    let (_, intent) = history::tag_edit(&ws, |ws| {
+        edit::tag_rename(ws, "stationery", "office").map(|n| n.to_string())
+    })
+    .unwrap();
+    log.record(intent.expect("a merge"));
+    step(&ws, &mut log, true);
+    assert_eq!(tags(&ws, "printer"), ["stationery"]);
+    assert_eq!(
+        names(&ws),
+        ["office"],
+        "office kept its entry; stationery's is gone for good"
+    );
+}
+
+#[test]
 fn preset_membership_goes_back_and_forth() {
     let fx = Fixture::new("preset");
     let ws = fx.ws();

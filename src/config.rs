@@ -34,26 +34,18 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UiLayout {
-    /// Results on the left, a preview pane always open on the right. One
-    /// column of cards, which is a list wearing frames; kept for anyone who
-    /// wants the preview in view the whole time.
-    Split,
-    /// Results across the full width in as many columns as fit; the preview
-    /// opens over them when asked for. The default: cards only earn their
-    /// frames once there are several to a row.
+    /// Results across the full width in as many columns of framed cards as
+    /// fit; the preview opens over them when asked for. The default: cards
+    /// only earn their frames once there are several to a row.
     #[default]
     Grid,
-}
-
-/// How much of each skill a result shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum UiDensity {
-    /// A framed card: name and deployment, description, tags.
-    #[default]
-    Cards,
-    /// One line each, two while searching.
-    Rows,
+    /// A list beside an always-open preview, three lines a skill: identity,
+    /// description, tags. The card's content without the frame.
+    List,
+    /// The same split with one line a skill (two while searching), for when
+    /// the names are what matters.
+    #[serde(alias = "split")]
+    Compact,
 }
 
 /// What caps the ends of a preset pill. A terminal cell is taller than it is
@@ -90,8 +82,6 @@ impl PillCaps {
 pub struct UiConfig {
     #[serde(default)]
     pub layout: UiLayout,
-    #[serde(default)]
-    pub density: UiDensity,
     #[serde(default)]
     pub pill_caps: PillCaps,
 }

@@ -20,7 +20,6 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
-use skills::config::UiDensity;
 use skills::ops::deploy::{
     self, PresetState, PresetStatus, plan_preset_activate, plan_preset_deactivate, preset_status,
 };
@@ -78,8 +77,9 @@ pub struct AgentsView {
     entries: CardGrid,
     /// One per entry row, in the grid's order.
     caps: Vec<Caps>,
-    /// Session override for `[ui].density`; flipping it never writes back.
-    density: Option<UiDensity>,
+    /// One line per entry instead of a card. A session switch only: the shape
+    /// of this page is not something the config decides.
+    compact: bool,
     scope_rects: Vec<(Rect, String)>,
     preset_rects: Vec<Rect>,
     /// The one column the entry scrollbar occupies, empty while it all fits.
@@ -102,10 +102,6 @@ impl Default for FocusState {
 }
 
 impl AgentsView {
-    fn density(&self, ctx: &Ctx) -> UiDensity {
-        self.density.unwrap_or(ctx.ws.config.ui.density)
-    }
-
     /// The scope as the planners want it: one key, or nothing at all.
     fn scope_agents(&self) -> Vec<String> {
         if self.scope.is_empty() {
@@ -319,10 +315,7 @@ impl View for AgentsView {
                 return vec![Action::Rescan];
             }
             KeyCode::Char('v') => {
-                self.density = Some(match self.density(ctx) {
-                    UiDensity::Cards => UiDensity::Rows,
-                    UiDensity::Rows => UiDensity::Cards,
-                });
+                self.compact = !self.compact;
                 return vec![];
             }
             KeyCode::Char('s') => {
@@ -681,7 +674,7 @@ impl View for AgentsView {
         let left = rows[2];
         self.left = left;
         let rows_data = self.rows(ctx);
-        let cards = self.density(ctx) == UiDensity::Cards;
+        let cards = !self.compact;
         let counts = match (
             rows_data.iter().filter(|r| r.managed).count(),
             rows_data.iter().filter(|r| !r.managed).count(),

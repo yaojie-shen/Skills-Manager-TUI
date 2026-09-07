@@ -343,9 +343,10 @@ impl SearchView {
         let searching = !self.input.value().trim().is_empty()
             && !Query::parse(self.input.value()).text.is_empty();
         // The layout decides the shape too: a grid is made of cards, and the
-        // split is a plain list beside its preview. One column of framed cards
-        // is a list wearing frames, which is the worst of both.
-        let cards = self.layout(ctx) == UiLayout::Grid;
+        // two splits are lists beside a preview. One column of framed cards
+        // would be a list wearing frames, which is the worst of both.
+        let layout = self.layout(ctx);
+        let cards = layout == UiLayout::Grid;
 
         let mut legend = vec![Span::raw(" skills ")];
         for a in agents {
@@ -358,14 +359,14 @@ impl SearchView {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        // A framed card is three lines of content plus its own border; a row is
-        // one line, two while an excerpt has something to say.
-        let cell_h = if cards {
-            CARD_H
-        } else if searching {
-            2
-        } else {
-            1
+        // A framed card is its content plus the border; the list is the same
+        // content bare; a compact row is one line, two while an excerpt has
+        // something to say.
+        let cell_h = match layout {
+            UiLayout::Grid => CARD_H,
+            UiLayout::List => 3,
+            UiLayout::Compact if searching => 2,
+            UiLayout::Compact => 1,
         };
         // One column is always kept back for the scrollbar so the column count
         // does not change under the user the moment the list grows past a screen.
@@ -438,6 +439,51 @@ impl SearchView {
                     )),
                     ci,
                 );
+            } else if layout == UiLayout::List {
+                // The card's lines without its frame or rule; the selection is
+                // the marker and a background, as in any list.
+                let style = if on {
+                    if self.focus == Focus::List {
+                        th.selected()
+                    } else {
+                        th.selected_unfocused()
+                    }
+                } else {
+                    Style::default()
+                };
+                let tail = r
+                    .source
+                    .as_ref()
+                    .map(|s| s.kind().to_string())
+                    .unwrap_or_default();
+                let body = h
+                    .excerpt
+                    .as_ref()
+                    .filter(|_| searching)
+                    .map(|e| e.text.as_str());
+                let mut lines = skill_card(
+                    r,
+                    ctx,
+                    agents,
+                    cell.width.saturating_sub(3) as usize,
+                    body,
+                    &tail,
+                    &h.terms,
+                );
+                lines.remove(2);
+                let lines: Vec<Line> = lines
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, l)| {
+                        // The marker sits on the first line only; the rest of
+                        // the entry is told by the background.
+                        let mark = if on && i == 0 { "▸ " } else { "  " };
+                        let mut spans = vec![Span::styled(mark, th.accent())];
+                        spans.extend(l.spans);
+                        Line::from(spans)
+                    })
+                    .collect();
+                f.render_widget(Paragraph::new(lines).style(style), cell);
             } else {
                 let style = if on {
                     if self.focus == Focus::List {
@@ -606,9 +652,11 @@ impl View for SearchView {
                 KeyCode::Char('U') => acts = self.act_update(ctx),
                 KeyCode::Char('x') => acts = self.act_remove(ctx),
                 KeyCode::Char('v') | KeyCode::Char('V') => {
+                    // Cycle from most to least room per skill.
                     self.layout = Some(match self.layout(ctx) {
-                        UiLayout::Split => UiLayout::Grid,
-                        UiLayout::Grid => UiLayout::Split,
+                        UiLayout::Grid => UiLayout::List,
+                        UiLayout::List => UiLayout::Compact,
+                        UiLayout::Compact => UiLayout::Grid,
                     });
                     self.overlay.close();
                 }

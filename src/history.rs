@@ -30,6 +30,7 @@
 //! could make safe, and this tool keeps no database.
 
 use crate::Workspace;
+use crate::config::Config;
 use crate::meta;
 use crate::ops::deploy::{self, Action};
 use crate::ops::edit;
@@ -181,6 +182,11 @@ pub enum MetaChange {
         before: Option<meta::Source>,
         after: Option<meta::Source>,
     },
+    /// A tag's `[[tags]]` entry in the config (its colour, its description)
+    /// moved to a new name by a rename. Recorded only for a plain rename: a
+    /// merge drops the old entry in favour of the target's, and moving the
+    /// target's entry "back" would steal it.
+    TagEntry { from: String, to: String },
     /// Members of one preset.
     Preset {
         name: String,
@@ -218,6 +224,7 @@ impl MetaChange {
                 added: removed,
                 removed: added,
             },
+            MetaChange::TagEntry { from, to } => MetaChange::TagEntry { from: to, to: from },
             MetaChange::Note {
                 skill,
                 before,
@@ -272,6 +279,9 @@ impl MetaChange {
             },
             // The text goes in the line: one note looks much like another, and
             // this is what a confirmation is for.
+            MetaChange::TagEntry { from, to } => {
+                format!("move the [[tags]] entry {from} to {to}")
+            }
             MetaChange::Note { skill, after, .. } => match after {
                 Some(t) => format!("set the note on {skill} to \"{}\"", snippet(t)),
                 None => format!("clear the note on {skill}"),
@@ -316,6 +326,23 @@ impl MetaChange {
                     },
                 ),
             },
+            MetaChange::TagEntry { from, to } => {
+                let names: Vec<String> = Config::load(&ws.root)?
+                    .tags
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect();
+                Ok(match (names.contains(from), names.contains(to)) {
+                    (true, false) => Fate::Ready,
+                    (false, true) => Fate::Done,
+                    (false, false) => {
+                        Fate::Blocked(format!("no [[tags]] entry for {from} any more"))
+                    }
+                    (true, true) => {
+                        Fate::Blocked(format!("{to} now has a [[tags]] entry of its own"))
+                    }
+                })
+            }
             MetaChange::Note {
                 skill,
                 before,
@@ -401,6 +428,10 @@ impl MetaChange {
                         meta.tags.join(", ")
                     }
                 ))
+            }
+            MetaChange::TagEntry { from, to } => {
+                Config::rename_tag_entry(&ws.root, from, to)?;
+                Ok(format!("[[tags]] entry {from} moved to {to}"))
             }
             MetaChange::Note { skill, after, .. } => {
                 edit::note_set(ws, skill, after.as_deref())?;
@@ -533,9 +564,25 @@ pub fn tag_edit(
     write: impl FnOnce(&Workspace) -> Result<String>,
 ) -> Result<(String, Option<Intent>)> {
     let before = all_tags(ws)?;
+    let entries_before = tag_entry_names(ws)?;
     let message = write(ws)?;
     let after = all_tags(ws)?;
+    let entries_after = tag_entry_names(ws)?;
     let mut changes = Vec::new();
+    let gone: Vec<&String> = entries_before
+        .iter()
+        .filter(|n| !entries_after.contains(n))
+        .collect();
+    let came: Vec<&String> = entries_after
+        .iter()
+        .filter(|n| !entries_before.contains(n))
+        .collect();
+    if let ([from], [to]) = (gone.as_slice(), came.as_slice()) {
+        changes.push(MetaChange::TagEntry {
+            from: (*from).clone(),
+            to: (*to).clone(),
+        });
+    }
     let empty = Vec::new();
     for key in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
         let (b, a) = (
@@ -556,6 +603,14 @@ pub fn tag_edit(
         message,
         (!changes.is_empty()).then_some(Intent::Meta(changes)),
     ))
+}
+
+fn tag_entry_names(ws: &Workspace) -> Result<Vec<String>> {
+    Ok(Config::load(&ws.root)?
+        .tags
+        .into_iter()
+        .map(|t| t.name)
+        .collect())
 }
 
 fn all_tags(ws: &Workspace) -> Result<BTreeMap<String, Vec<String>>> {
