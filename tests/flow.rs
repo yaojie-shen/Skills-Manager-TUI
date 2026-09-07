@@ -570,3 +570,56 @@ fn preset_status_activation_and_overlap() {
     assert_eq!(st.absent, vec!["nope"]);
     assert_eq!(st.total, 2);
 }
+
+/// Applying a plan against a tree that moved on: what is already right is left
+/// alone, and what belongs to the agent is still refused.
+#[test]
+fn apply_tolerates_the_state_it_wanted_and_still_guards_the_agents_own() {
+    let f = Fixture::new("tolerant");
+    f.add_skill("one", "1");
+    f.add_skill("two", "2");
+    let ws = f.ws();
+    let snap = ws.scan().unwrap();
+
+    let plan =
+        deploy::plan_deploy(&ws, &snap, &["one".into(), "two".into()], &["a".into()]).unwrap();
+    deploy::apply(&plan).unwrap();
+
+    // Re-applying the same plan is not an error: both links already point home.
+    assert_eq!(deploy::apply(&plan).unwrap(), 0, "nothing left to do");
+    assert!(f.agent_a.join("one").exists());
+
+    // Removing something a third party already removed is likewise fine, and
+    // must not abandon the rest of the batch.
+    let snap = ws.scan().unwrap();
+    let undo =
+        deploy::plan_undeploy(&ws, &snap, &["one".into(), "two".into()], &["a".into()]).unwrap();
+    std::fs::remove_file(f.agent_a.join("one")).unwrap();
+    deploy::apply(&undo).unwrap();
+    assert!(
+        !f.agent_a.join("two").exists(),
+        "the rest of the batch still ran"
+    );
+
+    // But a real directory the agent put there is never deleted.
+    let snap = ws.scan().unwrap();
+    let plan = deploy::plan_deploy(&ws, &snap, &["one".into()], &["a".into()]).unwrap();
+    deploy::apply(&plan).unwrap();
+    let snap = ws.scan().unwrap();
+    let undo = deploy::plan_undeploy(&ws, &snap, &["one".into()], &["a".into()]).unwrap();
+    std::fs::remove_file(f.agent_a.join("one")).unwrap();
+    std::fs::create_dir_all(f.agent_a.join("one")).unwrap();
+    std::fs::write(
+        f.agent_a.join("one/SKILL.md"),
+        "---\nname: one\n---\nmine\n",
+    )
+    .unwrap();
+    assert!(
+        deploy::apply(&undo).is_err(),
+        "refuses to delete what it did not create"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.agent_a.join("one/SKILL.md")).unwrap(),
+        "---\nname: one\n---\nmine\n"
+    );
+}

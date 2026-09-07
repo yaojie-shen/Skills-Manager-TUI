@@ -17,6 +17,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use skills::Workspace;
+use skills::history::{self, History, Plan};
 use skills::ops::deploy;
 use skills::ops::edit;
 use skills::reconcile::Snapshot;
@@ -86,6 +87,17 @@ pub enum Action {
     },
     /// Run a write, toast its result, rescan.
     Write(WriteFn),
+    /// Log something that has already happened.
+    Record(history::Intent),
+    /// Move the history after a confirmed undo or redo went through.
+    Step(Step),
+}
+
+/// Which way the history moves once a confirmed change has been applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Undo,
+    Redo,
 }
 
 /// Work that must run outside the alternate screen.
@@ -120,6 +132,7 @@ pub struct App {
     pub health: HealthView,
     pub modal: Option<Modal>,
     pub toasts: Toasts,
+    pub history: History,
     tasks_running: usize,
     spinner: usize,
     tx: Sender<Msg>,
@@ -144,6 +157,7 @@ impl App {
             health: HealthView::default(),
             modal: None,
             toasts: Toasts::default(),
+            history: History::default(),
             tasks_running: 0,
             spinner: 0,
             tx,
@@ -268,6 +282,7 @@ impl App {
             // Land on the new skill so the next thing to do, deploying it, is
             // one key away.
             TaskOutput::Installed(_, Ok(key)) => vec![
+                Action::Record(history::Intent::Install { skill: key.clone() }),
                 Action::Rescan,
                 Action::Toast(format!("installed {key} — press d to deploy it")),
                 Action::Search {
@@ -301,6 +316,8 @@ impl App {
         let in_search_input = self.tab == Tab::Search && self.search.input_focused();
         match (k.code, k.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return vec![Action::Quit],
+            (KeyCode::Char('z'), KeyModifiers::CONTROL) => return self.step(Step::Undo),
+            (KeyCode::Char('y'), KeyModifiers::CONTROL) => return self.step(Step::Redo),
             (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
                 return vec![Action::Rescan, Action::Toast("rescanning".into())];
             }
@@ -419,7 +436,12 @@ impl App {
                     return;
                 }
                 match deploy::apply(&actions) {
-                    Ok(_) => self.toast(deploy::summarize(&actions), Level::Ok),
+                    Ok(_) => {
+                        self.toast(deploy::summarize(&actions), Level::Ok);
+                        if let Some(intent) = history::Intent::from_actions(&actions) {
+                            self.history.record(intent);
+                        }
+                    }
                     Err(e) => self.toast(format!("{title} failed: {e:#}"), Level::Error),
                 }
                 self.rescan();
@@ -427,6 +449,9 @@ impl App {
             Action::ConfirmLinks { title, actions } => {
                 self.modal = Some(Modal::confirm(title, actions));
             }
+            Action::Record(intent) => self.history.record(intent),
+            Action::Step(Step::Undo) => self.history.commit_undo(),
+            Action::Step(Step::Redo) => self.history.commit_redo(),
             Action::Write(f) => {
                 match f(&self.ws) {
                     Ok(msg) => self.toast(msg, Level::Ok),
@@ -434,6 +459,61 @@ impl App {
                 }
                 self.rescan();
             }
+        }
+    }
+
+    /// Take one step back or forward. The plan is worked out against the tree
+    /// as it stands, so anything changed since is skipped rather than forced.
+    fn step(&mut self, dir: Step) -> Vec<Action> {
+        let entry = match dir {
+            Step::Undo => self.history.last(),
+            Step::Redo => self.history.next_redo(),
+        };
+        let Some(entry) = entry else {
+            return vec![Action::Toast(match dir {
+                Step::Undo => "nothing to undo".into(),
+                Step::Redo => "nothing to redo".into(),
+            })];
+        };
+        let intent = entry.intent.clone();
+        let what = intent.describe();
+        // Time has passed since the step was taken, so plan against the tree as
+        // it is now rather than the snapshot on screen.
+        let snap = match self.ws.scan() {
+            Ok(s) => {
+                self.snap = s;
+                &self.snap
+            }
+            Err(e) => return vec![Action::Error(format!("scan failed: {e:#}"))],
+        };
+        let plan = match dir {
+            Step::Undo => history::undo_plan(&self.ws, snap, &intent),
+            Step::Redo => history::redo_plan(&self.ws, snap, &intent),
+        };
+        match plan {
+            Ok(Plan::Links(actions)) => {
+                let verb = if dir == Step::Undo { "undo" } else { "redo" };
+                self.modal = Some(Modal::confirm_then(
+                    format!("{verb}: {what}"),
+                    actions,
+                    Some(dir),
+                ));
+                vec![]
+            }
+            Ok(Plan::Write { describe, apply }) => {
+                self.modal = Some(Modal::undo_write(describe, apply, dir));
+                vec![]
+            }
+            // Someone already put the tree where this step would leave it, so
+            // drop the entry rather than offering a change with nothing in it.
+            Ok(Plan::Nothing) => {
+                match dir {
+                    Step::Undo => self.history.commit_undo(),
+                    Step::Redo => self.history.commit_redo(),
+                }
+                vec![Action::Toast(format!("already done: {what}"))]
+            }
+            Err(e) => vec![Action::Error(format!("{e:#}"))],
         }
     }
 

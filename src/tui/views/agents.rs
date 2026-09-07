@@ -48,6 +48,8 @@ pub struct AgentsView {
     presets: Vec<(Preset, PresetStatus)>,
     preset_cursor: usize,
     entries: ListNav,
+    /// Compact rows are one line each; the default card gives an entry three.
+    compact: bool,
     scope_rects: Vec<(Rect, Option<String>)>,
     preset_rects: Vec<Rect>,
     left: Rect,
@@ -234,6 +236,10 @@ impl View for AgentsView {
             KeyCode::Char(']') => {
                 self.move_scope(1, ctx);
                 return vec![Action::Rescan];
+            }
+            KeyCode::Char('v') => {
+                self.compact = !self.compact;
+                return vec![];
             }
             KeyCode::Char('s') => {
                 return match deploy::plan_sync(ctx.ws, ctx.snap) {
@@ -470,18 +476,31 @@ impl View for AgentsView {
         let rows_data = self.rows(ctx);
         let show_agent = self.scope.is_none();
         let scope_agents = self.scope_agents(ctx);
+        let inner_w = left.width.saturating_sub(4) as usize; // borders + highlight symbol
+        self.entries.item_height = if self.compact { 1 } else { 3 };
         let items: Vec<ListItem> = rows_data
             .iter()
             .map(|row| match row {
-                Row::Header(text) => ListItem::new(Line::from(Span::styled(
-                    text.clone(),
-                    th.dim().add_modifier(ratatui::style::Modifier::ITALIC),
-                ))),
+                Row::Header(text) => {
+                    let head = Line::from(Span::styled(
+                        text.clone(),
+                        th.dim().add_modifier(ratatui::style::Modifier::ITALIC),
+                    ));
+                    if self.compact {
+                        return ListItem::new(head);
+                    }
+                    // Every item of a list is the same height, so a header spends
+                    // its two spare lines on the gap that separates the sections.
+                    ListItem::new(vec![Line::from(""), head, Line::from("")])
+                }
                 Row::Entry {
                     name,
                     states,
                     managed,
                 } => {
+                    if !self.compact {
+                        return entry_card(name, states, *managed, &scope_agents, ctx, inner_w);
+                    }
                     let mut spans = vec![Span::raw("  ")];
                     spans.push(Span::styled(
                         pad(name, 26),
@@ -541,6 +560,7 @@ impl View for AgentsView {
                 ("↓", "entries"),
                 ("[ ]", "scope"),
                 ("s", "sync"),
+                ("v", "density"),
             ],
             Focus::Entries => &[
                 ("j/k", "move"),
@@ -548,6 +568,7 @@ impl View for AgentsView {
                 ("Enter", "open in search"),
                 ("[ ]", "scope"),
                 ("c", "convert dir-link"),
+                ("v", "density"),
             ],
         }
     }
@@ -582,6 +603,98 @@ fn entry_note(state: &EntryState) -> String {
         EntryState::Foreign { target } => format!("links outside the root → {}", target.display()),
         EntryState::AgentOnly => "only here, not in the root".into(),
     }
+}
+
+/// What an entry is when the root holds no record to describe it.
+fn entry_summary(state: Option<&EntryState>) -> String {
+    match state {
+        Some(EntryState::Broken { .. }) => {
+            "the link points at something the root no longer has".into()
+        }
+        Some(EntryState::Foreign { target }) => {
+            format!("links outside the root to {}", target.display())
+        }
+        Some(EntryState::AgentOnly) => "only in this agent, not in the root".into(),
+        _ => "no description".into(),
+    }
+}
+
+/// Short status word for the right of a card.
+fn state_label(state: Option<&EntryState>) -> &'static str {
+    match state {
+        Some(EntryState::Deployed) => "managed",
+        Some(EntryState::Broken { .. }) => "broken link",
+        Some(EntryState::Shadow { same_content: true }) => "shadow",
+        Some(EntryState::Shadow {
+            same_content: false,
+        }) => "shadow, differs",
+        Some(EntryState::Foreign { .. }) => "foreign",
+        Some(EntryState::AgentOnly) => "the agent's own",
+        None => "",
+    }
+}
+
+/// A three-line card: the name and who has it, what the skill is, how it is filed.
+fn entry_card(
+    name: &str,
+    states: &[Option<&EntryState>],
+    managed: bool,
+    scope_agents: &[String],
+    ctx: &Ctx,
+    inner_w: usize,
+) -> ListItem<'static> {
+    let th = ctx.theme;
+    let mut marks: Vec<Span> = Vec::new();
+    for (i, state) in states.iter().enumerate() {
+        let (glyph, style) = glyph_for(*state, th);
+        marks.push(Span::styled(format!("{glyph} "), style));
+        marks.push(Span::styled(
+            format!("{}  ", abbrev(&scope_agents[i])),
+            th.dim(),
+        ));
+    }
+    let marks_w: usize = marks.iter().map(|s| width(&s.content)).sum();
+    let name_w = inner_w.saturating_sub(marks_w + 2);
+    let mut head = vec![
+        Span::raw("  "),
+        Span::styled(
+            pad(name, name_w),
+            if managed { th.bold() } else { th.dim() },
+        ),
+    ];
+    head.extend(marks);
+
+    // A skill several agents carry is filed by its root state, not by whichever
+    // agent happens to come first in the scope.
+    let state = states
+        .iter()
+        .flatten()
+        .copied()
+        .find(|s| matches!(s, EntryState::Deployed))
+        .or_else(|| states.iter().flatten().copied().next());
+    let record = ctx.snap.get(name);
+    let body = match record.and_then(|r| r.description.clone()) {
+        Some(d) => d,
+        None => entry_summary(state),
+    };
+    let right = state_label(state);
+    let tags = record.map(|r| r.tags.join(" · ")).unwrap_or_default();
+    let tags_w = inner_w.saturating_sub(width(right) + 4);
+    ListItem::new(vec![
+        Line::from(head),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(fit(&body, inner_w.saturating_sub(2)), th.dim()),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(pad(&tags, tags_w), th.tag()),
+            Span::styled(
+                right,
+                th.dim().add_modifier(ratatui::style::Modifier::ITALIC),
+            ),
+        ]),
+    ])
 }
 
 impl AgentsView {

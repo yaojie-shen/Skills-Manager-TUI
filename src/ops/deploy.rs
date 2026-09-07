@@ -393,12 +393,20 @@ pub fn apply(actions: &[Action]) -> Result<usize> {
         match a {
             Action::Skip { .. } => {}
             Action::Mkdir { path, .. } => {
+                // Only a directory that was not there counts as a change.
+                let fresh = !path.is_dir();
                 std::fs::create_dir_all(path)
                     .with_context(|| format!("creating {}", path.display()))?;
-                done += 1;
+                if fresh {
+                    done += 1;
+                }
             }
             Action::Link { path, target, .. } => {
                 if is_symlink(path) {
+                    // Already pointing where it should; nothing to redo.
+                    if crate::util::link_target_abs(path).as_deref() == Some(target.as_path()) {
+                        continue;
+                    }
                     std::fs::remove_file(path)?;
                 } else if path.exists() {
                     bail!("refusing to replace existing entry {}", path.display());
@@ -409,12 +417,21 @@ pub fn apply(actions: &[Action]) -> Result<usize> {
                 done += 1;
             }
             Action::Unlink { path, .. } => {
-                if !is_symlink(path) {
-                    bail!("refusing to remove non-symlink {}", path.display());
+                match std::fs::symlink_metadata(path) {
+                    // Already gone, by another session or by hand. The state
+                    // asked for is the state there is, so carry on rather than
+                    // abandoning the rest of the batch.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // Something is there that we did not put there.
+                    Ok(m) if !m.file_type().is_symlink() => {
+                        bail!("refusing to remove non-symlink {}", path.display())
+                    }
+                    _ => {
+                        std::fs::remove_file(path)
+                            .with_context(|| format!("removing {}", path.display()))?;
+                        done += 1;
+                    }
                 }
-                std::fs::remove_file(path)
-                    .with_context(|| format!("removing {}", path.display()))?;
-                done += 1;
             }
         }
     }

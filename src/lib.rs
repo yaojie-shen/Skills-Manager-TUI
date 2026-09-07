@@ -5,6 +5,7 @@
 pub mod config;
 pub mod dict;
 pub mod hash;
+pub mod history;
 pub mod meta;
 pub mod ops;
 pub mod paths;

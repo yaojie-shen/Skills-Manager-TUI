@@ -146,7 +146,19 @@ pub fn fetch(ws: &Workspace, r: &InstallRef) -> Result<Fetched> {
             };
             // A repository of many skills is normal; the caller decides which.
             if !skill_dir.join(SKILL_FILE).is_file() {
-                let choices = discover(&skill_dir);
+                // Reported relative to the repository root, because that is
+                // what a caller passes back as `subpath` on the second attempt.
+                let base = subpath.as_deref().unwrap_or("");
+                let choices: Vec<String> = discover(&skill_dir)
+                    .into_iter()
+                    .map(|c| {
+                        if base.is_empty() {
+                            c
+                        } else {
+                            format!("{}/{c}", base.trim_end_matches('/'))
+                        }
+                    })
+                    .collect();
                 let _ = std::fs::remove_dir_all(&work);
                 if choices.is_empty() {
                     bail!(

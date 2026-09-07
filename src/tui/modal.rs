@@ -1,7 +1,7 @@
 //! Overlays: help, messages, confirmations, text prompts, agent picker,
 //! and the update conflict resolver.
 
-use super::app::{Action, Ctx, Hints, WriteFn};
+use super::app::{Action, Ctx, Hints, Step, WriteFn};
 use super::widgets::{Input, ListNav, button, fit, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -59,6 +59,9 @@ pub enum Modal {
         title: String,
         lines: Vec<String>,
         actions: Vec<deploy::Action>,
+        /// Emitted only once the changes actually went through, so a cancelled
+        /// or failed confirmation leaves the history where it was.
+        then: Option<Step>,
         scroll: u16,
         btn: usize,
         btn_rects: Vec<Rect>,
@@ -69,6 +72,8 @@ pub enum Modal {
         title: String,
         lines: Vec<String>,
         write: Option<WriteFn>,
+        /// Set when this confirmation is a history step.
+        then: Option<Step>,
         btn: usize,
         btn_rects: Vec<Rect>,
         rect: Rect,
@@ -124,6 +129,11 @@ impl Modal {
         }
     }
     pub fn confirm(title: String, actions: Vec<deploy::Action>) -> Self {
+        Self::confirm_then(title, actions, None)
+    }
+
+    /// A confirmation that also moves the history when it succeeds.
+    pub fn confirm_then(title: String, actions: Vec<deploy::Action>, then: Option<Step>) -> Self {
         let lines: Vec<String> = actions.iter().map(|a| a.describe()).collect();
         if !actions.iter().any(|a| a.is_change()) {
             return Modal::message(
@@ -139,6 +149,7 @@ impl Modal {
             title,
             lines,
             actions,
+            then,
             scroll: 0,
             btn: 0,
             btn_rects: Vec::new(),
@@ -150,6 +161,7 @@ impl Modal {
             title,
             lines,
             write: Some(write),
+            then: None,
             btn: 1,
             btn_rects: Vec::new(),
             rect: Rect::default(),
@@ -347,6 +359,25 @@ impl Modal {
         }
     }
 
+    /// Confirm a history step that is a write rather than a set of links.
+    pub fn undo_write(describe: String, back: skills::history::WriteBack, dir: Step) -> Self {
+        let verb = if dir == Step::Undo { "undo" } else { "redo" };
+        Self::confirm_write(
+            format!(" {verb} "),
+            vec![format!("{}?", capitalize(&describe))],
+            Box::new(move |ws| back.apply(ws)),
+        )
+        .with_step(dir)
+    }
+
+    /// Carry the history move onto a write confirmation.
+    fn with_step(mut self, dir: Step) -> Self {
+        if let Modal::ConfirmWrite { then, .. } = &mut self {
+            *then = Some(dir);
+        }
+        self
+    }
+
     pub fn agent_pick(skill: &str) -> Self {
         let mut list = ListNav::default();
         list.select(Some(0));
@@ -438,14 +469,15 @@ impl Modal {
             },
             Modal::Confirm {
                 actions,
+                then,
                 btn,
                 scroll,
                 ..
             } => match k.code {
-                KeyCode::Char('y') => apply_links(std::mem::take(actions)),
+                KeyCode::Char('y') => apply_links(std::mem::take(actions), then.take()),
                 KeyCode::Enter => {
                     if *btn == 0 {
-                        apply_links(std::mem::take(actions))
+                        apply_links(std::mem::take(actions), then.take())
                     } else {
                         vec![Action::CloseModal, Action::Toast("cancelled".into())]
                     }
@@ -471,16 +503,18 @@ impl Modal {
                 }
                 _ => vec![],
             },
-            Modal::ConfirmWrite { write, btn, .. } => match k.code {
+            Modal::ConfirmWrite {
+                write, then, btn, ..
+            } => match k.code {
                 KeyCode::Char('y') => write
                     .take()
-                    .map(|w| vec![Action::CloseModal, Action::Write(w)])
+                    .map(|w| write_actions(w, then.take()))
                     .unwrap_or_default(),
                 KeyCode::Enter => {
                     if *btn == 0 {
                         write
                             .take()
-                            .map(|w| vec![Action::CloseModal, Action::Write(w)])
+                            .map(|w| write_actions(w, then.take()))
                             .unwrap_or_default()
                     } else {
                         vec![Action::CloseModal, Action::Toast("cancelled".into())]
@@ -693,6 +727,7 @@ impl Modal {
             }
             Modal::Confirm {
                 actions,
+                then,
                 scroll,
                 btn_rects,
                 rect,
@@ -704,7 +739,7 @@ impl Modal {
                 }
                 if click {
                     if btn_rects.first().is_some_and(|r| r.contains(at)) {
-                        return apply_links(std::mem::take(actions));
+                        return apply_links(std::mem::take(actions), then.take());
                     }
                     if btn_rects.get(1).is_some_and(|r| r.contains(at)) || !rect.contains(at) {
                         return vec![Action::CloseModal, Action::Toast("cancelled".into())];
@@ -714,6 +749,7 @@ impl Modal {
             }
             Modal::ConfirmWrite {
                 write,
+                then,
                 btn_rects,
                 rect,
                 ..
@@ -722,7 +758,7 @@ impl Modal {
                     if btn_rects.first().is_some_and(|r| r.contains(at)) {
                         return write
                             .take()
-                            .map(|w| vec![Action::CloseModal, Action::Write(w)])
+                            .map(|w| write_actions(w, then.take()))
                             .unwrap_or_default();
                     }
                     if btn_rects.get(1).is_some_and(|r| r.contains(at)) || !rect.contains(at) {
@@ -1222,6 +1258,24 @@ fn short_ref(reference: &str) -> String {
         .join("/")
 }
 
+/// A confirmed write, plus the history move it belongs to when it is a step.
+fn write_actions(w: WriteFn, then: Option<Step>) -> Vec<Action> {
+    let mut out = vec![Action::CloseModal, Action::Write(w)];
+    if let Some(step) = then {
+        out.push(Action::Step(step));
+    }
+    out
+}
+
+/// Sentences in a dialog start with a capital.
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
 fn flip(t: Take) -> Take {
     match t {
         Take::Local => Take::Upstream,
@@ -1229,13 +1283,24 @@ fn flip(t: Take) -> Take {
     }
 }
 
-fn apply_links(actions: Vec<deploy::Action>) -> Vec<Action> {
+fn apply_links(actions: Vec<deploy::Action>, then: Option<Step>) -> Vec<Action> {
     match deploy::apply(&actions) {
-        Ok(_) => vec![
-            Action::CloseModal,
-            Action::Toast(deploy::summarize(&actions)),
-            Action::Rescan,
-        ],
+        Ok(_) => {
+            let mut out = vec![
+                Action::CloseModal,
+                Action::Toast(deploy::summarize(&actions)),
+                Action::Rescan,
+            ];
+            // Nothing is written to the log until the change is on disk.
+            out.push(match then {
+                Some(step) => Action::Step(step),
+                None => match skills::history::Intent::from_actions(&actions) {
+                    Some(intent) => Action::Record(intent),
+                    None => return out,
+                },
+            });
+            out
+        }
         Err(e) => vec![
             Action::CloseModal,
             Action::Error(format!("{e:#}")),
@@ -1437,5 +1502,6 @@ Mouse
   right-click       deploy picker for that skill
   wheel             scroll lists and preview
 Global
+  Ctrl-Z  Ctrl-Y    undo and redo the last change
   1-5  Tab          switch tabs (Alt+1..5 while typing in the search box)
   /                 back to search      Ctrl-R  rescan      Ctrl-C  quit";
