@@ -271,10 +271,7 @@ impl App {
             }
         }
         if queued {
-            self.toast(
-                "task ready — waiting for the current dialog",
-                Level::Info,
-            );
+            self.toast("task ready — waiting for the current dialog", Level::Info);
         }
         // Drain only after the whole event, so CloseModal + OpenModal transitions
         // and failed input submissions cannot expose a queued dialog in between.
