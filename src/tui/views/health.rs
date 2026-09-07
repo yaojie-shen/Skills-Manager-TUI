@@ -1,7 +1,7 @@
 //! Health tab: everything that is not managed/unmanaged, plus update checks.
 
 use super::{View, status_glyph, status_text, wheel};
-use crate::tui::app::{Action, Ctx, Hints};
+use crate::tui::app::{Action, Ctx, Hints, Tab};
 use crate::tui::event::Task;
 use crate::tui::modal::Modal;
 use crate::tui::widgets::{ListNav, pad};
@@ -79,7 +79,10 @@ impl View for HealthView {
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         let n = self.keys.len();
         match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => vec![Action::Quit],
+            KeyCode::Char('q') => vec![Action::Quit],
+            // Esc means "back" everywhere else in the program, so here it goes
+            // back to the search page rather than out of the door.
+            KeyCode::Esc => vec![Action::SwitchTab(Tab::Search)],
             KeyCode::Down | KeyCode::Char('j') => {
                 self.list.move_by(1, n);
                 vec![]

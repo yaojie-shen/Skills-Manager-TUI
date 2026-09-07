@@ -1,26 +1,47 @@
-//! Presets tab.
+//! Presets tab: what each preset holds, and adding to or taking from it.
+//!
+//! Turning a preset on or off is the Agents page's job, one agent at a time.
+//! This page is where a preset is defined: which skills belong to it. The
+//! cards on the left say, per agent, how much of the preset is in place, so
+//! the definition and its effect can be read together without switching tabs.
 
+use super::cards::{self, CARD_H, cols_for, frame, frame_styled, skill_card};
+use super::preview::Overlay;
 use super::{View, split_panes, wheel};
-use crate::tui::app::{Action, Ctx, Hints};
+use crate::tui::app::{Action, Ctx, Hints, Tab};
 use crate::tui::modal::Modal;
-use crate::tui::widgets::{ListNav, pad};
+use crate::tui::widgets::{CardGrid, ScrollTrack, fit, pad, width};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use skills::history;
-use skills::ops::deploy;
+use skills::ops::deploy::{PresetState, preset_status};
 use skills::preset::Preset;
 
 #[derive(Default)]
 pub struct PresetsView {
     presets: Vec<Preset>,
-    list: ListNav,
-    members: ListNav,
+    list: CardGrid,
+    members: CardGrid,
     focus_members: bool,
     left: Rect,
     right: Rect,
+    list_track: ScrollTrack,
+    members_track: ScrollTrack,
+    /// Which track a drag started on, so it keeps hold of the thumb even when
+    /// the pointer wanders off the column.
+    drag: Option<Pane>,
+    /// A member opened for reading, over the page rather than instead of it.
+    preview: Overlay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    List,
+    Members,
 }
 
 impl PresetsView {
@@ -28,59 +49,18 @@ impl PresetsView {
         self.list.selected().and_then(|i| self.presets.get(i))
     }
 
-    fn plan(&self, ctx: &Ctx, on: bool) -> Vec<Action> {
-        let Some(p) = self.selected() else {
-            return vec![];
-        };
-        let targets = if p.agents.is_empty() {
-            ctx.ws.config.agent_keys()
-        } else {
-            p.agents.clone()
-        };
-        let present: Vec<String> = p
-            .skills
-            .iter()
-            .filter(|s| ctx.snap.get(s).is_some())
+    fn member_count(&self) -> usize {
+        self.selected().map(|p| p.skills.len()).unwrap_or(0)
+    }
+
+    fn selected_member(&self) -> Option<String> {
+        self.selected()
+            .and_then(|p| self.members.selected().and_then(|i| p.skills.get(i)))
             .cloned()
-            .collect();
-        let plan = if on {
-            deploy::plan_deploy(ctx.ws, ctx.snap, &present, &targets)
-        } else {
-            deploy::plan_undeploy(ctx.ws, ctx.snap, &present, &targets)
-        };
-        match plan {
-            Ok(mut actions) => {
-                for s in p.skills.iter().filter(|s| ctx.snap.get(s).is_none()) {
-                    actions.push(deploy::Action::Skip {
-                        agent: "*".into(),
-                        skill: s.clone(),
-                        reason: "not in skills root".into(),
-                    });
-                }
-                // Toggling a preset goes through without asking, the same as
-                // on the Agents page: it is one gesture, it says what it did,
-                // and undo takes it back.
-                vec![Action::ApplyLinks {
-                    title: format!(
-                        "{} preset {}",
-                        if on { "deploy" } else { "undeploy" },
-                        p.name
-                    ),
-                    actions,
-                }]
-            }
-            Err(e) => vec![Action::Error(format!("{e:#}"))],
-        }
     }
 
     fn remove_member(&self) -> Vec<Action> {
-        let Some(p) = self.selected() else {
-            return vec![];
-        };
-        let Some(i) = self.members.selected() else {
-            return vec![];
-        };
-        let Some(skill) = p.skills.get(i).cloned() else {
+        let (Some(p), Some(skill)) = (self.selected(), self.selected_member()) else {
             return vec![];
         };
         let name = p.name.clone();
@@ -88,235 +68,469 @@ impl PresetsView {
             history::preset_edit(ws, &name, |members| members.retain(|s| s != &skill))
         }))]
     }
+
+    fn add_members(&self, ctx: &Ctx) -> Vec<Action> {
+        // Membership is edited by picking from the library, never by typing
+        // a name from memory.
+        match self.selected() {
+            Some(p) => vec![Action::OpenModal(Box::new(Modal::preset_members(
+                p, ctx.snap,
+            )))],
+            None => vec![Action::Error(
+                "no preset selected; press c to create one".into(),
+            )],
+        }
+    }
+
+    /// Reading a member must not cost the place on this page, so it opens in a
+    /// window over it rather than by jumping to the search tab.
+    fn open_member(&mut self) -> Vec<Action> {
+        if let Some(k) = self.selected_member() {
+            self.preview.open(k);
+        }
+        vec![]
+    }
+
+    /// The three lines of a preset card: name and size, what it is for, and
+    /// how much of it each agent has. The last is derived from the links on
+    /// disk exactly as the pills on the Agents page are.
+    fn preset_card(&self, p: &Preset, ctx: &Ctx, inner_w: usize) -> Vec<Line<'static>> {
+        let th = ctx.theme;
+        let auto = ctx.ws.config.deploy.presets.contains(&p.name);
+        let count = match p.skills.len() {
+            1 => "1 skill".to_string(),
+            n => format!("{n} skills"),
+        };
+        let right = if auto {
+            format!("{count} · auto")
+        } else {
+            count
+        };
+        let name_w = inner_w.saturating_sub(width(&right) + 1);
+        let head = vec![
+            Span::styled(pad(&p.name, name_w), th.bold()),
+            Span::raw(" "),
+            Span::styled(right, th.dim()),
+        ];
+        let body = match &p.description {
+            Some(d) => Span::styled(fit(d, inner_w.saturating_sub(2)), th.dim()),
+            None => Span::styled("no description", th.dim()),
+        };
+        // One mark per agent the preset applies to. An agent outside the
+        // preset's own list is left out rather than shown as inactive, which
+        // would read as something to fix.
+        let agents: Vec<String> = if p.agents.is_empty() {
+            ctx.ws.config.agent_keys()
+        } else {
+            p.agents.clone()
+        };
+        let mut foot = vec![Span::raw("  ")];
+        for (i, key) in agents.iter().enumerate() {
+            if i > 0 {
+                foot.push(Span::raw("   "));
+            }
+            let st = preset_status(ctx.snap, p, std::slice::from_ref(key));
+            let (mark, style) = match st.state() {
+                PresetState::Active => ("✓", th.ok()),
+                PresetState::Partial => ("◐", th.warn()),
+                PresetState::Inactive => ("◌", th.dim()),
+                PresetState::Empty => ("◦", th.dim()),
+            };
+            foot.push(Span::styled(format!("{key} "), th.dim()));
+            foot.push(Span::styled(mark.to_string(), style));
+            if let Some(progress) = st.progress() {
+                foot.push(Span::styled(format!(" {progress}"), style));
+            }
+        }
+        vec![
+            Line::from(head),
+            Line::from(vec![Span::raw("  "), body]),
+            Line::from(""),
+            Line::from(foot),
+        ]
+    }
+
+    fn draw_presets(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        let th = ctx.theme;
+        let block = th.block(" presets ", !self.focus_members);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let content = Rect {
+            width: inner.width.saturating_sub(1),
+            ..inner
+        };
+        self.list.layout(content, 1, CARD_H, 0, self.presets.len());
+        if self.presets.is_empty() {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "no presets yet — press c to create one",
+                    th.dim(),
+                )),
+                Rect {
+                    height: 1,
+                    ..content
+                },
+            );
+            self.list_track.clear();
+            return;
+        }
+        let selected = self.list.selected();
+        for i in self.list.visible() {
+            let Some(cell) = self.list.cell(i) else {
+                continue;
+            };
+            let on = selected == Some(i);
+            let ci = frame(f, cell, on, !self.focus_members, th);
+            let lines = self.preset_card(&self.presets[i], ctx, ci.width as usize);
+            f.render_widget(Paragraph::new(lines), ci);
+        }
+        draw_track(f, inner, &self.list, selected, &mut self.list_track, th);
+    }
+
+    fn draw_members(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        let th = ctx.theme;
+        let Some(p) = self.selected().cloned() else {
+            let block = th.block(" members ", self.focus_members);
+            f.render_widget(block, area);
+            self.members_track.clear();
+            return;
+        };
+        let title = Line::from(vec![
+            Span::raw(" members of "),
+            Span::styled(p.name.clone(), th.bold()),
+            Span::raw(" "),
+        ]);
+        let block = th.block(title, self.focus_members);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let content = Rect {
+            width: inner.width.saturating_sub(1),
+            ..inner
+        };
+        let cols = cols_for(content.width);
+        self.members.layout(
+            content,
+            cols,
+            CARD_H,
+            if cols > 1 { 1 } else { 0 },
+            p.skills.len(),
+        );
+        if p.skills.is_empty() {
+            f.render_widget(
+                Paragraph::new(Span::styled("empty — press a to add skills", th.dim())),
+                Rect {
+                    height: 1,
+                    ..content
+                },
+            );
+            self.members_track.clear();
+            return;
+        }
+        let selected = self.members.selected();
+        let agents = &ctx.snap.agents;
+        for i in self.members.visible() {
+            let Some(cell) = self.members.cell(i) else {
+                continue;
+            };
+            let on = selected == Some(i);
+            let key = &p.skills[i];
+            let lines = match ctx.snap.get(key) {
+                Some(r) => {
+                    let ci = frame(f, cell, on, self.focus_members, th);
+                    let tail = r
+                        .source
+                        .as_ref()
+                        .map(|s| s.kind().to_string())
+                        .unwrap_or_default();
+                    skill_card(r, ctx, agents, ci.width as usize, None, &tail, &[])
+                        .into_iter()
+                        .map(|l| (ci, l))
+                        .collect::<Vec<_>>()
+                }
+                // A member with no directory behind it is the one thing on
+                // this page that needs fixing, so its frame says so.
+                None => {
+                    let border = if on {
+                        th.err().add_modifier(Modifier::BOLD)
+                    } else {
+                        th.err()
+                    };
+                    let ci = frame_styled(f, cell, border);
+                    vec![
+                        (
+                            ci,
+                            Line::from(vec![
+                                Span::styled("? ", th.err()),
+                                Span::styled(key.clone(), th.bold()),
+                            ]),
+                        ),
+                        (
+                            ci,
+                            Line::from(Span::styled("  not in the skills root", th.err())),
+                        ),
+                        (
+                            ci,
+                            Line::from(Span::styled("  x takes it off the preset", th.dim())),
+                        ),
+                    ]
+                }
+            };
+            if let Some((ci, _)) = lines.first() {
+                let ci = *ci;
+                f.render_widget(
+                    Paragraph::new(lines.into_iter().map(|(_, l)| l).collect::<Vec<_>>()),
+                    ci,
+                );
+            }
+        }
+        draw_track(
+            f,
+            inner,
+            &self.members,
+            selected,
+            &mut self.members_track,
+            th,
+        );
+    }
+}
+
+/// The scrollbar for a grid, in grid rows, drawn only once there is something
+/// to scroll to.
+fn draw_track(
+    f: &mut Frame,
+    inner: Rect,
+    grid: &CardGrid,
+    selected: Option<usize>,
+    track: &mut ScrollTrack,
+    th: &crate::tui::theme::Theme,
+) {
+    let vis = grid.visible_rows();
+    if grid.grid_rows() > vis && inner.height > 0 {
+        let rect = Rect {
+            x: inner.right().saturating_sub(1),
+            y: inner.y,
+            width: 1,
+            height: inner.height,
+        };
+        track.set(rect);
+        let mut sb = ScrollbarState::new(grid.grid_rows())
+            .position(selected.unwrap_or(0) / grid.cols())
+            .viewport_content_length(vis);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .style(th.dim()),
+            rect,
+            &mut sb,
+        );
+    } else {
+        track.clear();
+    }
 }
 
 impl View for PresetsView {
     fn refresh(&mut self, ctx: &Ctx) {
         self.presets = ctx.ws.presets.list().unwrap_or_default();
         self.list.clamp(self.presets.len());
-        let n = self.selected().map(|p| p.skills.len()).unwrap_or(0);
-        self.members.clamp(n);
+        self.members.clamp(self.member_count());
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.preview.handle_key(k) {
+            return vec![];
+        }
         let n = self.presets.len();
-        let mcount = self.selected().map(|p| p.skills.len()).unwrap_or(0);
+        let m = self.member_count();
+        if self.focus_members {
+            return match k.code {
+                KeyCode::Esc | KeyCode::Char('h') | KeyCode::BackTab => {
+                    self.focus_members = false;
+                    vec![]
+                }
+                // Along a row while there is a row; off the left edge is back
+                // to the preset list, which is where the eye goes anyway.
+                KeyCode::Left => {
+                    if self
+                        .members
+                        .selected()
+                        .unwrap_or(0)
+                        .is_multiple_of(self.members.cols())
+                    {
+                        self.focus_members = false;
+                    } else {
+                        self.members.move_by(-1, m);
+                    }
+                    vec![]
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.members.move_by(1, m);
+                    vec![]
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.members.move_rows(1, m);
+                    vec![]
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.members.move_rows(-1, m);
+                    vec![]
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.members.first(m);
+                    vec![]
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.members.last(m);
+                    vec![]
+                }
+                KeyCode::Char('x') | KeyCode::Delete => self.remove_member(),
+                KeyCode::Char('a') => self.add_members(ctx),
+                KeyCode::Enter => self.open_member(),
+                _ => vec![],
+            };
+        }
         match k.code {
-            KeyCode::Char('q') | KeyCode::Esc if !self.focus_members => vec![Action::Quit],
-            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
-                self.focus_members = false;
-                vec![]
-            }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') if !self.focus_members => {
-                if mcount > 0 {
-                    self.focus_members = true;
-                    self.members.clamp(mcount);
-                }
-                vec![]
-            }
+            KeyCode::Char('q') => vec![Action::Quit],
+            // Esc means "back" everywhere else in the program, so here it goes
+            // back to the search page rather than out of the door.
+            KeyCode::Esc => vec![Action::SwitchTab(Tab::Search)],
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.focus_members {
-                    self.members.move_by(1, mcount);
-                } else {
-                    self.list.move_by(1, n);
-                    self.members
-                        .first(self.selected().map(|p| p.skills.len()).unwrap_or(0));
-                }
+                self.list.move_by(1, n);
+                self.members.clamp(self.member_count());
                 vec![]
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.focus_members {
-                    self.members.move_by(-1, mcount);
-                } else {
-                    self.list.move_by(-1, n);
-                    self.members
-                        .first(self.selected().map(|p| p.skills.len()).unwrap_or(0));
+                self.list.move_by(-1, n);
+                self.members.clamp(self.member_count());
+                vec![]
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.list.first(n);
+                self.members.clamp(self.member_count());
+                vec![]
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.list.last(n);
+                self.members.clamp(self.member_count());
+                vec![]
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+                if m > 0 {
+                    self.focus_members = true;
+                    self.members.clamp(m);
                 }
                 vec![]
             }
             KeyCode::Char('c') => vec![Action::OpenModal(Box::new(Modal::new_preset()))],
-            // Membership is edited by picking from the library, never by typing
-            // a name from memory.
-            KeyCode::Char('a') | KeyCode::Char(' ') => match self.selected() {
-                Some(p) => vec![Action::OpenModal(Box::new(Modal::preset_members(
-                    p, ctx.snap,
-                )))],
-                None => vec![Action::Error(
-                    "no preset selected; press c to create one".into(),
-                )],
-            },
-            KeyCode::Char('x') | KeyCode::Delete if self.focus_members => self.remove_member(),
-            KeyCode::Char('X') | KeyCode::Char('x') => match self.selected() {
+            KeyCode::Char('a') => self.add_members(ctx),
+            // Deleting a whole preset is the one destructive key here, and it
+            // is the capital so a slip on `x` in the member list cannot reach it.
+            KeyCode::Char('D') => match self.selected() {
                 Some(p) => vec![Action::OpenModal(Box::new(Modal::delete_preset(&p.name)))],
                 None => vec![],
             },
-            KeyCode::Char('d') => self.plan(ctx, true),
-            KeyCode::Char('u') => self.plan(ctx, false),
-            KeyCode::Enter if self.focus_members => {
-                let key = self
-                    .selected()
-                    .and_then(|p| self.members.selected().and_then(|i| p.skills.get(i)))
-                    .cloned();
-                match key {
-                    Some(k) => vec![Action::Search {
-                        query: k,
-                        focus_list: true,
-                    }],
-                    None => vec![],
-                }
-            }
             _ => vec![],
         }
     }
 
-    fn handle_mouse(&mut self, m: MouseEvent, _ctx: &Ctx) -> Vec<Action> {
+    fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.preview.handle_mouse(m) {
+            return vec![];
+        }
         let at = (m.column, m.row).into();
-        let mcount = self.selected().map(|p| p.skills.len()).unwrap_or(0);
+        let mcount = self.member_count();
         if let Some(d) = wheel(&m) {
             if self.left.contains(at) {
-                self.list.move_by(d, self.presets.len());
+                self.list.move_by(d.signum(), self.presets.len());
+                self.members.clamp(self.member_count());
             } else if self.right.contains(at) {
-                self.members.move_by(d, mcount);
+                self.members.move_rows(d.signum(), mcount);
             }
             return vec![];
         }
-        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+        let pressing = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
+        let dragging = matches!(m.kind, MouseEventKind::Drag(MouseButton::Left));
+        // The tracks sit inside the panes, so they get first refusal.
+        let pane = if pressing && self.list_track.hit(m.column, m.row) {
+            Some(Pane::List)
+        } else if pressing && self.members_track.hit(m.column, m.row) {
+            Some(Pane::Members)
+        } else if dragging {
+            self.drag
+        } else {
+            None
+        };
+        if let Some(pane) = pane {
+            self.drag = Some(pane);
+            match pane {
+                Pane::List => {
+                    self.focus_members = false;
+                    if let Some(r) = self.list_track.index_at(m.row, self.list.grid_rows()) {
+                        self.list.select_row(r);
+                        self.members.clamp(self.member_count());
+                    }
+                }
+                Pane::Members => {
+                    self.focus_members = true;
+                    if let Some(r) = self.members_track.index_at(m.row, self.members.grid_rows()) {
+                        self.members.select_row(r);
+                    }
+                }
+            }
+            return vec![];
+        }
+        if !dragging {
+            self.drag = None;
+        }
+        if pressing {
             if self.left.contains(at) {
                 self.focus_members = false;
-                self.list.click(m.row, self.presets.len());
-            } else if self.right.contains(at) && self.members.click(m.row, mcount).is_some() {
+                if self.list.click(m.column, m.row).is_some() {
+                    self.members.clamp(self.member_count());
+                }
+            } else if self.right.contains(at)
+                && let Some((_, double)) = self.members.click(m.column, m.row)
+            {
                 self.focus_members = true;
+                if double {
+                    return self.open_member();
+                }
             }
         }
+        let _ = ctx;
         vec![]
     }
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let th = ctx.theme;
         let (left, right) = split_panes(area, 38);
         self.left = left;
         self.right = right;
-        let w = left.width.saturating_sub(4) as usize;
-        let items: Vec<ListItem> = self
-            .presets
-            .iter()
-            .map(|p| {
-                let auto = ctx.ws.config.deploy.presets.contains(&p.name);
-                ListItem::new(Line::from(vec![
-                    Span::raw(pad(&p.name, w.saturating_sub(12))),
-                    Span::styled(format!("{:>3} ", p.skills.len()), th.dim()),
-                    Span::styled(if auto { "auto" } else { "    " }, th.ok()),
-                ]))
-            })
-            .collect();
-        self.list.set_area_from_block(left);
-        let list = List::new(items)
-            .block(th.block(" presets ", !self.focus_members))
-            .highlight_style(if self.focus_members {
-                th.selected_unfocused()
-            } else {
-                th.selected()
-            })
-            .highlight_symbol("▸ ");
-        f.render_stateful_widget(list, left, &mut self.list.state);
-        if self.presets.is_empty() {
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    "no presets yet — press c to create one",
-                    th.dim(),
-                ))
-                .wrap(Wrap { trim: true }),
-                Rect {
-                    x: left.x + 2,
-                    y: left.y + 1,
-                    width: left.width.saturating_sub(4),
-                    height: 2,
-                },
-            );
-        }
-
-        let block = th.block(" members ", self.focus_members);
-        match self.selected().cloned() {
-            Some(p) => {
-                let mut header: Vec<Line> = vec![Line::from(vec![
-                    Span::styled(p.name.as_str(), th.bold().fg(th.accent)),
-                    Span::styled(
-                        format!(
-                            "   agents: {}",
-                            if p.agents.is_empty() {
-                                "all".to_string()
-                            } else {
-                                p.agents.join(", ")
-                            }
-                        ),
-                        th.dim(),
-                    ),
-                ])];
-                if let Some(d) = &p.description {
-                    header.push(Line::from(Span::styled(d.as_str(), th.dim())));
-                }
-                let inner = block.inner(right);
-                f.render_widget(block, right);
-                let hh = header.len() as u16;
-                f.render_widget(
-                    Paragraph::new(header),
-                    Rect {
-                        height: hh.min(inner.height),
-                        ..inner
-                    },
-                );
-                let list_area = Rect {
-                    y: inner.y + hh + 1,
-                    height: inner.height.saturating_sub(hh + 1),
-                    ..inner
-                };
-                self.members.rows = list_area;
-                let items: Vec<ListItem> = p
-                    .skills
-                    .iter()
-                    .map(|s| {
-                        let (mark, style) = match ctx.snap.get(s) {
-                            Some(r) if r.status.is_present() => ("●", th.ok()),
-                            Some(_) => ("✗", th.err()),
-                            None => ("?", th.err()),
-                        };
-                        ListItem::new(Line::from(vec![
-                            Span::styled(mark, style),
-                            Span::raw(format!(" {s}")),
-                        ]))
-                    })
-                    .collect();
-                let list = List::new(items)
-                    .highlight_style(if self.focus_members {
-                        th.selected()
-                    } else {
-                        th.selected_unfocused()
-                    })
-                    .highlight_symbol("▸ ");
-                f.render_stateful_widget(list, list_area, &mut self.members.state);
-                if p.skills.is_empty() {
-                    f.render_widget(
-                        Paragraph::new(Span::styled("empty — press a to add a skill", th.dim())),
-                        list_area,
-                    );
-                }
-            }
-            None => f.render_widget(block, right),
-        }
+        self.draw_presets(f, left, ctx);
+        self.draw_members(f, right, ctx);
+        self.preview.draw(f, area, ctx);
     }
 
     fn hints(&self) -> Hints {
         if self.focus_members {
-            &[("Enter", "open"), ("x", "remove member"), ("Esc", "back")]
+            &[
+                ("a", "add skills"),
+                ("x", "remove"),
+                ("Enter", "preview"),
+                ("←/Esc", "presets"),
+            ]
         } else {
             &[
                 ("c", "create"),
-                ("a", "choose skills"),
-                ("d/u", "deploy/undeploy"),
-                ("X", "delete"),
-                ("Enter", "members"),
+                ("a", "add skills"),
+                ("Enter/→", "members"),
+                ("D", "delete preset"),
                 ("q", "quit"),
             ]
         }
     }
 }
+
+// Keep the module's own name for the card constants in scope for callers
+// that only import this view.
+#[allow(unused_imports)]
+use cards::MIN_CARD_W as _;

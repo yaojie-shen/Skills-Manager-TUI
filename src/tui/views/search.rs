@@ -1,6 +1,8 @@
 //! Search tab: input, result list, preview.
 
-use super::{View, split_panes, status_glyph, status_text, wheel};
+use super::cards::{self, CARD_H, cols_for, frame, skill_card};
+use super::preview::{Overlay, highlight_spans, preview_lines};
+use super::{View, split_panes, status_glyph, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::event::Task;
 use crate::tui::modal::Modal;
@@ -12,16 +14,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use skills::config::{UiDensity, UiLayout};
-use skills::ops::deploy;
 use skills::ops::edit;
-use skills::reconcile::{DeployState, SkillRecord, SkillStatus};
-use skills::search::{Hit, Query, Searcher, highlight_ranges};
-
-/// Narrowest a card may get before the grid gives up a column. Below this the
-/// name and the deployment marks stop fitting on one line together.
-const MIN_CARD_W: u16 = 40;
-/// Most columns worth having: past this a card holds less than it costs to scan.
-const MAX_COLS: usize = 4;
+use skills::reconcile::{SkillRecord, SkillStatus};
+use skills::search::{Hit, Query, Searcher};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -51,7 +46,7 @@ pub struct SearchView {
     layout: Option<UiLayout>,
     density: Option<UiDensity>,
     /// Grid layout has no standing preview pane, so it opens over the results.
-    preview_open: bool,
+    overlay: Overlay,
     searcher: Searcher,
 }
 
@@ -73,7 +68,7 @@ impl Default for SearchView {
             esc_armed: false,
             layout: None,
             density: None,
-            preview_open: false,
+            overlay: Overlay::default(),
             searcher: Searcher::new(),
         }
     }
@@ -153,6 +148,21 @@ impl SearchView {
         self.preview_scroll = 0;
     }
 
+    /// Split layout has a pane to step into; grid layout opens a window over
+    /// the results instead, which is the same thing every other page does.
+    fn open_preview(&mut self, ctx: &Ctx) {
+        if self.hits.is_empty() {
+            return;
+        }
+        if self.layout(ctx) == UiLayout::Grid {
+            if let Some(r) = self.selected(ctx) {
+                self.overlay.open(r.key.clone());
+            }
+        } else {
+            self.focus = Focus::Preview;
+        }
+    }
+
     fn scroll_preview(&mut self, delta: i32) {
         let max = (self.preview_lines as i32 - self.preview_height as i32).max(0);
         self.preview_scroll = (self.preview_scroll as i32 + delta).clamp(0, max) as u16;
@@ -217,6 +227,21 @@ impl SearchView {
             Err(a) => vec![a],
         }
     }
+    fn act_rename(&self, ctx: &Ctx) -> Vec<Action> {
+        match self.need_present(ctx, "rename") {
+            Ok(r) => vec![Action::OpenModal(Box::new(Modal::rename(&r.key)))],
+            Err(a) => vec![a],
+        }
+    }
+    fn act_set_source(&self, ctx: &Ctx) -> Vec<Action> {
+        match self.need_present(ctx, "set the source of") {
+            Ok(r) => vec![Action::OpenModal(Box::new(Modal::set_source(
+                &r.key,
+                r.source.as_ref(),
+            )))],
+            Err(a) => vec![a],
+        }
+    }
     fn act_accept(&self, ctx: &Ctx) -> Vec<Action> {
         let Some(r) = self.selected(ctx) else {
             return vec![];
@@ -276,42 +301,6 @@ impl SearchView {
         };
         vec![Action::OpenModal(Box::new(Modal::remove(&r.key)))]
     }
-    fn act_toggle_agent(&self, ctx: &Ctx, idx: usize) -> Vec<Action> {
-        let Ok(r) = self.need_present(ctx, "deploy") else {
-            return vec![];
-        };
-        let Some(agent) = ctx.ws.config.agents.get(idx) else {
-            return vec![];
-        };
-        let deployed = matches!(r.deploy.get(&agent.key), Some(DeployState::Deployed));
-        let plan = if deployed {
-            deploy::plan_undeploy(
-                ctx.ws,
-                ctx.snap,
-                std::slice::from_ref(&r.key),
-                std::slice::from_ref(&agent.key),
-            )
-        } else {
-            deploy::plan_deploy(
-                ctx.ws,
-                ctx.snap,
-                std::slice::from_ref(&r.key),
-                std::slice::from_ref(&agent.key),
-            )
-        };
-        match plan {
-            Ok(actions) => vec![Action::ApplyLinks {
-                title: format!(
-                    "{} {} on {}",
-                    if deployed { "undeploy" } else { "deploy" },
-                    r.key,
-                    agent.key
-                ),
-                actions,
-            }],
-            Err(e) => vec![Action::Error(format!("{e:#}"))],
-        }
-    }
 }
 
 /// Drawing, split by band. `draw` itself only decides which of these run.
@@ -362,7 +351,10 @@ impl SearchView {
 
         let mut legend = vec![Span::raw(" skills ")];
         for a in agents {
-            legend.push(Span::styled(format!("{} ", abbrev(&a.key)), th.dim()));
+            legend.push(Span::styled(
+                format!("{} ", cards::abbrev(&a.key)),
+                th.dim(),
+            ));
         }
         let block = th.block(Line::from(legend), self.focus == Focus::List);
         let inner = block.inner(area);
@@ -371,7 +363,7 @@ impl SearchView {
         // A framed card is three lines of content plus its own border; a row is
         // one line, two while an excerpt has something to say.
         let cell_h = if cards {
-            5
+            CARD_H
         } else if searching {
             2
         } else {
@@ -381,7 +373,7 @@ impl SearchView {
         // does not change under the user the moment the list grows past a screen.
         let usable = inner.width.saturating_sub(1);
         let cols = if self.layout(ctx) == UiLayout::Grid && cards {
-            ((usable / MIN_CARD_W) as usize).clamp(1, MAX_COLS)
+            cols_for(usable)
         } else {
             1
         };
@@ -419,28 +411,37 @@ impl SearchView {
             let r = &ctx.snap.skills[h.index];
             let on = selected == Some(i);
             if cards {
-                // The frame carries the selection so the highlighted match keeps
-                // its own background; painting the whole card would bury it.
-                let border = if on {
-                    if self.focus == Focus::List {
-                        th.accent().add_modifier(ratatui::style::Modifier::BOLD)
-                    } else {
-                        th.accent()
-                    }
+                let ci = frame(f, cell, on, self.focus == Focus::List, th);
+                // While searching the card shows the excerpt around the match
+                // and names the fields it matched in; a hit on the name or a
+                // tag has no excerpt, so the description stays.
+                let body = h
+                    .excerpt
+                    .as_ref()
+                    .filter(|_| searching)
+                    .map(|e| e.text.as_str());
+                let tail = if searching {
+                    h.fields
+                        .iter()
+                        .map(|f| f.label())
+                        .collect::<Vec<_>>()
+                        .join("·")
                 } else {
-                    th.dim()
+                    r.source
+                        .as_ref()
+                        .map(|s| s.kind().to_string())
+                        .unwrap_or_default()
                 };
-                let b = ratatui::widgets::Block::default()
-                    .borders(ratatui::widgets::Borders::ALL)
-                    .border_type(ratatui::widgets::BorderType::Rounded)
-                    .border_style(border);
-                let ci = b.inner(cell).inner(ratatui::layout::Margin {
-                    horizontal: 1,
-                    vertical: 0,
-                });
-                f.render_widget(b, cell);
                 f.render_widget(
-                    Paragraph::new(card_lines(r, h, ctx, agents, ci.width as usize, searching)),
+                    Paragraph::new(skill_card(
+                        r,
+                        ctx,
+                        agents,
+                        ci.width as usize,
+                        body,
+                        &tail,
+                        &h.terms,
+                    )),
                     ci,
                 );
             } else {
@@ -537,23 +538,6 @@ impl SearchView {
             );
         }
     }
-
-    /// The preview as a panel over the results, for the layout that has no room
-    /// to keep one open. Sized to the text rather than to the screen, so a short
-    /// skill does not get a mostly empty window.
-    fn draw_preview_over(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let w = area.width.saturating_sub(8).clamp(20, 96);
-        let h = area.height.saturating_sub(4).max(6);
-        let rect = Rect {
-            x: area.x + (area.width - w) / 2,
-            y: area.y + (area.height - h) / 2,
-            width: w,
-            height: h,
-        };
-        f.render_widget(ratatui::widgets::Clear, rect);
-        self.preview_rect = rect;
-        self.draw_preview(f, rect, ctx);
-    }
 }
 
 impl View for SearchView {
@@ -567,6 +551,9 @@ impl View for SearchView {
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.overlay.handle_key(k) {
+            return vec![];
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let mut acts = Vec::new();
         match self.focus {
@@ -612,14 +599,13 @@ impl View for SearchView {
                 KeyCode::Right | KeyCode::Char('l') if self.grid.cols() > 1 => self.move_sel(1),
                 KeyCode::Left | KeyCode::Char('h') if self.grid.cols() > 1 => self.move_sel(-1),
                 KeyCode::Tab | KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                    if !self.hits.is_empty() {
-                        self.focus = Focus::Preview;
-                        self.preview_open = true;
-                    }
+                    self.open_preview(ctx)
                 }
                 KeyCode::Char('t') => acts = self.act_tags(ctx),
                 KeyCode::Char('n') => acts = self.act_note(ctx),
                 KeyCode::Char('d') => acts = self.act_deploy(ctx),
+                KeyCode::Char('r') => acts = self.act_rename(ctx),
+                KeyCode::Char('s') => acts = self.act_set_source(ctx),
                 KeyCode::Char('a') => acts = self.act_accept(ctx),
                 KeyCode::Char('m') => acts = self.act_migrate(ctx),
                 KeyCode::Char('u') => acts = self.act_check(ctx),
@@ -636,18 +622,14 @@ impl View for SearchView {
                         UiLayout::Split => UiLayout::Grid,
                         UiLayout::Grid => UiLayout::Split,
                     });
-                    self.preview_open = false;
+                    self.overlay.close();
                 }
                 KeyCode::Char('i') => acts = vec![Action::OpenModal(Box::new(Modal::install()))],
-                KeyCode::Char(c @ '1'..='9') if ctrl => {
-                    acts = self.act_toggle_agent(ctx, (c as u8 - b'1') as usize)
-                }
                 _ => {}
             },
             Focus::Preview => match k.code {
                 KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
                     self.focus = Focus::List;
-                    self.preview_open = false;
                 }
                 KeyCode::Tab => self.focus = Focus::Input,
                 KeyCode::Char('q') => return vec![Action::Quit],
@@ -676,10 +658,11 @@ impl View for SearchView {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.overlay.handle_mouse(m) {
+            return vec![];
+        }
         let at = (m.column, m.row).into();
         if let Some(d) = wheel(&m) {
-            // The preview sits over the results in grid layout, so it gets first
-            // refusal on anything inside it.
             if self.preview_rect.contains(at) {
                 self.scroll_preview(d);
             } else if self.list_rect.contains(at) {
@@ -715,8 +698,7 @@ impl View for SearchView {
                 if let Some((_, double)) = self.grid.click(m.column, m.row) {
                     self.preview_scroll = 0;
                     if double {
-                        self.focus = Focus::Preview;
-                        self.preview_open = true;
+                        self.open_preview(ctx);
                     }
                 }
             }
@@ -751,9 +733,7 @@ impl View for SearchView {
         self.draw_results(f, left, ctx);
         if grid {
             self.preview_rect = Rect::default();
-            if self.preview_open && self.selected(ctx).is_some() {
-                self.draw_preview_over(f, rows[1], ctx);
-            }
+            self.overlay.draw(f, rows[1], ctx);
         } else {
             self.preview_rect = right;
             self.draw_preview(f, right, ctx);
@@ -773,13 +753,14 @@ impl View for SearchView {
                 ("t", "tags"),
                 ("n", "note"),
                 ("d", "deploy"),
+                ("r", "rename"),
+                ("s", "source"),
                 ("a", "accept"),
                 ("u/U", "check/update"),
                 ("x", "remove"),
                 ("Enter", "preview"),
                 ("i", "install"),
-                ("v", "density"),
-                ("/", "search"),
+                ("v/V", "layout"),
             ],
             Focus::Preview => &[
                 ("j/k", "scroll"),
@@ -791,102 +772,6 @@ impl View for SearchView {
             ],
         }
     }
-}
-
-/// How a skill stands with one agent.
-fn deploy_glyph(
-    state: Option<&DeployState>,
-    th: &crate::tui::theme::Theme,
-) -> (&'static str, Style) {
-    match state {
-        Some(DeployState::Deployed) => ("✓", th.ok()),
-        Some(DeployState::Broken) => ("!", th.err()),
-        Some(DeployState::Shadow { .. }) | Some(DeployState::Foreign) => ("~", th.warn()),
-        _ => ("·", th.dim()),
-    }
-}
-
-/// A three-line card: name and where it is deployed, what it is, how it is filed.
-fn card_lines<'a>(
-    r: &'a SkillRecord,
-    h: &'a Hit,
-    ctx: &'a Ctx,
-    agents: &'a [skills::reconcile::AgentReport],
-    inner_w: usize,
-    searching: bool,
-) -> Vec<Line<'a>> {
-    let th = ctx.theme;
-    // Line 1: status, name, and one labelled marker per agent, right-aligned.
-    let deploy: Vec<Span> = agents
-        .iter()
-        .flat_map(|a| {
-            let (g, style) = deploy_glyph(r.deploy.get(&a.key), th);
-            [
-                Span::styled(format!("{g} "), style),
-                Span::styled(format!("{}  ", abbrev(&a.key)), th.dim()),
-            ]
-        })
-        .collect();
-    let deploy_w: usize = deploy.iter().map(|s| width(&s.content)).sum();
-    let name_w = inner_w.saturating_sub(deploy_w + 3);
-    let mut head = vec![status_glyph(&r.status, th), Span::raw(" ")];
-    head.extend(highlight_spans(
-        &pad(&r.key, name_w),
-        &h.terms,
-        th.bold(),
-        th,
-    ));
-    head.extend(deploy);
-
-    // Line 2: the excerpt while searching, otherwise the description.
-    let body_w = inner_w.saturating_sub(2);
-    // While searching, prefer the excerpt around the match; a hit on the name
-    // or a tag produces no excerpt, so fall back to the description rather
-    // than claiming the skill has none.
-    let body_text = h
-        .excerpt
-        .as_ref()
-        .filter(|_| searching)
-        .map(|e| e.text.clone())
-        .or_else(|| r.description.clone());
-    let mut body = vec![Span::raw("  ")];
-    match body_text {
-        Some(t) => body.extend(highlight_spans(&fit(&t, body_w), &h.terms, th.dim(), th)),
-        None => body.push(Span::styled("no description", th.dim())),
-    }
-
-    // Line 3: tags on the left, and on the right what the search matched or
-    // where the skill came from.
-    let right = if searching {
-        h.fields
-            .iter()
-            .map(|f| f.label())
-            .collect::<Vec<_>>()
-            .join("·")
-    } else {
-        r.source
-            .as_ref()
-            .map(|s| s.kind().to_string())
-            .unwrap_or_default()
-    };
-    let tags_w = inner_w.saturating_sub(width(&right) + 4);
-    let mut foot = vec![Span::raw("  ")];
-    if r.tags.is_empty() {
-        foot.push(Span::styled(pad("", tags_w), th.dim()));
-    } else {
-        foot.extend(highlight_spans(
-            &pad(&r.tags.join(" · "), tags_w),
-            &h.terms,
-            th.tag(),
-            th,
-        ));
-    }
-    foot.push(Span::styled(
-        right,
-        th.dim().add_modifier(ratatui::style::Modifier::ITALIC),
-    ));
-
-    vec![Line::from(head), Line::from(body), Line::from(foot)]
 }
 
 /// The compact density: one line, and a second carrying the excerpt while a
@@ -929,7 +814,7 @@ fn row_lines<'a>(
     }
     spans.push(Span::raw(" "));
     for a in agents {
-        let (g, style) = deploy_glyph(r.deploy.get(&a.key), th);
+        let (g, style) = cards::deploy_glyph(r.deploy.get(&a.key), th);
         spans.push(Span::styled(format!("{g}  "), style));
     }
     if !searching {
@@ -951,146 +836,4 @@ fn row_lines<'a>(
         ))
     }
     vec![Line::from(spans), Line::from(sub)]
-}
-
-/// Two-letter agent abbreviation used as a column header.
-fn abbrev(key: &str) -> String {
-    key.chars().take(2).collect()
-}
-
-fn kv<'a>(k: &'a str, v: impl Into<String>, th: &crate::tui::theme::Theme) -> Line<'a> {
-    Line::from(vec![
-        Span::styled(format!("{k:<9}"), th.dim()),
-        Span::raw(v.into()),
-    ])
-}
-
-fn preview_lines<'a>(r: &'a SkillRecord, ctx: &'a Ctx, terms: &[String]) -> Vec<Line<'a>> {
-    let th = ctx.theme;
-    let mut lines = vec![Line::from(vec![
-        Span::styled(r.key.as_str(), th.bold().fg(th.accent)),
-        Span::raw("  "),
-        status_glyph(&r.status, th),
-        Span::raw(" "),
-        Span::styled(status_text(&r.status), th.dim()),
-    ])];
-    if r.name_mismatch {
-        lines.push(kv(
-            "name",
-            format!("{}  ≠ directory name", r.name.as_deref().unwrap_or("")),
-            th,
-        ));
-    }
-    let mut tag_line = vec![Span::styled(format!("{:<9}", "tags"), th.dim())];
-    if r.tags.is_empty() {
-        tag_line.push(Span::styled("none", th.dim()));
-    } else {
-        for t in &r.tags {
-            tag_line.push(Span::styled(
-                format!(" {t} "),
-                th.tag().bg(ctx.theme.selection_bg),
-            ));
-            tag_line.push(Span::raw(" "));
-        }
-    }
-    lines.push(Line::from(tag_line));
-    let mut dep = vec![Span::styled(format!("{:<9}", "deploy"), th.dim())];
-    for a in &ctx.snap.agents {
-        let (txt, style) = match r.deploy.get(&a.key) {
-            Some(DeployState::Deployed) => ("✓", th.ok()),
-            Some(DeployState::NotDeployed) => ("·", th.dim()),
-            Some(DeployState::Shadow { same_content: true }) => ("shadow", th.warn()),
-            Some(DeployState::Shadow {
-                same_content: false,
-            }) => ("shadow≠", th.warn()),
-            Some(DeployState::Foreign) => ("foreign", th.warn()),
-            Some(DeployState::Broken) => ("broken", th.err()),
-            Some(DeployState::NoAgentDir) | None => ("no dir", th.dim()),
-        };
-        dep.push(Span::raw(format!("{} ", a.key)));
-        dep.push(Span::styled(format!("{txt}   "), style));
-    }
-    lines.push(Line::from(dep));
-    lines.push(kv(
-        "source",
-        r.source
-            .as_ref()
-            .map(|s| s.summary())
-            .unwrap_or_else(|| "none".into()),
-        th,
-    ));
-    if r.external {
-        lines.push(kv("path", format!("{} (symlink)", r.path.display()), th));
-    }
-    if let Some(n) = &r.note {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("note", th.bold().fg(th.tag))));
-        for l in n.lines() {
-            lines.push(Line::from(highlight_spans(l, terms, Style::default(), th)));
-        }
-    }
-    if let Some(d) = &r.description {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "description",
-            th.bold().fg(th.accent),
-        )));
-        lines.push(Line::from(highlight_spans(d, terms, Style::default(), th)));
-    }
-    if let Some(b) = &r.body {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "SKILL.md",
-            th.bold().fg(th.accent),
-        )));
-        lines.push(Line::from(Span::styled("─".repeat(24), th.dim())));
-        for line in tui_markdown::from_str(b).lines {
-            lines.push(highlight_line(line, terms, th));
-        }
-    }
-    lines
-}
-
-/// Split `text` into spans, styling the parts that match `terms`.
-fn highlight_spans<'a>(
-    text: &str,
-    terms: &[String],
-    base: Style,
-    th: &crate::tui::theme::Theme,
-) -> Vec<Span<'a>> {
-    let ranges = highlight_ranges(text, terms);
-    if ranges.is_empty() {
-        return vec![Span::styled(text.to_string(), base)];
-    }
-    // The hit keeps none of the surrounding style: a highlighter covers what
-    // is under it, and the dimmed grey of an excerpt would be unreadable on yellow.
-    let hl = th.match_hit();
-    let mut out = Vec::new();
-    let mut pos = 0;
-    for (s, e) in ranges {
-        if s > pos {
-            out.push(Span::styled(text[pos..s].to_string(), base));
-        }
-        out.push(Span::styled(text[s..e].to_string(), hl));
-        pos = e;
-    }
-    if pos < text.len() {
-        out.push(Span::styled(text[pos..].to_string(), base));
-    }
-    out
-}
-
-/// Apply highlighting to every span of an already styled line (markdown output).
-fn highlight_line<'a>(line: Line<'a>, terms: &[String], th: &crate::tui::theme::Theme) -> Line<'a> {
-    if terms.is_empty() {
-        return line;
-    }
-    let mut spans = Vec::new();
-    for sp in line.spans {
-        let base = sp.style;
-        spans.extend(highlight_spans(&sp.content, terms, base, th));
-    }
-    Line::from(spans)
-        .style(line.style)
-        .alignment(line.alignment.unwrap_or_default())
 }

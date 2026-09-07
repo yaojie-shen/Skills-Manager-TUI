@@ -7,8 +7,11 @@
 //! ours to add and remove, anything else the agent brought itself is shown but
 //! never written to.
 
+use super::cards::{self, CARD_H, cols_for, frame, skill_card};
+use super::preview::Overlay;
 use super::{View, wheel};
-use crate::tui::app::{Action, Ctx, Hints};
+use crate::tui::app::{Action, Ctx, Hints, Tab};
+use crate::tui::modal::Modal;
 use crate::tui::widgets::{CardGrid, fit, pad, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -22,10 +25,6 @@ use skills::ops::deploy::{
 };
 use skills::preset::Preset;
 
-/// Narrowest an entry card may get before the grid gives up a column.
-const MIN_CARD_W: u16 = 40;
-/// Most columns worth having on one row.
-const MAX_COLS: usize = 4;
 use skills::reconcile::{AgentDirMode, EntryState};
 
 /// The three bands of the page, top to bottom. Arrows move between them, so
@@ -62,6 +61,8 @@ pub struct AgentsView {
     /// The one column the entry scrollbar occupies, empty while it all fits.
     entries_track: Rect,
     left: Rect,
+    /// An entry opened for reading, over the page rather than instead of it.
+    preview: Overlay,
 }
 
 /// `Focus` needs a default for `#[derive(Default)]` on the view.
@@ -144,7 +145,7 @@ impl AgentsView {
             Ok(actions) => vec![Action::ApplyLinks {
                 title: format!(
                     "{} {} · {}",
-                    if on { "activate" } else { "deactivate" },
+                    if on { "deploy" } else { "undeploy" },
                     preset.name,
                     self.scope
                 ),
@@ -208,9 +209,13 @@ impl View for AgentsView {
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.preview.handle_key(k) {
+            return vec![];
+        }
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => return vec![Action::Quit],
+            KeyCode::Char('q') => return vec![Action::Quit],
+            KeyCode::Esc => return vec![Action::SwitchTab(Tab::Search)],
             // Scope is switchable from anywhere: it frames everything else.
             KeyCode::Char('[') => {
                 self.move_scope(-1, ctx);
@@ -329,11 +334,30 @@ impl View for AgentsView {
                         if let Some(Row { name, .. }) =
                             self.entries.selected().and_then(|i| rows.get(i))
                         {
-                            return vec![Action::Search {
-                                query: name.to_string(),
-                                focus_list: true,
-                            }];
+                            self.preview.open(name.to_string());
                         }
+                    }
+                    // Only an entry the root knows nothing about can be taken
+                    // in; everything else here is either already ours or the
+                    // agent's to keep.
+                    KeyCode::Char('a') => {
+                        let Some(row) = self.entries.selected().and_then(|i| rows.get(i)) else {
+                            return vec![Action::Error("nothing selected".into())];
+                        };
+                        if !matches!(row.state, Some(EntryState::AgentOnly)) {
+                            return vec![Action::Error(format!(
+                                "{}: adopt applies to entries the root does not have",
+                                row.name
+                            ))];
+                        }
+                        let Some(report) = ctx.snap.agent(&self.scope) else {
+                            return vec![];
+                        };
+                        return vec![Action::OpenModal(Box::new(Modal::adopt(
+                            &self.scope,
+                            row.name,
+                            report.skills_dir.join(row.name),
+                        )))];
                     }
                     _ => {}
                 }
@@ -343,6 +367,9 @@ impl View for AgentsView {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.preview.handle_mouse(m) {
+            return vec![];
+        }
         let at = (m.column, m.row).into();
         if let Some(d) = wheel(&m) {
             if self.left.contains(at) {
@@ -522,7 +549,7 @@ impl View for AgentsView {
             // remembers the place, which marks it without competing with the
             // list for attention.
             let fill = if selected && focused { lit(base) } else { base };
-            let mut body_style = Style::default().bg(fill).fg(ink(fill));
+            let mut body_style = Style::default().bg(fill).fg(cards::ink(fill));
             if selected {
                 body_style = body_style.add_modifier(if focused {
                     Modifier::BOLD | Modifier::UNDERLINED
@@ -564,15 +591,11 @@ impl View for AgentsView {
         let inner = block.inner(left);
         f.render_widget(block, left);
 
-        let cell_h = if cards { 5 } else { 1 };
+        let cell_h = if cards { CARD_H } else { 1 };
         // One column is held back for the scrollbar so the column count does not
         // shift the moment the list outgrows a screen.
         let usable = inner.width.saturating_sub(1);
-        let cols = if cards {
-            ((usable / MIN_CARD_W) as usize).clamp(1, MAX_COLS)
-        } else {
-            1
-        };
+        let cols = if cards { cols_for(usable) } else { 1 };
         let content = Rect {
             width: usable,
             ..inner
@@ -593,36 +616,57 @@ impl View for AgentsView {
             let row = &rows_data[i];
             let on = selected == Some(i);
             if cards {
-                // The frame carries the selection; painting the card over would
-                // bury the state colours it is there to show.
-                let border = if on {
-                    if self.focus() == Focus::Entries {
-                        th.accent().add_modifier(Modifier::BOLD)
-                    } else {
-                        th.accent()
+                let ci = frame(f, cell, on, self.focus() == Focus::Entries, th);
+                let lines = match ctx.snap.get(row.name) {
+                    // A skill the root knows is drawn the way every page draws
+                    // it. Being in this grid already says it is linked, so the
+                    // tail says where it came from rather than "managed" again.
+                    Some(r) if row.managed => {
+                        let tail = r
+                            .source
+                            .as_ref()
+                            .map(|s| s.kind().to_string())
+                            .unwrap_or_default();
+                        skill_card(
+                            r,
+                            ctx,
+                            &ctx.snap.agents,
+                            ci.width as usize,
+                            None,
+                            &tail,
+                            &[],
+                        )
                     }
-                } else {
-                    th.dim()
+                    // The agent's own: there may be no record behind it, and
+                    // even when there is, what matters is the shape it is in.
+                    _ => {
+                        let (glyph, gs) = glyph_for(row.state, th);
+                        let label = state_label(row.state);
+                        let name_w = (ci.width as usize).saturating_sub(4);
+                        vec![
+                            Line::from(vec![
+                                Span::styled(format!("{glyph} "), gs),
+                                Span::styled(pad(row.name, name_w), th.dim()),
+                            ]),
+                            Line::from(vec![
+                                Span::raw("  "),
+                                Span::styled(
+                                    fit(
+                                        &entry_summary(row.state),
+                                        (ci.width as usize).saturating_sub(2),
+                                    ),
+                                    th.dim(),
+                                ),
+                            ]),
+                            Line::from(""),
+                            Line::from(vec![
+                                Span::raw("  "),
+                                Span::styled(label, th.dim().add_modifier(Modifier::ITALIC)),
+                            ]),
+                        ]
+                    }
                 };
-                let b = ratatui::widgets::Block::default()
-                    .borders(ratatui::widgets::Borders::ALL)
-                    .border_type(ratatui::widgets::BorderType::Rounded)
-                    .border_style(border);
-                let ci = b.inner(cell).inner(ratatui::layout::Margin {
-                    horizontal: 1,
-                    vertical: 0,
-                });
-                f.render_widget(b, cell);
-                f.render_widget(
-                    Paragraph::new(entry_card(
-                        row.name,
-                        row.state,
-                        row.managed,
-                        ctx,
-                        ci.width as usize,
-                    )),
-                    ci,
-                );
+                f.render_widget(Paragraph::new(lines), ci);
             } else {
                 let style = if on {
                     if self.focus() == Focus::Entries {
@@ -669,13 +713,14 @@ impl View for AgentsView {
                 &mut sb,
             );
         }
+        self.preview.draw(f, area, ctx);
     }
 
     fn hints(&self) -> Hints {
         match self.focus() {
             Focus::Presets => &[
-                ("Enter", "install / remove"),
-                ("x", "remove"),
+                ("Enter", "deploy / undeploy"),
+                ("x", "undeploy"),
                 ("←→", "pick preset"),
                 ("↓", "entries"),
                 ("[ ]", "scope"),
@@ -685,7 +730,8 @@ impl View for AgentsView {
             Focus::Entries => &[
                 ("j/k", "move"),
                 ("↑", "back to presets"),
-                ("Enter", "open in search"),
+                ("Enter", "preview"),
+                ("a", "adopt"),
                 ("[ ]", "agent"),
                 ("c", "convert dir-link"),
                 ("v", "density"),
@@ -713,14 +759,6 @@ fn lit(c: Color) -> Color {
         Color::Magenta => Color::LightMagenta,
         Color::DarkGray => Color::Gray,
         other => other,
-    }
-}
-
-/// Text colour that stays legible on a filled pill.
-fn ink(fill: Color) -> Color {
-    match fill {
-        Color::DarkGray | Color::Black | Color::Blue | Color::Red | Color::Magenta => Color::White,
-        _ => Color::Black,
     }
 }
 
@@ -777,49 +815,4 @@ fn state_label(state: Option<&EntryState>) -> &'static str {
         Some(EntryState::AgentOnly) => "the agent's own",
         None => "",
     }
-}
-
-/// A three-line card: the name and who has it, what the skill is, how it is filed.
-fn entry_card(
-    name: &str,
-    state: Option<&EntryState>,
-    managed: bool,
-    ctx: &Ctx,
-    inner_w: usize,
-) -> Vec<Line<'static>> {
-    let th = ctx.theme;
-    let (glyph, glyph_style) = glyph_for(state, th);
-    let mark = Span::styled(format!("{glyph}  "), glyph_style);
-    let name_w = inner_w.saturating_sub(width(&mark.content) + 2);
-    let head = vec![
-        Span::raw("  "),
-        Span::styled(
-            pad(name, name_w),
-            if managed { th.bold() } else { th.dim() },
-        ),
-        mark,
-    ];
-    let record = ctx.snap.get(name);
-    let body = match record.and_then(|r| r.description.clone()) {
-        Some(d) => d,
-        None => entry_summary(state),
-    };
-    let right = state_label(state);
-    let tags = record.map(|r| r.tags.join(" · ")).unwrap_or_default();
-    let tags_w = inner_w.saturating_sub(width(right) + 4);
-    vec![
-        Line::from(head),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(fit(&body, inner_w.saturating_sub(2)), th.dim()),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(pad(&tags, tags_w), th.tag()),
-            Span::styled(
-                right,
-                th.dim().add_modifier(ratatui::style::Modifier::ITALIC),
-            ),
-        ]),
-    ]
 }

@@ -605,7 +605,7 @@ fn phrase(items: &[String], max: usize, plural: &str) -> String {
 pub fn summarize(actions: &[Action]) -> String {
     let mut added = (Vec::new(), Vec::new());
     let mut removed = (Vec::new(), Vec::new());
-    let mut skipped = 0;
+    let mut skipped: Vec<String> = Vec::new();
     for a in actions {
         match a {
             Action::Link { skill, agent, .. } => {
@@ -616,10 +616,22 @@ pub fn summarize(actions: &[Action]) -> String {
                 removed.0.push(skill.clone());
                 removed.1.push(agent.clone());
             }
-            Action::Skip { .. } => skipped += 1,
+            Action::Skip { skill, reason, .. } => {
+                let s = format!("{skill} ({reason})");
+                if !skipped.contains(&s) {
+                    skipped.push(s);
+                }
+            }
             Action::Mkdir { .. } => {}
         }
     }
+    // A count of skips tells nobody what to do about them; the first couple
+    // named with their reason does.
+    let skips = match skipped.len() {
+        0 => String::new(),
+        n if n <= 2 => format!("skipped {}", skipped.join(", ")),
+        n => format!("skipped {}, {} more", skipped[..2].join(", "), n - 2),
+    };
     let mut parts = Vec::new();
     if !added.0.is_empty() {
         parts.push(format!(
@@ -636,15 +648,15 @@ pub fn summarize(actions: &[Action]) -> String {
         ));
     }
     if parts.is_empty() {
-        return if skipped > 0 {
-            format!("nothing to do, {skipped} skipped")
-        } else {
+        return if skips.is_empty() {
             "nothing to do".into()
+        } else {
+            format!("nothing to do; {skips}")
         };
     }
     let mut out = parts.join("; ");
-    if skipped > 0 {
-        out.push_str(&format!(" ({skipped} skipped)"));
+    if !skips.is_empty() {
+        out.push_str(&format!("; {skips}"));
     }
     out
 }
@@ -711,10 +723,10 @@ mod tests {
     #[test]
     fn reports_when_there_was_nothing_to_do() {
         assert_eq!(summarize(&[]), "nothing to do");
-        assert_eq!(summarize(&[skip()]), "nothing to do, 1 skipped");
+        assert_eq!(summarize(&[skip()]), "nothing to do; skipped s (because)");
         assert_eq!(
             summarize(&[link("one", "claude"), skip()]),
-            "added one to claude (1 skipped)"
+            "added one to claude; skipped s (because)"
         );
     }
 }

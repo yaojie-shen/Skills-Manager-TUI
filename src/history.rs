@@ -15,21 +15,24 @@
 //! be put back because the skill and the agent directory between them still say
 //! what it was; a note that was overwritten exists nowhere else the moment the
 //! file is saved. So a metadata entry carries the values themselves — for tags
-//! and preset members the two sets the write added and took off, for a note the
-//! text on either side — and only the *reversal* is re-derived against the file
-//! as it stands. Sets are undone element by element, so a tag added by hand in
-//! between survives, and undoing "add a tag that was already there" removes
-//! nothing, because adding it changed nothing to begin with. A note has no such
-//! structure: it is put back only while the file still holds what this step
-//! wrote, and anything else means someone edited it since, so it is left alone.
+//! and preset members the two sets the write added and took off, for a note or
+//! a source the value on either side — and only the *reversal* is re-derived
+//! against the file as it stands. Sets are undone element by element, so a tag
+//! added by hand in between survives, and undoing "add a tag that was already
+//! there" removes nothing, because adding it changed nothing to begin with. A
+//! note or a source has no such structure: it is put back only while the file
+//! still holds what this step wrote, and anything else means someone edited it
+//! since, so it is left alone.
 //!
 //! The history lives only as long as the process. Replaying an intent against a
 //! tree that git or another session has moved on is not something a stored log
 //! could make safe, and this tool keeps no database.
 
 use crate::Workspace;
+use crate::meta;
 use crate::ops::deploy::{self, Action};
 use crate::ops::edit;
+use crate::ops::install::{self, InstallRef};
 use crate::reconcile::Snapshot;
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,6 +55,11 @@ pub enum Intent {
     Meta(Vec<MetaChange>),
     /// A skill fetched into the root. Undoing removes what was fetched.
     Install { skill: String },
+    /// A skill moved to a new name: directory, metadata, every link and every
+    /// preset that named it. Undoing is the same move the other way, planned
+    /// afresh when it is asked for, so a skill gone or a name taken in the
+    /// meantime stops it rather than being written over.
+    Rename { from: String, to: String },
     /// Something that discarded content and so cannot be taken back. Kept so
     /// the log stays honest about everything that happened.
     OneWay { what: String },
@@ -88,6 +96,7 @@ impl Intent {
             }
             Intent::Meta(changes) => describe_changes(changes),
             Intent::Install { skill } => format!("installed {skill}"),
+            Intent::Rename { from, to } => format!("renamed {from} to {to}"),
             Intent::OneWay { what } => what.clone(),
         }
     }
@@ -150,6 +159,16 @@ pub enum MetaChange {
         before: Option<String>,
         after: Option<String>,
     },
+    /// The recorded source of one skill. Like a note it is one value with no
+    /// structure to merge, so it goes back only while the file still holds
+    /// what this step wrote. The whole value travels, revision included: a
+    /// reference alone would come back without the revision the install had
+    /// recorded, and the next check would call the skill out of date.
+    Source {
+        skill: String,
+        before: Option<meta::Source>,
+        after: Option<meta::Source>,
+    },
     /// Members of one preset.
     Preset {
         name: String,
@@ -188,6 +207,15 @@ impl MetaChange {
                 before: after,
                 after: before,
             },
+            MetaChange::Source {
+                skill,
+                before,
+                after,
+            } => MetaChange::Source {
+                skill,
+                before: after,
+                after: before,
+            },
             MetaChange::Preset {
                 name,
                 added,
@@ -218,6 +246,10 @@ impl MetaChange {
             MetaChange::Note { skill, after, .. } => match after {
                 Some(t) => format!("set the note on {skill} to \"{}\"", snippet(t)),
                 None => format!("clear the note on {skill}"),
+            },
+            MetaChange::Source { skill, after, .. } => match after {
+                Some(s) => format!("set the source of {skill} to {}", s.summary()),
+                None => format!("clear the source of {skill}"),
             },
             MetaChange::Preset {
                 name,
@@ -261,6 +293,18 @@ impl MetaChange {
                 Some(now) if &now == before => Ok(Fate::Ready),
                 Some(_) => Ok(Fate::Blocked(format!(
                     "the note on {skill} was changed since"
+                ))),
+            },
+            MetaChange::Source {
+                skill,
+                before,
+                after,
+            } => match current_source(ws, skill)? {
+                None => Ok(Fate::Blocked(format!("{skill} is gone"))),
+                Some(now) if &now == after => Ok(Fate::Done),
+                Some(now) if &now == before => Ok(Fate::Ready),
+                Some(_) => Ok(Fate::Blocked(format!(
+                    "the source of {skill} was changed since"
                 ))),
             },
             MetaChange::Preset {
@@ -324,6 +368,22 @@ impl MetaChange {
                     }
                 ))
             }
+            // Written as the value, not through `install::set_source`: that
+            // takes a reference and records no revision, and this has to put
+            // back exactly what was there.
+            MetaChange::Source { skill, after, .. } => {
+                let mut meta = edit::load_or_init(ws, skill)?;
+                meta.source = after.clone();
+                ws.meta.save(skill, &meta)?;
+                Ok(format!(
+                    "source {} on {skill}",
+                    if after.is_some() {
+                        "restored"
+                    } else {
+                        "cleared"
+                    }
+                ))
+            }
             MetaChange::Preset {
                 name,
                 added,
@@ -364,6 +424,14 @@ fn current_tags(ws: &Workspace, skill: &str) -> Result<Option<Vec<String>>> {
 fn current_note(ws: &Workspace, skill: &str) -> Result<Option<Option<String>>> {
     match ws.meta.load(skill).ok().flatten() {
         Some(m) => Ok(Some(m.note)),
+        None => Ok(ws.skill_path(skill).is_dir().then_some(None)),
+    }
+}
+
+/// The source a skill records now, with the same two layers as `current_note`.
+fn current_source(ws: &Workspace, skill: &str) -> Result<Option<Option<meta::Source>>> {
+    match ws.meta.load(skill).ok().flatten() {
+        Some(m) => Ok(Some(m.source)),
         None => Ok(ws.skill_path(skill).is_dir().then_some(None)),
     }
 }
@@ -463,6 +531,28 @@ pub fn note_edit(
     Ok((message, intent))
 }
 
+/// Point a skill at a new source, keeping the one it replaced.
+pub fn source_edit(
+    ws: &Workspace,
+    skill: &str,
+    r: &InstallRef,
+) -> Result<(String, Option<Intent>)> {
+    let before = ws.meta.load(skill).ok().flatten().and_then(|m| m.source);
+    let after = install::set_source(ws, skill, r)?.source;
+    let message = format!(
+        "source of {skill} set to {}",
+        after.as_ref().map(|s| s.summary()).unwrap_or_default()
+    );
+    let intent = (after != before).then(|| {
+        Intent::Meta(vec![MetaChange::Source {
+            skill: skill.to_string(),
+            before,
+            after,
+        }])
+    });
+    Ok((message, intent))
+}
+
 /// Change the membership of a preset, recording which skills went in and out.
 pub fn preset_edit(
     ws: &Workspace,
@@ -529,6 +619,11 @@ pub enum WriteBack {
     },
     /// Metadata to write, already turned the way this step runs it.
     Meta(Vec<MetaChange>),
+    /// A skill to move, already turned the way this step runs it.
+    Rename {
+        from: String,
+        to: String,
+    },
 }
 
 impl WriteBack {
@@ -537,6 +632,13 @@ impl WriteBack {
             WriteBack::RemoveInstalled { skill } => {
                 let snap = ws.scan()?;
                 edit::remove(ws, &snap, skill, false).map(|_| format!("removed {skill} again"))
+            }
+            // The links to move are read off a fresh scan, as everything the
+            // rename touches is, since the plan the user confirmed was drawn
+            // a moment ago.
+            WriteBack::Rename { from, to } => {
+                let snap = ws.scan()?;
+                edit::rename(ws, &snap, from, to).map(|_| format!("renamed {from} to {to}"))
             }
             WriteBack::Meta(changes) => {
                 let mut done = Vec::new();
@@ -660,6 +762,7 @@ pub fn undo_plan(ws: &Workspace, snap: &Snapshot, intent: &Intent) -> Result<Pla
                 },
             })
         }
+        Intent::Rename { from, to } => rename(ws, snap, to, from),
         Intent::OneWay { what } => bail!("{what} cannot be taken back"),
     }
 }
@@ -671,8 +774,39 @@ pub fn redo_plan(ws: &Workspace, snap: &Snapshot, intent: &Intent) -> Result<Pla
         Intent::Meta(changes) => meta(ws, changes),
         // Fetching is a fresh network operation, not a reversal of a removal.
         Intent::Install { skill } => bail!("install {skill} again to bring it back"),
+        Intent::Rename { from, to } => rename(ws, snap, from, to),
         Intent::OneWay { what } => bail!("{what} cannot be redone"),
     }
+}
+
+/// Plan moving `from` to `to`, which is what either direction of a rename
+/// comes down to. The skill has to be where the step left it, and the name it
+/// is going to has to be free: a skill absent means someone already took this
+/// step or removed the skill since, and a name taken since is not something
+/// to move over. Either way the tree is left as it is and the reason said.
+fn rename(ws: &Workspace, snap: &Snapshot, from: &str, to: &str) -> Result<Plan> {
+    let present = |key: &str| snap.get(key).is_some_and(|r| r.status.is_present());
+    if !present(from) {
+        return Ok(Plan::Nothing(if present(to) {
+            format!("already done: renamed {from} to {to}")
+        } else {
+            format!("{from} is gone")
+        }));
+    }
+    // Metadata alone counts as taken: `edit::rename` would refuse to move a
+    // file over it, and a missing skill's tags and note are still someone's.
+    if snap.get(to).is_some() || ws.skill_path(to).exists() {
+        return Ok(Plan::Nothing(format!(
+            "{to} is taken; {from} left as it is"
+        )));
+    }
+    Ok(Plan::Write {
+        describe: format!("rename {from} to {to}"),
+        apply: WriteBack::Rename {
+            from: from.to_string(),
+            to: to.to_string(),
+        },
+    })
 }
 
 /// An empty plan means the tree already matches; say so rather than opening an
@@ -837,6 +971,23 @@ mod tests {
         };
         assert_eq!(tags.describe(), "tag bicycle with commute");
         assert_eq!(tags.reverse().describe(), "take commute off bicycle");
+
+        let source = MetaChange::Source {
+            skill: "etcd".into(),
+            before: None,
+            after: Some(meta::Source::Git {
+                url: "https://github.com/acme/etcd".into(),
+                subpath: None,
+                branch: Some("main".into()),
+                revision: None,
+            }),
+        };
+        assert_eq!(
+            source.describe(),
+            "set the source of etcd to https://github.com/acme/etcd@main"
+        );
+        assert_eq!(source.reverse().describe(), "clear the source of etcd");
+        assert_eq!(source.reverse().reverse(), source);
     }
 
     #[test]

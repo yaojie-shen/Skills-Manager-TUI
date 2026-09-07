@@ -4,7 +4,9 @@
 use skills::Workspace;
 use skills::config::{AgentConfig, Config, DeployConfig};
 use skills::history::{self, History, Plan};
-use skills::ops::edit;
+use skills::meta::{Baseline, SkillMeta, Source};
+use skills::ops::install::InstallRef;
+use skills::ops::{deploy, edit};
 use skills::preset::Preset;
 use std::path::PathBuf;
 
@@ -363,4 +365,156 @@ fn preset_membership_goes_back_and_forth() {
     let message = step(&ws, &mut log, true);
     assert!(message.contains("is gone"), "{message}");
     assert!(ws.presets.load("commute").unwrap().is_none());
+}
+
+/// Rename through the core the way the TUI's confirmation does, and log it.
+fn rename(ws: &Workspace, log: &mut History, from: &str, to: &str) {
+    let snap = ws.scan().unwrap();
+    edit::rename(ws, &snap, from, to).unwrap();
+    log.record(history::Intent::Rename {
+        from: from.into(),
+        to: to.into(),
+    });
+}
+
+fn source(ws: &Workspace, key: &str) -> Option<Source> {
+    ws.meta.load(key).unwrap().and_then(|m| m.source)
+}
+
+#[test]
+fn renaming_a_skill_goes_back_and_forth_with_its_link() {
+    let fx = Fixture::new("rename");
+    let ws = fx.ws();
+    let mut log = History::default();
+    let agent = fx.base.join("agent-a");
+    tag_set(&ws, &mut log, "printer", &["office"]);
+    let snap = ws.scan().unwrap();
+    let plan = deploy::plan_deploy(&ws, &snap, &["printer".into()], &["a".into()]).unwrap();
+    deploy::apply(&plan).unwrap();
+
+    rename(&ws, &mut log, "printer", "etcd");
+    assert!(fx.root.join("etcd").is_dir());
+    assert!(!fx.root.join("printer").exists());
+    assert_eq!(tags(&ws, "etcd"), ["office"], "metadata moved with it");
+    assert_eq!(
+        std::fs::read_link(agent.join("etcd")).unwrap(),
+        fx.root.join("etcd")
+    );
+    assert!(!agent.join("printer").exists());
+
+    // Back: the directory, the metadata and the link all return to the old name.
+    let message = step(&ws, &mut log, true);
+    assert_eq!(message, "renamed etcd to printer");
+    assert!(fx.root.join("printer").is_dir());
+    assert!(!fx.root.join("etcd").exists());
+    assert_eq!(tags(&ws, "printer"), ["office"]);
+    assert_eq!(
+        std::fs::read_link(agent.join("printer")).unwrap(),
+        fx.root.join("printer")
+    );
+    assert!(!agent.join("etcd").exists());
+
+    // And forward again.
+    step(&ws, &mut log, false);
+    assert!(fx.root.join("etcd").is_dir());
+    assert!(agent.join("etcd").exists());
+    assert!(!fx.root.join("printer").exists());
+}
+
+#[test]
+fn undoing_a_rename_stops_when_the_old_name_is_taken() {
+    let fx = Fixture::new("rename-taken");
+    let ws = fx.ws();
+    let mut log = History::default();
+
+    rename(&ws, &mut log, "printer", "etcd");
+    // Something new has moved in under the old name since.
+    fx.add_skill("printer");
+    std::fs::write(fx.root.join("printer").join("extra.txt"), "new one").unwrap();
+
+    let message = step(&ws, &mut log, true);
+    assert!(message.contains("printer is taken"), "{message}");
+    assert!(
+        fx.root.join("printer").join("extra.txt").is_file(),
+        "the skill that took the name is left alone"
+    );
+    assert!(
+        fx.root.join("etcd").is_dir(),
+        "and the renamed one stays put"
+    );
+    assert!(log.is_empty(), "a step with nothing to do is dropped");
+}
+
+#[test]
+fn setting_a_source_goes_back_and_forth_with_its_revision() {
+    let fx = Fixture::new("source");
+    let ws = fx.ws();
+    let mut log = History::default();
+    let installed = Source::Git {
+        url: "https://github.com/acme/printer".into(),
+        subpath: None,
+        branch: Some("main".into()),
+        revision: Some("0123456789abcdef".into()),
+    };
+    ws.meta
+        .save(
+            "printer",
+            &SkillMeta {
+                source: Some(installed.clone()),
+                baseline: Some(Baseline {
+                    hash: "x".into(),
+                    hash_algo: 1,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let (message, intent) = history::source_edit(
+        &ws,
+        "printer",
+        &InstallRef::Git {
+            url: "https://github.com/acme/printers".into(),
+            branch: None,
+            subpath: Some("printer".into()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        message,
+        "source of printer set to https://github.com/acme/printers/printer"
+    );
+    log.record(intent.expect("a different source is a step"));
+    assert!(matches!(
+        source(&ws, "printer"),
+        Some(Source::Git { revision: None, .. })
+    ));
+
+    // Undo brings the whole recorded source back, revision included.
+    step(&ws, &mut log, true);
+    assert_eq!(source(&ws, "printer"), Some(installed));
+    step(&ws, &mut log, false);
+    assert!(matches!(
+        source(&ws, "printer"),
+        Some(Source::Git { ref url, .. }) if url == "https://github.com/acme/printers"
+    ));
+
+    // A skill that never had metadata gets its source taken back to none.
+    let (_, intent) = history::source_edit(
+        &ws,
+        "bicycle",
+        &InstallRef::Git {
+            url: "https://github.com/acme/bicycle".into(),
+            branch: None,
+            subpath: None,
+        },
+    )
+    .unwrap();
+    log.record(intent.unwrap());
+    step(&ws, &mut log, true);
+    assert_eq!(source(&ws, "bicycle"), None);
+    assert!(
+        ws.meta.exists("bicycle"),
+        "the file stays; only the source went"
+    );
 }

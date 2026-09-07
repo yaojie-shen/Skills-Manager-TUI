@@ -12,9 +12,11 @@ use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 use skills::history;
 use skills::ops::deploy;
 use skills::ops::edit;
+use skills::ops::install;
 use skills::ops::update::{self, FileChange, Prepared, Take};
-use skills::reconcile::DeployState;
+use skills::reconcile::{AgentDirMode, DeployState, EntryState};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// One choosable row.
 pub struct PickItem {
@@ -44,6 +46,8 @@ pub enum InputKind {
     PresetName,
     RenameTag { old: String },
     Install,
+    Rename { skill: String },
+    SetSource { skill: String },
 }
 
 pub enum Modal {
@@ -217,6 +221,103 @@ impl Modal {
             hint: "new name · Enter rename everywhere · Esc cancel".into(),
             rect: Rect::default(),
         }
+    }
+
+    /// Ask for a skill's new name. The field starts with the old one, since a
+    /// rename is usually a small edit to it.
+    pub fn rename(skill: &str) -> Self {
+        Modal::Input {
+            title: format!(" rename {skill} "),
+            input: Input::with_value(skill),
+            kind: InputKind::Rename {
+                skill: skill.into(),
+            },
+            hint: "new name · Enter shows what moves · Esc cancel".into(),
+            rect: Rect::default(),
+        }
+    }
+
+    /// What a rename moves, read off the snapshot so the user sees it before
+    /// answering. The write plans again from a fresh scan, as `App::step`
+    /// does, because this list is a keystroke old by the time it is confirmed.
+    fn confirm_rename(old: &str, new: &str, ctx: &Ctx) -> Self {
+        let mut lines = vec![
+            format!("Rename \"{old}\" to \"{new}\"?"),
+            format!("directory  {old}/ → {new}/"),
+        ];
+        if ctx.snap.get(old).is_some_and(|r| r.meta.is_some()) {
+            lines.push(format!("metadata   {old}.toml → {new}.toml"));
+        }
+        for a in &ctx.snap.agents {
+            if a.mode == AgentDirMode::Real
+                && matches!(a.entries.get(old), Some(EntryState::Deployed))
+            {
+                lines.push(format!("link       {}/{old} → {}/{new}", a.key, a.key));
+            }
+        }
+        for p in ctx.ws.presets.list().unwrap_or_default() {
+            if p.skills.iter().any(|s| s == old) {
+                lines.push(format!("preset     {}: {old} → {new}", p.name));
+            }
+        }
+        let (from, to) = (old.to_string(), new.to_string());
+        Self::confirm_meta(
+            format!(" rename {old} "),
+            lines,
+            Box::new(move |ws| {
+                let snap = ws.scan()?;
+                edit::rename(ws, &snap, &from, &to)?;
+                Ok((
+                    format!("renamed {from} to {to}"),
+                    Some(history::Intent::Rename { from, to }),
+                ))
+            }),
+        )
+    }
+
+    /// Point a skill at a different source. The field starts empty rather than
+    /// with the old value: a source is replaced, not edited, and what it is
+    /// now sits on the hint line for reference.
+    pub fn set_source(skill: &str, current: Option<&skills::meta::Source>) -> Self {
+        let now = current
+            .map(|s| s.summary())
+            .unwrap_or_else(|| "none".into());
+        Modal::Input {
+            title: format!(" source of {skill} "),
+            input: Input::default(),
+            kind: InputKind::SetSource {
+                skill: skill.into(),
+            },
+            hint: format!("now {now} · owner/repo[/path], a git URL or a path replaces it"),
+            rect: Rect::default(),
+        }
+    }
+
+    /// Take a directory the agent has of its own into the root. What follows
+    /// is what `install::adopt` does on that branch: the directory moves into
+    /// the root, the agent is left a link to it there, and metadata is created
+    /// with the content as it stands for its baseline.
+    ///
+    /// Not logged. Taking it back would mean moving the directory out of the
+    /// root, deleting the link the agent now reads through and recreating a
+    /// real directory in its place — three writes on a live path with nothing
+    /// on disk to re-derive them from. Nor is it an `Intent::OneWay`: nothing
+    /// consumes those yet, and one on top of the stack would only refuse every
+    /// undo and hide the reversible steps beneath it.
+    pub fn adopt(agent: &str, name: &str, path: PathBuf) -> Self {
+        let a = agent.to_string();
+        Self::confirm_write(
+            format!(" adopt {name} "),
+            vec![
+                format!("Adopt \"{name}\" from {agent} into the skills root?"),
+                format!("Its directory moves into the root; {agent} keeps a link to it there."),
+                "Metadata is created with the content as it stands for its baseline.".into(),
+                "Undo does not cover this.".into(),
+            ],
+            Box::new(move |ws| {
+                install::adopt(ws, &path, None).map(|k| format!("adopted {k} from {a}"))
+            }),
+        )
     }
     pub fn delete_tag(tag: &str) -> Self {
         let t = tag.to_string();
@@ -1350,8 +1451,36 @@ fn toggle_agent(ctx: &Ctx, skill: &str, idx: usize) -> Vec<Action> {
     }
 }
 
-fn submit(kind: &InputKind, value: String, _ctx: &Ctx) -> Vec<Action> {
+fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
     match kind {
+        InputKind::Rename { skill } => {
+            let new = value.trim().to_string();
+            if new.is_empty() || new == *skill {
+                return vec![];
+            }
+            // Refused here rather than after the confirmation, which would
+            // otherwise list moves that are never going to happen.
+            if !skills::util::valid_skill_key(&new) {
+                return vec![Action::Error(format!("invalid skill name: {new:?}"))];
+            }
+            vec![Action::OpenModal(Box::new(Modal::confirm_rename(
+                skill, &new, ctx,
+            )))]
+        }
+        // A metadata field, written straight away like a tag; undo has it.
+        InputKind::SetSource { skill } => {
+            let reference = value.trim().to_string();
+            if reference.is_empty() {
+                return vec![];
+            }
+            let skill = skill.clone();
+            match install::parse_ref(&reference, None, None) {
+                Ok(r) => vec![Action::WriteMeta(Box::new(move |ws| {
+                    history::source_edit(ws, &skill, &r)
+                }))],
+                Err(e) => vec![Action::Error(format!("{e:#}"))],
+            }
+        }
         InputKind::Tags { skill } => {
             let skill = skill.clone();
             let tags: Vec<String> = value
@@ -1501,9 +1630,12 @@ const HELP: &str = "Search
   Enter / Tab       move focus: input → list → preview   (Esc goes back)
   i                 install a skill from a repo or a local path
   t  n  d           tags / note in $EDITOR / deploy picker
+  r  s              rename the skill / set where it came from
   Ctrl-1..9         toggle deploy on agent N directly
   a  m  x           accept local changes / migrate renamed metadata / remove
   u  U              check upstream / update from upstream (git sources)
+Agents
+  a                 adopt an entry the agent has but the root does not
 Mouse
   click             focus panes, select rows, press buttons, switch tabs
   double-click      open preview (or tag / preset / health item)

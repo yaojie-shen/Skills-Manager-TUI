@@ -216,7 +216,10 @@ pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
                 path,
                 status,
                 name: doc.as_ref().map(|d| d.name.clone()),
-                description: doc.as_ref().map(|d| d.description.clone()),
+                description: doc
+                    .as_ref()
+                    .map(|d| d.description.trim().to_string())
+                    .filter(|d| !d.is_empty()),
                 body: doc.as_ref().map(|d| d.body.clone()),
                 external,
                 name_mismatch: doc.as_ref().map(|d| d.name_mismatch()).unwrap_or(false),

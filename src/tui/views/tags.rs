@@ -1,7 +1,7 @@
 //! Tags tab: browse by tag, rename/delete.
 
 use super::{View, split_panes, status_glyph, wheel};
-use crate::tui::app::{Action, Ctx, Hints};
+use crate::tui::app::{Action, Ctx, Hints, Tab};
 use crate::tui::modal::Modal;
 use crate::tui::widgets::{ListNav, pad};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -58,7 +58,10 @@ impl View for TagsView {
     fn handle_key(&mut self, k: KeyEvent, _ctx: &Ctx) -> Vec<Action> {
         let n = self.rows.len();
         match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => vec![Action::Quit],
+            KeyCode::Char('q') => vec![Action::Quit],
+            // Esc means "back" everywhere else in the program, so here it goes
+            // back to the search page rather than out of the door.
+            KeyCode::Esc => vec![Action::SwitchTab(Tab::Search)],
             KeyCode::Down | KeyCode::Char('j') => {
                 self.list.move_by(1, n);
                 vec![]
