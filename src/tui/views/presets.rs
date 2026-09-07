@@ -137,8 +137,12 @@ impl View for PresetsView {
                 vec![]
             }
             KeyCode::Char('c') => vec![Action::OpenModal(Box::new(Modal::new_preset()))],
-            KeyCode::Char('a') => match self.selected() {
-                Some(p) => vec![Action::OpenModal(Box::new(Modal::add_to_preset(&p.name)))],
+            // Membership is edited by picking from the library, never by typing
+            // a name from memory.
+            KeyCode::Char('a') | KeyCode::Char(' ') => match self.selected() {
+                Some(p) => vec![Action::OpenModal(Box::new(Modal::preset_members(
+                    p, ctx.snap,
+                )))],
                 None => vec![Action::Error(
                     "no preset selected; press c to create one".into(),
                 )],
@@ -309,7 +313,7 @@ impl View for PresetsView {
         } else {
             &[
                 ("c", "create"),
-                ("a", "add skill"),
+                ("a", "choose skills"),
                 ("d/u", "deploy/undeploy"),
                 ("X", "delete"),
                 ("Enter", "members"),

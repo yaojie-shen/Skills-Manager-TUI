@@ -4,11 +4,12 @@
 use super::event::{Msg, Task, TaskOutput, spawn_task};
 use super::modal::Modal;
 use super::theme::Theme;
+use super::toast::Toasts;
 use super::views::{
     View, agents::AgentsView, health::HealthView, presets::PresetsView, search::SearchView,
     tags::TagsView,
 };
-use super::widgets::{SPINNER, fit, width};
+use super::widgets::{SPINNER, width};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -20,7 +21,6 @@ use skills::ops::deploy;
 use skills::ops::edit;
 use skills::reconcile::Snapshot;
 use std::sync::mpsc::Sender;
-use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -101,12 +101,6 @@ pub enum Level {
     Error,
 }
 
-pub struct Toast {
-    pub text: String,
-    pub level: Level,
-    pub at: Instant,
-}
-
 /// Read-only context handed to views while drawing and handling input.
 pub struct Ctx<'a> {
     pub ws: &'a Workspace,
@@ -125,7 +119,7 @@ pub struct App {
     pub agents: AgentsView,
     pub health: HealthView,
     pub modal: Option<Modal>,
-    pub toast: Option<Toast>,
+    pub toasts: Toasts,
     tasks_running: usize,
     spinner: usize,
     tx: Sender<Msg>,
@@ -149,7 +143,7 @@ impl App {
             agents: AgentsView::default(),
             health: HealthView::default(),
             modal: None,
-            toast: None,
+            toasts: Toasts::default(),
             tasks_running: 0,
             spinner: 0,
             tx,
@@ -183,11 +177,7 @@ impl App {
     }
 
     pub fn toast(&mut self, text: impl Into<String>, level: Level) {
-        self.toast = Some(Toast {
-            text: text.into(),
-            level,
-            at: Instant::now(),
-        });
+        self.toasts.push(text, level);
     }
 
     // ---- external ---------------------------------------------------------
@@ -222,12 +212,7 @@ impl App {
         let actions = match msg {
             Msg::Tick => {
                 self.spinner = (self.spinner + 1) % SPINNER.len();
-                if let Some(t) = &self.toast
-                    && t.level != Level::Error
-                    && t.at.elapsed() > Duration::from_secs(6)
-                {
-                    self.toast = None;
-                }
+                self.toasts.expire();
                 Vec::new()
             }
             Msg::Resize => Vec::new(),
@@ -279,6 +264,27 @@ impl App {
             }
             TaskOutput::Prepared(key, Err(e)) => {
                 vec![Action::Error(format!("update {key}: {e:#}"))]
+            }
+            // Land on the new skill so the next thing to do, deploying it, is
+            // one key away.
+            TaskOutput::Installed(_, Ok(key)) => vec![
+                Action::Rescan,
+                Action::Toast(format!("installed {key} — press d to deploy it")),
+                Action::Search {
+                    query: key,
+                    focus_list: true,
+                },
+            ],
+            // A reference that holds several skills is not a failure; it is a
+            // question, so ask it.
+            TaskOutput::Installed(reference, Err(e)) => {
+                match e.downcast_ref::<skills::ops::install::NotOneSkill>() {
+                    Some(choice) => vec![Action::OpenModal(Box::new(Modal::install_choice(
+                        &reference,
+                        choice.choices.clone(),
+                    )))],
+                    None => vec![Action::Error(format!("install {reference}: {e:#}"))],
+                }
             }
         }
     }
@@ -413,7 +419,7 @@ impl App {
                     return;
                 }
                 match deploy::apply(&actions) {
-                    Ok(n) => self.toast(format!("{title}: {n} change(s)"), Level::Ok),
+                    Ok(_) => self.toast(deploy::summarize(&actions), Level::Ok),
                     Err(e) => self.toast(format!("{title} failed: {e:#}"), Level::Error),
                 }
                 self.rescan();
@@ -470,6 +476,8 @@ impl App {
         if let Some(m) = self.modal.as_mut() {
             m.draw(f, area, &ctx);
         }
+        // Above everything: a notification should be readable over a dialog.
+        self.toasts.draw(f, area, &self.theme);
     }
 
     fn draw_header(&mut self, f: &mut Frame, area: Rect) {
@@ -515,36 +523,22 @@ impl App {
                 Tab::Health => self.health.hints(),
             }
         };
+        // Results moved out to the notification stack, so the footer is only keys.
         let mut spans: Vec<Span> = Vec::new();
-        let mut left_w = 0usize;
-        if let Some(t) = &self.toast {
-            let style = match t.level {
-                Level::Info => th.dim(),
-                Level::Ok => th.ok(),
-                Level::Error => th.err(),
-            };
-            let text = format!(
-                " {} ",
-                fit(&t.text, (area.width as usize).saturating_sub(2))
-            );
-            left_w = width(&text);
-            spans.push(Span::styled(text, style));
-        }
-        let mut hint_spans: Vec<Span> = Vec::new();
         let mut hint_w = 0usize;
         for (key, desc) in hints {
             let piece_w = width(key) + width(desc) + 3;
-            if left_w + hint_w + piece_w + 1 > area.width as usize {
+            if hint_w + piece_w + 1 > area.width as usize {
                 break;
             }
-            hint_spans.push(Span::styled(*key, th.key_hint()));
-            hint_spans.push(Span::styled(format!(" {desc}  "), th.dim()));
+            spans.push(Span::styled(*key, th.key_hint()));
+            spans.push(Span::styled(format!(" {desc}  "), th.dim()));
             hint_w += piece_w;
         }
-        let pad = (area.width as usize).saturating_sub(left_w + hint_w);
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.extend(hint_spans);
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        let pad = (area.width as usize).saturating_sub(hint_w);
+        let mut line = vec![Span::raw(" ".repeat(pad))];
+        line.extend(spans);
+        f.render_widget(Paragraph::new(Line::from(line)), area);
     }
 }
 

@@ -9,6 +9,7 @@ mod app;
 mod event;
 mod modal;
 mod theme;
+mod toast;
 mod views;
 mod widgets;
 

@@ -6,6 +6,7 @@ use super::widgets::{Input, ListNav, button, fit, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 use skills::ops::deploy;
@@ -14,11 +15,34 @@ use skills::ops::update::{self, FileChange, Prepared, Take};
 use skills::reconcile::DeployState;
 use std::collections::BTreeMap;
 
+/// One choosable row.
+pub struct PickItem {
+    /// What the action consumes; not always what is displayed.
+    pub id: String,
+    pub label: String,
+    pub sub: String,
+}
+
+pub enum PickAction {
+    /// Toggle skills in and out of a preset. Each toggle writes at once, so the
+    /// list doubles as the preset's membership.
+    PresetMembers { preset: String },
+    /// Pick one skill inside a fetched reference and install it.
+    InstallFrom { reference: String },
+}
+
+impl PickAction {
+    /// Several rows can be on at once, versus one choice and done.
+    fn multi(&self) -> bool {
+        matches!(self, PickAction::PresetMembers { .. })
+    }
+}
+
 pub enum InputKind {
     Tags { skill: String },
     PresetName,
-    PresetAddSkill { preset: String },
     RenameTag { old: String },
+    Install,
 }
 
 pub enum Modal {
@@ -59,6 +83,20 @@ pub enum Modal {
     AgentPick {
         skill: String,
         list: ListNav,
+        rect: Rect,
+    },
+    /// A searchable list to choose from. Used wherever a name would otherwise
+    /// have to be typed from memory.
+    Picker {
+        title: String,
+        input: Input,
+        items: Vec<PickItem>,
+        /// Indices into `items` currently on.
+        chosen: std::collections::BTreeSet<usize>,
+        /// Indices matching the filter, in display order.
+        shown: Vec<usize>,
+        list: ListNav,
+        action: PickAction,
         rect: Rect,
     },
     Resolve {
@@ -137,17 +175,18 @@ impl Modal {
             rect: Rect::default(),
         }
     }
-    pub fn add_to_preset(preset: &str) -> Self {
+    /// Ask where to fetch a skill from. Accepts what `skills install` accepts.
+    pub fn install() -> Self {
         Modal::Input {
-            title: format!(" add skill to {preset} "),
+            title: " install a skill ".into(),
             input: Input::default(),
-            kind: InputKind::PresetAddSkill {
-                preset: preset.into(),
-            },
-            hint: "skill directory name · Enter add · Esc cancel".into(),
+            kind: InputKind::Install,
+            hint: "owner/repo[/path] · a git URL · a local path — Enter installs, Esc cancels"
+                .into(),
             rect: Rect::default(),
         }
     }
+
     pub fn rename_tag(old: &str) -> Self {
         Modal::Input {
             title: format!(" rename tag {old} "),
@@ -232,6 +271,82 @@ impl Modal {
         )
     }
 
+    /// Every skill in the root, with the ones already in `preset` switched on.
+    pub fn preset_members(
+        preset: &skills::preset::Preset,
+        snap: &skills::reconcile::Snapshot,
+    ) -> Self {
+        let items: Vec<PickItem> = snap
+            .skills
+            .iter()
+            .filter(|s| s.status.is_present())
+            .map(|s| PickItem {
+                id: s.key.clone(),
+                label: s.key.clone(),
+                sub: s
+                    .description
+                    .clone()
+                    .or_else(|| Some(s.tags.join(" · ")))
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let chosen = items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| preset.skills.contains(&it.id))
+            .map(|(i, _)| i)
+            .collect();
+        Self::picker(
+            format!(" skills in {} ", preset.name),
+            items,
+            chosen,
+            PickAction::PresetMembers {
+                preset: preset.name.clone(),
+            },
+        )
+    }
+
+    /// The skills a fetched reference turned out to hold.
+    pub fn install_choice(reference: &str, choices: Vec<String>) -> Self {
+        let items: Vec<PickItem> = choices
+            .into_iter()
+            .map(|path| PickItem {
+                label: path.rsplit('/').next().unwrap_or(&path).to_string(),
+                sub: path.clone(),
+                id: path,
+            })
+            .collect();
+        Self::picker(
+            format!(" {} holds several skills ", short_ref(reference)),
+            items,
+            Default::default(),
+            PickAction::InstallFrom {
+                reference: reference.to_string(),
+            },
+        )
+    }
+
+    fn picker(
+        title: String,
+        items: Vec<PickItem>,
+        chosen: std::collections::BTreeSet<usize>,
+        action: PickAction,
+    ) -> Self {
+        let shown: Vec<usize> = (0..items.len()).collect();
+        let mut list = ListNav::default();
+        list.clamp(shown.len());
+        Modal::Picker {
+            title,
+            input: Input::default(),
+            items,
+            chosen,
+            shown,
+            list,
+            action,
+            rect: Rect::default(),
+        }
+    }
+
     pub fn agent_pick(skill: &str) -> Self {
         let mut list = ListNav::default();
         list.select(Some(0));
@@ -283,6 +398,18 @@ impl Modal {
                 &[("Enter/y", "apply"), ("Esc/n", "cancel"), ("←→", "buttons")]
             }
             Modal::Input { .. } => &[("Enter", "save"), ("Esc", "cancel")],
+            Modal::Picker { action, .. } if action.multi() => &[
+                ("type", "filter"),
+                ("Space", "toggle"),
+                ("↑↓", "move"),
+                ("Esc", "done"),
+            ],
+            Modal::Picker { .. } => &[
+                ("type", "filter"),
+                ("Enter", "install"),
+                ("↑↓", "move"),
+                ("Esc", "cancel"),
+            ],
             Modal::AgentPick { .. } => &[("Space/Enter", "toggle"), ("Esc", "close")],
             Modal::Resolve { .. } => &[
                 ("Space", "toggle side"),
@@ -408,6 +535,59 @@ impl Modal {
                     }
                     _ => vec![],
                 }
+            }
+            Modal::Picker {
+                input,
+                items,
+                chosen,
+                shown,
+                list,
+                action,
+                ..
+            } => {
+                let multi = action.multi();
+                match k.code {
+                    KeyCode::Esc => return vec![Action::CloseModal],
+                    KeyCode::Down | KeyCode::Char('n') if k.code == KeyCode::Down || ctrl => {
+                        list.move_by(1, shown.len())
+                    }
+                    KeyCode::Up | KeyCode::Char('p') if k.code == KeyCode::Up || ctrl => {
+                        list.move_by(-1, shown.len())
+                    }
+                    KeyCode::Char(' ') if multi => {
+                        if let Some(i) = list.selected().and_then(|i| shown.get(i)).copied() {
+                            let on = !chosen.contains(&i);
+                            if on {
+                                chosen.insert(i);
+                            } else {
+                                chosen.remove(&i);
+                            }
+                            return vec![preset_toggle(action, &items[i].id, on)];
+                        }
+                    }
+                    KeyCode::Enter if multi => return vec![Action::CloseModal],
+                    KeyCode::Enter => {
+                        if let Some(i) = list.selected().and_then(|i| shown.get(i)).copied()
+                            && let PickAction::InstallFrom { reference } = action
+                        {
+                            return vec![
+                                Action::CloseModal,
+                                Action::Toast(format!("fetching {}…", items[i].label)),
+                                Action::Spawn(crate::tui::event::Task::Install {
+                                    reference: reference.clone(),
+                                    subpath: Some(items[i].id.clone()),
+                                }),
+                            ];
+                        }
+                    }
+                    _ => {
+                        if input.handle_key(k) {
+                            refilter(input.value(), items, shown);
+                            list.clamp(shown.len());
+                        }
+                    }
+                }
+                vec![]
             }
             Modal::Resolve {
                 prepared,
@@ -570,6 +750,47 @@ impl Modal {
                     }
                     if let Some((i, _)) = list.click(m.row, n) {
                         return toggle_agent(ctx, skill, i);
+                    }
+                }
+                vec![]
+            }
+            Modal::Picker {
+                items,
+                chosen,
+                shown,
+                list,
+                action,
+                rect,
+                ..
+            } => {
+                if let Some(d) = wheel {
+                    list.move_by(d, shown.len());
+                } else if click {
+                    if !rect.contains(at) {
+                        return vec![Action::CloseModal];
+                    }
+                    if let Some((row, double)) = list.click(m.row, shown.len())
+                        && let Some(i) = shown.get(row).copied()
+                    {
+                        if action.multi() {
+                            let on = !chosen.contains(&i);
+                            if on {
+                                chosen.insert(i);
+                            } else {
+                                chosen.remove(&i);
+                            }
+                            return vec![preset_toggle(action, &items[i].id, on)];
+                        }
+                        if double && let PickAction::InstallFrom { reference } = action {
+                            return vec![
+                                Action::CloseModal,
+                                Action::Toast(format!("fetching {}…", items[i].label)),
+                                Action::Spawn(crate::tui::event::Task::Install {
+                                    reference: reference.clone(),
+                                    subpath: Some(items[i].id.clone()),
+                                }),
+                            ];
+                        }
                     }
                 }
                 vec![]
@@ -772,6 +993,77 @@ impl Modal {
                     .highlight_symbol("▸ ");
                 f.render_stateful_widget(w, r, &mut list.state);
             }
+            Modal::Picker {
+                title,
+                input,
+                items,
+                chosen,
+                shown,
+                list,
+                action,
+                rect,
+            } => {
+                let multi = action.multi();
+                let r = centered(
+                    area,
+                    76,
+                    (shown.len() as u16 + 5).clamp(8, area.height.saturating_sub(4)),
+                );
+                *rect = r;
+                f.render_widget(Clear, r);
+                let block = th.block(title.as_str(), true);
+                let inner = block.inner(r);
+                f.render_widget(block, r);
+                let field = Rect {
+                    x: inner.x + 1,
+                    width: inner.width.saturating_sub(2),
+                    height: 1,
+                    ..inner
+                };
+                input.render(f, field, true, "type to filter…", th);
+                let list_area = Rect {
+                    y: inner.y + 2,
+                    height: inner.height.saturating_sub(2),
+                    ..inner
+                };
+                list.rows = list_area;
+                let rows: Vec<ListItem> = shown
+                    .iter()
+                    .map(|i| {
+                        let it = &items[*i];
+                        let on = chosen.contains(i);
+                        let mark = if !multi {
+                            Span::raw("  ")
+                        } else if on {
+                            Span::styled("✓ ", th.ok())
+                        } else {
+                            Span::styled("  ", th.dim())
+                        };
+                        ListItem::new(Line::from(vec![
+                            mark,
+                            Span::styled(
+                                fit(&it.label, 26),
+                                if on { th.bold() } else { Style::default() },
+                            ),
+                            Span::raw("  "),
+                            Span::styled(
+                                fit(&it.sub, list_area.width.saturating_sub(32) as usize),
+                                th.dim(),
+                            ),
+                        ]))
+                    })
+                    .collect();
+                let w = List::new(rows)
+                    .highlight_style(th.selected())
+                    .highlight_symbol("▸ ");
+                f.render_stateful_widget(w, list_area, &mut list.state);
+                if shown.is_empty() {
+                    f.render_widget(
+                        Paragraph::new(Span::styled("nothing matches", th.dim())),
+                        list_area,
+                    );
+                }
+            }
             Modal::Resolve {
                 prepared,
                 files,
@@ -880,6 +1172,56 @@ impl Modal {
     }
 }
 
+/// Narrow `shown` to the rows whose label or sublabel contains `query`.
+fn refilter(query: &str, items: &[PickItem], shown: &mut Vec<usize>) {
+    let q = query.trim().to_lowercase();
+    shown.clear();
+    shown.extend((0..items.len()).filter(|i| {
+        q.is_empty()
+            || items[*i].label.to_lowercase().contains(&q)
+            || items[*i].sub.to_lowercase().contains(&q)
+    }));
+}
+
+/// Add or drop one skill from a preset, writing the file straight away so the
+/// list the user is looking at is the membership.
+fn preset_toggle(action: &PickAction, skill: &str, on: bool) -> Action {
+    let PickAction::PresetMembers { preset } = action else {
+        return Action::Toast(String::new());
+    };
+    let (preset, skill) = (preset.clone(), skill.to_string());
+    Action::Write(Box::new(move |ws| {
+        let mut p = ws
+            .presets
+            .load(&preset)?
+            .ok_or_else(|| anyhow::anyhow!("no such preset: {preset}"))?;
+        p.skills.retain(|s| s != &skill);
+        if on {
+            p.skills.push(skill.clone());
+            p.skills.sort();
+        }
+        ws.presets.save(&p)?;
+        Ok(format!(
+            "{} {skill} {} {preset}",
+            if on { "added" } else { "removed" },
+            if on { "to" } else { "from" }
+        ))
+    }))
+}
+
+/// The tail of a URL or path, for a dialog title.
+fn short_ref(reference: &str) -> String {
+    reference
+        .trim_end_matches('/')
+        .rsplit('/')
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn flip(t: Take) -> Take {
     match t {
         Take::Local => Take::Upstream,
@@ -888,11 +1230,10 @@ fn flip(t: Take) -> Take {
 }
 
 fn apply_links(actions: Vec<deploy::Action>) -> Vec<Action> {
-    let n = actions.iter().filter(|a| a.is_change()).count();
     match deploy::apply(&actions) {
         Ok(_) => vec![
             Action::CloseModal,
-            Action::Toast(format!("applied {n} change(s)")),
+            Action::Toast(deploy::summarize(&actions)),
             Action::Rescan,
         ],
         Err(e) => vec![
@@ -940,7 +1281,7 @@ fn toggle_agent(ctx: &Ctx, skill: &str, idx: usize) -> Vec<Action> {
     }
 }
 
-fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
+fn submit(kind: &InputKind, value: String, _ctx: &Ctx) -> Vec<Action> {
     match kind {
         InputKind::Tags { skill } => {
             let skill = skill.clone();
@@ -978,23 +1319,18 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
                 Ok(format!("created preset {name}"))
             }))]
         }
-        InputKind::PresetAddSkill { preset } => {
-            let key = value.trim().to_string();
-            if ctx.snap.get(&key).is_none() {
-                return vec![Action::Error(format!("no such skill: {key}"))];
+        InputKind::Install => {
+            let reference = value.trim().to_string();
+            if reference.is_empty() {
+                return vec![];
             }
-            let preset = preset.clone();
-            vec![Action::Write(Box::new(move |ws| {
-                let mut p = ws
-                    .presets
-                    .load(&preset)?
-                    .ok_or_else(|| anyhow::anyhow!("no such preset: {preset}"))?;
-                if !p.skills.contains(&key) {
-                    p.skills.push(key.clone());
-                }
-                ws.presets.save(&p)?;
-                Ok(format!("{preset}: added {key}"))
-            }))]
+            vec![
+                Action::Toast(format!("fetching {reference}…")),
+                Action::Spawn(crate::tui::event::Task::Install {
+                    reference,
+                    subpath: None,
+                }),
+            ]
         }
         InputKind::RenameTag { old } => {
             let old = old.clone();
@@ -1090,6 +1426,7 @@ const HELP: &str = "Search
   type              fuzzy search over name, tags, description, note
   tag:x agent:y     filters; also status:modified  source:git  untagged
   Enter / Tab       move focus: input → list → preview   (Esc goes back)
+  i                 install a skill from a repo or a local path
   t  n  d           tags / note in $EDITOR / deploy picker
   Ctrl-1..9         toggle deploy on agent N directly
   a  m  x           accept local changes / migrate renamed metadata / remove

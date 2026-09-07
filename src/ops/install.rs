@@ -144,12 +144,17 @@ pub fn fetch(ws: &Workspace, r: &InstallRef) -> Result<Fetched> {
                 Some(s) if !s.is_empty() => work.join(s),
                 _ => work.clone(),
             };
+            // A repository of many skills is normal; the caller decides which.
             if !skill_dir.join(SKILL_FILE).is_file() {
+                let choices = discover(&skill_dir);
                 let _ = std::fs::remove_dir_all(&work);
-                bail!(
-                    "no {SKILL_FILE} at {} in {url}; pass --subpath",
-                    subpath.as_deref().unwrap_or("repo root")
-                );
+                if choices.is_empty() {
+                    bail!(
+                        "no {SKILL_FILE} at {} in {url}",
+                        subpath.as_deref().unwrap_or("the repository root")
+                    );
+                }
+                return Err(NotOneSkill { choices }.into());
             }
             Ok(Fetched {
                 skill_dir,
@@ -192,6 +197,38 @@ pub fn default_name(r: &InstallRef, fetched: &Fetched) -> String {
             }
         },
     }
+}
+
+/// Raised when a reference resolves to a directory holding several skills
+/// rather than one. Carries the subpaths a caller can offer to choose from.
+#[derive(Debug)]
+pub struct NotOneSkill {
+    pub choices: Vec<String>,
+}
+
+impl std::fmt::Display for NotOneSkill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "holds {} skills; pick one", self.choices.len())
+    }
+}
+
+impl std::error::Error for NotOneSkill {}
+
+/// Subpaths under `dir` that contain a `SKILL.md`, relative and sorted.
+pub fn discover(dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = walkdir::WalkDir::new(dir)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name() == SKILL_FILE && e.file_type().is_file())
+        .filter_map(|e| {
+            let rel = e.path().parent()?.strip_prefix(dir).ok()?;
+            let s = rel.to_string_lossy().into_owned();
+            (!s.is_empty() && !s.split('/').any(|p| p.starts_with('.'))).then_some(s)
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// Install: fetch, validate, move into the root, write metadata. Returns the key.

@@ -1,70 +1,321 @@
-//! Agents tab: per-agent directory state, sync and convert.
+//! Agents tab: what a given agent actually has, and the presets that fill it.
+//!
+//! Everything on this page is scoped to one agent or to all of them at once.
+//! Entries are split by who owns them: skills linked from the central root are
+//! ours to add and remove, anything else the agent brought itself is shown but
+//! never written to.
 
 use super::{View, split_panes, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
-use crate::tui::widgets::{ListNav, pad};
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crate::tui::widgets::{ListNav, fit, pad, width};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
-use skills::ops::deploy;
+use skills::ops::deploy::{
+    self, PresetState, PresetStatus, plan_preset_activate, plan_preset_deactivate, preset_status,
+};
+use skills::preset::Preset;
 use skills::reconcile::{AgentDirMode, EntryState};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Only two things take the keyboard. The scope is switched by `[` and `]`
+/// from anywhere, so it never needs to hold focus.
+enum Focus {
+    Presets,
+    Entries,
+}
+
+/// One row of the entry list: either a section header or an entry under it.
+enum Row<'a> {
+    Header(String),
+    /// One skill name, with the state it has in each agent of the scope.
+    /// A skill present in several agents is one row, not one row per agent.
+    Entry {
+        name: &'a str,
+        states: Vec<Option<&'a EntryState>>,
+        managed: bool,
+    },
+}
 
 #[derive(Default)]
 pub struct AgentsView {
-    list: ListNav,
+    /// None = all agents.
+    scope: Option<String>,
+    focus: FocusState,
+    presets: Vec<(Preset, PresetStatus)>,
+    preset_cursor: usize,
+    entries: ListNav,
+    scope_rects: Vec<(Rect, Option<String>)>,
+    preset_rects: Vec<Rect>,
     left: Rect,
     right: Rect,
     detail_scroll: u16,
 }
 
+/// `Focus` needs a default for `#[derive(Default)]` on the view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FocusState(Focus);
+
+impl Default for FocusState {
+    fn default() -> Self {
+        FocusState(Focus::Presets)
+    }
+}
+
 impl AgentsView {
-    fn sync(&self, ctx: &Ctx) -> Vec<Action> {
-        match deploy::plan_sync(ctx.ws, ctx.snap) {
-            Ok(actions) => vec![Action::ConfirmLinks {
-                title: "sync agents to desired state".into(),
-                actions,
-            }],
-            Err(e) => vec![Action::Error(format!("{e:#}"))],
+    /// Agents the current scope covers.
+    fn scope_agents(&self, ctx: &Ctx) -> Vec<String> {
+        match &self.scope {
+            Some(k) => vec![k.clone()],
+            None => ctx.ws.config.agent_keys(),
         }
     }
-    fn convert(&self, ctx: &Ctx) -> Vec<Action> {
-        let Some(a) = self.list.selected().and_then(|i| ctx.snap.agents.get(i)) else {
-            return vec![];
+
+    fn scope_label(&self) -> &str {
+        self.scope.as_deref().unwrap_or("all agents")
+    }
+
+    fn focus(&self) -> Focus {
+        self.focus.0
+    }
+
+    fn set_focus(&mut self, f: Focus) {
+        self.focus = FocusState(f);
+    }
+
+    /// Entry rows for the current scope, grouped into ours and theirs.
+    fn rows<'a>(&self, ctx: &'a Ctx) -> Vec<Row<'a>> {
+        let agents = self.scope_agents(ctx);
+        // Collect names first so a skill deployed to several agents stays one row.
+        let mut names: Vec<&str> = Vec::new();
+        for key in &agents {
+            if let Some(report) = ctx.snap.agent(key) {
+                for name in report.entries.keys() {
+                    if !names.contains(&name.as_str()) {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        names.sort_unstable();
+        let mut managed: Vec<Row> = Vec::new();
+        let mut local: Vec<Row> = Vec::new();
+        for name in names {
+            let states: Vec<Option<&EntryState>> = agents
+                .iter()
+                .map(|key| ctx.snap.agent(key).and_then(|r| r.entries.get(name)))
+                .collect();
+            // Ours as soon as any agent links it into the root; otherwise the
+            // agent's own, however many agents happen to carry a copy.
+            let is_managed = states
+                .iter()
+                .any(|s| matches!(s, Some(EntryState::Deployed)));
+            let row = Row::Entry {
+                name,
+                states,
+                managed: is_managed,
+            };
+            if is_managed {
+                managed.push(row)
+            } else {
+                local.push(row)
+            }
+        }
+        let mut out = Vec::new();
+        if !managed.is_empty() {
+            out.push(Row::Header(format!("managed · {} linked", managed.len())));
+            out.append(&mut managed);
+        }
+        if !local.is_empty() {
+            out.push(Row::Header(format!(
+                "the agent's own · {} left alone",
+                local.len()
+            )));
+            out.append(&mut local);
+        }
+        out
+    }
+
+    fn selected_preset(&self) -> Option<&(Preset, PresetStatus)> {
+        self.presets.get(self.preset_cursor)
+    }
+
+    fn activate(&self, ctx: &Ctx, on: bool) -> Vec<Action> {
+        let Some((preset, status)) = self.selected_preset() else {
+            return vec![Action::Error("no preset here yet".into())];
         };
-        match deploy::plan_convert(ctx.ws, ctx.snap, &a.key) {
+        let scope = self.scope_agents(ctx);
+        let plan = if on {
+            plan_preset_activate(ctx.ws, ctx.snap, preset, &scope)
+        } else {
+            plan_preset_deactivate(ctx.ws, ctx.snap, preset, &scope)
+        };
+        match plan {
             Ok(actions) => vec![Action::ConfirmLinks {
-                title: format!("convert {} to per-skill links", a.key),
+                title: format!(
+                    "{} {} · {}",
+                    if on { "activate" } else { "deactivate" },
+                    preset.name,
+                    self.scope_label()
+                ),
                 actions,
             }],
-            Err(e) => vec![Action::Error(format!("{e:#}"))],
+            Err(e) => {
+                let _ = status;
+                vec![Action::Error(format!("{e:#}"))]
+            }
         }
+    }
+
+    /// Section labels carry the focus: the active one is accented, the rest dim.
+    fn label_style(&self, section: Focus, th: &crate::tui::theme::Theme) -> Style {
+        if self.focus() == section {
+            th.accent().add_modifier(ratatui::style::Modifier::BOLD)
+        } else {
+            th.dim()
+        }
+    }
+
+    fn move_scope(&mut self, delta: i32, ctx: &Ctx) {
+        let keys = ctx.ws.config.agent_keys();
+        let cur = match &self.scope {
+            None => 0i32,
+            Some(k) => keys
+                .iter()
+                .position(|x| x == k)
+                .map(|i| i as i32 + 1)
+                .unwrap_or(0),
+        };
+        let next = (cur + delta).rem_euclid(keys.len() as i32 + 1);
+        self.scope = if next == 0 {
+            None
+        } else {
+            keys.get((next - 1) as usize).cloned()
+        };
     }
 }
 
 impl View for AgentsView {
     fn refresh(&mut self, ctx: &Ctx) {
-        self.list.clamp(ctx.snap.agents.len());
+        // A scope pinned to an agent that no longer exists falls back to all.
+        if let Some(k) = &self.scope
+            && ctx.ws.config.agent(k).is_none()
+        {
+            self.scope = None;
+        }
+        let scope = self.scope_agents(ctx);
+        self.presets = ctx
+            .ws
+            .presets
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| {
+                let st = preset_status(ctx.snap, &p, &scope);
+                (p, st)
+            })
+            .collect();
+        self.preset_cursor = self.preset_cursor.min(self.presets.len().saturating_sub(1));
+        self.entries.clamp(self.rows(ctx).len());
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
-        let n = ctx.snap.agents.len();
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => vec![Action::Quit],
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.list.move_by(1, n);
-                self.detail_scroll = 0;
+            KeyCode::Char('q') | KeyCode::Esc => return vec![Action::Quit],
+            // Scope is switchable from anywhere: it frames everything else.
+            KeyCode::Char('[') => {
+                self.move_scope(-1, ctx);
+                return vec![Action::Rescan];
+            }
+            KeyCode::Char(']') => {
+                self.move_scope(1, ctx);
+                return vec![Action::Rescan];
+            }
+            KeyCode::Char('s') => {
+                return match deploy::plan_sync(ctx.ws, ctx.snap) {
+                    Ok(actions) => vec![Action::ConfirmLinks {
+                        title: "sync agents to the desired state".into(),
+                        actions,
+                    }],
+                    Err(e) => vec![Action::Error(format!("{e:#}"))],
+                };
+            }
+            KeyCode::Char('c') => {
+                let Some(agent) = self.scope.clone() else {
+                    return vec![Action::Error("pick a single agent to convert".into())];
+                };
+                return match deploy::plan_convert(ctx.ws, ctx.snap, &agent) {
+                    Ok(actions) => vec![Action::ConfirmLinks {
+                        title: format!("convert {agent} to per-skill links"),
+                        actions,
+                    }],
+                    Err(e) => vec![Action::Error(format!("{e:#}"))],
+                };
+            }
+            _ => {}
+        }
+        match self.focus() {
+            Focus::Presets => match k.code {
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.preset_cursor = self.preset_cursor.saturating_sub(1);
+                    vec![]
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.preset_cursor =
+                        (self.preset_cursor + 1).min(self.presets.len().saturating_sub(1));
+                    vec![]
+                }
+                KeyCode::Enter if shift => self.activate(ctx, false),
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    let on = !matches!(
+                        self.selected_preset().map(|(_, st)| st.state()),
+                        Some(PresetState::Active)
+                    );
+                    self.activate(ctx, on)
+                }
+                KeyCode::Char('x') | KeyCode::Backspace => self.activate(ctx, false),
+                // Focus follows the arrows rather than a separate key, so there
+                // is nothing invisible to remember.
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.set_focus(Focus::Entries);
+                    self.entries.clamp(self.rows(ctx).len());
+                    vec![]
+                }
+                _ => vec![],
+            },
+            Focus::Entries => {
+                let n = self.rows(ctx).len();
+                match k.code {
+                    KeyCode::Down | KeyCode::Char('j') => self.entries.move_by(1, n),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if self.entries.selected().unwrap_or(0) == 0 {
+                            self.set_focus(Focus::Presets);
+                        } else {
+                            self.entries.move_by(-1, n);
+                        }
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => self.entries.first(n),
+                    KeyCode::End | KeyCode::Char('G') => self.entries.last(n),
+                    KeyCode::Enter => {
+                        if let Some(Row::Entry { name, .. }) = self
+                            .entries
+                            .selected()
+                            .and_then(|i| self.rows(ctx).into_iter().nth(i))
+                        {
+                            return vec![Action::Search {
+                                query: name.to_string(),
+                                focus_list: true,
+                            }];
+                        }
+                    }
+                    _ => {}
+                }
                 vec![]
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.list.move_by(-1, n);
-                self.detail_scroll = 0;
-                vec![]
-            }
-            KeyCode::Char('s') => self.sync(ctx),
-            KeyCode::Char('c') => self.convert(ctx),
-            _ => vec![],
         }
     }
 
@@ -72,133 +323,209 @@ impl View for AgentsView {
         let at = (m.column, m.row).into();
         if let Some(d) = wheel(&m) {
             if self.left.contains(at) {
-                self.list.move_by(d, ctx.snap.agents.len());
+                self.set_focus(Focus::Entries);
+                self.entries.move_by(d, self.rows(ctx).len());
             } else if self.right.contains(at) {
                 self.detail_scroll = (self.detail_scroll as i32 + d).max(0) as u16;
             }
             return vec![];
         }
-        if let MouseEventKind::Down(MouseButton::Left) = m.kind
-            && self.left.contains(at)
-        {
-            self.list.click(m.row, ctx.snap.agents.len());
-            self.detail_scroll = 0;
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            if let Some((_, scope)) = self
+                .scope_rects
+                .iter()
+                .find(|(r, _)| r.contains(at))
+                .map(|(r, s)| (*r, s.clone()))
+            {
+                self.scope = scope;
+                return vec![Action::Rescan];
+            }
+            if let Some(i) = self.preset_rects.iter().position(|r| r.contains(at)) {
+                self.preset_cursor = i;
+                self.set_focus(Focus::Presets);
+                // A pill is a switch: clicking an installed one takes it off
+                // again rather than re-running an install that has nothing to do.
+                // Shift forces removal whatever the state.
+                let on = !m.modifiers.contains(KeyModifiers::SHIFT)
+                    && !matches!(
+                        self.selected_preset().map(|(_, st)| st.state()),
+                        Some(PresetState::Active)
+                    );
+                return self.activate(ctx, on);
+            }
+            if self.left.contains(at) {
+                self.set_focus(Focus::Entries);
+                self.entries.click(m.row, self.rows(ctx).len());
+            }
         }
         vec![]
     }
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let th = ctx.theme;
-        let (left, right) = split_panes(area, 38);
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(2),
+                Constraint::Min(1),
+            ])
+            .split(area);
+
+        // Scope chips.
+        self.scope_rects.clear();
+        let mut spans = vec![Span::styled(" scope ", th.dim())];
+        let mut x = rows[0].x + width(" scope ") as u16;
+        let chip = |label: String,
+                    key: Option<String>,
+                    on: bool,
+                    spans: &mut Vec<Span<'static>>,
+                    x: &mut u16,
+                    rects: &mut Vec<(Rect, Option<String>)>| {
+            let text = format!(" {label} ");
+            let w = width(&text) as u16;
+            rects.push((Rect::new(*x, rows[0].y, w, 1), key));
+            spans.push(Span::styled(
+                text,
+                if on {
+                    th.selected().fg(th.accent)
+                } else {
+                    th.dim()
+                },
+            ));
+            spans.push(Span::raw(" "));
+            *x += w + 1;
+        };
+        chip(
+            "all".into(),
+            None,
+            self.scope.is_none(),
+            &mut spans,
+            &mut x,
+            &mut self.scope_rects,
+        );
+        for a in &ctx.ws.config.agents {
+            let on = self.scope.as_deref() == Some(a.key.as_str());
+            chip(
+                a.key.clone(),
+                Some(a.key.clone()),
+                on,
+                &mut spans,
+                &mut x,
+                &mut self.scope_rects,
+            );
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+
+        // Preset pills.
+        self.preset_rects.clear();
+        let mut pills = vec![Span::styled(
+            " presets ",
+            self.label_style(Focus::Presets, th),
+        )];
+        let mut x = rows[1].x + width(" presets ") as u16;
+        if self.presets.is_empty() {
+            pills.push(Span::styled(
+                "none yet — create one on the Presets tab",
+                th.dim(),
+            ));
+        }
+        for (i, (preset, status)) in self.presets.iter().enumerate() {
+            let mark = match status.state() {
+                PresetState::Active => "✓ ",
+                PresetState::Partial => "◐ ",
+                PresetState::Inactive => "○ ",
+                PresetState::Empty => "· ",
+            };
+            let text = format!(" {mark}{} {} ", preset.name, status.label());
+            let w = width(&text) as u16;
+            self.preset_rects.push(Rect::new(x, rows[1].y, w, 1));
+            let style = match status.state() {
+                PresetState::Active => th.ok(),
+                PresetState::Partial => th.warn(),
+                _ => th.dim(),
+            };
+            // Reversing paints the pill solid in its own state colour, which
+            // reads as selected from across the screen; without focus a bold
+            // outline is enough to remember the place.
+            let style = if i == self.preset_cursor {
+                if self.focus() == Focus::Presets {
+                    style.add_modifier(ratatui::style::Modifier::REVERSED)
+                } else {
+                    style.add_modifier(ratatui::style::Modifier::BOLD)
+                }
+            } else {
+                style
+            };
+            pills.push(Span::styled(text, style));
+            pills.push(Span::raw(" "));
+            x += w + 1;
+        }
+        f.render_widget(Paragraph::new(Line::from(pills)), rows[1]);
+
+        // Entries and detail.
+        let (left, right) = split_panes(rows[2], 55);
         self.left = left;
         self.right = right;
-        let items: Vec<ListItem> = ctx
-            .snap
-            .agents
+        let rows_data = self.rows(ctx);
+        let show_agent = self.scope.is_none();
+        let scope_agents = self.scope_agents(ctx);
+        let items: Vec<ListItem> = rows_data
             .iter()
-            .map(|a| {
-                let mode = match &a.mode {
-                    AgentDirMode::Missing => Span::styled("missing", th.dim()),
-                    AgentDirMode::DirLinked => Span::styled("dir-linked", th.warn()),
-                    AgentDirMode::DirForeign { .. } => Span::styled("dir-foreign", th.warn()),
-                    AgentDirMode::Real => {
-                        let d = a.count(|s| matches!(s, EntryState::Deployed));
-                        let issues = a.entries.len() - d;
-                        if issues > 0 {
-                            Span::styled(format!("{d} deployed, {issues} issue(s)"), th.warn())
-                        } else {
-                            Span::styled(format!("{d} deployed"), th.ok())
+            .map(|row| match row {
+                Row::Header(text) => ListItem::new(Line::from(Span::styled(
+                    text.clone(),
+                    th.dim().add_modifier(ratatui::style::Modifier::ITALIC),
+                ))),
+                Row::Entry {
+                    name,
+                    states,
+                    managed,
+                } => {
+                    let mut spans = vec![Span::raw("  ")];
+                    spans.push(Span::styled(
+                        pad(name, 26),
+                        if *managed { Style::default() } else { th.dim() },
+                    ));
+                    if show_agent {
+                        // One column per agent, so a skill in both reads at a glance.
+                        for (i, state) in states.iter().enumerate() {
+                            let (glyph, style) = glyph_for(*state, th);
+                            spans.push(Span::styled(
+                                format!("{glyph} {} ", abbrev(&scope_agents[i])),
+                                style,
+                            ));
                         }
+                    } else {
+                        let state = states.first().copied().flatten();
+                        let (glyph, style) = glyph_for(state, th);
+                        spans.insert(1, Span::styled(format!("{glyph} "), style));
+                        spans.push(Span::styled(
+                            state.map(entry_note).unwrap_or_default(),
+                            th.dim(),
+                        ));
                     }
-                };
-                ListItem::new(Line::from(vec![Span::raw(pad(&a.key, 10)), mode]))
+                    ListItem::new(Line::from(spans))
+                }
             })
             .collect();
-        self.list.set_area_from_block(left);
+        let title = format!(" {} ", self.scope_label());
+        self.entries.set_area_from_block(left);
         let list = List::new(items)
-            .block(th.block(" agents ", true))
-            .highlight_style(th.selected())
+            .block(th.block(title, self.focus() == Focus::Entries))
+            .highlight_style(if self.focus() == Focus::Entries {
+                th.selected()
+            } else {
+                th.selected_unfocused()
+            })
             .highlight_symbol("▸ ");
-        f.render_stateful_widget(list, left, &mut self.list.state);
+        f.render_stateful_widget(list, left, &mut self.entries.state);
 
-        let block = th.block(" details ", false);
+        let block = th.block(" detail ", false);
         let inner = block.inner(right);
         f.render_widget(block, right);
-        let mut lines: Vec<Line> = Vec::new();
-        if let Some(a) = self.list.selected().and_then(|i| ctx.snap.agents.get(i)) {
-            lines.push(Line::from(Span::styled(
-                a.name.as_str(),
-                th.bold().fg(th.accent),
-            )));
-            lines.push(Line::from(vec![
-                Span::styled("dir   ", th.dim()),
-                Span::raw(skills::paths::contract_tilde(&a.skills_dir)),
-            ]));
-            let mode = match &a.mode {
-                AgentDirMode::Missing => "directory does not exist; it is created on first deploy or sync".to_string(),
-                AgentDirMode::DirLinked => "whole directory is a symlink to the skills root — every skill is visible; press c to convert to per-skill links".into(),
-                AgentDirMode::DirForeign { target } => format!("directory is a symlink to {} — left alone", target.display()),
-                AgentDirMode::Real => "real directory with per-skill entries".into(),
-            };
-            lines.push(Line::from(vec![
-                Span::styled("mode  ", th.dim()),
-                Span::raw(mode),
-            ]));
-            lines.push(Line::from(""));
-            let mut issues: Vec<(&String, &EntryState)> = a
-                .entries
-                .iter()
-                .filter(|(_, s)| !matches!(s, EntryState::Deployed))
-                .collect();
-            issues.sort_by_key(|(n, _)| (*n).clone());
-            if a.mode == AgentDirMode::Real {
-                if issues.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "all entries are links into the root",
-                        th.ok(),
-                    )));
-                } else {
-                    lines.push(Line::from(Span::styled(
-                        "entries needing attention",
-                        th.bold(),
-                    )));
-                }
-            }
-            for (name, st) in issues {
-                let (txt, style) = match st {
-                    EntryState::Broken { target } => {
-                        (format!("broken → {}", target.display()), th.err())
-                    }
-                    EntryState::Foreign { target } => {
-                        (format!("foreign → {}", target.display()), th.warn())
-                    }
-                    EntryState::Shadow { same_content } => (
-                        format!(
-                            "shadow ({})",
-                            if *same_content {
-                                "same content; sync can replace it"
-                            } else {
-                                "differs; resolve by hand"
-                            }
-                        ),
-                        th.warn(),
-                    ),
-                    EntryState::AgentOnly => (
-                        "agent-only; adopt with `skills adopt <path>`".to_string(),
-                        th.warn(),
-                    ),
-                    EntryState::Deployed => unreachable!(),
-                };
-                lines.push(Line::from(vec![
-                    Span::raw(pad(name, 24)),
-                    Span::styled(txt, style),
-                ]));
-            }
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![Span::styled("s", th.key_hint()), Span::styled(" sync all agents to the desired state (config + presets), with a preview first", th.dim())]));
-        }
         f.render_widget(
-            Paragraph::new(lines)
+            Paragraph::new(self.detail(ctx))
                 .wrap(Wrap { trim: false })
                 .scroll((self.detail_scroll, 0)),
             inner,
@@ -206,11 +533,133 @@ impl View for AgentsView {
     }
 
     fn hints(&self) -> Hints {
-        &[
-            ("s", "sync"),
-            ("c", "convert dir-link"),
-            ("/", "search"),
-            ("q", "quit"),
-        ]
+        match self.focus() {
+            Focus::Presets => &[
+                ("Enter", "install / remove"),
+                ("x", "remove"),
+                ("←→", "pick preset"),
+                ("↓", "entries"),
+                ("[ ]", "scope"),
+                ("s", "sync"),
+            ],
+            Focus::Entries => &[
+                ("j/k", "move"),
+                ("↑", "back to presets"),
+                ("Enter", "open in search"),
+                ("[ ]", "scope"),
+                ("c", "convert dir-link"),
+            ],
+        }
+    }
+}
+
+/// Two-letter agent label used as a column head.
+fn abbrev(key: &str) -> String {
+    key.chars().take(2).collect()
+}
+
+/// Marker for one agent's relationship to a skill; `None` means that agent
+/// does not have it at all.
+fn glyph_for(state: Option<&EntryState>, th: &crate::tui::theme::Theme) -> (&'static str, Style) {
+    match state {
+        Some(EntryState::Deployed) => ("●", th.ok()),
+        Some(EntryState::Broken { .. }) => ("!", th.err()),
+        Some(EntryState::Shadow { .. }) => ("▪", th.warn()),
+        Some(EntryState::Foreign { .. }) => ("→", th.warn()),
+        Some(EntryState::AgentOnly) => ("▪", th.dim()),
+        None => ("·", th.dim()),
+    }
+}
+
+fn entry_note(state: &EntryState) -> String {
+    match state {
+        EntryState::Deployed => String::new(),
+        EntryState::Broken { .. } => "broken link".into(),
+        EntryState::Shadow { same_content: true } => "the agent's own copy, same content".into(),
+        EntryState::Shadow {
+            same_content: false,
+        } => "the agent's own copy, differs".into(),
+        EntryState::Foreign { target } => format!("links outside the root → {}", target.display()),
+        EntryState::AgentOnly => "only here, not in the root".into(),
+    }
+}
+
+impl AgentsView {
+    fn detail<'a>(&self, ctx: &'a Ctx) -> Vec<Line<'a>> {
+        let th = ctx.theme;
+        let mut lines = Vec::new();
+        if let Some((preset, status)) = self.selected_preset() {
+            lines.push(Line::from(Span::styled(
+                preset.name.clone(),
+                th.bold().fg(th.accent),
+            )));
+            if let Some(d) = &preset.description {
+                lines.push(Line::from(Span::styled(d.clone(), th.dim())));
+            }
+            lines.push(Line::from(vec![
+                Span::styled("in scope  ", th.dim()),
+                Span::raw(format!(
+                    "{} of {} skill-agent pairs",
+                    status.installed, status.total
+                )),
+            ]));
+            for skill in &preset.skills {
+                let deployed: Vec<&str> = ctx
+                    .snap
+                    .get(skill)
+                    .map(|r| r.deployed_to())
+                    .unwrap_or_default();
+                let mark = if status.absent.contains(skill) {
+                    Span::styled("✗", th.err())
+                } else if deployed.is_empty() {
+                    Span::styled("○", th.dim())
+                } else {
+                    Span::styled("●", th.ok())
+                };
+                lines.push(Line::from(vec![
+                    mark,
+                    Span::raw(format!(" {}", pad(skill, 26))),
+                    Span::styled(
+                        if status.absent.contains(skill) {
+                            "not in the root".to_string()
+                        } else {
+                            deployed.join(", ")
+                        },
+                        th.dim(),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
+        for a in &ctx.snap.agents {
+            if self.scope.as_deref().is_some_and(|k| k != a.key) {
+                continue;
+            }
+            let mode = match &a.mode {
+                AgentDirMode::Missing => "no directory yet".to_string(),
+                AgentDirMode::DirLinked => {
+                    "whole directory is one link; press c to split it".into()
+                }
+                AgentDirMode::DirForeign { target } => {
+                    format!("directory links to {}", target.display())
+                }
+                AgentDirMode::Real => {
+                    let d = a.count(|s| matches!(s, EntryState::Deployed));
+                    format!("{d} linked, {} the agent's own", a.entries.len() - d)
+                }
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:<10}", a.key), th.bold()),
+                Span::styled(mode, th.dim()),
+            ]));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "           {}",
+                    fit(&skills::paths::contract_tilde(&a.skills_dir), 60)
+                ),
+                th.dim(),
+            )));
+        }
+        lines
     }
 }

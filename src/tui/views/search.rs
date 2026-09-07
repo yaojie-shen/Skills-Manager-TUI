@@ -37,6 +37,8 @@ pub struct SearchView {
     list_rect: Rect,
     preview_rect: Rect,
     esc_armed: bool,
+    /// Cards show description, tags and per-agent deployment; compact is one line.
+    cards: bool,
     searcher: Searcher,
 }
 
@@ -54,6 +56,7 @@ impl Default for SearchView {
             list_rect: Rect::default(),
             preview_rect: Rect::default(),
             esc_armed: false,
+            cards: true,
             searcher: Searcher::new(),
         }
     }
@@ -306,11 +309,9 @@ impl View for SearchView {
                     self.input.clear();
                     self.run_search(ctx, false);
                 }
-                KeyCode::Enter | KeyCode::Tab | KeyCode::Down => {
-                    if !self.hits.is_empty() {
-                        self.focus = Focus::List;
-                    }
-                }
+                // Focus moves even with nothing to select: the list is where
+                // the action keys live, and installing the first skill needs them.
+                KeyCode::Enter | KeyCode::Tab | KeyCode::Down => self.focus = Focus::List,
                 KeyCode::Up => self.move_sel(-1),
                 KeyCode::Char('n') if ctrl => self.move_sel(1),
                 KeyCode::Char('p') if ctrl => self.move_sel(-1),
@@ -346,6 +347,8 @@ impl View for SearchView {
                 KeyCode::Char('u') => acts = self.act_check(ctx),
                 KeyCode::Char('U') => acts = self.act_update(ctx),
                 KeyCode::Char('x') => acts = self.act_remove(ctx),
+                KeyCode::Char('v') => self.cards = !self.cards,
+                KeyCode::Char('i') => acts = vec![Action::OpenModal(Box::new(Modal::install()))],
                 KeyCode::Char(c @ '1'..='9') if ctrl => {
                     acts = self.act_toggle_agent(ctx, (c as u8 - b'1') as usize)
                 }
@@ -463,6 +466,16 @@ impl View for SearchView {
         // List.
         let agents = &ctx.snap.agents;
         let inner_w = left.width.saturating_sub(4) as usize; // borders + highlight symbol
+        let searching = !self.input.value().trim().is_empty()
+            && !Query::parse(self.input.value()).text.is_empty();
+        // A card is three lines: identity, what it is, how it is filed.
+        self.list.item_height = if self.cards {
+            3
+        } else if searching {
+            2
+        } else {
+            1
+        };
         let dep_w = agents.len() * 3;
         let key_w = self
             .hits
@@ -471,9 +484,6 @@ impl View for SearchView {
             .max()
             .unwrap_or(8)
             .min(inner_w.saturating_sub(dep_w + 6));
-        let searching = !self.input.value().trim().is_empty()
-            && !Query::parse(self.input.value()).text.is_empty();
-        self.list.item_height = if searching { 2 } else { 1 };
         // The selected row paints its own background instead of relying on
         // `highlight_style`, which is patched over span styles and would
         // erase the highlighter background on a match.
@@ -493,6 +503,9 @@ impl View for SearchView {
                     Style::default()
                 };
                 let r = &ctx.snap.skills[h.index];
+                if self.cards {
+                    return card(r, h, ctx, agents, inner_w, searching).style(row_style);
+                }
                 let mut spans = vec![status_glyph(&r.status, th), Span::raw(" ")];
                 spans.extend(highlight_spans(
                     &pad(&r.key, key_w),
@@ -514,14 +527,7 @@ impl View for SearchView {
                 }
                 spans.push(Span::raw(" "));
                 for a in agents {
-                    let (g, style) = match r.deploy.get(&a.key) {
-                        Some(DeployState::Deployed) => ("✓", th.ok()),
-                        Some(DeployState::Broken) => ("!", th.err()),
-                        Some(DeployState::Shadow { .. }) | Some(DeployState::Foreign) => {
-                            ("~", th.warn())
-                        }
-                        _ => ("·", th.dim()),
-                    };
+                    let (g, style) = deploy_glyph(r.deploy.get(&a.key), th);
                     spans.push(Span::styled(format!("{g}  "), style));
                 }
                 if !searching {
@@ -633,8 +639,9 @@ impl View for SearchView {
                 ("u/U", "check/update"),
                 ("x", "remove"),
                 ("Enter", "preview"),
+                ("i", "install"),
+                ("v", "density"),
                 ("/", "search"),
-                ("?", "help"),
             ],
             Focus::Preview => &[
                 ("j/k", "scroll"),
@@ -646,6 +653,102 @@ impl View for SearchView {
             ],
         }
     }
+}
+
+/// How a skill stands with one agent.
+fn deploy_glyph(
+    state: Option<&DeployState>,
+    th: &crate::tui::theme::Theme,
+) -> (&'static str, Style) {
+    match state {
+        Some(DeployState::Deployed) => ("✓", th.ok()),
+        Some(DeployState::Broken) => ("!", th.err()),
+        Some(DeployState::Shadow { .. }) | Some(DeployState::Foreign) => ("~", th.warn()),
+        _ => ("·", th.dim()),
+    }
+}
+
+/// A three-line card: name and where it is deployed, what it is, how it is filed.
+fn card<'a>(
+    r: &'a SkillRecord,
+    h: &'a Hit,
+    ctx: &'a Ctx,
+    agents: &'a [skills::reconcile::AgentReport],
+    inner_w: usize,
+    searching: bool,
+) -> ListItem<'a> {
+    let th = ctx.theme;
+    // Line 1: status, name, and one labelled marker per agent, right-aligned.
+    let deploy: Vec<Span> = agents
+        .iter()
+        .flat_map(|a| {
+            let (g, style) = deploy_glyph(r.deploy.get(&a.key), th);
+            [
+                Span::styled(format!("{g} "), style),
+                Span::styled(format!("{}  ", abbrev(&a.key)), th.dim()),
+            ]
+        })
+        .collect();
+    let deploy_w: usize = deploy.iter().map(|s| width(&s.content)).sum();
+    let name_w = inner_w.saturating_sub(deploy_w + 3);
+    let mut head = vec![status_glyph(&r.status, th), Span::raw(" ")];
+    head.extend(highlight_spans(
+        &pad(&r.key, name_w),
+        &h.terms,
+        th.bold(),
+        th,
+    ));
+    head.extend(deploy);
+
+    // Line 2: the excerpt while searching, otherwise the description.
+    let body_w = inner_w.saturating_sub(2);
+    // While searching, prefer the excerpt around the match; a hit on the name
+    // or a tag produces no excerpt, so fall back to the description rather
+    // than claiming the skill has none.
+    let body_text = h
+        .excerpt
+        .as_ref()
+        .filter(|_| searching)
+        .map(|e| e.text.clone())
+        .or_else(|| r.description.clone());
+    let mut body = vec![Span::raw("  ")];
+    match body_text {
+        Some(t) => body.extend(highlight_spans(&fit(&t, body_w), &h.terms, th.dim(), th)),
+        None => body.push(Span::styled("no description", th.dim())),
+    }
+
+    // Line 3: tags on the left, and on the right what the search matched or
+    // where the skill came from.
+    let right = if searching {
+        h.fields
+            .iter()
+            .map(|f| f.label())
+            .collect::<Vec<_>>()
+            .join("·")
+    } else {
+        r.source
+            .as_ref()
+            .map(|s| s.kind().to_string())
+            .unwrap_or_default()
+    };
+    let tags_w = inner_w.saturating_sub(width(&right) + 4);
+    let mut foot = vec![Span::raw("  ")];
+    if r.tags.is_empty() {
+        foot.push(Span::styled(pad("", tags_w), th.dim()));
+    } else {
+        foot.extend(highlight_spans(
+            &pad(&r.tags.join(" · "), tags_w),
+            &h.terms,
+            th.tag(),
+            th,
+        ));
+    }
+    foot.push(Span::styled(
+        right,
+        th.dim().add_modifier(ratatui::style::Modifier::ITALIC),
+    ));
+
+    ListItem::new(vec![Line::from(head), Line::from(body), Line::from(foot)])
 }
 
 /// Two-letter agent abbreviation used as a column header.

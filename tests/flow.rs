@@ -449,3 +449,124 @@ fn git_install_check_update_conflict() {
         "staging cleaned"
     );
 }
+
+/// Presets overlap, report progress per agent scope, and never touch local skills.
+#[test]
+fn preset_status_activation_and_overlap() {
+    use skills::ops::deploy::{
+        PresetState, plan_preset_activate, plan_preset_deactivate, preset_status,
+    };
+    use skills::preset::Preset;
+
+    let f = Fixture::new("preset");
+    for k in ["one", "two", "three"] {
+        f.add_skill(k, k);
+    }
+    // A local skill only agent A has, plus one shadowing a managed name.
+    std::fs::create_dir_all(f.agent_a.join("local-only")).unwrap();
+    std::fs::write(
+        f.agent_a.join("local-only/SKILL.md"),
+        "---\nname: local-only\n---\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(f.agent_a.join("two")).unwrap();
+    std::fs::write(
+        f.agent_a.join("two/SKILL.md"),
+        "---\nname: two\n---\ndifferent\n",
+    )
+    .unwrap();
+
+    let ws = f.ws();
+    let daily = Preset {
+        name: "daily".into(),
+        skills: vec!["one".into(), "two".into()],
+        ..Default::default()
+    };
+    let extra = Preset {
+        name: "extra".into(),
+        skills: vec!["two".into(), "three".into()],
+        ..Default::default()
+    };
+    ws.presets.save(&daily).unwrap();
+    ws.presets.save(&extra).unwrap();
+    let scope = vec!["a".to_string(), "b".to_string()];
+
+    // Nothing deployed yet: 2 skills over 2 agents is 4 pairs.
+    let snap = ws.scan().unwrap();
+    let st = preset_status(&snap, &daily, &scope);
+    assert_eq!((st.installed, st.total), (0, 4));
+    assert_eq!(st.state(), PresetState::Inactive);
+
+    // Activating daily leaves agent A's shadowed "two" alone.
+    let actions = plan_preset_activate(&ws, &snap, &daily, &scope).unwrap();
+    deploy::apply(&actions).unwrap();
+    let snap = ws.scan().unwrap();
+    assert_eq!(
+        snap.agent("a").unwrap().entries["two"],
+        EntryState::Shadow {
+            same_content: false
+        }
+    );
+    assert_eq!(
+        snap.agent("a").unwrap().entries["local-only"],
+        EntryState::AgentOnly
+    );
+    // 3 of 4: one on both agents, two only on b, because a's slot is a local dir.
+    let st = preset_status(&snap, &daily, &scope);
+    assert_eq!((st.installed, st.total), (3, 4));
+    assert_eq!(st.state(), PresetState::Partial);
+
+    // The overlapping preset now reads as partly installed without being touched.
+    let st = preset_status(&snap, &extra, &scope);
+    assert_eq!(
+        (st.installed, st.total),
+        (1, 4),
+        "only two-on-b is shared and deployed"
+    );
+    assert_eq!(st.state(), PresetState::Partial);
+
+    // Clicking it fills in the rest.
+    let actions = plan_preset_activate(&ws, &snap, &extra, &scope).unwrap();
+    deploy::apply(&actions).unwrap();
+    let snap = ws.scan().unwrap();
+    let st = preset_status(&snap, &extra, &scope);
+    assert_eq!((st.installed, st.total), (3, 4));
+
+    // Narrowing the scope to one agent recounts against that agent only.
+    let st = preset_status(&snap, &extra, &["b".to_string()]);
+    assert_eq!((st.installed, st.total), (2, 2));
+    assert_eq!(st.state(), PresetState::Active);
+    assert_eq!(st.label(), "2");
+
+    // Deactivating removes every member, including ones shared with daily.
+    let actions = plan_preset_deactivate(&ws, &snap, &extra, &scope).unwrap();
+    deploy::apply(&actions).unwrap();
+    let snap = ws.scan().unwrap();
+    assert_eq!(
+        preset_status(&snap, &extra, &scope).state(),
+        PresetState::Inactive
+    );
+    let daily_after = preset_status(&snap, &daily, &scope);
+    assert_eq!(
+        (daily_after.installed, daily_after.total),
+        (2, 4),
+        "daily lost the shared skill"
+    );
+
+    // Local skills survived all of it.
+    assert!(f.agent_a.join("local-only/SKILL.md").is_file());
+    assert_eq!(
+        std::fs::read_to_string(f.agent_a.join("two/SKILL.md")).unwrap(),
+        "---\nname: two\n---\ndifferent\n"
+    );
+
+    // A member missing from the root is reported, not counted.
+    let ghost = Preset {
+        name: "ghost".into(),
+        skills: vec!["one".into(), "nope".into()],
+        ..Default::default()
+    };
+    let st = preset_status(&snap, &ghost, &scope);
+    assert_eq!(st.absent, vec!["nope"]);
+    assert_eq!(st.total, 2);
+}

@@ -1,7 +1,8 @@
 //! Symlink deployment: deploy, undeploy, sync to desired state, convert dir-linked agents.
 
 use crate::Workspace;
-use crate::reconcile::{AgentDirMode, EntryState, Snapshot};
+use crate::preset::Preset;
+use crate::reconcile::{AgentDirMode, DeployState, EntryState, Snapshot};
 use crate::util::is_symlink;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -418,4 +419,282 @@ pub fn apply(actions: &[Action]) -> Result<usize> {
         }
     }
     Ok(done)
+}
+
+// ---- presets ---------------------------------------------------------------
+
+/// Where a preset stands within an agent scope. Counted in skill-agent pairs,
+/// so a preset of 3 skills over 2 agents has a total of 6.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PresetStatus {
+    pub installed: usize,
+    pub total: usize,
+    /// Members with no directory in the skills root; they cannot be deployed.
+    pub absent: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PresetState {
+    /// No deployable member, or no agent in scope.
+    Empty,
+    /// Every pair is deployed.
+    Active,
+    /// Some pairs are deployed.
+    Partial,
+    /// No pair is deployed.
+    Inactive,
+}
+
+impl PresetStatus {
+    pub fn state(&self) -> PresetState {
+        if self.total == 0 {
+            PresetState::Empty
+        } else if self.installed == self.total {
+            PresetState::Active
+        } else if self.installed == 0 {
+            PresetState::Inactive
+        } else {
+            PresetState::Partial
+        }
+    }
+
+    /// `8/8`, or just `8` once complete.
+    pub fn label(&self) -> String {
+        match self.state() {
+            PresetState::Empty => "empty".into(),
+            PresetState::Active => format!("{}", self.total),
+            _ => format!("{}/{}", self.installed, self.total),
+        }
+    }
+}
+
+/// Agents a preset applies to inside `scope`: its own list narrowed to the
+/// scope, or the whole scope when the preset targets everything.
+pub fn preset_agents(preset: &Preset, scope: &[String]) -> Vec<String> {
+    if preset.agents.is_empty() {
+        scope.to_vec()
+    } else {
+        scope
+            .iter()
+            .filter(|a| preset.agents.contains(a))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Count how much of `preset` is deployed across `scope`. Only members that
+/// exist in the skills root count; a member whose directory is gone is listed
+/// in `absent` and excluded from the total, so a preset referring to a deleted
+/// skill can still read as complete.
+pub fn preset_status(snap: &Snapshot, preset: &Preset, scope: &[String]) -> PresetStatus {
+    let agents = preset_agents(preset, scope);
+    let mut installed = 0;
+    let mut total = 0;
+    let mut absent = Vec::new();
+    for skill in &preset.skills {
+        match snap.get(skill) {
+            Some(rec) if rec.status.is_present() => {
+                for agent in &agents {
+                    total += 1;
+                    if matches!(rec.deploy.get(agent), Some(DeployState::Deployed)) {
+                        installed += 1;
+                    }
+                }
+            }
+            _ => absent.push(skill.clone()),
+        }
+    }
+    PresetStatus {
+        installed,
+        total,
+        absent,
+    }
+}
+
+/// Deploy whatever of `preset` is still missing in `scope`. Members already in
+/// place, and entries the tool does not own, are skipped rather than replaced.
+pub fn plan_preset_activate(
+    ws: &Workspace,
+    snap: &Snapshot,
+    preset: &Preset,
+    scope: &[String],
+) -> Result<Vec<Action>> {
+    let agents = preset_agents(preset, scope);
+    let present: Vec<String> = preset
+        .skills
+        .iter()
+        .filter(|s| snap.get(s).is_some_and(|r| r.status.is_present()))
+        .cloned()
+        .collect();
+    let mut actions = plan_deploy(ws, snap, &present, &agents)?;
+    for skill in preset.skills.iter().filter(|s| !present.contains(s)) {
+        actions.push(Action::Skip {
+            agent: "*".into(),
+            skill: skill.clone(),
+            reason: "not in the skills root".into(),
+        });
+    }
+    Ok(actions)
+}
+
+/// Undeploy every member of `preset` from `scope`. Overlap with other presets
+/// is deliberately ignored: a preset is applied as a one-time copy, not a live
+/// membership, so deactivating removes all of its skills.
+pub fn plan_preset_deactivate(
+    ws: &Workspace,
+    snap: &Snapshot,
+    preset: &Preset,
+    scope: &[String],
+) -> Result<Vec<Action>> {
+    let agents = preset_agents(preset, scope);
+    let present: Vec<String> = preset
+        .skills
+        .iter()
+        .filter(|s| snap.get(s).is_some())
+        .cloned()
+        .collect();
+    plan_undeploy(ws, snap, &present, &agents)
+}
+
+// ---- describing what happened ----------------------------------------------
+
+/// Distinct values in order of first appearance, rendered as a phrase: up to
+/// `max` are named, beyond that they are counted.
+fn phrase(items: &[String], max: usize, plural: &str) -> String {
+    let mut seen: Vec<&str> = Vec::new();
+    for i in items {
+        if !seen.contains(&i.as_str()) {
+            seen.push(i);
+        }
+    }
+    match seen.len() {
+        0 => String::new(),
+        n if n > max => format!("{n} {plural}"),
+        1 => seen[0].to_string(),
+        2 => format!("{} and {}", seen[0], seen[1]),
+        _ => {
+            let (last, rest) = seen.split_last().unwrap();
+            format!("{} and {last}", rest.join(", "))
+        }
+    }
+}
+
+/// A sentence saying what a batch of actions did, for a notification.
+/// Names the skills while there are few enough to be worth naming.
+pub fn summarize(actions: &[Action]) -> String {
+    let mut added = (Vec::new(), Vec::new());
+    let mut removed = (Vec::new(), Vec::new());
+    let mut skipped = 0;
+    for a in actions {
+        match a {
+            Action::Link { skill, agent, .. } => {
+                added.0.push(skill.clone());
+                added.1.push(agent.clone());
+            }
+            Action::Unlink { skill, agent, .. } => {
+                removed.0.push(skill.clone());
+                removed.1.push(agent.clone());
+            }
+            Action::Skip { .. } => skipped += 1,
+            Action::Mkdir { .. } => {}
+        }
+    }
+    let mut parts = Vec::new();
+    if !added.0.is_empty() {
+        parts.push(format!(
+            "added {} to {}",
+            phrase(&added.0, 3, "skills"),
+            phrase(&added.1, 2, "agents")
+        ));
+    }
+    if !removed.0.is_empty() {
+        parts.push(format!(
+            "removed {} from {}",
+            phrase(&removed.0, 3, "skills"),
+            phrase(&removed.1, 2, "agents")
+        ));
+    }
+    if parts.is_empty() {
+        return if skipped > 0 {
+            format!("nothing to do, {skipped} skipped")
+        } else {
+            "nothing to do".into()
+        };
+    }
+    let mut out = parts.join("; ");
+    if skipped > 0 {
+        out.push_str(&format!(" ({skipped} skipped)"));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn link(skill: &str, agent: &str) -> Action {
+        Action::Link {
+            agent: agent.into(),
+            skill: skill.into(),
+            path: PathBuf::new(),
+            target: PathBuf::new(),
+        }
+    }
+    fn unlink(skill: &str, agent: &str) -> Action {
+        Action::Unlink {
+            agent: agent.into(),
+            skill: skill.into(),
+            path: PathBuf::new(),
+        }
+    }
+    fn skip() -> Action {
+        Action::Skip {
+            agent: "a".into(),
+            skill: "s".into(),
+            reason: "because".into(),
+        }
+    }
+
+    #[test]
+    fn names_a_few_and_counts_many() {
+        assert_eq!(summarize(&[link("one", "claude")]), "added one to claude");
+        assert_eq!(
+            summarize(&[link("one", "claude"), link("two", "claude")]),
+            "added one and two to claude"
+        );
+        // The same skill on two agents is still one skill.
+        assert_eq!(
+            summarize(&[link("one", "claude"), link("one", "codex")]),
+            "added one to claude and codex"
+        );
+        assert_eq!(
+            summarize(&[
+                link("a", "claude"),
+                link("b", "claude"),
+                link("c", "claude"),
+                link("d", "claude")
+            ]),
+            "added 4 skills to claude"
+        );
+    }
+
+    #[test]
+    fn separates_the_two_directions() {
+        assert_eq!(
+            summarize(&[link("one", "claude"), unlink("two", "codex")]),
+            "added one to claude; removed two from codex"
+        );
+    }
+
+    #[test]
+    fn reports_when_there_was_nothing_to_do() {
+        assert_eq!(summarize(&[]), "nothing to do");
+        assert_eq!(summarize(&[skip()]), "nothing to do, 1 skipped");
+        assert_eq!(
+            summarize(&[link("one", "claude"), skip()]),
+            "added one to claude (1 skipped)"
+        );
+    }
 }
