@@ -1,8 +1,7 @@
 //! Notifications that appear in the bottom-right corner and fade on their own.
 //!
-//! Each carries a countdown drawn as a pie that empties clockwise, the way a
-//! desktop notification shows its remaining time. Errors have no countdown:
-//! something went wrong and the message waits to be read.
+//! A fixed status marker identifies each result. A thin line below the message
+//! shrinks with its remaining lifetime; errors stay longer than ordinary results.
 
 use super::app::Level;
 use super::theme::Theme;
@@ -19,15 +18,6 @@ const LIFETIME: Duration = Duration::from_secs(5);
 const ERROR_LIFETIME: Duration = Duration::from_secs(20);
 /// Most shown at once; older ones are dropped rather than pushed off screen.
 const MAX_VISIBLE: usize = 3;
-
-/// A full circle emptying clockwise. Geometric Shapes has quarters and no more,
-/// so the countdown moves in five steps rather than sweeping smoothly.
-///
-/// Every glyph is East Asian Width N. The obvious spellings of full, half and
-/// empty (U+25CF, U+25D1, U+25CB) are Ambiguous, and a terminal told to render
-/// ambiguous characters wide would take two columns for them and push the rest
-/// of the notification line out from under its own border.
-const PIE: [&str; 5] = ["⬤", "◕", "◗", "◔", "◌"];
 
 pub struct Toast {
     pub text: String,
@@ -56,11 +46,18 @@ impl Toast {
         self.at.elapsed() >= self.lifetime()
     }
 
-    /// The countdown glyph, full at first and empty just before it goes.
-    fn pie(&self) -> &'static str {
-        let ratio = self.at.elapsed().as_secs_f32() / self.lifetime().as_secs_f32();
-        let step = (ratio * PIE.len() as f32) as usize;
-        PIE[step.min(PIE.len() - 1)]
+    fn marker(&self) -> &'static str {
+        match self.level {
+            Level::Info => "i",
+            Level::Ok => "✓",
+            Level::Error => "!",
+        }
+    }
+
+    /// Keep a sliver visible until expiry, with the full line at creation.
+    fn bar_width(&self, width: usize) -> usize {
+        let remaining = 1.0 - self.at.elapsed().as_secs_f64() / self.lifetime().as_secs_f64();
+        (remaining.clamp(0.0, 1.0) * width as f64).ceil() as usize
     }
 }
 
@@ -90,10 +87,17 @@ impl Toasts {
             return None;
         }
         let max_text = (area.width as usize).saturating_sub(12).min(56);
-        let lines: Vec<(String, Level, &'static str)> = self
+        // Keep the newest messages when the terminal cannot fit the whole stack.
+        let visible = self
             .items
+            .len()
+            .min(area.height.saturating_sub(6) as usize / 2);
+        if visible == 0 {
+            return None;
+        }
+        let lines: Vec<_> = self.items[self.items.len() - visible..]
             .iter()
-            .map(|t| (fit(&t.text, max_text), t.level, t.pie()))
+            .map(|t| (fit(&t.text, max_text), t))
             .collect();
         let inner_w = lines
             .iter()
@@ -101,7 +105,7 @@ impl Toasts {
             .max()
             .unwrap_or(10);
         let w = (inner_w + 2) as u16;
-        let h = lines.len() as u16 + 2;
+        let h = lines.len() as u16 * 2 + 2;
         if area.width < w + 4 || area.height < h + 4 {
             return None;
         }
@@ -116,19 +120,28 @@ impl Toasts {
         f.render_widget(Clear, rect);
         let body: Vec<Line> = lines
             .iter()
-            .map(|(text, level, pie)| {
-                let style = match level {
+            .flat_map(|(text, toast)| {
+                let style = match toast.level {
                     Level::Info => th.dim(),
                     Level::Ok => th.ok(),
                     Level::Error => th.err(),
                 };
-                Line::from(vec![
-                    Span::styled(format!(" {pie} "), style),
-                    Span::raw(text.clone()),
-                ])
+                [
+                    Line::from(vec![
+                        Span::styled(format!(" {} ", toast.marker()), style),
+                        Span::raw(text.clone()),
+                    ]),
+                    Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled(
+                            "━".repeat(toast.bar_width(inner_w.saturating_sub(2))),
+                            style,
+                        ),
+                    ]),
+                ]
             })
             .collect();
-        let border = match lines.last().map(|(_, l, _)| l) {
+        let border = match lines.last().map(|(_, t)| t.level) {
             Some(Level::Error) => th.err(),
             _ => th.dim(),
         };
@@ -150,31 +163,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_pie_empties_over_the_lifetime() {
-        let fresh = Toast::new("x", Level::Ok);
-        assert_eq!(fresh.pie(), "⬤");
-        assert!(!fresh.done());
-
-        // Walk the clock by hand rather than sleeping through five seconds.
-        let mut aged = Toast::new("x", Level::Ok);
-        for (elapsed, want) in [(0, "⬤"), (1, "◕"), (2, "◗"), (3, "◔"), (4, "◌")] {
-            aged.at = Instant::now() - Duration::from_secs(elapsed) - Duration::from_millis(100);
-            assert_eq!(aged.pie(), want, "at {elapsed}s");
-            assert!(!aged.done(), "at {elapsed}s");
+    fn the_line_shrinks_without_changing_the_status_marker() {
+        let mut toast = Toast::new("saved", Level::Ok);
+        assert_eq!(toast.bar_width(20), 20);
+        for (elapsed_ms, want) in [(1000, 16), (2500, 10), (4900, 1), (5000, 0)] {
+            toast.at = Instant::now() - Duration::from_millis(elapsed_ms);
+            assert_eq!(toast.bar_width(20), want);
+            assert_eq!(toast.marker(), "✓");
         }
-        aged.at = Instant::now() - LIFETIME;
-        assert!(aged.done());
+        assert!(toast.done());
     }
 
     #[test]
-    fn errors_linger_but_still_go() {
-        let mut e = Toast::new("boom", Level::Error);
-        // Well past an ordinary lifetime, and still there to be read.
-        e.at = Instant::now() - LIFETIME * 2;
-        assert!(!e.done());
-        assert_eq!(e.pie(), "◗", "halfway through the longer error lifetime");
-        e.at = Instant::now() - ERROR_LIFETIME;
-        assert!(e.done());
+    fn errors_use_their_longer_lifetime() {
+        let mut toast = Toast::new("failed", Level::Error);
+        toast.at = Instant::now() - Duration::from_secs(10);
+        assert_eq!(toast.bar_width(20), 10);
+        assert_eq!(toast.marker(), "!");
+        assert!(!toast.done());
+        toast.at = Instant::now() - ERROR_LIFETIME;
+        assert_eq!(toast.bar_width(20), 0);
+        assert!(toast.done());
+    }
+
+    #[test]
+    fn each_message_has_its_own_line_and_small_windows_keep_the_newest() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut toasts = Toasts::default();
+        toasts.push("old", Level::Info);
+        toasts.push("saved", Level::Ok);
+        toasts.push("failed", Level::Error);
+        toasts.items[1].at = Instant::now() - Duration::from_millis(2500);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut rect = Rect::default();
+        terminal
+            .draw(|f| rect = toasts.draw(f, f.area(), &Theme::default()).unwrap())
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let bars: Vec<_> = (rect.y..rect.bottom())
+            .map(|y| {
+                (rect.x..rect.right())
+                    .filter(|&x| buffer[(x, y)].symbol() == "━")
+                    .count()
+            })
+            .filter(|&n| n > 0)
+            .collect();
+        assert_eq!(bars.len(), 3);
+        assert!(bars[1] < bars[0]);
+        assert_eq!(bars[0], bars[2]);
+
+        terminal.resize(Rect::new(0, 0, 80, 10)).unwrap();
+        terminal.backend_mut().resize(80, 10);
+        terminal
+            .draw(|f| rect = toasts.draw(f, f.area(), &Theme::default()).unwrap())
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(!text.contains("old"));
+        assert!(text.contains("saved"));
+        assert!(text.contains("failed"));
+        assert_eq!(rect.height, 6);
     }
 
     #[test]
