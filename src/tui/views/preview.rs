@@ -8,13 +8,14 @@
 use super::{status_glyph, status_text};
 use crate::tui::app::Ctx;
 use crate::tui::theme::Theme;
+use crate::tui::widgets::OverlayClear as Clear;
 use crate::tui::widgets::width;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Margin, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use skills::reconcile::{DeployState, SkillRecord};
 use skills::search::highlight_ranges;
 

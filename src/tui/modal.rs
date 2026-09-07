@@ -3,12 +3,13 @@
 
 use super::app::{Action, Ctx, Hints, MetaFn, Step, WriteFn};
 use super::widgets::{Input, ListNav, button, fit, width};
+use crate::tui::widgets::OverlayClear as Clear;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 use skills::history;
 use skills::ops::deploy;
 use skills::ops::edit;

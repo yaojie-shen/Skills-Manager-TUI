@@ -6,10 +6,11 @@
 use super::app::Level;
 use super::theme::Theme;
 use super::widgets::{fit, width};
+use crate::tui::widgets::OverlayClear as Clear;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 use std::time::{Duration, Instant};
 
 /// How long a notification stays before it goes. An error gets longer: it has

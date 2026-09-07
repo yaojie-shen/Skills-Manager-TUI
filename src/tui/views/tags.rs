@@ -12,6 +12,7 @@ use super::preview::Overlay;
 use super::{View, split_panes, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
 use crate::tui::modal::Modal;
+use crate::tui::widgets::OverlayClear as Clear;
 use crate::tui::widgets::{CardGrid, Input, ListNav, ScrollTrack, fit, pad, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -19,7 +20,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use skills::Workspace;
 use skills::config::Config;

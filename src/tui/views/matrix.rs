@@ -7,13 +7,14 @@
 //! define or configure — it only lets the switches be seen and thrown together.
 
 use crate::tui::app::{Action, Ctx};
+use crate::tui::widgets::OverlayClear as Clear;
 use crate::tui::widgets::{pad, width};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::Paragraph;
 use skills::ops::deploy::{
     PresetState, plan_preset_activate, plan_preset_deactivate, preset_status,
 };
