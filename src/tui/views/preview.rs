@@ -45,8 +45,8 @@ impl Overlay {
         self.scroll = (self.scroll as i32 + delta).clamp(0, max) as u16;
     }
 
-    /// Keys while the overlay is up. Returns whether the key was taken, so a
-    /// page can fall through to its own bindings for anything else.
+    /// Consume every page key while the overlay is open, including unbound
+    /// keys, so hidden page actions cannot run underneath the preview.
     pub fn handle_key(&mut self, k: KeyEvent) -> bool {
         if !self.is_open() {
             return false;
@@ -59,7 +59,7 @@ impl Overlay {
             KeyCode::PageUp => self.scroll_by(-(self.height as i32 - 2)),
             KeyCode::Home | KeyCode::Char('g') => self.scroll = 0,
             KeyCode::End | KeyCode::Char('G') => self.scroll_by(i32::MAX / 2),
-            _ => return false,
+            _ => {}
         }
         true
     }

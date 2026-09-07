@@ -579,3 +579,78 @@ impl View for PresetsView {
 // that only import this view.
 #[allow(unused_imports)]
 use cards::MIN_CARD_W as _;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::theme::Theme;
+    use crossterm::event::KeyModifiers;
+    use skills::{Workspace, config::Config};
+
+    #[test]
+    fn preview_blocks_member_removal_until_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "skills-preview-keys-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = Config {
+            agents: vec![],
+            ..Config::default()
+        };
+        config.save(&root).unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        ws.presets
+            .save(&Preset {
+                name: "reading".into(),
+                skills: vec!["printer".into()],
+                ..Preset::default()
+            })
+            .unwrap();
+        let before = std::fs::read(ws.presets.path("reading")).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = PresetsView::default();
+        view.refresh(&ctx);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(view.handle_key(key(KeyCode::Right), &ctx).is_empty());
+        assert!(view.handle_key(key(KeyCode::Enter), &ctx).is_empty());
+        assert!(view.preview.is_open());
+
+        for code in [KeyCode::Char('x'), KeyCode::Delete, KeyCode::Char('a')] {
+            assert!(view.handle_key(key(code), &ctx).is_empty());
+            assert!(view.preview.is_open());
+            assert!(view.focus_members);
+            assert_eq!(view.selected_member().as_deref(), Some("printer"));
+            assert_eq!(std::fs::read(ws.presets.path("reading")).unwrap(), before);
+        }
+
+        assert!(view.handle_key(key(KeyCode::Esc), &ctx).is_empty());
+        assert!(!view.preview.is_open());
+        assert!(view.focus_members);
+        let mut actions = view.handle_key(key(KeyCode::Char('x')), &ctx);
+        assert_eq!(actions.len(), 1);
+        let Action::WriteMeta(write) = actions.remove(0) else {
+            panic!("member removal should resume after closing the preview");
+        };
+        write(&ws).unwrap();
+        assert!(
+            ws.presets
+                .load("reading")
+                .unwrap()
+                .unwrap()
+                .skills
+                .is_empty()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
