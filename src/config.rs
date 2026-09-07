@@ -24,6 +24,72 @@ pub struct Config {
     pub tags: Vec<TagConfig>,
     #[serde(default)]
     pub search: SearchConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+/// How the result area is arranged. Both settings can be flipped at runtime for
+/// the session; only `config.toml` decides what the next start looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UiLayout {
+    /// Results on the left, a preview pane always open on the right.
+    #[default]
+    Split,
+    /// Results across the full width in as many columns as fit; the preview
+    /// opens over them when asked for.
+    Grid,
+}
+
+/// How much of each skill a result shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UiDensity {
+    /// A framed card: name and deployment, description, tags.
+    #[default]
+    Cards,
+    /// One line each, two while searching.
+    Rows,
+}
+
+/// What caps the ends of a preset pill. A terminal cell is taller than it is
+/// wide, so a rounded end has to be drawn by a glyph that fills the whole cell:
+/// the geometric half-discs (U+25D6/U+25D7) sit at x-height and read as a bead
+/// beside the fill, not as the end of a capsule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PillCaps {
+    /// Powerline's thick half circles, full height and genuinely round. Needs a
+    /// patched font (Nerd Font, Powerline); without one they show as tofu.
+    #[default]
+    Round,
+    /// Half blocks: full height with square ends, present in every font.
+    Block,
+    /// No caps at all, leaving a plain filled rectangle.
+    None,
+}
+
+impl PillCaps {
+    /// Left and right cap, drawn in the fill colour against the page.
+    pub fn glyphs(self) -> (&'static str, &'static str) {
+        match self {
+            // U+E0B6 and U+E0B4, Powerline Extra's round caps.
+            PillCaps::Round => ("\u{e0b6}", "\u{e0b4}"),
+            PillCaps::Block => ("\u{258c}", "\u{2590}"),
+            PillCaps::None => ("", ""),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct UiConfig {
+    #[serde(default)]
+    pub layout: UiLayout,
+    #[serde(default)]
+    pub density: UiDensity,
+    #[serde(default)]
+    pub pill_caps: PillCaps,
 }
 
 /// Search tuning. Defaults follow Omnisearch-style field boosting; every value
@@ -229,6 +295,7 @@ impl Default for Config {
             deploy: DeployConfig::default(),
             tags: Vec::new(),
             search: SearchConfig::default(),
+            ui: UiConfig::default(),
         }
     }
 }

@@ -4,7 +4,7 @@ use super::{View, split_panes, status_glyph, status_text, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::event::Task;
 use crate::tui::modal::Modal;
-use crate::tui::widgets::{Input, ListNav, fit, pad, width};
+use crate::tui::widgets::{Input, ListNav, ScrollTrack, fit, pad, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -35,6 +35,9 @@ pub struct SearchView {
     preview_height: u16,
     input_rect: Rect,
     list_rect: Rect,
+    list_track: ScrollTrack,
+    /// A drag keeps hold of the track even when the pointer wanders off it.
+    track_drag: bool,
     preview_rect: Rect,
     esc_armed: bool,
     /// Cards show description, tags and per-agent deployment; compact is one line.
@@ -54,6 +57,8 @@ impl Default for SearchView {
             preview_height: 0,
             input_rect: Rect::default(),
             list_rect: Rect::default(),
+            list_track: ScrollTrack::default(),
+            track_drag: false,
             preview_rect: Rect::default(),
             esc_armed: false,
             cards: true,
@@ -394,6 +399,22 @@ impl View for SearchView {
             }
             return vec![];
         }
+        // The track is inside `list_rect`, so it has to claim the event before
+        // the row hit-test below turns it into a row click.
+        let dragging = matches!(m.kind, MouseEventKind::Drag(MouseButton::Left));
+        let pressing = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
+        if (pressing && self.list_track.hit(m.column, m.row)) || (dragging && self.track_drag) {
+            self.track_drag = true;
+            self.focus = Focus::List;
+            if let Some(i) = self.list_track.index_at(m.row, self.hits.len()) {
+                self.list.select(Some(i));
+                self.preview_scroll = 0;
+            }
+            return vec![];
+        }
+        if !dragging {
+            self.track_drag = false;
+        }
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
             if self.input_rect.contains(at) {
                 self.focus = Focus::Input;
@@ -465,7 +486,6 @@ impl View for SearchView {
 
         // List.
         let agents = &ctx.snap.agents;
-        let inner_w = left.width.saturating_sub(4) as usize; // borders + highlight symbol
         let searching = !self.input.value().trim().is_empty()
             && !Query::parse(self.input.value()).text.is_empty();
         // A card is three lines: identity, what it is, how it is filed.
@@ -476,6 +496,11 @@ impl View for SearchView {
         } else {
             1
         };
+        let rows_h = left.height.saturating_sub(2);
+        let per_page = (rows_h / self.list.item_height.max(1)) as usize;
+        let overflow = per_page > 0 && self.hits.len() > per_page;
+        // Borders + highlight symbol, plus the column the scrollbar sits in.
+        let inner_w = left.width.saturating_sub(4 + u16::from(overflow)) as usize;
         let dep_w = agents.len() * 3;
         let key_w = self
             .hits
@@ -561,6 +586,29 @@ impl View for SearchView {
         self.list.set_area_from_block(left);
         let list = List::new(items).block(block).highlight_symbol("▸ ");
         f.render_stateful_widget(list, left, &mut self.list.state);
+        // Derived from the selection every frame, so wheel, keys and drags all
+        // keep the thumb in step without anyone having to update it.
+        if overflow {
+            let track = Rect {
+                x: left.right().saturating_sub(2),
+                y: left.y + 1,
+                width: 1,
+                height: rows_h,
+            };
+            self.list_track.set(track);
+            let mut sb = ScrollbarState::new(self.hits.len())
+                .position(selected.unwrap_or(0))
+                .viewport_content_length(per_page);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                track,
+                &mut sb,
+            );
+        } else {
+            self.list_track.clear();
+        }
         if self.hits.is_empty() {
             let msg = if ctx.snap.skills.is_empty() {
                 "no skills in this root"

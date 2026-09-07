@@ -361,3 +361,87 @@ pub fn button(label: &str, active: bool, theme: &Theme) -> Span<'static> {
     };
     Span::styled(text, style)
 }
+
+// ---- scrollbar track ------------------------------------------------------
+
+/// The clickable track of a vertical scrollbar: the cells it occupies plus the
+/// mapping from a terminal row back to an item index. The mapping is in item
+/// space, which is what the user aims at, not the terminal rows an item
+/// happens to occupy.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScrollTrack {
+    rect: Rect,
+}
+
+impl ScrollTrack {
+    pub fn set(&mut self, rect: Rect) {
+        self.rect = rect;
+    }
+    /// A track with no rect is not on screen and must not swallow clicks.
+    pub fn clear(&mut self) {
+        self.rect = Rect::default();
+    }
+    pub fn hit(&self, x: u16, y: u16) -> bool {
+        self.rect.width > 0
+            && self.rect.height > 0
+            && x >= self.rect.x
+            && x < self.rect.right()
+            && y >= self.rect.y
+            && y < self.rect.bottom()
+    }
+    /// Item index for a row on the track. `y` is clamped to the track's ends so
+    /// a drag that runs past either edge pins to the first or last item.
+    pub fn index_at(&self, y: u16, len: usize) -> Option<usize> {
+        if len == 0 || self.rect.height == 0 {
+            return None;
+        }
+        let span = (self.rect.height - 1) as usize;
+        if span == 0 {
+            return Some(0);
+        }
+        let off = (y.clamp(self.rect.y, self.rect.bottom() - 1) - self.rect.y) as usize;
+        Some((off * (len - 1) + span / 2) / span)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track() -> ScrollTrack {
+        let mut t = ScrollTrack::default();
+        t.set(Rect {
+            x: 40,
+            y: 5,
+            width: 1,
+            height: 10,
+        });
+        t
+    }
+
+    #[test]
+    fn track_hit_testing() {
+        let t = track();
+        assert!(t.hit(40, 5));
+        assert!(t.hit(40, 14));
+        assert!(!t.hit(40, 15));
+        assert!(!t.hit(39, 8));
+        assert!(!t.hit(41, 8));
+        assert!(!ScrollTrack::default().hit(0, 0));
+    }
+
+    #[test]
+    fn track_maps_rows_to_item_indices() {
+        let t = track();
+        assert_eq!(t.index_at(5, 100), Some(0));
+        assert_eq!(t.index_at(14, 100), Some(99));
+        assert_eq!(t.index_at(10, 100), Some(55));
+        // Off the ends of the track a drag pins to the first or last item.
+        assert_eq!(t.index_at(0, 100), Some(0));
+        assert_eq!(t.index_at(200, 100), Some(99));
+        assert_eq!(t.index_at(8, 0), None);
+        // Fewer items than rows still spans the whole range.
+        assert_eq!(t.index_at(5, 3), Some(0));
+        assert_eq!(t.index_at(14, 3), Some(2));
+    }
+}

@@ -11,9 +11,11 @@ use crate::tui::widgets::{ListNav, fit, pad, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 use skills::ops::deploy::{
     self, PresetState, PresetStatus, plan_preset_activate, plan_preset_deactivate, preset_status,
 };
@@ -52,6 +54,8 @@ pub struct AgentsView {
     compact: bool,
     scope_rects: Vec<(Rect, Option<String>)>,
     preset_rects: Vec<Rect>,
+    /// The one column the entry scrollbar occupies, empty while it all fits.
+    entries_track: Rect,
     left: Rect,
     right: Rect,
     detail_scroll: u16,
@@ -89,6 +93,38 @@ impl AgentsView {
     }
 
     /// Entry rows for the current scope, grouped into ours and theirs.
+    /// A header is a caption, not something to act on. A move that lands on one
+    /// carries on in the direction it was going, and falls back the other way
+    /// when there is nothing further ahead.
+    fn snap_off_header(&mut self, rows: &[Row], dir: i32) {
+        let Some(i) = self.entries.selected() else {
+            return;
+        };
+        if !matches!(rows.get(i), Some(Row::Header(_))) {
+            return;
+        }
+        let entry = |j: &usize| matches!(rows.get(*j), Some(Row::Entry { .. }));
+        let ahead = (i + 1..rows.len()).find(entry);
+        let behind = (0..i).rev().find(entry);
+        let pick = if dir >= 0 {
+            ahead.or(behind)
+        } else {
+            behind.or(ahead)
+        };
+        if let Some(j) = pick {
+            self.entries.select(Some(j));
+        }
+    }
+
+    /// Whether anything selectable sits above the selection. Nothing there means
+    /// the arrow leaves the list for the pills above it.
+    fn at_first_entry(&self, rows: &[Row]) -> bool {
+        let Some(i) = self.entries.selected() else {
+            return true;
+        };
+        !(0..i).any(|j| matches!(rows.get(j), Some(Row::Entry { .. })))
+    }
+
     fn rows<'a>(&self, ctx: &'a Ctx) -> Vec<Row<'a>> {
         let agents = self.scope_agents(ctx);
         // Collect names first so a skill deployed to several agents stays one row.
@@ -221,7 +257,9 @@ impl View for AgentsView {
             })
             .collect();
         self.preset_cursor = self.preset_cursor.min(self.presets.len().saturating_sub(1));
-        self.entries.clamp(self.rows(ctx).len());
+        let rows = self.rows(ctx);
+        self.entries.clamp(rows.len());
+        self.snap_off_header(&rows, 1);
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
@@ -288,29 +326,40 @@ impl View for AgentsView {
                 // is nothing invisible to remember.
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.set_focus(Focus::Entries);
-                    self.entries.clamp(self.rows(ctx).len());
+                    let rows = self.rows(ctx);
+                    self.entries.clamp(rows.len());
+                    self.snap_off_header(&rows, 1);
                     vec![]
                 }
                 _ => vec![],
             },
             Focus::Entries => {
-                let n = self.rows(ctx).len();
+                let rows = self.rows(ctx);
+                let n = rows.len();
                 match k.code {
-                    KeyCode::Down | KeyCode::Char('j') => self.entries.move_by(1, n),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.entries.move_by(1, n);
+                        self.snap_off_header(&rows, 1);
+                    }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if self.entries.selected().unwrap_or(0) == 0 {
+                        if self.at_first_entry(&rows) {
                             self.set_focus(Focus::Presets);
                         } else {
                             self.entries.move_by(-1, n);
+                            self.snap_off_header(&rows, -1);
                         }
                     }
-                    KeyCode::Home | KeyCode::Char('g') => self.entries.first(n),
-                    KeyCode::End | KeyCode::Char('G') => self.entries.last(n),
+                    KeyCode::Home | KeyCode::Char('g') => {
+                        self.entries.first(n);
+                        self.snap_off_header(&rows, 1);
+                    }
+                    KeyCode::End | KeyCode::Char('G') => {
+                        self.entries.last(n);
+                        self.snap_off_header(&rows, -1);
+                    }
                     KeyCode::Enter => {
-                        if let Some(Row::Entry { name, .. }) = self
-                            .entries
-                            .selected()
-                            .and_then(|i| self.rows(ctx).into_iter().nth(i))
+                        if let Some(Row::Entry { name, .. }) =
+                            self.entries.selected().and_then(|i| rows.get(i))
                         {
                             return vec![Action::Search {
                                 query: name.to_string(),
@@ -330,9 +379,29 @@ impl View for AgentsView {
         if let Some(d) = wheel(&m) {
             if self.left.contains(at) {
                 self.set_focus(Focus::Entries);
-                self.entries.move_by(d, self.rows(ctx).len());
+                let rows = self.rows(ctx);
+                self.entries.move_by(d, rows.len());
+                self.snap_off_header(&rows, d);
             } else if self.right.contains(at) {
                 self.detail_scroll = (self.detail_scroll as i32 + d).max(0) as u16;
+            }
+            return vec![];
+        }
+        // Dragging the thumb reads the same as clicking the track: both put the
+        // selection where the pointer is.
+        if matches!(
+            m.kind,
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
+        ) && self.entries_track.contains(at)
+        {
+            let n = self.rows(ctx).len();
+            if n > 0 {
+                let span = self.entries_track.height.max(1) as usize;
+                let i = (m.row - self.entries_track.y) as usize * n / span;
+                self.set_focus(Focus::Entries);
+                self.entries.select(Some(i.min(n - 1)));
+                let rows = self.rows(ctx);
+                self.snap_off_header(&rows, 1);
             }
             return vec![];
         }
@@ -361,7 +430,9 @@ impl View for AgentsView {
             }
             if self.left.contains(at) {
                 self.set_focus(Focus::Entries);
-                self.entries.click(m.row, self.rows(ctx).len());
+                let rows = self.rows(ctx);
+                self.entries.click(m.row, rows.len());
+                self.snap_off_header(&rows, 1);
             }
         }
         vec![]
@@ -437,33 +508,44 @@ impl View for AgentsView {
             ));
         }
         for (i, (preset, status)) in self.presets.iter().enumerate() {
+            // Every glyph here is East Asian Width N, so the caps and the text
+            // keep their column count in terminals that widen ambiguous ones.
             let mark = match status.state() {
                 PresetState::Active => "✓ ",
-                PresetState::Partial => "◐ ",
-                PresetState::Inactive => "○ ",
-                PresetState::Empty => "· ",
+                PresetState::Partial => "◒ ",
+                PresetState::Inactive => "◌ ",
+                PresetState::Empty => "◦ ",
             };
-            let text = format!(" {mark}{} {} ", preset.name, status.label());
-            let w = width(&text) as u16;
+            let body = format!(" {mark}{} {} ", preset.name, status.label());
+            // The caps belong to the pill as far as the mouse is concerned.
+            let (lcap, rcap) = ctx.ws.config.ui.pill_caps.glyphs();
+            let w = width(&body) as u16 + width(lcap) as u16 + width(rcap) as u16;
             self.preset_rects.push(Rect::new(x, rows[1].y, w, 1));
-            let style = match status.state() {
-                PresetState::Active => th.ok(),
-                PresetState::Partial => th.warn(),
-                _ => th.dim(),
+            let base = match status.state() {
+                PresetState::Active => th.ok,
+                PresetState::Partial => th.warn,
+                _ => th.dim,
             };
-            // Reversing paints the pill solid in its own state colour, which
-            // reads as selected from across the screen; without focus a bold
-            // outline is enough to remember the place.
-            let style = if i == self.preset_cursor {
-                if self.focus() == Focus::Presets {
-                    style.add_modifier(ratatui::style::Modifier::REVERSED)
+            let selected = i == self.preset_cursor;
+            let focused = self.focus() == Focus::Presets;
+            // With the keyboard here the pill is lit; without it the fill stays
+            // put and only the text is underlined, so the place is still marked
+            // but nothing competes with the list for attention.
+            let fill = if selected && focused { lit(base) } else { base };
+            let mut body_style = Style::default().bg(fill).fg(ink(fill));
+            if selected {
+                body_style = body_style.add_modifier(if focused {
+                    Modifier::BOLD
                 } else {
-                    style.add_modifier(ratatui::style::Modifier::BOLD)
-                }
-            } else {
-                style
-            };
-            pills.push(Span::styled(text, style));
+                    Modifier::UNDERLINED
+                });
+            }
+            // The caps carry the fill as foreground against the page, which is
+            // what rounds the ends off; reversing them would square the pill.
+            let cap = Style::default().fg(fill);
+            pills.push(Span::styled(lcap, cap));
+            pills.push(Span::styled(body, body_style));
+            pills.push(Span::styled(rcap, cap));
             pills.push(Span::raw(" "));
             x += w + 1;
         }
@@ -540,6 +622,31 @@ impl View for AgentsView {
             .highlight_symbol("▸ ");
         f.render_stateful_widget(list, left, &mut self.entries.state);
 
+        // The scrollbar sits on the right border, showing where the selection
+        // is among all the rows rather than how far the pixels have scrolled.
+        let per_page = (left.height.saturating_sub(2) / self.entries.item_height.max(1)) as usize;
+        self.entries_track = Rect::default();
+        if rows_data.len() > per_page && left.height > 2 {
+            let track = Rect::new(
+                left.right().saturating_sub(1),
+                left.y + 1,
+                1,
+                left.height - 2,
+            );
+            self.entries_track = track;
+            let mut sb = ScrollbarState::new(rows_data.len())
+                .position(self.entries.selected().unwrap_or(0))
+                .viewport_content_length(per_page);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None)
+                    .style(th.dim()),
+                track,
+                &mut sb,
+            );
+        }
+
         let block = th.block(" detail ", false);
         let inner = block.inner(right);
         f.render_widget(block, right);
@@ -571,6 +678,29 @@ impl View for AgentsView {
                 ("v", "density"),
             ],
         }
+    }
+}
+
+/// The bright twin of a pill colour, used for the pill holding the keyboard.
+/// Anything outside the basic palette is left alone; the bold text still marks it.
+fn lit(c: Color) -> Color {
+    match c {
+        Color::Green => Color::LightGreen,
+        Color::Yellow => Color::LightYellow,
+        Color::Red => Color::LightRed,
+        Color::Cyan => Color::LightCyan,
+        Color::Blue => Color::LightBlue,
+        Color::Magenta => Color::LightMagenta,
+        Color::DarkGray => Color::Gray,
+        other => other,
+    }
+}
+
+/// Text colour that stays legible on a filled pill.
+fn ink(fill: Color) -> Color {
+    match fill {
+        Color::DarkGray | Color::Black | Color::Blue | Color::Red | Color::Magenta => Color::White,
+        _ => Color::Black,
     }
 }
 

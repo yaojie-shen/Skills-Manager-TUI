@@ -22,7 +22,12 @@ const MAX_VISIBLE: usize = 3;
 
 /// A full circle emptying clockwise. Geometric Shapes has quarters and no more,
 /// so the countdown moves in five steps rather than sweeping smoothly.
-const PIE: [&str; 5] = ["●", "◕", "◑", "◔", "○"];
+///
+/// Every glyph is East Asian Width N. The obvious spellings of full, half and
+/// empty (U+25CF, U+25D1, U+25CB) are Ambiguous, and a terminal told to render
+/// ambiguous characters wide would take two columns for them and push the rest
+/// of the notification line out from under its own border.
+const PIE: [&str; 5] = ["⬤", "◕", "◗", "◔", "◌"];
 
 pub struct Toast {
     pub text: String,
@@ -147,12 +152,12 @@ mod tests {
     #[test]
     fn the_pie_empties_over_the_lifetime() {
         let fresh = Toast::new("x", Level::Ok);
-        assert_eq!(fresh.pie(), "●");
+        assert_eq!(fresh.pie(), "⬤");
         assert!(!fresh.done());
 
         // Walk the clock by hand rather than sleeping through five seconds.
         let mut aged = Toast::new("x", Level::Ok);
-        for (elapsed, want) in [(0, "●"), (1, "◕"), (2, "◑"), (3, "◔"), (4, "○")] {
+        for (elapsed, want) in [(0, "⬤"), (1, "◕"), (2, "◗"), (3, "◔"), (4, "◌")] {
             aged.at = Instant::now() - Duration::from_secs(elapsed) - Duration::from_millis(100);
             assert_eq!(aged.pie(), want, "at {elapsed}s");
             assert!(!aged.done(), "at {elapsed}s");
@@ -167,7 +172,7 @@ mod tests {
         // Well past an ordinary lifetime, and still there to be read.
         e.at = Instant::now() - LIFETIME * 2;
         assert!(!e.done());
-        assert_eq!(e.pie(), "◑", "halfway through the longer error lifetime");
+        assert_eq!(e.pie(), "◗", "halfway through the longer error lifetime");
         e.at = Instant::now() - ERROR_LIFETIME;
         assert!(e.done());
     }
