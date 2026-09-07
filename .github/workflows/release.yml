@@ -1,0 +1,178 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build (for example v0.1.0-alpha.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.98.0
+
+jobs:
+  version:
+    name: Validate version tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      commit: ${{ steps.version.outputs.commit }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Match tag to Cargo version
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import tomllib
+
+          tag = os.environ["RELEASE_TAG"]
+          with open("Cargo.toml", "rb") as f:
+              version = tomllib.load(f)["package"]["version"]
+          if tag != f"v{version}":
+              raise SystemExit(f"Tag {tag!r} does not match Cargo version v{version}")
+          commit = subprocess.check_output(
+              ["git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}"], text=True
+          ).strip()
+          head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          if head != commit:
+              raise SystemExit("Checkout does not match the requested tag")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"tag={tag}\ncommit={commit}\n")
+              f.write(f"prerelease={str('-' in version.split('+', 1)[0]).lower()}\n")
+          PY
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      TARGET: ${{ matrix.target }}
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.version.outputs.commit }}
+          persist-credentials: false
+      - name: Install musl linker
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc' >> "$GITHUB_ENV"
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Check tagged source
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets --target "$TARGET" -- -D warnings
+          cargo test --locked --all-targets --target "$TARGET"
+      - name: Build optimized binary
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: cargo build --locked --release --target "$TARGET"
+      - name: Verify binary
+        shell: bash
+        run: |
+          binary="target/$TARGET/release/skills"
+          "$binary" --version
+          "$binary" --help > /dev/null
+          file "$binary"
+          if [[ "$TARGET" == x86_64-unknown-linux-musl ]]; then
+            if readelf -l "$binary" | grep -q INTERP; then
+              echo 'Linux release must be static: found an ELF interpreter' >&2
+              exit 1
+            fi
+            if readelf -d "$binary" | grep -q NEEDED; then
+              echo 'Linux release must be static: found a shared library dependency' >&2
+              exit 1
+            fi
+          else
+            test "$(lipo -archs "$binary")" = arm64
+          fi
+      - name: Package binary and licenses
+        shell: bash
+        run: |
+          package="skills-$RELEASE_TAG-$TARGET"
+          mkdir -p "dist/$package/licenses"
+          cp "target/$TARGET/release/skills" "dist/$package/skills"
+          cp LICENSE "dist/$package/LICENSE"
+          cp data/dict/LICENSE-*.txt data/dict/SOURCES.md "dist/$package/licenses/"
+          tar -czf "dist/$package.tar.gz" -C dist "$package"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    name: Publish GitHub Release
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum ./*.tar.gz > SHA256SUMS
+      - name: Create draft, upload, and publish
+        shell: bash
+        run: |
+          # Existing published releases are left intact; retries can finish a draft.
+          if gh release view "$RELEASE_TAG" --json isDraft > release.json 2>/dev/null; then
+            if [[ "$(jq -r .isDraft release.json)" != true ]]; then
+              echo "Release $RELEASE_TAG is already published; refusing to replace its assets" >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+          latest=true
+          if [[ "$PRERELEASE" == true ]]; then latest=false; fi
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease="$PRERELEASE" --latest="$latest"
