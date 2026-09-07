@@ -702,9 +702,7 @@ impl Modal {
                 KeyCode::Esc => vec![Action::CloseModal],
                 KeyCode::Enter => {
                     let value = input.value().to_string();
-                    let mut acts = vec![Action::CloseModal];
-                    acts.extend(submit(kind, value, ctx));
-                    acts
+                    vec![Action::SubmitInput(submit(kind, value, ctx))]
                 }
                 _ => {
                     input.handle_key(k);

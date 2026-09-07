@@ -72,6 +72,8 @@ pub enum Action {
     Spawn(Task),
     OpenModal(Box<Modal>),
     CloseModal,
+    /// Keep the input and cursor until validation and synchronous writes succeed.
+    SubmitInput(Vec<Action>),
     SwitchTab(Tab),
     /// Land on a preset by name once the list next reloads: after creating
     /// or renaming one, the card to look at is the one that has just changed.
@@ -418,6 +420,38 @@ impl App {
             Action::Spawn(task) => self.spawn(task),
             Action::OpenModal(m) => self.modal = Some(*m),
             Action::CloseModal => self.modal = None,
+            Action::SubmitInput(actions) => {
+                let prompt = self.modal.take();
+                for action in actions {
+                    let result = match action {
+                        Action::Error(error) => Err(anyhow::anyhow!(error)),
+                        Action::Write(write) => {
+                            let result = write(&self.ws);
+                            self.rescan();
+                            result.map(|message| self.toast(message, Level::Ok))
+                        }
+                        Action::WriteMeta(write) => {
+                            let result = write(&self.ws);
+                            self.rescan();
+                            result.map(|(message, intent)| {
+                                self.toast(message, Level::Ok);
+                                if let Some(intent) = intent {
+                                    self.history.record(intent);
+                                }
+                            })
+                        }
+                        other => {
+                            self.apply(other);
+                            Ok(())
+                        }
+                    };
+                    if let Err(error) = result {
+                        self.modal = prompt;
+                        self.toast(format!("{error:#}"), Level::Error);
+                        break;
+                    }
+                }
+            }
             Action::SwitchTab(t) => {
                 self.switch_tab(t);
                 if t == Tab::Search {
@@ -696,6 +730,70 @@ pub type Hints = &'static [(&'static str, &'static str)];
 #[cfg(test)]
 mod matrix_key_tests {
     use super::*;
+
+    #[test]
+    fn failed_inputs_keep_their_text_and_cursor_until_a_successful_retry() {
+        let root = std::env::temp_dir().join(format!("skills-input-retry-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        ws.presets
+            .save(&skills::preset::Preset {
+                name: "reading".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(ws, tx).unwrap();
+        let press =
+            |app: &mut App, code| app.handle(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        let value = |app: &App| match &app.modal {
+            Some(Modal::Input { input, .. }) => input.value().to_string(),
+            _ => panic!("input must remain open"),
+        };
+        app.modal = Some(Modal::rename_preset("reading"));
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(value(&app), "reading/");
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(value(&app), "readings/"); // Cursor stayed before the slash.
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        assert!(app.ws.presets.load("readings").unwrap().is_some());
+
+        app.modal = Some(Modal::new_preset());
+        for c in "readings".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter); // Write closure rejects the duplicate.
+        assert_eq!(value(&app), "readings");
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        assert!(app.ws.presets.load("readings2").unwrap().is_some());
+
+        // A metadata write can fail after validation, too.
+        app.modal = Some(Modal::rename_preset("readings2"));
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Enter); // Existing destination.
+        assert_eq!(value(&app), "readings");
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        assert!(app.ws.presets.load("readings3").unwrap().is_some());
+        app.modal = Some(Modal::new_preset());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn matrix_receives_keys_before_global_shortcuts() {
