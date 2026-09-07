@@ -74,6 +74,7 @@ pub struct AgentsView {
     focus: FocusState,
     presets: Vec<(Preset, PresetStatus)>,
     preset_cursor: usize,
+    preset_offset: usize,
     entries: CardGrid,
     /// One per entry row, in the grid's order.
     caps: Vec<Caps>,
@@ -81,7 +82,7 @@ pub struct AgentsView {
     /// of this page is not something the config decides.
     compact: bool,
     scope_rects: Vec<(Rect, String)>,
-    preset_rects: Vec<Rect>,
+    preset_rects: Vec<(usize, Rect)>,
     /// The one column the entry scrollbar occupies, empty while it all fits.
     entries_track: Rect,
     left: Rect,
@@ -201,6 +202,13 @@ impl AgentsView {
     }
 
     fn activate(&self, ctx: &Ctx, on: bool) -> Vec<Action> {
+        if !self
+            .preset_rects
+            .iter()
+            .any(|(i, _)| *i == self.preset_cursor)
+        {
+            return vec![];
+        }
         let Some((preset, status)) = self.selected_preset() else {
             return vec![Action::Error("no preset here yet".into())];
         };
@@ -506,8 +514,8 @@ impl View for AgentsView {
                 self.set_focus(Focus::Agents);
                 return vec![Action::Rescan];
             }
-            if let Some(i) = self.preset_rects.iter().position(|r| r.contains(at)) {
-                self.preset_cursor = i;
+            if let Some((i, _)) = self.preset_rects.iter().find(|(_, r)| r.contains(at)) {
+                self.preset_cursor = *i;
                 self.set_focus(Focus::Presets);
                 // A pill is a switch: clicking an installed one takes it off
                 // again rather than re-running an install that has nothing to do.
@@ -616,26 +624,40 @@ impl View for AgentsView {
                 th.dim(),
             ));
         }
-        for (i, (preset, status)) in self.presets.iter().enumerate() {
-            // Part way on is a circle filled from the left, the way a gauge
-            // fills: the top-and-bottom split (U+25D2) reads as a different
-            // shape rather than as a fraction of the same one. It is one of the
-            // two glyphs here whose width is Ambiguous, alongside the caps, so
-            // a terminal that widens those shifts this row either way.
-            let mark = match status.state() {
-                PresetState::Active => "✓ ",
-                PresetState::Partial => "◐ ",
-                PresetState::Inactive => "◌ ",
-                PresetState::Empty => "◦ ",
-            };
-            let body = match status.progress() {
-                Some(count) => format!(" {mark}{} {count} ", preset.name),
-                None => format!(" {mark}{} ", preset.name),
-            };
-            // The caps belong to the pill as far as the mouse is concerned.
-            let (lcap, rcap) = ctx.ws.config.ui.pill_caps.glyphs();
-            let w = width(&body) as u16 + width(lcap) as u16 + width(rcap) as u16;
-            self.preset_rects.push(Rect::new(x, rows[1].y, w, 1));
+        let (lcap, rcap) = ctx.ws.config.ui.pill_caps.glyphs();
+        let caps_w = width(lcap) + width(rcap);
+        // Reserve an indicator on each side; every mouse target is a whole pill.
+        let budget = rows[1].width.saturating_sub(13) as usize;
+        let bodies: Vec<String> = self
+            .presets
+            .iter()
+            .map(|(preset, status)| {
+                let mark = match status.state() {
+                    PresetState::Active => "✓ ",
+                    PresetState::Partial => "◐ ",
+                    PresetState::Inactive => "◌ ",
+                    PresetState::Empty => "◦ ",
+                };
+                let suffix = status
+                    .progress()
+                    .map(|p| format!(" {p} "))
+                    .unwrap_or(" ".into());
+                let name_w = budget.saturating_sub(caps_w + width(mark) + width(&suffix) + 2);
+                format!(" {mark}{}{suffix}", fit(&preset.name, name_w))
+            })
+            .collect();
+        let widths: Vec<usize> = bodies.iter().map(|b| width(b) + caps_w + 1).collect();
+        let visible = pill_window(&widths, self.preset_cursor, &mut self.preset_offset, budget);
+        pills.push(Span::styled(
+            if visible.start > 0 { "‹ " } else { "  " },
+            th.dim(),
+        ));
+        x += 2;
+        for i in visible.clone() {
+            let (_, status) = &self.presets[i];
+            let body = bodies[i].clone();
+            let w = (widths[i] - 1) as u16;
+            self.preset_rects.push((i, Rect::new(x, rows[1].y, w, 1)));
             let base = match status.state() {
                 PresetState::Active => th.ok,
                 PresetState::Partial => th.warn,
@@ -666,6 +688,14 @@ impl View for AgentsView {
             pills.push(Span::raw(" "));
             x += w + 1;
         }
+        pills.push(Span::styled(
+            if visible.end < self.presets.len() {
+                "›"
+            } else {
+                " "
+            },
+            th.dim(),
+        ));
         f.render_widget(Paragraph::new(Line::from(pills)), rows[1]);
 
         // The whole width goes to the entries. A detail pane here only ever had
@@ -940,5 +970,96 @@ fn state_label(state: Option<&EntryState>) -> &'static str {
         Some(EntryState::Foreign { .. }) => "foreign",
         Some(EntryState::AgentOnly) => "the agent's own",
         None => "",
+    }
+}
+
+/// Fit whole pills, moving the start only when selection leaves the viewport.
+fn pill_window(
+    widths: &[usize],
+    selected: usize,
+    offset: &mut usize,
+    budget: usize,
+) -> std::ops::Range<usize> {
+    if widths.is_empty() {
+        *offset = 0;
+        return 0..0;
+    }
+    let selected = selected.min(widths.len() - 1);
+    *offset = (*offset).min(selected);
+    while *offset < selected && widths[*offset..=selected].iter().sum::<usize>() > budget {
+        *offset += 1;
+    }
+    let mut end = *offset;
+    let mut used = 0;
+    while end < widths.len() && used + widths[end] <= budget {
+        used += widths[end];
+        end += 1;
+    }
+    *offset..end
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+    use crate::tui::theme::Theme;
+    use ratatui::{Terminal, backend::TestBackend};
+    use skills::{Workspace, config::AgentConfig};
+
+    #[test]
+    fn selected_pill_is_visible_and_mouse_targets_are_clipped() {
+        let root = std::env::temp_dir().join(format!("skills-pills-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut ws = Workspace::open(&root).unwrap();
+        ws.config.agents = vec![AgentConfig {
+            key: "sample".into(),
+            name: "Sample".into(),
+            skills_dir: "../sample".into(),
+        }];
+        for i in 0..24 {
+            ws.presets
+                .save(&Preset {
+                    name: format!("group-{i:02}-long-name"),
+                    ..Preset::default()
+                })
+                .unwrap();
+        }
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = AgentsView::default();
+        view.refresh(&ctx);
+        for (w, h) in [(100, 30), (80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            for i in (0..24).chain((0..24).rev()) {
+                view.preset_cursor = i;
+                terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+                assert!(view.preset_rects.iter().any(|(index, _)| *index == i));
+                for (_, rect) in &view.preset_rects {
+                    assert!(rect.right() <= w);
+                    assert!(rect.bottom() <= h);
+                }
+                let (_, rect) = view
+                    .preset_rects
+                    .iter()
+                    .find(|(index, _)| *index == i)
+                    .unwrap();
+                let actions = view.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: rect.x,
+                        row: rect.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &ctx,
+                );
+                assert_eq!(view.preset_cursor, i);
+                assert!(!actions.is_empty());
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

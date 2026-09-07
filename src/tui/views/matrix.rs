@@ -25,6 +25,8 @@ pub struct Matrix {
     presets: Vec<Preset>,
     row: usize,
     col: usize,
+    row_offset: usize,
+    col_offset: usize,
     rect: Rect,
     /// Where each cell was drawn, for the mouse: `(preset row, agent column, rect)`.
     cells: Vec<(usize, usize, Rect)>,
@@ -123,10 +125,18 @@ impl Matrix {
                 self.col = self.col.saturating_sub(1);
                 vec![]
             }
-            KeyCode::Char(' ') | KeyCode::Enter => self.toggle(ctx, self.row, self.col),
-            KeyCode::Char('A') => self.toggle_row(ctx, self.row),
+            KeyCode::Char(' ') | KeyCode::Enter if self.selection_visible() => {
+                self.toggle(ctx, self.row, self.col)
+            }
+            KeyCode::Char('A') if self.selection_visible() => self.toggle_row(ctx, self.row),
             _ => vec![],
         })
+    }
+
+    fn selection_visible(&self) -> bool {
+        self.cells
+            .iter()
+            .any(|(r, c, _)| *r == self.row && *c == self.col)
     }
 
     /// A click on a cell throws it; a click outside the window closes it.
@@ -171,7 +181,7 @@ impl Matrix {
             .map(|a| width(&a.key))
             .max()
             .unwrap_or(4)
-            .max(8);
+            .clamp(8, 20);
         // The key help is the widest thing in a small table, so it sets the floor.
         let help = " Space toggle · A whole row · Esc";
         let inner_w = (name_w + 2 + agents.len() * (col_w + 2)).max(width(help)) as u16;
@@ -190,9 +200,20 @@ impl Matrix {
         let inner = block.inner(rect);
         f.render_widget(block, rect);
 
+        let name_w = name_w.min((inner.width as usize).saturating_sub(12));
+        let col_w = col_w.min((inner.width as usize).saturating_sub(name_w + 4));
+        let visible_cols = (inner.width as usize).saturating_sub(name_w + 2) / (col_w + 2);
+        let visible_rows = inner.height.saturating_sub(4) as usize;
+        let rows = viewport(
+            self.presets.len(),
+            self.row,
+            &mut self.row_offset,
+            visible_rows,
+        );
+        let cols = viewport(agents.len(), self.col, &mut self.col_offset, visible_cols);
         let mut lines: Vec<Line> = Vec::new();
         let mut head = vec![Span::raw(format!(" {} ", pad("", name_w)))];
-        for a in agents {
+        for a in &agents[cols.clone()] {
             head.push(Span::styled(
                 format!(" {} ", pad(&a.key, col_w)),
                 th.dim().add_modifier(Modifier::BOLD),
@@ -200,7 +221,8 @@ impl Matrix {
         }
         lines.push(Line::from(head));
         lines.push(Line::from(""));
-        for (ri, p) in self.presets.iter().enumerate() {
+        for ri in rows.clone() {
+            let p = &self.presets[ri];
             let mut spans = vec![Span::styled(
                 format!(" {} ", pad(&p.name, name_w)),
                 if ri == self.row {
@@ -209,7 +231,8 @@ impl Matrix {
                     Style::default()
                 },
             )];
-            for (ci, a) in agents.iter().enumerate() {
+            for ci in cols.clone() {
+                let a = &agents[ci];
                 let st = preset_status(ctx.snap, p, std::slice::from_ref(&a.key));
                 let (mark, style) = match st.state() {
                     PresetState::Active => ("✓", th.ok()),
@@ -225,8 +248,9 @@ impl Matrix {
                 if ri == self.row && ci == self.col {
                     cell = cell.bg(th.selection_bg).add_modifier(Modifier::BOLD);
                 }
-                let x = inner.x + 1 + name_w as u16 + 2 + (ci as u16) * (col_w as u16 + 2);
-                let y = inner.y + 2 + ri as u16;
+                let x =
+                    inner.x + name_w as u16 + 2 + ((ci - cols.start) as u16) * (col_w as u16 + 2);
+                let y = inner.y + 2 + (ri - rows.start) as u16;
                 self.cells
                     .push((ri, ci, Rect::new(x, y, col_w as u16 + 2, 1)));
                 spans.push(Span::styled(format!(" {} ", pad(&text, col_w)), cell));
@@ -236,8 +260,109 @@ impl Matrix {
         if self.presets.is_empty() {
             lines.push(Line::from(Span::styled(" no presets yet", th.dim())));
         }
-        lines.push(Line::from(""));
+        let position = format!(
+            " ↑↓ rows {}–{}/{} · ←→ cols {}–{}/{}",
+            if rows.is_empty() { 0 } else { rows.start + 1 },
+            rows.end,
+            self.presets.len(),
+            if cols.is_empty() { 0 } else { cols.start + 1 },
+            cols.end,
+            agents.len()
+        );
+        lines.push(Line::from(Span::styled(position, th.dim())));
         lines.push(Line::from(Span::styled(help, th.dim())));
         f.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+fn viewport(
+    total: usize,
+    selected: usize,
+    offset: &mut usize,
+    capacity: usize,
+) -> std::ops::Range<usize> {
+    if total == 0 || capacity == 0 {
+        *offset = 0;
+        return 0..0;
+    }
+    let selected = selected.min(total - 1);
+    *offset = (*offset).min(selected).min(total.saturating_sub(capacity));
+    if selected >= *offset + capacity {
+        *offset = selected + 1 - capacity;
+    }
+    *offset..(*offset + capacity).min(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::theme::Theme;
+    use crossterm::event::KeyModifiers;
+    use ratatui::{Terminal, backend::TestBackend};
+    use skills::{Workspace, config::AgentConfig};
+
+    #[test]
+    fn selection_and_mouse_targets_stay_inside_scrolling_matrix() {
+        let root = std::env::temp_dir().join(format!("skills-matrix-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut ws = Workspace::open(&root).unwrap();
+        ws.config.agents = (0..12)
+            .map(|i| AgentConfig {
+                key: format!("agent-{i:02}-long-name"),
+                name: format!("Agent {i}"),
+                skills_dir: format!("../agent-{i}"),
+            })
+            .collect();
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut matrix = Matrix {
+            open: true,
+            presets: (0..40)
+                .map(|i| Preset {
+                    name: format!("group-{i:02}-long-name-文件系统"),
+                    ..Preset::default()
+                })
+                .collect(),
+            ..Matrix::default()
+        };
+        for (w, h) in [(100, 30), (80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            for (r, c) in [(0, 0), (39, 11), (20, 5), (0, 0)] {
+                matrix.row = r;
+                matrix.col = c;
+                terminal.draw(|f| matrix.draw(f, f.area(), &ctx)).unwrap();
+                assert!(matrix.selection_visible());
+                let inner = theme.block("", true).inner(matrix.rect);
+                for (_, _, cell) in &matrix.cells {
+                    assert!(inner.contains((cell.x, cell.y).into()));
+                    assert!(cell.right() <= inner.right());
+                    assert!(cell.bottom() <= inner.bottom() - 2);
+                }
+                let (_, _, selected) = matrix
+                    .cells
+                    .iter()
+                    .find(|(ri, ci, _)| *ri == r && *ci == c)
+                    .unwrap();
+                assert_eq!(
+                    terminal.backend().buffer()[(selected.x, selected.y)].bg,
+                    theme.selection_bg
+                );
+            }
+            // A queued navigation key cannot activate a not-yet-painted cell.
+            matrix.row = 39;
+            matrix.col = 11;
+            assert!(
+                matrix
+                    .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
