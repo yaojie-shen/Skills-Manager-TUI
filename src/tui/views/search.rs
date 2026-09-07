@@ -4,19 +4,24 @@ use super::{View, split_panes, status_glyph, status_text, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::event::Task;
 use crate::tui::modal::Modal;
-use crate::tui::widgets::{Input, ListNav, ScrollTrack, fit, pad, width};
+use crate::tui::widgets::{CardGrid, Input, ScrollTrack, fit, pad, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use skills::config::{UiDensity, UiLayout};
 use skills::ops::deploy;
 use skills::ops::edit;
 use skills::reconcile::{DeployState, SkillRecord, SkillStatus};
 use skills::search::{Hit, Query, Searcher, highlight_ranges};
+
+/// Narrowest a card may get before the grid gives up a column. Below this the
+/// name and the deployment marks stop fitting on one line together.
+const MIN_CARD_W: u16 = 40;
+/// Most columns worth having: past this a card holds less than it costs to scan.
+const MAX_COLS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -29,7 +34,7 @@ pub struct SearchView {
     input: Input,
     focus: Focus,
     hits: Vec<Hit>,
-    list: ListNav,
+    grid: CardGrid,
     preview_scroll: u16,
     preview_lines: usize,
     preview_height: u16,
@@ -40,8 +45,13 @@ pub struct SearchView {
     track_drag: bool,
     preview_rect: Rect,
     esc_armed: bool,
-    /// Cards show description, tags and per-agent deployment; compact is one line.
-    cards: bool,
+    /// Session overrides for what `config.toml` set. Flipping these is a way to
+    /// try a layout on for size; what the next start looks like stays the file's
+    /// business, so neither is written back.
+    layout: Option<UiLayout>,
+    density: Option<UiDensity>,
+    /// Grid layout has no standing preview pane, so it opens over the results.
+    preview_open: bool,
     searcher: Searcher,
 }
 
@@ -51,7 +61,7 @@ impl Default for SearchView {
             input: Input::default(),
             focus: Focus::Input,
             hits: Vec::new(),
-            list: ListNav::default(),
+            grid: CardGrid::default(),
             preview_scroll: 0,
             preview_lines: 0,
             preview_height: 0,
@@ -61,7 +71,9 @@ impl Default for SearchView {
             track_drag: false,
             preview_rect: Rect::default(),
             esc_armed: false,
-            cards: true,
+            layout: None,
+            density: None,
+            preview_open: false,
             searcher: Searcher::new(),
         }
     }
@@ -85,8 +97,15 @@ impl SearchView {
         self.run_search(ctx, false);
     }
 
+    fn layout(&self, ctx: &Ctx) -> UiLayout {
+        self.layout.unwrap_or(ctx.ws.config.ui.layout)
+    }
+    fn density(&self, ctx: &Ctx) -> UiDensity {
+        self.density.unwrap_or(ctx.ws.config.ui.density)
+    }
+
     fn selected<'a>(&self, ctx: &'a Ctx) -> Option<&'a SkillRecord> {
-        self.list
+        self.grid
             .selected()
             .and_then(|i| self.hits.get(i))
             .map(|h| &ctx.snap.skills[h.index])
@@ -107,7 +126,7 @@ impl SearchView {
                 .iter()
                 .position(|h| ctx.snap.skills[h.index].key == k)
         });
-        self.list
+        self.grid
             .select(idx.or(if self.hits.is_empty() { None } else { Some(0) }));
         if !keep {
             self.preview_scroll = 0;
@@ -115,15 +134,22 @@ impl SearchView {
     }
 
     fn selected_terms(&self) -> &[String] {
-        self.list
+        self.grid
             .selected()
             .and_then(|i| self.hits.get(i))
             .map(|h| h.terms.as_slice())
             .unwrap_or(&[])
     }
 
+    /// One step along a row, which in a single column is one step down the list.
     fn move_sel(&mut self, delta: i32) {
-        self.list.move_by(delta, self.hits.len());
+        self.grid.move_by(delta, self.hits.len());
+        self.preview_scroll = 0;
+    }
+
+    /// One step down or up, which crosses a whole grid row when there are several.
+    fn move_row(&mut self, delta: i32) {
+        self.grid.move_rows(delta, self.hits.len());
         self.preview_scroll = 0;
     }
 
@@ -288,6 +314,248 @@ impl SearchView {
     }
 }
 
+/// Drawing, split by band. `draw` itself only decides which of these run.
+impl SearchView {
+    fn draw_input(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        let th = ctx.theme;
+        let title = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                format!("{}/{}", self.hits.len(), ctx.snap.skills.len()),
+                th.dim(),
+            ),
+            Span::raw(" "),
+        ]);
+        let block = th.block(title, self.focus == Focus::Input);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        self.input_rect = area;
+        let prompt = Rect {
+            x: inner.x + 1,
+            width: 2,
+            ..inner
+        };
+        f.render_widget(Paragraph::new(Span::styled("› ", th.accent())), prompt);
+        let field = Rect {
+            x: inner.x + 3,
+            width: inner.width.saturating_sub(4),
+            ..inner
+        };
+        self.input.render(
+            f,
+            field,
+            self.focus == Focus::Input,
+            "search skills…   tag:x  agent:y  status:modified  untagged",
+            th,
+        );
+    }
+
+    /// The results, as a grid of cells that happens to be one column wide in
+    /// the split layout. Drawing cell by cell rather than through `List` is what
+    /// lets a card carry its own frame and lets several sit on a row.
+    fn draw_results(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        let th = ctx.theme;
+        let agents = &ctx.snap.agents;
+        let searching = !self.input.value().trim().is_empty()
+            && !Query::parse(self.input.value()).text.is_empty();
+        let cards = self.density(ctx) == UiDensity::Cards;
+
+        let mut legend = vec![Span::raw(" skills ")];
+        for a in agents {
+            legend.push(Span::styled(format!("{} ", abbrev(&a.key)), th.dim()));
+        }
+        let block = th.block(Line::from(legend), self.focus == Focus::List);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        // A framed card is three lines of content plus its own border; a row is
+        // one line, two while an excerpt has something to say.
+        let cell_h = if cards {
+            5
+        } else if searching {
+            2
+        } else {
+            1
+        };
+        // One column is always kept back for the scrollbar so the column count
+        // does not change under the user the moment the list grows past a screen.
+        let usable = inner.width.saturating_sub(1);
+        let cols = if self.layout(ctx) == UiLayout::Grid && cards {
+            ((usable / MIN_CARD_W) as usize).clamp(1, MAX_COLS)
+        } else {
+            1
+        };
+        let gap = if cols > 1 { 1 } else { 0 };
+        let content = Rect {
+            width: usable,
+            ..inner
+        };
+        self.grid
+            .layout(content, cols, cell_h, gap, self.hits.len());
+
+        if self.hits.is_empty() {
+            let msg = if ctx.snap.skills.is_empty() {
+                "no skills in this root"
+            } else {
+                "no match"
+            };
+            f.render_widget(
+                Paragraph::new(Span::styled(msg, th.dim())),
+                Rect {
+                    height: 1,
+                    ..content
+                },
+            );
+            self.list_track.clear();
+            return;
+        }
+
+        let selected = self.grid.selected();
+        for i in self.grid.visible() {
+            let Some(cell) = self.grid.cell(i) else {
+                continue;
+            };
+            let h = &self.hits[i];
+            let r = &ctx.snap.skills[h.index];
+            let on = selected == Some(i);
+            if cards {
+                // The frame carries the selection so the highlighted match keeps
+                // its own background; painting the whole card would bury it.
+                let border = if on {
+                    if self.focus == Focus::List {
+                        th.accent().add_modifier(ratatui::style::Modifier::BOLD)
+                    } else {
+                        th.accent()
+                    }
+                } else {
+                    th.dim()
+                };
+                let b = ratatui::widgets::Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .border_type(ratatui::widgets::BorderType::Rounded)
+                    .border_style(border);
+                let ci = b.inner(cell).inner(ratatui::layout::Margin {
+                    horizontal: 1,
+                    vertical: 0,
+                });
+                f.render_widget(b, cell);
+                f.render_widget(
+                    Paragraph::new(card_lines(r, h, ctx, agents, ci.width as usize, searching)),
+                    ci,
+                );
+            } else {
+                let style = if on {
+                    if self.focus == Focus::List {
+                        th.selected()
+                    } else {
+                        th.selected_unfocused()
+                    }
+                } else {
+                    Style::default()
+                };
+                let lines = row_lines(
+                    r,
+                    h,
+                    ctx,
+                    agents,
+                    cell.width.saturating_sub(2) as usize,
+                    searching,
+                    on,
+                );
+                f.render_widget(Paragraph::new(lines).style(style), cell);
+            }
+        }
+
+        // Item space here is grid rows, which is what the thumb is measuring and
+        // what a click on the track has to land on.
+        let vis = self.grid.visible_rows();
+        if self.grid.grid_rows() > vis && inner.height > 0 {
+            let track = Rect {
+                x: inner.right().saturating_sub(1),
+                y: inner.y,
+                width: 1,
+                height: inner.height,
+            };
+            self.list_track.set(track);
+            let mut sb = ScrollbarState::new(self.grid.grid_rows())
+                .position(selected.unwrap_or(0) / self.grid.cols())
+                .viewport_content_length(vis);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                track,
+                &mut sb,
+            );
+        } else {
+            self.list_track.clear();
+        }
+    }
+
+    fn draw_preview(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        let th = ctx.theme;
+        let block = th.block(" preview ", self.focus == Focus::Preview);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        self.preview_height = inner.height;
+        let Some(r) = self.selected(ctx) else {
+            f.render_widget(
+                Paragraph::new(Span::styled("select a skill to preview", th.dim())),
+                inner,
+            );
+            return;
+        };
+        let terms: Vec<String> = self.selected_terms().to_vec();
+        let lines = preview_lines(r, ctx, &terms);
+        // Count wrapped lines for scroll clamping (approximate: by display width).
+        let w = inner.width.max(1) as usize;
+        self.preview_lines = lines
+            .iter()
+            .map(|l| width(&l.to_string()).max(1).div_ceil(w))
+            .sum();
+        let max = self.preview_lines.saturating_sub(inner.height as usize) as u16;
+        self.preview_scroll = self.preview_scroll.min(max);
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((self.preview_scroll, 0)),
+            inner,
+        );
+        if self.preview_lines > inner.height as usize {
+            let mut sb =
+                ScrollbarState::new(self.preview_lines.saturating_sub(inner.height as usize))
+                    .position(self.preview_scroll as usize);
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                area.inner(ratatui::layout::Margin {
+                    vertical: 1,
+                    horizontal: 0,
+                }),
+                &mut sb,
+            );
+        }
+    }
+
+    /// The preview as a panel over the results, for the layout that has no room
+    /// to keep one open. Sized to the text rather than to the screen, so a short
+    /// skill does not get a mostly empty window.
+    fn draw_preview_over(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        let w = area.width.saturating_sub(8).clamp(20, 96);
+        let h = area.height.saturating_sub(4).max(6);
+        let rect = Rect {
+            x: area.x + (area.width - w) / 2,
+            y: area.y + (area.height - h) / 2,
+            width: w,
+            height: h,
+        };
+        f.render_widget(ratatui::widgets::Clear, rect);
+        self.preview_rect = rect;
+        self.draw_preview(f, rect, ctx);
+    }
+}
+
 impl View for SearchView {
     fn refresh(&mut self, ctx: &Ctx) {
         self.searcher.configure(
@@ -329,19 +597,24 @@ impl View for SearchView {
             Focus::List => match k.code {
                 KeyCode::Esc => self.focus = Focus::Input,
                 KeyCode::Char('q') => return vec![Action::Quit],
-                KeyCode::Down | KeyCode::Char('j') => self.move_sel(1),
-                KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.move_row(1),
+                KeyCode::Up | KeyCode::Char('k') => self.move_row(-1),
                 KeyCode::PageDown | KeyCode::Char('f') if k.code == KeyCode::PageDown || ctrl => {
-                    self.move_sel(self.list.page())
+                    self.move_sel(self.grid.page())
                 }
                 KeyCode::PageUp | KeyCode::Char('b') if k.code == KeyCode::PageUp || ctrl => {
-                    self.move_sel(-self.list.page())
+                    self.move_sel(-self.grid.page())
                 }
-                KeyCode::Home | KeyCode::Char('g') => self.list.first(self.hits.len()),
-                KeyCode::End | KeyCode::Char('G') => self.list.last(self.hits.len()),
+                KeyCode::Home | KeyCode::Char('g') => self.grid.first(self.hits.len()),
+                KeyCode::End | KeyCode::Char('G') => self.grid.last(self.hits.len()),
+                // Along a row when there is a row to walk; otherwise the old
+                // meaning, which is to step across into the preview.
+                KeyCode::Right | KeyCode::Char('l') if self.grid.cols() > 1 => self.move_sel(1),
+                KeyCode::Left | KeyCode::Char('h') if self.grid.cols() > 1 => self.move_sel(-1),
                 KeyCode::Tab | KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                     if !self.hits.is_empty() {
                         self.focus = Focus::Preview;
+                        self.preview_open = true;
                     }
                 }
                 KeyCode::Char('t') => acts = self.act_tags(ctx),
@@ -352,7 +625,19 @@ impl View for SearchView {
                 KeyCode::Char('u') => acts = self.act_check(ctx),
                 KeyCode::Char('U') => acts = self.act_update(ctx),
                 KeyCode::Char('x') => acts = self.act_remove(ctx),
-                KeyCode::Char('v') => self.cards = !self.cards,
+                KeyCode::Char('v') => {
+                    self.density = Some(match self.density(ctx) {
+                        UiDensity::Cards => UiDensity::Rows,
+                        UiDensity::Rows => UiDensity::Cards,
+                    })
+                }
+                KeyCode::Char('V') => {
+                    self.layout = Some(match self.layout(ctx) {
+                        UiLayout::Split => UiLayout::Grid,
+                        UiLayout::Grid => UiLayout::Split,
+                    });
+                    self.preview_open = false;
+                }
                 KeyCode::Char('i') => acts = vec![Action::OpenModal(Box::new(Modal::install()))],
                 KeyCode::Char(c @ '1'..='9') if ctrl => {
                     acts = self.act_toggle_agent(ctx, (c as u8 - b'1') as usize)
@@ -361,7 +646,8 @@ impl View for SearchView {
             },
             Focus::Preview => match k.code {
                 KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
-                    self.focus = Focus::List
+                    self.focus = Focus::List;
+                    self.preview_open = false;
                 }
                 KeyCode::Tab => self.focus = Focus::Input,
                 KeyCode::Char('q') => return vec![Action::Quit],
@@ -392,22 +678,25 @@ impl View for SearchView {
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
         let at = (m.column, m.row).into();
         if let Some(d) = wheel(&m) {
-            if self.list_rect.contains(at) {
-                self.move_sel(d);
-            } else if self.preview_rect.contains(at) {
+            // The preview sits over the results in grid layout, so it gets first
+            // refusal on anything inside it.
+            if self.preview_rect.contains(at) {
                 self.scroll_preview(d);
+            } else if self.list_rect.contains(at) {
+                // A wheel notch is a row of cards, however many are on it.
+                self.move_row(d.signum());
             }
             return vec![];
         }
         // The track is inside `list_rect`, so it has to claim the event before
-        // the row hit-test below turns it into a row click.
+        // the cell hit-test below turns it into a click on a card.
         let dragging = matches!(m.kind, MouseEventKind::Drag(MouseButton::Left));
         let pressing = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
         if (pressing && self.list_track.hit(m.column, m.row)) || (dragging && self.track_drag) {
             self.track_drag = true;
             self.focus = Focus::List;
-            if let Some(i) = self.list_track.index_at(m.row, self.hits.len()) {
-                self.list.select(Some(i));
+            if let Some(r) = self.list_track.index_at(m.row, self.grid.grid_rows()) {
+                self.grid.select_row(r);
                 self.preview_scroll = 0;
             }
             return vec![];
@@ -419,21 +708,22 @@ impl View for SearchView {
             if self.input_rect.contains(at) {
                 self.focus = Focus::Input;
                 self.input.click(m.column);
+            } else if self.preview_rect.contains(at) {
+                self.focus = Focus::Preview;
             } else if self.list_rect.contains(at) {
                 self.focus = Focus::List;
-                if let Some((_, double)) = self.list.click(m.row, self.hits.len()) {
+                if let Some((_, double)) = self.grid.click(m.column, m.row) {
                     self.preview_scroll = 0;
                     if double {
                         self.focus = Focus::Preview;
+                        self.preview_open = true;
                     }
                 }
-            } else if self.preview_rect.contains(at) {
-                self.focus = Focus::Preview;
             }
         }
         if let MouseEventKind::Down(MouseButton::Right) = m.kind
             && self.list_rect.contains(at)
-            && self.list.click(m.row, self.hits.len()).is_some()
+            && self.grid.click(m.column, m.row).is_some()
         {
             self.focus = Focus::List;
             return self.act_deploy(ctx);
@@ -442,231 +732,31 @@ impl View for SearchView {
     }
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let th = ctx.theme;
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(1)])
             .split(area);
+        self.draw_input(f, rows[0], ctx);
 
-        // Input.
-        let title = Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                format!("{}/{}", self.hits.len(), ctx.snap.skills.len()),
-                th.dim(),
-            ),
-            Span::raw(" "),
-        ]);
-        let block = th.block(title, self.focus == Focus::Input);
-        let inner = block.inner(rows[0]);
-        f.render_widget(block, rows[0]);
-        self.input_rect = rows[0];
-        let prompt = Rect {
-            x: inner.x + 1,
-            width: 2,
-            ..inner
+        // Split keeps a preview open beside the results and so gets one column
+        // of cards; grid spends the whole width on cards and puts the preview
+        // over them when it is wanted.
+        let grid = self.layout(ctx) == UiLayout::Grid;
+        let (left, right) = if grid {
+            (rows[1], Rect::default())
+        } else {
+            split_panes(rows[1], 38)
         };
-        f.render_widget(Paragraph::new(Span::styled("› ", th.accent())), prompt);
-        let field = Rect {
-            x: inner.x + 3,
-            width: inner.width.saturating_sub(4),
-            ..inner
-        };
-        self.input.render(
-            f,
-            field,
-            self.focus == Focus::Input,
-            "search skills…   tag:x  agent:y  status:modified  untagged",
-            th,
-        );
-
-        let (left, right) = split_panes(rows[1], 38);
         self.list_rect = left;
-        self.preview_rect = right;
-
-        // List.
-        let agents = &ctx.snap.agents;
-        let searching = !self.input.value().trim().is_empty()
-            && !Query::parse(self.input.value()).text.is_empty();
-        // A card is three lines: identity, what it is, how it is filed.
-        self.list.item_height = if self.cards {
-            3
-        } else if searching {
-            2
-        } else {
-            1
-        };
-        let rows_h = left.height.saturating_sub(2);
-        let per_page = (rows_h / self.list.item_height.max(1)) as usize;
-        let overflow = per_page > 0 && self.hits.len() > per_page;
-        // Borders + highlight symbol, plus the column the scrollbar sits in.
-        let inner_w = left.width.saturating_sub(4 + u16::from(overflow)) as usize;
-        let dep_w = agents.len() * 3;
-        let key_w = self
-            .hits
-            .iter()
-            .map(|h| width(&ctx.snap.skills[h.index].key))
-            .max()
-            .unwrap_or(8)
-            .min(inner_w.saturating_sub(dep_w + 6));
-        // The selected row paints its own background instead of relying on
-        // `highlight_style`, which is patched over span styles and would
-        // erase the highlighter background on a match.
-        let selected = self.list.selected();
-        let items: Vec<ListItem> = self
-            .hits
-            .iter()
-            .enumerate()
-            .map(|(row, h)| {
-                let row_style = if selected == Some(row) {
-                    if self.focus == Focus::List {
-                        th.selected()
-                    } else {
-                        th.selected_unfocused()
-                    }
-                } else {
-                    Style::default()
-                };
-                let r = &ctx.snap.skills[h.index];
-                if self.cards {
-                    return card(r, h, ctx, agents, inner_w, searching).style(row_style);
-                }
-                let mut spans = vec![status_glyph(&r.status, th), Span::raw(" ")];
-                spans.extend(highlight_spans(
-                    &pad(&r.key, key_w),
-                    &h.terms,
-                    Style::default(),
-                    th,
-                ));
-                let tags_w = inner_w.saturating_sub(key_w + 2 + dep_w + 2);
-                if !r.tags.is_empty() && tags_w > 3 {
-                    spans.push(Span::raw(" "));
-                    spans.extend(highlight_spans(
-                        &pad(&r.tags.join(","), tags_w - 1),
-                        &h.terms,
-                        th.tag(),
-                        th,
-                    ));
-                } else {
-                    spans.push(Span::raw(" ".repeat(tags_w)));
-                }
-                spans.push(Span::raw(" "));
-                for a in agents {
-                    let (g, style) = deploy_glyph(r.deploy.get(&a.key), th);
-                    spans.push(Span::styled(format!("{g}  "), style));
-                }
-                if !searching {
-                    return ListItem::new(Line::from(spans)).style(row_style);
-                }
-                // Second line: where it matched and an excerpt with highlights.
-                let mut sub = vec![Span::raw("  ")];
-                let fields: Vec<&str> = h.fields.iter().map(|f| f.label()).collect();
-                sub.push(Span::styled(
-                    format!("{} ", fields.join("·")),
-                    th.dim().add_modifier(ratatui::style::Modifier::ITALIC),
-                ));
-                let avail = inner_w.saturating_sub(4 + fields.join("·").len());
-                if let Some(e) = &h.excerpt {
-                    sub.extend(highlight_spans(
-                        &fit(&e.text, avail),
-                        &h.terms,
-                        th.dim(),
-                        th,
-                    ))
-                }
-                ListItem::new(vec![Line::from(spans), Line::from(sub)]).style(row_style)
-            })
-            .collect();
-        let mut legend = vec![Span::raw(" skills ")];
-        for a in agents {
-            legend.push(Span::styled(format!("{} ", abbrev(&a.key)), th.dim()));
-        }
-        let list_title = Line::from(legend);
-        let block = th.block(list_title, self.focus == Focus::List);
-        self.list.set_area_from_block(left);
-        let list = List::new(items).block(block).highlight_symbol("▸ ");
-        f.render_stateful_widget(list, left, &mut self.list.state);
-        // Derived from the selection every frame, so wheel, keys and drags all
-        // keep the thumb in step without anyone having to update it.
-        if overflow {
-            let track = Rect {
-                x: left.right().saturating_sub(2),
-                y: left.y + 1,
-                width: 1,
-                height: rows_h,
-            };
-            self.list_track.set(track);
-            let mut sb = ScrollbarState::new(self.hits.len())
-                .position(selected.unwrap_or(0))
-                .viewport_content_length(per_page);
-            f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(None)
-                    .end_symbol(None),
-                track,
-                &mut sb,
-            );
-        } else {
-            self.list_track.clear();
-        }
-        if self.hits.is_empty() {
-            let msg = if ctx.snap.skills.is_empty() {
-                "no skills in this root"
-            } else {
-                "no match"
-            };
-            f.render_widget(
-                Paragraph::new(Span::styled(msg, th.dim())),
-                Rect {
-                    x: left.x + 2,
-                    y: left.y + 1,
-                    width: left.width.saturating_sub(4),
-                    height: 1,
-                },
-            );
-        }
-
-        // Preview.
-        let block = th.block(" preview ", self.focus == Focus::Preview);
-        let inner = block.inner(right);
-        f.render_widget(block, right);
-        self.preview_height = inner.height;
-        if let Some(r) = self.selected(ctx) {
-            let terms: Vec<String> = self.selected_terms().to_vec();
-            let lines = preview_lines(r, ctx, &terms);
-            // Count wrapped lines for scroll clamping (approximate: by display width).
-            let w = inner.width.max(1) as usize;
-            self.preview_lines = lines
-                .iter()
-                .map(|l| width(&l.to_string()).max(1).div_ceil(w))
-                .sum();
-            let max = self.preview_lines.saturating_sub(inner.height as usize) as u16;
-            self.preview_scroll = self.preview_scroll.min(max);
-            let p = Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((self.preview_scroll, 0));
-            f.render_widget(p, inner);
-            if self.preview_lines > inner.height as usize {
-                let mut sb =
-                    ScrollbarState::new(self.preview_lines.saturating_sub(inner.height as usize))
-                        .position(self.preview_scroll as usize);
-                let track = right.inner(ratatui::layout::Margin {
-                    vertical: 1,
-                    horizontal: 0,
-                });
-                f.render_stateful_widget(
-                    Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                        .begin_symbol(None)
-                        .end_symbol(None),
-                    track,
-                    &mut sb,
-                );
+        self.draw_results(f, left, ctx);
+        if grid {
+            self.preview_rect = Rect::default();
+            if self.preview_open && self.selected(ctx).is_some() {
+                self.draw_preview_over(f, rows[1], ctx);
             }
         } else {
-            f.render_widget(
-                Paragraph::new(Span::styled("select a skill to preview", th.dim())),
-                inner,
-            );
+            self.preview_rect = right;
+            self.draw_preview(f, right, ctx);
         }
     }
 
@@ -717,14 +807,14 @@ fn deploy_glyph(
 }
 
 /// A three-line card: name and where it is deployed, what it is, how it is filed.
-fn card<'a>(
+fn card_lines<'a>(
     r: &'a SkillRecord,
     h: &'a Hit,
     ctx: &'a Ctx,
     agents: &'a [skills::reconcile::AgentReport],
     inner_w: usize,
     searching: bool,
-) -> ListItem<'a> {
+) -> Vec<Line<'a>> {
     let th = ctx.theme;
     // Line 1: status, name, and one labelled marker per agent, right-aligned.
     let deploy: Vec<Span> = agents
@@ -796,7 +886,71 @@ fn card<'a>(
         th.dim().add_modifier(ratatui::style::Modifier::ITALIC),
     ));
 
-    ListItem::new(vec![Line::from(head), Line::from(body), Line::from(foot)])
+    vec![Line::from(head), Line::from(body), Line::from(foot)]
+}
+
+/// The compact density: one line, and a second carrying the excerpt while a
+/// query is running. `on` draws the selection marker the list widget used to.
+#[allow(clippy::too_many_arguments)]
+fn row_lines<'a>(
+    r: &'a SkillRecord,
+    h: &'a Hit,
+    ctx: &'a Ctx,
+    agents: &'a [skills::reconcile::AgentReport],
+    inner_w: usize,
+    searching: bool,
+    on: bool,
+) -> Vec<Line<'a>> {
+    let th = ctx.theme;
+    let dep_w = agents.len() * 3;
+    let key_w = 26.min(inner_w.saturating_sub(dep_w + 6));
+    let mut spans = vec![
+        Span::styled(if on { "▸ " } else { "  " }, th.accent()),
+        status_glyph(&r.status, th),
+        Span::raw(" "),
+    ];
+    spans.extend(highlight_spans(
+        &pad(&r.key, key_w),
+        &h.terms,
+        Style::default(),
+        th,
+    ));
+    let tags_w = inner_w.saturating_sub(key_w + 4 + dep_w + 2);
+    if !r.tags.is_empty() && tags_w > 3 {
+        spans.push(Span::raw(" "));
+        spans.extend(highlight_spans(
+            &pad(&r.tags.join(","), tags_w - 1),
+            &h.terms,
+            th.tag(),
+            th,
+        ));
+    } else {
+        spans.push(Span::raw(" ".repeat(tags_w)));
+    }
+    spans.push(Span::raw(" "));
+    for a in agents {
+        let (g, style) = deploy_glyph(r.deploy.get(&a.key), th);
+        spans.push(Span::styled(format!("{g}  "), style));
+    }
+    if !searching {
+        return vec![Line::from(spans)];
+    }
+    let mut sub = vec![Span::raw("    ")];
+    let fields: Vec<&str> = h.fields.iter().map(|f| f.label()).collect();
+    sub.push(Span::styled(
+        format!("{} ", fields.join("·")),
+        th.dim().add_modifier(ratatui::style::Modifier::ITALIC),
+    ));
+    let avail = inner_w.saturating_sub(6 + width(&fields.join("·")));
+    if let Some(e) = &h.excerpt {
+        sub.extend(highlight_spans(
+            &fit(&e.text, avail),
+            &h.terms,
+            th.dim(),
+            th,
+        ))
+    }
+    vec![Line::from(spans), Line::from(sub)]
 }
 
 /// Two-letter agent abbreviation used as a column header.

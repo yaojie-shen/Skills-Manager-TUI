@@ -5,6 +5,8 @@ use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseEvent};
 use skills::Workspace;
 use skills::ops::update::{self, CheckResult, Prepared};
 use skills::reconcile::Snapshot;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
@@ -39,11 +41,55 @@ pub enum TaskOutput {
     Installed(String, Result<String>),
 }
 
-pub fn spawn_input(tx: Sender<Msg>) {
+/// A way to take the input thread off the terminal for a while.
+///
+/// Handing the terminal to an editor is not just a matter of leaving the
+/// alternate screen. The input thread sits inside crossterm's reader, and while
+/// it does, two things go wrong: the editor and the thread compete for the same
+/// keystrokes, and the cursor-position query that ratatui makes on the way
+/// back in cannot get at the reader to collect its answer and times out. So
+/// the thread has to be parked, and confirmed parked, before either happens.
+#[derive(Default)]
+pub struct InputGate {
+    pause: AtomicBool,
+    idle: AtomicBool,
+}
+
+impl InputGate {
+    /// Ask the thread to stop reading and wait until it has. The wait is what
+    /// matters: a flag alone would leave a window where the thread is still in
+    /// `poll`, and a keystroke meant for the editor lands in the TUI instead.
+    pub fn hold(&self) {
+        self.idle.store(false, Ordering::SeqCst);
+        self.pause.store(true, Ordering::SeqCst);
+        while !self.idle.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    pub fn release(&self) {
+        self.pause.store(false, Ordering::SeqCst);
+    }
+}
+
+pub fn spawn_input(tx: Sender<Msg>, gate: Arc<InputGate>) {
     std::thread::Builder::new()
         .name("input".into())
         .spawn(move || {
             loop {
+                if gate.pause.load(Ordering::SeqCst) {
+                    gate.idle.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                gate.idle.store(false, Ordering::SeqCst);
+                // Polling with a timeout rather than blocking in `read` is what
+                // lets the pause flag be noticed at all.
+                match crossterm::event::poll(Duration::from_millis(100)) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(_) => return,
+                }
                 match crossterm::event::read() {
                     Ok(Event::Key(k))
                         if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat =>

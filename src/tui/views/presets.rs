@@ -9,6 +9,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
+use skills::history;
 use skills::ops::deploy;
 use skills::preset::Preset;
 
@@ -83,14 +84,8 @@ impl PresetsView {
             return vec![];
         };
         let name = p.name.clone();
-        vec![Action::Write(Box::new(move |ws| {
-            let mut p = ws
-                .presets
-                .load(&name)?
-                .ok_or_else(|| anyhow::anyhow!("no such preset: {name}"))?;
-            p.skills.retain(|s| s != &skill);
-            ws.presets.save(&p)?;
-            Ok(format!("{name}: removed {skill}"))
+        vec![Action::WriteMeta(Box::new(move |ws| {
+            history::preset_edit(ws, &name, |members| members.retain(|s| s != &skill))
         }))]
     }
 }

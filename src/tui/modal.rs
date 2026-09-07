@@ -1,7 +1,7 @@
 //! Overlays: help, messages, confirmations, text prompts, agent picker,
 //! and the update conflict resolver.
 
-use super::app::{Action, Ctx, Hints, Step, WriteFn};
+use super::app::{Action, Ctx, Hints, MetaFn, Step, WriteFn};
 use super::widgets::{Input, ListNav, button, fit, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -9,6 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
+use skills::history;
 use skills::ops::deploy;
 use skills::ops::edit;
 use skills::ops::update::{self, FileChange, Prepared, Take};
@@ -71,7 +72,7 @@ pub enum Modal {
     ConfirmWrite {
         title: String,
         lines: Vec<String>,
-        write: Option<WriteFn>,
+        write: Option<MetaFn>,
         /// Set when this confirmation is a history step.
         then: Option<Step>,
         btn: usize,
@@ -156,7 +157,16 @@ impl Modal {
             rect: Rect::default(),
         }
     }
+    /// A write with nothing to log: everything it could take back is either
+    /// gone for good or already an entry of its own.
     fn confirm_write(title: String, lines: Vec<String>, write: WriteFn) -> Self {
+        Self::confirm_meta(
+            title,
+            lines,
+            Box::new(move |ws| write(ws).map(|m| (m, None))),
+        )
+    }
+    fn confirm_meta(title: String, lines: Vec<String>, write: MetaFn) -> Self {
         Modal::ConfirmWrite {
             title,
             lines,
@@ -210,11 +220,13 @@ impl Modal {
     }
     pub fn delete_tag(tag: &str) -> Self {
         let t = tag.to_string();
-        Self::confirm_write(
+        Self::confirm_meta(
             format!(" delete tag {tag} "),
             vec![format!("Remove the tag \"{tag}\" from every skill?")],
             Box::new(move |ws| {
-                edit::tag_delete(ws, &t).map(|n| format!("removed tag from {n} skill(s)"))
+                history::tag_edit(ws, |ws| {
+                    edit::tag_delete(ws, &t).map(|n| format!("removed tag from {n} skill(s)"))
+                })
             }),
         )
     }
@@ -1226,22 +1238,14 @@ fn preset_toggle(action: &PickAction, skill: &str, on: bool) -> Action {
         return Action::Toast(String::new());
     };
     let (preset, skill) = (preset.clone(), skill.to_string());
-    Action::Write(Box::new(move |ws| {
-        let mut p = ws
-            .presets
-            .load(&preset)?
-            .ok_or_else(|| anyhow::anyhow!("no such preset: {preset}"))?;
-        p.skills.retain(|s| s != &skill);
-        if on {
-            p.skills.push(skill.clone());
-            p.skills.sort();
-        }
-        ws.presets.save(&p)?;
-        Ok(format!(
-            "{} {skill} {} {preset}",
-            if on { "added" } else { "removed" },
-            if on { "to" } else { "from" }
-        ))
+    Action::WriteMeta(Box::new(move |ws| {
+        history::preset_edit(ws, &preset, |skills| {
+            skills.retain(|s| s != &skill);
+            if on {
+                skills.push(skill.clone());
+                skills.sort();
+            }
+        })
     }))
 }
 
@@ -1259,8 +1263,8 @@ fn short_ref(reference: &str) -> String {
 }
 
 /// A confirmed write, plus the history move it belongs to when it is a step.
-fn write_actions(w: WriteFn, then: Option<Step>) -> Vec<Action> {
-    let mut out = vec![Action::CloseModal, Action::Write(w)];
+fn write_actions(w: MetaFn, then: Option<Step>) -> Vec<Action> {
+    let mut out = vec![Action::CloseModal, Action::WriteMeta(w)];
     if let Some(step) = then {
         out.push(Action::Step(step));
     }
@@ -1355,16 +1359,18 @@ fn submit(kind: &InputKind, value: String, _ctx: &Ctx) -> Vec<Action> {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            vec![Action::Write(Box::new(move |ws| {
-                edit::tag_set(ws, &skill, &tags).map(|m| {
-                    format!(
-                        "{skill}: {}",
-                        if m.tags.is_empty() {
-                            "no tags".into()
-                        } else {
-                            m.tags.join(", ")
-                        }
-                    )
+            vec![Action::WriteMeta(Box::new(move |ws| {
+                history::tag_edit(ws, |ws| {
+                    edit::tag_set(ws, &skill, &tags).map(|m| {
+                        format!(
+                            "{skill}: {}",
+                            if m.tags.is_empty() {
+                                "no tags".into()
+                            } else {
+                                m.tags.join(", ")
+                            }
+                        )
+                    })
                 })
             }))]
         }
@@ -1403,8 +1409,10 @@ fn submit(kind: &InputKind, value: String, _ctx: &Ctx) -> Vec<Action> {
             if new.is_empty() || new == old {
                 return vec![];
             }
-            vec![Action::Write(Box::new(move |ws| {
-                edit::tag_rename(ws, &old, &new).map(|n| format!("renamed tag on {n} skill(s)"))
+            vec![Action::WriteMeta(Box::new(move |ws| {
+                history::tag_edit(ws, |ws| {
+                    edit::tag_rename(ws, &old, &new).map(|n| format!("renamed tag on {n} skill(s)"))
+                })
             }))]
         }
     }

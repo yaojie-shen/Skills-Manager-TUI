@@ -11,15 +11,28 @@
 //! reverses precisely what happened, and does not change meaning if the preset
 //! behind it is edited or deleted afterwards.
 //!
+//! Metadata writes cannot be re-derived that way. A link that was removed can
+//! be put back because the skill and the agent directory between them still say
+//! what it was; a note that was overwritten exists nowhere else the moment the
+//! file is saved. So a metadata entry carries the values themselves — for tags
+//! and preset members the two sets the write added and took off, for a note the
+//! text on either side — and only the *reversal* is re-derived against the file
+//! as it stands. Sets are undone element by element, so a tag added by hand in
+//! between survives, and undoing "add a tag that was already there" removes
+//! nothing, because adding it changed nothing to begin with. A note has no such
+//! structure: it is put back only while the file still holds what this step
+//! wrote, and anything else means someone edited it since, so it is left alone.
+//!
 //! The history lives only as long as the process. Replaying an intent against a
 //! tree that git or another session has moved on is not something a stored log
 //! could make safe, and this tool keeps no database.
 
 use crate::Workspace;
 use crate::ops::deploy::{self, Action};
+use crate::ops::edit;
 use crate::reconcile::Snapshot;
-use anyhow::{Result, bail};
-use std::collections::BTreeMap;
+use anyhow::{Context, Result, bail};
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 /// One link: a skill in one agent's directory.
@@ -33,6 +46,10 @@ pub enum Intent {
         added: Vec<Pair>,
         removed: Vec<Pair>,
     },
+    /// Metadata written: tags, a note, preset membership. One batch, because a
+    /// tag renamed or deleted touches every skill that carried it and comes
+    /// back as one step.
+    Meta(Vec<MetaChange>),
     /// A skill fetched into the root. Undoing removes what was fetched.
     Install { skill: String },
     /// Something that discarded content and so cannot be taken back. Kept so
@@ -69,6 +86,7 @@ impl Intent {
                 }
                 parts.join("; ")
             }
+            Intent::Meta(changes) => describe_changes(changes),
             Intent::Install { skill } => format!("installed {skill}"),
             Intent::OneWay { what } => what.clone(),
         }
@@ -114,6 +132,377 @@ fn list(items: &[&str], max: usize, plural: &str) -> String {
     }
 }
 
+/// One metadata write, as the difference it made. Reversing it swaps the two
+/// sides; applying it means "leave the file holding this", which is why the
+/// same value works for undo and for redo.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetaChange {
+    /// Tags of one skill: what the write put on it and what it took off.
+    Tags {
+        skill: String,
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
+    /// The note of one skill. `None` on either side is no note at all, which is
+    /// a value like any other and has to be recorded as one.
+    Note {
+        skill: String,
+        before: Option<String>,
+        after: Option<String>,
+    },
+    /// Members of one preset.
+    Preset {
+        name: String,
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
+}
+
+/// What applying one change would do to the files as they stand now.
+enum Fate {
+    /// The file already reads the way applying it would leave it.
+    Done,
+    /// Applying it would discard an edit made since, so it is not applied.
+    Blocked(String),
+    Ready,
+}
+
+impl MetaChange {
+    fn reverse(&self) -> MetaChange {
+        match self.clone() {
+            MetaChange::Tags {
+                skill,
+                added,
+                removed,
+            } => MetaChange::Tags {
+                skill,
+                added: removed,
+                removed: added,
+            },
+            MetaChange::Note {
+                skill,
+                before,
+                after,
+            } => MetaChange::Note {
+                skill,
+                before: after,
+                after: before,
+            },
+            MetaChange::Preset {
+                name,
+                added,
+                removed,
+            } => MetaChange::Preset {
+                name,
+                added: removed,
+                removed: added,
+            },
+        }
+    }
+
+    /// One line, phrased as the change to make. It reads as the question a
+    /// confirmation asks and as the line the log shows.
+    fn describe(&self) -> String {
+        match self {
+            MetaChange::Tags {
+                skill,
+                added,
+                removed,
+            } => match (added.is_empty(), removed.is_empty()) {
+                (false, true) => format!("tag {skill} with {}", some(added, 3, "tags")),
+                (true, false) => format!("take {} off {skill}", some(removed, 3, "tags")),
+                _ => format!("change the tags on {skill}"),
+            },
+            // The text goes in the line: one note looks much like another, and
+            // this is what a confirmation is for.
+            MetaChange::Note { skill, after, .. } => match after {
+                Some(t) => format!("set the note on {skill} to \"{}\"", snippet(t)),
+                None => format!("clear the note on {skill}"),
+            },
+            MetaChange::Preset {
+                name,
+                added,
+                removed,
+            } => match (added.is_empty(), removed.is_empty()) {
+                (false, true) => format!("put {} in preset {name}", some(added, 3, "skills")),
+                (true, false) => {
+                    format!("take {} out of preset {name}", some(removed, 3, "skills"))
+                }
+                _ => format!("change the members of preset {name}"),
+            },
+        }
+    }
+
+    fn fate(&self, ws: &Workspace) -> Result<Fate> {
+        match self {
+            MetaChange::Tags {
+                skill,
+                added,
+                removed,
+            } => match current_tags(ws, skill)? {
+                None => Ok(Fate::Blocked(format!("{skill} is gone"))),
+                Some(now) => Ok(
+                    if added.iter().any(|t| !now.contains(t))
+                        || removed.iter().any(|t| now.contains(t))
+                    {
+                        Fate::Ready
+                    } else {
+                        Fate::Done
+                    },
+                ),
+            },
+            MetaChange::Note {
+                skill,
+                before,
+                after,
+            } => match current_note(ws, skill)? {
+                None => Ok(Fate::Blocked(format!("{skill} is gone"))),
+                Some(now) if &now == after => Ok(Fate::Done),
+                Some(now) if &now == before => Ok(Fate::Ready),
+                Some(_) => Ok(Fate::Blocked(format!(
+                    "the note on {skill} was changed since"
+                ))),
+            },
+            MetaChange::Preset {
+                name,
+                added,
+                removed,
+            } => match ws.presets.load(name)? {
+                None => Ok(Fate::Blocked(format!("preset {name} is gone"))),
+                Some(p) => Ok(
+                    if added.iter().any(|s| !p.skills.contains(s))
+                        || removed.iter().any(|s| p.skills.contains(s))
+                    {
+                        Fate::Ready
+                    } else {
+                        Fate::Done
+                    },
+                ),
+            },
+        }
+    }
+
+    /// Leave the file holding this change. The fate is worked out again here
+    /// because the confirmation the user answered was drawn a moment ago.
+    fn apply(&self, ws: &Workspace) -> Result<String> {
+        match self.fate(ws)? {
+            Fate::Done => return Ok(format!("already done: {}", self.describe())),
+            Fate::Blocked(why) => return Ok(format!("{why}; left as it is")),
+            Fate::Ready => {}
+        }
+        match self {
+            MetaChange::Tags {
+                skill,
+                added,
+                removed,
+            } => {
+                let mut meta = edit::load_or_init(ws, skill)?;
+                meta.tags.retain(|t| !removed.contains(t));
+                for t in added {
+                    if !meta.tags.contains(t) {
+                        meta.tags.push(t.clone());
+                    }
+                }
+                ws.meta.save(skill, &meta)?;
+                Ok(format!(
+                    "{skill}: {}",
+                    if meta.tags.is_empty() {
+                        "no tags".to_string()
+                    } else {
+                        meta.tags.join(", ")
+                    }
+                ))
+            }
+            MetaChange::Note { skill, after, .. } => {
+                edit::note_set(ws, skill, after.as_deref())?;
+                Ok(format!(
+                    "note {} on {skill}",
+                    if after.is_some() {
+                        "restored"
+                    } else {
+                        "cleared"
+                    }
+                ))
+            }
+            MetaChange::Preset {
+                name,
+                added,
+                removed,
+            } => {
+                let mut p = ws
+                    .presets
+                    .load(name)?
+                    .with_context(|| format!("no such preset: {name}"))?;
+                p.skills.retain(|s| !removed.contains(s));
+                let before = p.skills.len();
+                for s in added {
+                    if !p.skills.contains(s) {
+                        p.skills.push(s.clone());
+                    }
+                }
+                if p.skills.len() != before {
+                    p.skills.sort();
+                }
+                ws.presets.save(&p)?;
+                Ok(format!("{name}: {} skill(s)", p.skills.len()))
+            }
+        }
+    }
+}
+
+/// The tags a skill carries now, or `None` if neither its metadata nor its
+/// directory is there any more.
+fn current_tags(ws: &Workspace, skill: &str) -> Result<Option<Vec<String>>> {
+    match ws.meta.load(skill).ok().flatten() {
+        Some(m) => Ok(Some(m.tags)),
+        None => Ok(ws.skill_path(skill).is_dir().then(Vec::new)),
+    }
+}
+
+/// The note a skill carries now. The outer `None` is "no such skill", the inner
+/// one "no note".
+fn current_note(ws: &Workspace, skill: &str) -> Result<Option<Option<String>>> {
+    match ws.meta.load(skill).ok().flatten() {
+        Some(m) => Ok(Some(m.note)),
+        None => Ok(ws.skill_path(skill).is_dir().then_some(None)),
+    }
+}
+
+fn describe_changes(changes: &[MetaChange]) -> String {
+    match changes {
+        [] => "nothing".into(),
+        [one] => one.describe(),
+        many if many.iter().all(|c| matches!(c, MetaChange::Tags { .. })) => {
+            format!("change the tags on {} skills", many.len())
+        }
+        many => format!("{} metadata changes", many.len()),
+    }
+}
+
+/// The opening of a note, on one line, for a dialog that has room for little.
+fn snippet(note: &str) -> String {
+    let first = note.lines().map(str::trim).find(|l| !l.is_empty());
+    let first = first.unwrap_or("");
+    match first.char_indices().nth(40) {
+        Some((i, _)) => format!("{}…", &first[..i]),
+        None if first.len() < note.trim().len() => format!("{first}…"),
+        None => first.to_string(),
+    }
+}
+
+fn some(items: &[String], max: usize, plural: &str) -> String {
+    let refs: Vec<&str> = items.iter().map(|s| s.as_str()).collect();
+    list(&refs, max, plural)
+}
+
+/// Run a write that may change the tags of any number of skills, and record the
+/// per-skill differences it left behind. Comparing every metadata file on both
+/// sides costs nothing next to the rescan that follows, and it covers a rename
+/// or a delete spanning many skills with the same code as a single edit.
+pub fn tag_edit(
+    ws: &Workspace,
+    write: impl FnOnce(&Workspace) -> Result<String>,
+) -> Result<(String, Option<Intent>)> {
+    let before = all_tags(ws)?;
+    let message = write(ws)?;
+    let after = all_tags(ws)?;
+    let mut changes = Vec::new();
+    let empty = Vec::new();
+    for key in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
+        let (b, a) = (
+            before.get(key).unwrap_or(&empty),
+            after.get(key).unwrap_or(&empty),
+        );
+        let added: Vec<String> = a.iter().filter(|t| !b.contains(t)).cloned().collect();
+        let removed: Vec<String> = b.iter().filter(|t| !a.contains(t)).cloned().collect();
+        if !added.is_empty() || !removed.is_empty() {
+            changes.push(MetaChange::Tags {
+                skill: key.clone(),
+                added,
+                removed,
+            });
+        }
+    }
+    Ok((
+        message,
+        (!changes.is_empty()).then_some(Intent::Meta(changes)),
+    ))
+}
+
+fn all_tags(ws: &Workspace) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut out = BTreeMap::new();
+    for key in ws.meta.list_keys()? {
+        // A metadata file too broken to read is also one this tool must never
+        // rewrite, so keep it out of the comparison entirely.
+        if let Some(m) = ws.meta.load(&key).ok().flatten() {
+            out.insert(key, m.tags);
+        }
+    }
+    Ok(out)
+}
+
+/// Write a note, keeping the text it replaced.
+pub fn note_edit(
+    ws: &Workspace,
+    skill: &str,
+    text: Option<&str>,
+) -> Result<(String, Option<Intent>)> {
+    let before = ws.meta.load(skill).ok().flatten().and_then(|m| m.note);
+    let after = edit::note_set(ws, skill, text)?.note;
+    let message = format!(
+        "note {} on {skill}",
+        if after.is_some() { "saved" } else { "cleared" }
+    );
+    let intent = (after != before).then(|| {
+        Intent::Meta(vec![MetaChange::Note {
+            skill: skill.to_string(),
+            before,
+            after,
+        }])
+    });
+    Ok((message, intent))
+}
+
+/// Change the membership of a preset, recording which skills went in and out.
+pub fn preset_edit(
+    ws: &Workspace,
+    name: &str,
+    change: impl FnOnce(&mut Vec<String>),
+) -> Result<(String, Option<Intent>)> {
+    let mut p = ws
+        .presets
+        .load(name)?
+        .with_context(|| format!("no such preset: {name}"))?;
+    let before = p.skills.clone();
+    change(&mut p.skills);
+    ws.presets.save(&p)?;
+    let added: Vec<String> = p
+        .skills
+        .iter()
+        .filter(|s| !before.contains(s))
+        .cloned()
+        .collect();
+    let removed: Vec<String> = before
+        .iter()
+        .filter(|s| !p.skills.contains(s))
+        .cloned()
+        .collect();
+    let message = match (added.as_slice(), removed.as_slice()) {
+        ([], []) => return Ok((format!("{name} unchanged"), None)),
+        ([s], []) => format!("added {s} to {name}"),
+        ([], [s]) => format!("removed {s} from {name}"),
+        _ => format!("{name}: {} skill(s)", p.skills.len()),
+    };
+    Ok((
+        message,
+        Some(Intent::Meta(vec![MetaChange::Preset {
+            name: name.to_string(),
+            added,
+            removed,
+        }])),
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub intent: Intent,
@@ -126,15 +515,20 @@ pub enum Plan {
     Links(Vec<Action>),
     /// A write, described for the confirmation.
     Write { describe: String, apply: WriteBack },
-    /// The tree already looks the way the step would leave it.
-    Nothing,
+    /// Nothing left to do, and why: the tree already looks the way the step
+    /// would leave it, or something changed since that must not be overwritten.
+    Nothing(String),
 }
 
 /// A non-link step to run. Carrying the values rather than a closure keeps the
 /// plan inspectable, which the confirmation needs.
 #[derive(Debug, Clone)]
 pub enum WriteBack {
-    RemoveInstalled { skill: String },
+    RemoveInstalled {
+        skill: String,
+    },
+    /// Metadata to write, already turned the way this step runs it.
+    Meta(Vec<MetaChange>),
 }
 
 impl WriteBack {
@@ -142,8 +536,14 @@ impl WriteBack {
         match self {
             WriteBack::RemoveInstalled { skill } => {
                 let snap = ws.scan()?;
-                crate::ops::edit::remove(ws, &snap, skill, false)
-                    .map(|_| format!("removed {skill} again"))
+                edit::remove(ws, &snap, skill, false).map(|_| format!("removed {skill} again"))
+            }
+            WriteBack::Meta(changes) => {
+                let mut done = Vec::new();
+                for c in changes {
+                    done.push(c.apply(ws)?);
+                }
+                Ok(done.join("; "))
             }
         }
     }
@@ -241,10 +641,17 @@ fn plan_pairs(
 pub fn undo_plan(ws: &Workspace, snap: &Snapshot, intent: &Intent) -> Result<Plan> {
     match intent {
         // Reversed: what was added comes out, what was removed goes back.
-        Intent::Links { added, removed } => links(plan_pairs(ws, snap, removed, added)?),
+        Intent::Links { added, removed } => links(plan_pairs(ws, snap, removed, added)?, intent),
+        Intent::Meta(changes) => meta(
+            ws,
+            &changes.iter().map(MetaChange::reverse).collect::<Vec<_>>(),
+        ),
         Intent::Install { skill } => {
             if snap.get(skill).is_none() {
-                return Ok(Plan::Nothing);
+                return Ok(Plan::Nothing(format!(
+                    "already done: {}",
+                    intent.describe()
+                )));
             }
             Ok(Plan::Write {
                 describe: format!("remove {skill} and every link to it"),
@@ -260,7 +667,8 @@ pub fn undo_plan(ws: &Workspace, snap: &Snapshot, intent: &Intent) -> Result<Pla
 /// Redoing runs the original intent again.
 pub fn redo_plan(ws: &Workspace, snap: &Snapshot, intent: &Intent) -> Result<Plan> {
     match intent {
-        Intent::Links { added, removed } => links(plan_pairs(ws, snap, added, removed)?),
+        Intent::Links { added, removed } => links(plan_pairs(ws, snap, added, removed)?, intent),
+        Intent::Meta(changes) => meta(ws, changes),
         // Fetching is a fresh network operation, not a reversal of a removal.
         Intent::Install { skill } => bail!("install {skill} again to bring it back"),
         Intent::OneWay { what } => bail!("{what} cannot be redone"),
@@ -269,12 +677,40 @@ pub fn redo_plan(ws: &Workspace, snap: &Snapshot, intent: &Intent) -> Result<Pla
 
 /// An empty plan means the tree already matches; say so rather than opening an
 /// empty confirmation.
-fn links(actions: Vec<Action>) -> Result<Plan> {
+fn links(actions: Vec<Action>, intent: &Intent) -> Result<Plan> {
     if actions.iter().any(|a| a.is_change()) {
         Ok(Plan::Links(actions))
     } else {
-        Ok(Plan::Nothing)
+        Ok(Plan::Nothing(format!(
+            "already done: {}",
+            intent.describe()
+        )))
     }
+}
+
+/// Keep only the changes that would still do something. One a hand edit has
+/// overtaken is dropped with its reason rather than written over.
+fn meta(ws: &Workspace, changes: &[MetaChange]) -> Result<Plan> {
+    let mut ready = Vec::new();
+    let mut blocked = Vec::new();
+    for c in changes {
+        match c.fate(ws)? {
+            Fate::Ready => ready.push(c.clone()),
+            Fate::Blocked(why) => blocked.push(why),
+            Fate::Done => {}
+        }
+    }
+    if ready.is_empty() {
+        return Ok(Plan::Nothing(if blocked.is_empty() {
+            format!("already done: {}", describe_changes(changes))
+        } else {
+            blocked.join("; ")
+        }));
+    }
+    Ok(Plan::Write {
+        describe: describe_changes(&ready),
+        apply: WriteBack::Meta(ready),
+    })
 }
 
 #[cfg(test)]
@@ -377,6 +813,46 @@ mod tests {
         h.commit_redo();
         assert!(h.is_empty());
         assert!(h.last().is_none());
+    }
+
+    #[test]
+    fn reversing_a_metadata_change_swaps_the_two_sides() {
+        let note = MetaChange::Note {
+            skill: "printer".into(),
+            before: None,
+            after: Some("out of paper".into()),
+        };
+        assert_eq!(
+            note.describe(),
+            "set the note on printer to \"out of paper\""
+        );
+        let back = note.reverse();
+        assert_eq!(back.describe(), "clear the note on printer");
+        assert_eq!(back.reverse(), note, "twice over is where it started");
+
+        let tags = MetaChange::Tags {
+            skill: "bicycle".into(),
+            added: vec!["commute".into()],
+            removed: vec![],
+        };
+        assert_eq!(tags.describe(), "tag bicycle with commute");
+        assert_eq!(tags.reverse().describe(), "take commute off bicycle");
+    }
+
+    #[test]
+    fn a_write_across_several_skills_is_described_as_one() {
+        let changes: Vec<MetaChange> = ["printer", "bicycle", "etcd"]
+            .iter()
+            .map(|s| MetaChange::Tags {
+                skill: (*s).into(),
+                added: vec!["paper".into()],
+                removed: vec!["stationery".into()],
+            })
+            .collect();
+        assert_eq!(
+            Intent::Meta(changes).describe(),
+            "change the tags on 3 skills"
+        );
     }
 
     #[test]

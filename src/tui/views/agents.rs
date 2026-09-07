@@ -7,21 +7,25 @@
 //! ours to add and remove, anything else the agent brought itself is shown but
 //! never written to.
 
-use super::{View, split_panes, wheel};
+use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
-use crate::tui::widgets::{ListNav, fit, pad, width};
+use crate::tui::widgets::{CardGrid, fit, pad, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use skills::config::UiDensity;
 use skills::ops::deploy::{
     self, PresetState, PresetStatus, plan_preset_activate, plan_preset_deactivate, preset_status,
 };
 use skills::preset::Preset;
+
+/// Narrowest an entry card may get before the grid gives up a column.
+const MIN_CARD_W: u16 = 40;
+/// Most columns worth having on one row.
+const MAX_COLS: usize = 4;
 use skills::reconcile::{AgentDirMode, EntryState};
 
 /// The three bands of the page, top to bottom. Arrows move between them, so
@@ -34,15 +38,13 @@ enum Focus {
     Entries,
 }
 
-/// One row of the entry list: either a section header or an entry under it.
-enum Row<'a> {
-    Header(String),
-    /// One skill name and the state it has in the agent on show.
-    Entry {
-        name: &'a str,
-        state: Option<&'a EntryState>,
-        managed: bool,
-    },
+/// One entry of the agent's directory: a skill name and what shape it is in.
+/// The two groups used to carry captions of their own; each card now says which
+/// group it is in, which is what let the whole list become a grid.
+struct Row<'a> {
+    name: &'a str,
+    state: Option<&'a EntryState>,
+    managed: bool,
 }
 
 #[derive(Default)]
@@ -52,16 +54,14 @@ pub struct AgentsView {
     focus: FocusState,
     presets: Vec<(Preset, PresetStatus)>,
     preset_cursor: usize,
-    entries: ListNav,
-    /// Compact rows are one line each; the default card gives an entry three.
-    compact: bool,
+    entries: CardGrid,
+    /// Session override for `[ui].density`; flipping it never writes back.
+    density: Option<UiDensity>,
     scope_rects: Vec<(Rect, String)>,
     preset_rects: Vec<Rect>,
     /// The one column the entry scrollbar occupies, empty while it all fits.
     entries_track: Rect,
     left: Rect,
-    right: Rect,
-    detail_scroll: u16,
 }
 
 /// `Focus` needs a default for `#[derive(Default)]` on the view.
@@ -75,6 +75,10 @@ impl Default for FocusState {
 }
 
 impl AgentsView {
+    fn density(&self, ctx: &Ctx) -> UiDensity {
+        self.density.unwrap_or(ctx.ws.config.ui.density)
+    }
+
     /// The scope as the planners want it: one key, or nothing at all.
     fn scope_agents(&self) -> Vec<String> {
         if self.scope.is_empty() {
@@ -93,52 +97,18 @@ impl AgentsView {
     }
 
     /// Entry rows for the current scope, grouped into ours and theirs.
-    /// A header is a caption, not something to act on. A move that lands on one
-    /// carries on in the direction it was going, and falls back the other way
-    /// when there is nothing further ahead.
-    fn snap_off_header(&mut self, rows: &[Row], dir: i32) {
-        let Some(i) = self.entries.selected() else {
-            return;
-        };
-        if !matches!(rows.get(i), Some(Row::Header(_))) {
-            return;
-        }
-        let entry = |j: &usize| matches!(rows.get(*j), Some(Row::Entry { .. }));
-        let ahead = (i + 1..rows.len()).find(entry);
-        let behind = (0..i).rev().find(entry);
-        let pick = if dir >= 0 {
-            ahead.or(behind)
-        } else {
-            behind.or(ahead)
-        };
-        if let Some(j) = pick {
-            self.entries.select(Some(j));
-        }
-    }
-
-    /// Whether anything selectable sits above the selection. Nothing there means
-    /// the arrow leaves the list for the pills above it.
-    fn at_first_entry(&self, rows: &[Row]) -> bool {
-        let Some(i) = self.entries.selected() else {
-            return true;
-        };
-        !(0..i).any(|j| matches!(rows.get(j), Some(Row::Entry { .. })))
-    }
-
+    /// Ours first, then the agent's own; alphabetical inside each group.
     fn rows<'a>(&self, ctx: &'a Ctx) -> Vec<Row<'a>> {
         let Some(report) = ctx.snap.agent(&self.scope) else {
             return Vec::new();
         };
         let mut names: Vec<&str> = report.entries.keys().map(String::as_str).collect();
         names.sort_unstable();
-        let mut managed: Vec<Row> = Vec::new();
-        let mut local: Vec<Row> = Vec::new();
+        let (mut managed, mut local): (Vec<Row>, Vec<Row>) = (Vec::new(), Vec::new());
         for name in names {
             let state = report.entries.get(name);
-            // Ours as soon as it links into the root; otherwise the agent's own,
-            // whatever shape it takes.
             let is_managed = matches!(state, Some(EntryState::Deployed));
-            let row = Row::Entry {
+            let row = Row {
                 name,
                 state,
                 managed: is_managed,
@@ -149,19 +119,8 @@ impl AgentsView {
                 local.push(row)
             }
         }
-        let mut out = Vec::new();
-        if !managed.is_empty() {
-            out.push(Row::Header(format!("managed · {} linked", managed.len())));
-            out.append(&mut managed);
-        }
-        if !local.is_empty() {
-            out.push(Row::Header(format!(
-                "the agent's own · {} left alone",
-                local.len()
-            )));
-            out.append(&mut local);
-        }
-        out
+        managed.append(&mut local);
+        managed
     }
 
     fn selected_preset(&self) -> Option<&(Preset, PresetStatus)> {
@@ -246,7 +205,6 @@ impl View for AgentsView {
         self.preset_cursor = self.preset_cursor.min(self.presets.len().saturating_sub(1));
         let rows = self.rows(ctx);
         self.entries.clamp(rows.len());
-        self.snap_off_header(&rows, 1);
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
@@ -263,7 +221,10 @@ impl View for AgentsView {
                 return vec![Action::Rescan];
             }
             KeyCode::Char('v') => {
-                self.compact = !self.compact;
+                self.density = Some(match self.density(ctx) {
+                    UiDensity::Cards => UiDensity::Rows,
+                    UiDensity::Rows => UiDensity::Cards,
+                });
                 return vec![];
             }
             KeyCode::Char('s') => {
@@ -335,7 +296,6 @@ impl View for AgentsView {
                     self.set_focus(Focus::Entries);
                     let rows = self.rows(ctx);
                     self.entries.clamp(rows.len());
-                    self.snap_off_header(&rows, 1);
                     vec![]
                 }
                 _ => vec![],
@@ -344,28 +304,29 @@ impl View for AgentsView {
                 let rows = self.rows(ctx);
                 let n = rows.len();
                 match k.code {
+                    // Down and up cross a whole row of cards; left and right
+                    // walk along one, and only mean anything once there is more
+                    // than one column to walk.
                     KeyCode::Down | KeyCode::Char('j') => {
-                        self.entries.move_by(1, n);
-                        self.snap_off_header(&rows, 1);
+                        self.entries.move_rows(1, n);
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if self.at_first_entry(&rows) {
+                        if self.entries.selected().unwrap_or(0) < self.entries.cols() {
                             self.set_focus(Focus::Presets);
                         } else {
-                            self.entries.move_by(-1, n);
-                            self.snap_off_header(&rows, -1);
+                            self.entries.move_rows(-1, n);
                         }
                     }
+                    KeyCode::Right | KeyCode::Char('l') => self.entries.move_by(1, n),
+                    KeyCode::Left | KeyCode::Char('h') => self.entries.move_by(-1, n),
                     KeyCode::Home | KeyCode::Char('g') => {
                         self.entries.first(n);
-                        self.snap_off_header(&rows, 1);
                     }
                     KeyCode::End | KeyCode::Char('G') => {
                         self.entries.last(n);
-                        self.snap_off_header(&rows, -1);
                     }
                     KeyCode::Enter => {
-                        if let Some(Row::Entry { name, .. }) =
+                        if let Some(Row { name, .. }) =
                             self.entries.selected().and_then(|i| rows.get(i))
                         {
                             return vec![Action::Search {
@@ -386,11 +347,8 @@ impl View for AgentsView {
         if let Some(d) = wheel(&m) {
             if self.left.contains(at) {
                 self.set_focus(Focus::Entries);
-                let rows = self.rows(ctx);
-                self.entries.move_by(d, rows.len());
-                self.snap_off_header(&rows, d);
-            } else if self.right.contains(at) {
-                self.detail_scroll = (self.detail_scroll as i32 + d).max(0) as u16;
+                // A wheel notch is a row of cards, however many are on it.
+                self.entries.move_rows(d.signum(), self.rows(ctx).len());
             }
             return vec![];
         }
@@ -401,14 +359,12 @@ impl View for AgentsView {
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left)
         ) && self.entries_track.contains(at)
         {
-            let n = self.rows(ctx).len();
+            let n = self.entries.grid_rows();
             if n > 0 {
                 let span = self.entries_track.height.max(1) as usize;
-                let i = (m.row - self.entries_track.y) as usize * n / span;
+                let r = (m.row.saturating_sub(self.entries_track.y)) as usize * n / span;
                 self.set_focus(Focus::Entries);
-                self.entries.select(Some(i.min(n - 1)));
-                let rows = self.rows(ctx);
-                self.snap_off_header(&rows, 1);
+                self.entries.select_row(r.min(n - 1));
             }
             return vec![];
         }
@@ -438,9 +394,7 @@ impl View for AgentsView {
             }
             if self.left.contains(at) {
                 self.set_focus(Focus::Entries);
-                let rows = self.rows(ctx);
-                self.entries.click(m.row, rows.len());
-                self.snap_off_header(&rows, 1);
+                self.entries.click(m.column, m.row);
             }
         }
         vec![]
@@ -562,16 +516,18 @@ impl View for AgentsView {
             };
             let selected = i == self.preset_cursor;
             let focused = self.focus() == Focus::Presets;
-            // With the keyboard here the pill is lit; without it the fill stays
-            // put and only the text is underlined, so the place is still marked
-            // but nothing competes with the list for attention.
+            // With the keyboard on this row the pill is lit and underlined, so
+            // the cursor is visible without reading the colours against each
+            // other. Once the focus moves on, the underline goes and bold alone
+            // remembers the place, which marks it without competing with the
+            // list for attention.
             let fill = if selected && focused { lit(base) } else { base };
             let mut body_style = Style::default().bg(fill).fg(ink(fill));
             if selected {
                 body_style = body_style.add_modifier(if focused {
-                    Modifier::BOLD
+                    Modifier::BOLD | Modifier::UNDERLINED
                 } else {
-                    Modifier::UNDERLINED
+                    Modifier::BOLD
                 });
             }
             // The caps carry the fill as foreground against the page, which is
@@ -585,78 +541,125 @@ impl View for AgentsView {
         }
         f.render_widget(Paragraph::new(Line::from(pills)), rows[1]);
 
-        // Entries and detail.
-        let (left, right) = split_panes(rows[2], 55);
+        // The whole width goes to the entries. A detail pane here only ever had
+        // the selected preset's members to show, which the pills already count
+        // and the list below already spells out one skill at a time.
+        let left = rows[2];
         self.left = left;
-        self.right = right;
         let rows_data = self.rows(ctx);
-        let inner_w = left.width.saturating_sub(4) as usize; // borders + highlight symbol
-        self.entries.item_height = if self.compact { 1 } else { 3 };
-        let items: Vec<ListItem> = rows_data
-            .iter()
-            .map(|row| match row {
-                Row::Header(text) => {
-                    let head = Line::from(Span::styled(
-                        text.clone(),
-                        th.dim().add_modifier(ratatui::style::Modifier::ITALIC),
-                    ));
-                    if self.compact {
-                        return ListItem::new(head);
-                    }
-                    // Every item of a list is the same height, so a header spends
-                    // its two spare lines on the gap that separates the sections.
-                    ListItem::new(vec![Line::from(""), head, Line::from("")])
-                }
-                Row::Entry {
-                    name,
-                    state,
-                    managed,
-                } => {
-                    if !self.compact {
-                        return entry_card(name, *state, *managed, ctx, inner_w);
-                    }
-                    let (glyph, style) = glyph_for(*state, th);
-                    ListItem::new(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(format!("{glyph} "), style),
-                        Span::styled(
-                            pad(name, 26),
-                            if *managed { Style::default() } else { th.dim() },
-                        ),
-                        Span::styled(state.map(entry_note).unwrap_or_default(), th.dim()),
-                    ]))
-                }
-            })
-            .collect();
-        // The picker above already says which agent this is; repeating it here
-        // would only take up room the section headings use better.
-        let title = " skills ".to_string();
-        self.entries.set_area_from_block(left);
-        let list = List::new(items)
-            .block(th.block(title, self.focus() == Focus::Entries))
-            .highlight_style(if self.focus() == Focus::Entries {
-                th.selected()
-            } else {
-                th.selected_unfocused()
-            })
-            .highlight_symbol("▸ ");
-        f.render_stateful_widget(list, left, &mut self.entries.state);
+        let cards = self.density(ctx) == UiDensity::Cards;
+        let counts = match (
+            rows_data.iter().filter(|r| r.managed).count(),
+            rows_data.iter().filter(|r| !r.managed).count(),
+        ) {
+            (0, 0) => "nothing here yet".to_string(),
+            (n, 0) => format!("{n} linked"),
+            (0, m) => format!("{m} the agent's own"),
+            (n, m) => format!("{n} linked · {m} the agent's own"),
+        };
+        let block = th.block(
+            format!(" skills · {counts} "),
+            self.focus() == Focus::Entries,
+        );
+        let inner = block.inner(left);
+        f.render_widget(block, left);
 
-        // The scrollbar sits on the right border, showing where the selection
-        // is among all the rows rather than how far the pixels have scrolled.
-        let per_page = (left.height.saturating_sub(2) / self.entries.item_height.max(1)) as usize;
+        let cell_h = if cards { 5 } else { 1 };
+        // One column is held back for the scrollbar so the column count does not
+        // shift the moment the list outgrows a screen.
+        let usable = inner.width.saturating_sub(1);
+        let cols = if cards {
+            ((usable / MIN_CARD_W) as usize).clamp(1, MAX_COLS)
+        } else {
+            1
+        };
+        let content = Rect {
+            width: usable,
+            ..inner
+        };
+        self.entries.layout(
+            content,
+            cols,
+            cell_h,
+            if cols > 1 { 1 } else { 0 },
+            rows_data.len(),
+        );
+
+        let selected = self.entries.selected();
+        for i in self.entries.visible() {
+            let Some(cell) = self.entries.cell(i) else {
+                continue;
+            };
+            let row = &rows_data[i];
+            let on = selected == Some(i);
+            if cards {
+                // The frame carries the selection; painting the card over would
+                // bury the state colours it is there to show.
+                let border = if on {
+                    if self.focus() == Focus::Entries {
+                        th.accent().add_modifier(Modifier::BOLD)
+                    } else {
+                        th.accent()
+                    }
+                } else {
+                    th.dim()
+                };
+                let b = ratatui::widgets::Block::default()
+                    .borders(ratatui::widgets::Borders::ALL)
+                    .border_type(ratatui::widgets::BorderType::Rounded)
+                    .border_style(border);
+                let ci = b.inner(cell).inner(ratatui::layout::Margin {
+                    horizontal: 1,
+                    vertical: 0,
+                });
+                f.render_widget(b, cell);
+                f.render_widget(
+                    Paragraph::new(entry_card(
+                        row.name,
+                        row.state,
+                        row.managed,
+                        ctx,
+                        ci.width as usize,
+                    )),
+                    ci,
+                );
+            } else {
+                let style = if on {
+                    if self.focus() == Focus::Entries {
+                        th.selected()
+                    } else {
+                        th.selected_unfocused()
+                    }
+                } else {
+                    Style::default()
+                };
+                let (glyph, gs) = glyph_for(row.state, th);
+                let line = Line::from(vec![
+                    Span::styled(if on { "▸ " } else { "  " }, th.accent()),
+                    Span::styled(format!("{glyph} "), gs),
+                    Span::styled(
+                        pad(row.name, 26),
+                        if row.managed {
+                            Style::default()
+                        } else {
+                            th.dim()
+                        },
+                    ),
+                    Span::styled(row.state.map(entry_note).unwrap_or_default(), th.dim()),
+                ]);
+                f.render_widget(Paragraph::new(line).style(style), cell);
+            }
+        }
+
+        // The thumb measures grid rows, which is what a click on the track lands on.
+        let vis = self.entries.visible_rows();
         self.entries_track = Rect::default();
-        if rows_data.len() > per_page && left.height > 2 {
-            let track = Rect::new(
-                left.right().saturating_sub(1),
-                left.y + 1,
-                1,
-                left.height - 2,
-            );
+        if self.entries.grid_rows() > vis && inner.height > 0 {
+            let track = Rect::new(inner.right().saturating_sub(1), inner.y, 1, inner.height);
             self.entries_track = track;
-            let mut sb = ScrollbarState::new(rows_data.len())
-                .position(self.entries.selected().unwrap_or(0))
-                .viewport_content_length(per_page);
+            let mut sb = ScrollbarState::new(self.entries.grid_rows())
+                .position(selected.unwrap_or(0) / self.entries.cols())
+                .viewport_content_length(vis);
             f.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight)
                     .begin_symbol(None)
@@ -666,16 +669,6 @@ impl View for AgentsView {
                 &mut sb,
             );
         }
-
-        let block = th.block(" detail ", false);
-        let inner = block.inner(right);
-        f.render_widget(block, right);
-        f.render_widget(
-            Paragraph::new(self.detail(ctx))
-                .wrap(Wrap { trim: false })
-                .scroll((self.detail_scroll, 0)),
-            inner,
-        );
     }
 
     fn hints(&self) -> Hints {
@@ -793,7 +786,7 @@ fn entry_card(
     managed: bool,
     ctx: &Ctx,
     inner_w: usize,
-) -> ListItem<'static> {
+) -> Vec<Line<'static>> {
     let th = ctx.theme;
     let (glyph, glyph_style) = glyph_for(state, th);
     let mark = Span::styled(format!("{glyph}  "), glyph_style);
@@ -814,7 +807,7 @@ fn entry_card(
     let right = state_label(state);
     let tags = record.map(|r| r.tags.join(" · ")).unwrap_or_default();
     let tags_w = inner_w.saturating_sub(width(right) + 4);
-    ListItem::new(vec![
+    vec![
         Line::from(head),
         Line::from(vec![
             Span::raw("  "),
@@ -828,85 +821,5 @@ fn entry_card(
                 th.dim().add_modifier(ratatui::style::Modifier::ITALIC),
             ),
         ]),
-    ])
-}
-
-impl AgentsView {
-    fn detail<'a>(&self, ctx: &'a Ctx) -> Vec<Line<'a>> {
-        let th = ctx.theme;
-        let mut lines = Vec::new();
-        if let Some((preset, status)) = self.selected_preset() {
-            lines.push(Line::from(Span::styled(
-                preset.name.clone(),
-                th.bold().fg(th.accent),
-            )));
-            if let Some(d) = &preset.description {
-                lines.push(Line::from(Span::styled(d.clone(), th.dim())));
-            }
-            lines.push(Line::from(vec![
-                Span::styled("in scope  ", th.dim()),
-                Span::raw(format!(
-                    "{} of {} skill-agent pairs",
-                    status.installed, status.total
-                )),
-            ]));
-            for skill in &preset.skills {
-                let deployed: Vec<&str> = ctx
-                    .snap
-                    .get(skill)
-                    .map(|r| r.deployed_to())
-                    .unwrap_or_default();
-                let mark = if status.absent.contains(skill) {
-                    Span::styled("✗", th.err())
-                } else if deployed.is_empty() {
-                    Span::styled("○", th.dim())
-                } else {
-                    Span::styled("●", th.ok())
-                };
-                lines.push(Line::from(vec![
-                    mark,
-                    Span::raw(format!(" {}", pad(skill, 26))),
-                    Span::styled(
-                        if status.absent.contains(skill) {
-                            "not in the root".to_string()
-                        } else {
-                            deployed.join(", ")
-                        },
-                        th.dim(),
-                    ),
-                ]));
-            }
-            lines.push(Line::from(""));
-        }
-        for a in &ctx.snap.agents {
-            if a.key != self.scope {
-                continue;
-            }
-            let mode = match &a.mode {
-                AgentDirMode::Missing => "no directory yet".to_string(),
-                AgentDirMode::DirLinked => {
-                    "whole directory is one link; press c to split it".into()
-                }
-                AgentDirMode::DirForeign { target } => {
-                    format!("directory links to {}", target.display())
-                }
-                AgentDirMode::Real => {
-                    let d = a.count(|s| matches!(s, EntryState::Deployed));
-                    format!("{d} linked, {} the agent's own", a.entries.len() - d)
-                }
-            };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{:<10}", a.key), th.bold()),
-                Span::styled(mode, th.dim()),
-            ]));
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "           {}",
-                    fit(&skills::paths::contract_tilde(&a.skills_dir), 60)
-                ),
-                th.dim(),
-            )));
-        }
-        lines
-    }
+    ]
 }

@@ -32,16 +32,19 @@ pub fn run(root: Option<&Path>) -> Result<()> {
 
     install_panic_hook();
     let mut terminal = enter()?;
-    event::spawn_input(tx.clone());
+    let gate = std::sync::Arc::new(event::InputGate::default());
+    event::spawn_input(tx.clone(), gate.clone());
     event::spawn_ticker(tx);
 
     let result = (|| -> Result<()> {
         loop {
             terminal.draw(|f| app.draw(f))?;
             if let Some(req) = app.take_external() {
+                gate.hold();
                 leave(&mut terminal)?;
                 let outcome = app.run_external(req);
                 terminal = enter()?;
+                gate.release();
                 app.finish_external(outcome);
                 continue;
             }

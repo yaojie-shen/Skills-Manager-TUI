@@ -318,9 +318,6 @@ impl ListNav {
         self.state
             .select(if len == 0 { None } else { Some(len - 1) });
     }
-    pub fn page(&self) -> i32 {
-        (self.rows.height as i32 / self.item_height.max(1) as i32).max(1)
-    }
     /// Row index under the pointer, if any.
     pub fn row_at(&self, y: u16, len: usize) -> Option<usize> {
         if y < self.rows.y || y >= self.rows.bottom() {
@@ -443,5 +440,164 @@ mod tests {
         // Fewer items than rows still spans the whole range.
         assert_eq!(t.index_at(5, 3), Some(0));
         assert_eq!(t.index_at(14, 3), Some(2));
+    }
+}
+
+// ---- card grid ------------------------------------------------------------
+
+/// Selection and scrolling for a grid of equally sized cells. One column is the
+/// ordinary list case, so the split and grid layouts share this and there is no
+/// second set of navigation rules to keep in step.
+///
+/// Everything is in item space rather than terminal rows: the caller says how
+/// many columns fit and how tall a cell is, and asks back for the rectangle of
+/// each visible item. Scrolling moves by whole grid rows, so a resize never
+/// leaves half a card at the top.
+#[derive(Debug, Clone, Default)]
+pub struct CardGrid {
+    sel: Option<usize>,
+    /// First visible grid row.
+    offset: usize,
+    cols: usize,
+    cell_w: u16,
+    cell_h: u16,
+    /// Columns left between cells; the last column of a cell is given up to it.
+    gap: u16,
+    /// Inner area of the last render, without borders.
+    rows: Rect,
+    len: usize,
+    last_click: Option<(std::time::Instant, usize)>,
+}
+
+impl CardGrid {
+    pub fn selected(&self) -> Option<usize> {
+        self.sel
+    }
+    pub fn select(&mut self, i: Option<usize>) {
+        self.sel = i;
+    }
+    pub fn cols(&self) -> usize {
+        self.cols.max(1)
+    }
+    /// Grid rows the whole list needs.
+    pub fn grid_rows(&self) -> usize {
+        self.len.div_ceil(self.cols())
+    }
+    /// Grid rows that fit on screen.
+    pub fn visible_rows(&self) -> usize {
+        (self.rows.height / self.cell_h.max(1)) as usize
+    }
+    pub fn page(&self) -> i32 {
+        (self.visible_rows().max(1) * self.cols()) as i32
+    }
+    pub fn clamp(&mut self, len: usize) {
+        self.len = len;
+        self.sel = if len == 0 {
+            None
+        } else {
+            Some(self.sel.unwrap_or(0).min(len - 1))
+        };
+    }
+    pub fn first(&mut self, len: usize) {
+        self.len = len;
+        self.sel = (len > 0).then_some(0);
+    }
+    pub fn last(&mut self, len: usize) {
+        self.len = len;
+        self.sel = (len > 0).then_some(len - 1);
+    }
+    /// Move by whole items: along a row, or through the whole list in one column.
+    pub fn move_by(&mut self, delta: i32, len: usize) {
+        self.len = len;
+        if len == 0 {
+            self.sel = None;
+            return;
+        }
+        let cur = self.sel.unwrap_or(0) as i32;
+        self.sel = Some((cur + delta).clamp(0, len as i32 - 1) as usize);
+    }
+    /// Move by whole grid rows, keeping the column where it is.
+    pub fn move_rows(&mut self, delta: i32, len: usize) {
+        self.move_by(delta * self.cols() as i32, len);
+    }
+    /// Put the selection on a grid row, keeping its column. Used by the
+    /// scrollbar, which points at rows rather than at items.
+    pub fn select_row(&mut self, row: usize) {
+        if self.len == 0 {
+            return;
+        }
+        let col = self.sel.unwrap_or(0) % self.cols();
+        let i = row * self.cols() + col;
+        self.sel = Some(i.min(self.len - 1));
+    }
+
+    /// Record the geometry of a render and scroll so the selection is on screen.
+    /// Called every frame, which is what keeps a resize from losing the cursor.
+    pub fn layout(&mut self, inner: Rect, cols: usize, cell_h: u16, gap: u16, len: usize) {
+        self.rows = inner;
+        self.cols = cols.max(1);
+        self.cell_h = cell_h.max(1);
+        self.gap = gap;
+        self.cell_w = (inner.width / self.cols as u16).max(1);
+        self.clamp(len);
+        let vis = self.visible_rows().max(1);
+        if let Some(i) = self.sel {
+            let r = i / self.cols();
+            if r < self.offset {
+                self.offset = r;
+            } else if r >= self.offset + vis {
+                self.offset = r + 1 - vis;
+            }
+        }
+        self.offset = self.offset.min(self.grid_rows().saturating_sub(vis));
+    }
+
+    /// Where item `i` is drawn, or `None` when it is scrolled out of sight. The
+    /// last row of a short grid is left-aligned, which falls out of laying every
+    /// row out from the left rather than centring a ragged one.
+    pub fn cell(&self, i: usize) -> Option<Rect> {
+        let cols = self.cols();
+        let (r, c) = (i / cols, i % cols);
+        if r < self.offset || r >= self.offset + self.visible_rows() {
+            return None;
+        }
+        Some(Rect {
+            x: self.rows.x + c as u16 * self.cell_w,
+            y: self.rows.y + (r - self.offset) as u16 * self.cell_h,
+            width: self.cell_w.saturating_sub(self.gap),
+            height: self.cell_h,
+        })
+    }
+
+    /// The range of items worth drawing this frame.
+    pub fn visible(&self) -> std::ops::Range<usize> {
+        let cols = self.cols();
+        let start = self.offset * cols;
+        let end = ((self.offset + self.visible_rows()) * cols).min(self.len);
+        start..end.max(start)
+    }
+
+    /// Item under the pointer, if the pointer is over one at all.
+    pub fn hit(&self, x: u16, y: u16) -> Option<usize> {
+        if x < self.rows.x || x >= self.rows.right() || y < self.rows.y || y >= self.rows.bottom() {
+            return None;
+        }
+        let c = ((x - self.rows.x) / self.cell_w.max(1)) as usize;
+        if c >= self.cols() {
+            return None;
+        }
+        let r = self.offset + ((y - self.rows.y) / self.cell_h.max(1)) as usize;
+        let i = r * self.cols() + c;
+        (i < self.len).then_some(i)
+    }
+
+    /// Select what was clicked. Returns `(index, is_double_click)`.
+    pub fn click(&mut self, x: u16, y: u16) -> Option<(usize, bool)> {
+        let i = self.hit(x, y)?;
+        let now = std::time::Instant::now();
+        let double = matches!(self.last_click, Some((t, j)) if j == i && now.duration_since(t).as_millis() < 400);
+        self.last_click = Some((now, i));
+        self.sel = Some(i);
+        Some((i, double))
     }
 }

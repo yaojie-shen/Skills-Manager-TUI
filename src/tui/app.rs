@@ -19,7 +19,6 @@ use ratatui::widgets::Paragraph;
 use skills::Workspace;
 use skills::history::{self, History, Plan};
 use skills::ops::deploy;
-use skills::ops::edit;
 use skills::reconcile::Snapshot;
 use std::sync::mpsc::Sender;
 
@@ -57,6 +56,11 @@ impl Tab {
 /// A write to perform on the workspace; returns the toast text.
 pub type WriteFn = Box<dyn FnOnce(&Workspace) -> Result<String> + Send>;
 
+/// A metadata write: the toast text, plus what it changed so the log can take
+/// it back. The values are read inside the write, since only there is the state
+/// it replaced still on disk.
+pub type MetaFn = Box<dyn FnOnce(&Workspace) -> Result<(String, Option<history::Intent>)> + Send>;
+
 /// Requests a view or modal hands back to the app.
 pub enum Action {
     Quit,
@@ -87,6 +91,8 @@ pub enum Action {
     },
     /// Run a write, toast its result, rescan.
     Write(WriteFn),
+    /// Run a write that can be taken back, and log what it changed.
+    WriteMeta(MetaFn),
     /// Log something that has already happened.
     Record(history::Intent),
     /// Move the history after a confirmed undo or redo went through.
@@ -211,8 +217,13 @@ impl App {
 
     pub fn finish_external(&mut self, outcome: Result<(String, String)>) {
         match outcome {
-            Ok((skill, text)) => match edit::note_set(&self.ws, &skill, Some(&text)) {
-                Ok(_) => self.toast(format!("note saved on {skill}"), Level::Ok),
+            Ok((skill, text)) => match history::note_edit(&self.ws, &skill, Some(&text)) {
+                Ok((msg, intent)) => {
+                    self.toast(msg, Level::Ok);
+                    if let Some(intent) = intent {
+                        self.history.record(intent);
+                    }
+                }
                 Err(e) => self.toast(format!("note failed: {e:#}"), Level::Error),
             },
             Err(e) => self.toast(format!("editor: {e:#}"), Level::Error),
@@ -459,6 +470,19 @@ impl App {
                 }
                 self.rescan();
             }
+            Action::WriteMeta(f) => {
+                match f(&self.ws) {
+                    Ok((msg, intent)) => {
+                        self.toast(msg, Level::Ok);
+                        // A write that left the files as they were is not a step.
+                        if let Some(intent) = intent {
+                            self.history.record(intent);
+                        }
+                    }
+                    Err(e) => self.toast(format!("{e:#}"), Level::Error),
+                }
+                self.rescan();
+            }
         }
     }
 
@@ -504,14 +528,16 @@ impl App {
                 self.modal = Some(Modal::undo_write(describe, apply, dir));
                 vec![]
             }
-            // Someone already put the tree where this step would leave it, so
-            // drop the entry rather than offering a change with nothing in it.
-            Ok(Plan::Nothing) => {
+            // Nothing left for this step to do, either because someone already
+            // put things where it would leave them or because they went
+            // somewhere else entirely. Drop the entry rather than offer a
+            // change with nothing in it, and say which it was.
+            Ok(Plan::Nothing(why)) => {
                 match dir {
                     Step::Undo => self.history.commit_undo(),
                     Step::Redo => self.history.commit_redo(),
                 }
-                vec![Action::Toast(format!("already done: {what}"))]
+                vec![Action::Toast(why)]
             }
             Err(e) => vec![Action::Error(format!("{e:#}"))],
         }
