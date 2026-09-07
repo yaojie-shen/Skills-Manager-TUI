@@ -8,6 +8,7 @@ use crate::tui::widgets::{Input, ListNav, fit, pad, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
@@ -15,7 +16,7 @@ use ratatui::widgets::{
 use skills::ops::deploy;
 use skills::ops::edit;
 use skills::reconcile::{DeployState, SkillRecord, SkillStatus};
-use skills::search::{Hit, Query, Searcher};
+use skills::search::{Hit, Query, Searcher, highlight_ranges};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -103,6 +104,14 @@ impl SearchView {
         if !keep {
             self.preview_scroll = 0;
         }
+    }
+
+    fn selected_terms(&self) -> &[String] {
+        self.list
+            .selected()
+            .and_then(|i| self.hits.get(i))
+            .map(|h| h.terms.as_slice())
+            .unwrap_or(&[])
     }
 
     fn move_sel(&mut self, delta: i32) {
@@ -273,6 +282,11 @@ impl SearchView {
 
 impl View for SearchView {
     fn refresh(&mut self, ctx: &Ctx) {
+        self.searcher.configure(
+            ctx.ws.config.search.clone(),
+            skills::dict::Dictionaries::load(&ctx.ws.root, &ctx.ws.config.search.dictionaries),
+        );
+        self.searcher.index(&ctx.snap.skills);
         self.run_search(ctx, true);
     }
 
@@ -457,21 +471,43 @@ impl View for SearchView {
             .max()
             .unwrap_or(8)
             .min(inner_w.saturating_sub(dep_w + 6));
+        let searching = !self.input.value().trim().is_empty()
+            && !Query::parse(self.input.value()).text.is_empty();
+        self.list.item_height = if searching { 2 } else { 1 };
+        // The selected row paints its own background instead of relying on
+        // `highlight_style`, which is patched over span styles and would
+        // erase the highlighter background on a match.
+        let selected = self.list.selected();
         let items: Vec<ListItem> = self
             .hits
             .iter()
-            .map(|h| {
+            .enumerate()
+            .map(|(row, h)| {
+                let row_style = if selected == Some(row) {
+                    if self.focus == Focus::List {
+                        th.selected()
+                    } else {
+                        th.selected_unfocused()
+                    }
+                } else {
+                    Style::default()
+                };
                 let r = &ctx.snap.skills[h.index];
-                let mut spans = vec![
-                    status_glyph(&r.status, th),
-                    Span::raw(" "),
-                    Span::raw(pad(&r.key, key_w)),
-                ];
+                let mut spans = vec![status_glyph(&r.status, th), Span::raw(" ")];
+                spans.extend(highlight_spans(
+                    &pad(&r.key, key_w),
+                    &h.terms,
+                    Style::default(),
+                    th,
+                ));
                 let tags_w = inner_w.saturating_sub(key_w + 2 + dep_w + 2);
                 if !r.tags.is_empty() && tags_w > 3 {
-                    spans.push(Span::styled(
-                        format!(" {}", pad(&r.tags.join(","), tags_w - 1)),
+                    spans.push(Span::raw(" "));
+                    spans.extend(highlight_spans(
+                        &pad(&r.tags.join(","), tags_w - 1),
+                        &h.terms,
                         th.tag(),
+                        th,
                     ));
                 } else {
                     spans.push(Span::raw(" ".repeat(tags_w)));
@@ -488,7 +524,26 @@ impl View for SearchView {
                     };
                     spans.push(Span::styled(format!("{g}  "), style));
                 }
-                ListItem::new(Line::from(spans))
+                if !searching {
+                    return ListItem::new(Line::from(spans)).style(row_style);
+                }
+                // Second line: where it matched and an excerpt with highlights.
+                let mut sub = vec![Span::raw("  ")];
+                let fields: Vec<&str> = h.fields.iter().map(|f| f.label()).collect();
+                sub.push(Span::styled(
+                    format!("{} ", fields.join("·")),
+                    th.dim().add_modifier(ratatui::style::Modifier::ITALIC),
+                ));
+                let avail = inner_w.saturating_sub(4 + fields.join("·").len());
+                if let Some(e) = &h.excerpt {
+                    sub.extend(highlight_spans(
+                        &fit(&e.text, avail),
+                        &h.terms,
+                        th.dim(),
+                        th,
+                    ))
+                }
+                ListItem::new(vec![Line::from(spans), Line::from(sub)]).style(row_style)
             })
             .collect();
         let mut legend = vec![Span::raw(" skills ")];
@@ -498,14 +553,7 @@ impl View for SearchView {
         let list_title = Line::from(legend);
         let block = th.block(list_title, self.focus == Focus::List);
         self.list.set_area_from_block(left);
-        let list = List::new(items)
-            .block(block)
-            .highlight_style(if self.focus == Focus::List {
-                th.selected()
-            } else {
-                th.selected_unfocused()
-            })
-            .highlight_symbol("▸ ");
+        let list = List::new(items).block(block).highlight_symbol("▸ ");
         f.render_stateful_widget(list, left, &mut self.list.state);
         if self.hits.is_empty() {
             let msg = if ctx.snap.skills.is_empty() {
@@ -530,7 +578,8 @@ impl View for SearchView {
         f.render_widget(block, right);
         self.preview_height = inner.height;
         if let Some(r) = self.selected(ctx) {
-            let lines = preview_lines(r, ctx);
+            let terms: Vec<String> = self.selected_terms().to_vec();
+            let lines = preview_lines(r, ctx, &terms);
             // Count wrapped lines for scroll clamping (approximate: by display width).
             let w = inner.width.max(1) as usize;
             self.preview_lines = lines
@@ -611,7 +660,7 @@ fn kv<'a>(k: &'a str, v: impl Into<String>, th: &crate::tui::theme::Theme) -> Li
     ])
 }
 
-fn preview_lines<'a>(r: &'a SkillRecord, ctx: &'a Ctx) -> Vec<Line<'a>> {
+fn preview_lines<'a>(r: &'a SkillRecord, ctx: &'a Ctx, terms: &[String]) -> Vec<Line<'a>> {
     let th = ctx.theme;
     let mut lines = vec![Line::from(vec![
         Span::styled(r.key.as_str(), th.bold().fg(th.accent)),
@@ -672,7 +721,7 @@ fn preview_lines<'a>(r: &'a SkillRecord, ctx: &'a Ctx) -> Vec<Line<'a>> {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("note", th.bold().fg(th.tag))));
         for l in n.lines() {
-            lines.push(Line::from(l));
+            lines.push(Line::from(highlight_spans(l, terms, Style::default(), th)));
         }
     }
     if let Some(d) = &r.description {
@@ -681,7 +730,7 @@ fn preview_lines<'a>(r: &'a SkillRecord, ctx: &'a Ctx) -> Vec<Line<'a>> {
             "description",
             th.bold().fg(th.accent),
         )));
-        lines.push(Line::from(d.as_str()));
+        lines.push(Line::from(highlight_spans(d, terms, Style::default(), th)));
     }
     if let Some(b) = &r.body {
         lines.push(Line::from(""));
@@ -690,8 +739,53 @@ fn preview_lines<'a>(r: &'a SkillRecord, ctx: &'a Ctx) -> Vec<Line<'a>> {
             th.bold().fg(th.accent),
         )));
         lines.push(Line::from(Span::styled("─".repeat(24), th.dim())));
-        lines.extend(tui_markdown::from_str(b).lines);
+        for line in tui_markdown::from_str(b).lines {
+            lines.push(highlight_line(line, terms, th));
+        }
     }
-    let _ = fit;
     lines
+}
+
+/// Split `text` into spans, styling the parts that match `terms`.
+fn highlight_spans<'a>(
+    text: &str,
+    terms: &[String],
+    base: Style,
+    th: &crate::tui::theme::Theme,
+) -> Vec<Span<'a>> {
+    let ranges = highlight_ranges(text, terms);
+    if ranges.is_empty() {
+        return vec![Span::styled(text.to_string(), base)];
+    }
+    // The hit keeps none of the surrounding style: a highlighter covers what
+    // is under it, and the dimmed grey of an excerpt would be unreadable on yellow.
+    let hl = th.match_hit();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    for (s, e) in ranges {
+        if s > pos {
+            out.push(Span::styled(text[pos..s].to_string(), base));
+        }
+        out.push(Span::styled(text[s..e].to_string(), hl));
+        pos = e;
+    }
+    if pos < text.len() {
+        out.push(Span::styled(text[pos..].to_string(), base));
+    }
+    out
+}
+
+/// Apply highlighting to every span of an already styled line (markdown output).
+fn highlight_line<'a>(line: Line<'a>, terms: &[String], th: &crate::tui::theme::Theme) -> Line<'a> {
+    if terms.is_empty() {
+        return line;
+    }
+    let mut spans = Vec::new();
+    for sp in line.spans {
+        let base = sp.style;
+        spans.extend(highlight_spans(&sp.content, terms, base, th));
+    }
+    Line::from(spans)
+        .style(line.style)
+        .alignment(line.alignment.unwrap_or_default())
 }

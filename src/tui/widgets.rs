@@ -266,12 +266,25 @@ impl Input {
 // ---- list navigation ------------------------------------------------------
 
 /// Selection + offset for a list, with mouse helpers.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ListNav {
     pub state: ListState,
     /// Inner rows area from the last render (without borders).
     pub rows: Rect,
+    /// Terminal rows per item (2 when items carry an excerpt line).
+    pub item_height: u16,
     last_click: Option<(std::time::Instant, usize)>,
+}
+
+impl Default for ListNav {
+    fn default() -> Self {
+        Self {
+            state: ListState::default(),
+            rows: Rect::default(),
+            item_height: 1,
+            last_click: None,
+        }
+    }
 }
 
 impl ListNav {
@@ -306,14 +319,14 @@ impl ListNav {
             .select(if len == 0 { None } else { Some(len - 1) });
     }
     pub fn page(&self) -> i32 {
-        (self.rows.height as i32).max(1)
+        (self.rows.height as i32 / self.item_height.max(1) as i32).max(1)
     }
     /// Row index under the pointer, if any.
     pub fn row_at(&self, y: u16, len: usize) -> Option<usize> {
         if y < self.rows.y || y >= self.rows.bottom() {
             return None;
         }
-        let i = self.state.offset() + (y - self.rows.y) as usize;
+        let i = self.state.offset() + ((y - self.rows.y) / self.item_height.max(1)) as usize;
         (i < len).then_some(i)
     }
     /// Select the clicked row. Returns `(index, is_double_click)`.

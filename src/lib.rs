@@ -3,6 +3,7 @@
 //! symlinks. Both the CLI and the TUI are thin layers over this crate.
 
 pub mod config;
+pub mod dict;
 pub mod hash;
 pub mod meta;
 pub mod ops;

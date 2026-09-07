@@ -14,6 +14,9 @@ pub struct Theme {
     pub tag: Color,
     pub border: Color,
     pub border_focus: Color,
+    /// Search matches, painted like a highlighter pen.
+    pub match_bg: Color,
+    pub match_fg: Color,
 }
 
 impl Default for Theme {
@@ -28,6 +31,8 @@ impl Default for Theme {
             tag: Color::Magenta,
             border: Color::DarkGray,
             border_focus: Color::Cyan,
+            match_bg: Color::Rgb(255, 214, 79),
+            match_fg: Color::Rgb(24, 24, 24),
         }
     }
 }
@@ -73,6 +78,11 @@ impl Theme {
     }
     pub fn err(&self) -> Style {
         Style::default().fg(self.err)
+    }
+    /// Marker-pen styling for a search match. Both colors are set so the run
+    /// stays readable over a selected row or dimmed excerpt text.
+    pub fn match_hit(&self) -> Style {
+        Style::default().bg(self.match_bg).fg(self.match_fg)
     }
     pub fn key_hint(&self) -> Style {
         Style::default()

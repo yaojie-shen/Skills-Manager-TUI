@@ -22,6 +22,126 @@ pub struct Config {
     pub deploy: DeployConfig,
     #[serde(default)]
     pub tags: Vec<TagConfig>,
+    #[serde(default)]
+    pub search: SearchConfig,
+}
+
+/// Search tuning. Defaults follow Omnisearch-style field boosting; every value
+/// can be overridden in `config.toml` under `[search]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SearchConfig {
+    /// Per-field BM25F boosts.
+    #[serde(default)]
+    pub weights: FieldWeights,
+    /// Match on word prefixes (`msgp` finds `msgpack`).
+    #[serde(default = "default_true")]
+    pub prefix: bool,
+    /// Typo tolerance: edit distance 1 from 4 chars, 2 from 8 chars.
+    #[serde(default = "default_true")]
+    pub fuzzy: bool,
+    /// Expand query words through the English/Chinese dictionaries.
+    #[serde(default = "default_true")]
+    pub dictionary: bool,
+    /// Per-source weight of a dictionary-expanded match, relative to a direct
+    /// match. Zero disables that source.
+    #[serde(default)]
+    pub dictionaries: DictionaryWeights,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            weights: FieldWeights::default(),
+            prefix: true,
+            fuzzy: true,
+            dictionary: true,
+            dictionaries: DictionaryWeights::default(),
+        }
+    }
+}
+
+/// How much a match found through each dictionary counts. Technical terms are
+/// nearly one-to-one and carry a strong signal; general vocabulary is more
+/// ambiguous, so it only breaks ties. The user's own table is trusted most.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DictionaryWeights {
+    #[serde(default = "w_tech")]
+    pub tech: f32,
+    #[serde(default = "w_common")]
+    pub common: f32,
+    #[serde(default = "w_user")]
+    pub user: f32,
+}
+
+impl Default for DictionaryWeights {
+    fn default() -> Self {
+        Self {
+            tech: w_tech(),
+            common: w_common(),
+            user: w_user(),
+        }
+    }
+}
+
+fn w_tech() -> f32 {
+    0.7
+}
+fn w_common() -> f32 {
+    0.4
+}
+fn w_user() -> f32 {
+    1.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FieldWeights {
+    #[serde(default = "w_name")]
+    pub name: f32,
+    #[serde(default = "w_tag")]
+    pub tag: f32,
+    #[serde(default = "w_description")]
+    pub description: f32,
+    #[serde(default = "w_note")]
+    pub note: f32,
+    #[serde(default = "w_heading")]
+    pub heading: f32,
+    #[serde(default = "w_body")]
+    pub body: f32,
+}
+
+impl Default for FieldWeights {
+    fn default() -> Self {
+        Self {
+            name: w_name(),
+            tag: w_tag(),
+            description: w_description(),
+            note: w_note(),
+            heading: w_heading(),
+            body: w_body(),
+        }
+    }
+}
+
+fn w_name() -> f32 {
+    6.0
+}
+fn w_tag() -> f32 {
+    4.0
+}
+fn w_description() -> f32 {
+    2.0
+}
+fn w_note() -> f32 {
+    2.0
+}
+fn w_heading() -> f32 {
+    1.5
+}
+fn w_body() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +228,7 @@ impl Default for Config {
             agents: default_agents(),
             deploy: DeployConfig::default(),
             tags: Vec::new(),
+            search: SearchConfig::default(),
         }
     }
 }

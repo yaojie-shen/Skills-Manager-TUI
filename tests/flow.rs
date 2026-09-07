@@ -41,6 +41,7 @@ impl Fixture {
                 presets: vec![],
             },
             tags: vec![],
+            search: Default::default(),
         };
         cfg.save(&root).unwrap();
         Self {

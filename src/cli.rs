@@ -423,7 +423,9 @@ struct ListRow<'a> {
     deployed: Vec<&'a str>,
     source: Option<&'static str>,
     description: Option<&'a str>,
-    score: u32,
+    score: f32,
+    matched: Vec<skills::search::Field>,
+    excerpt: Option<&'a str>,
 }
 
 fn cmd_list(ctx: &Ctx, a: ListArgs) -> Result<()> {
@@ -442,7 +444,7 @@ fn cmd_list(ctx: &Ctx, a: ListArgs) -> Result<()> {
         input.push_str(" untagged");
     }
     let q = Query::parse(&input);
-    let hits = Searcher::new().search(&snap.skills, &q);
+    let hits = Searcher::for_workspace(&ctx.ws).search(&snap.skills, &q);
     let rows: Vec<ListRow> = hits
         .iter()
         .map(|h| {
@@ -456,6 +458,8 @@ fn cmd_list(ctx: &Ctx, a: ListArgs) -> Result<()> {
                 source: r.source.as_ref().map(|s| s.kind()),
                 description: r.description.as_deref(),
                 score: h.score,
+                matched: h.fields.clone(),
+                excerpt: h.excerpt.as_ref().map(|e| e.text.as_str()),
             }
         })
         .collect();
@@ -477,6 +481,16 @@ fn cmd_list(ctx: &Ctx, a: ListArgs) -> Result<()> {
                 truncate(r.description.unwrap_or(""), 70),
                 w = w
             );
+            if let Some(e) = r.excerpt {
+                let fields: Vec<&str> = r.matched.iter().map(|f| f.label()).collect();
+                println!(
+                    "{:<w$}  ↳ [{}] {}",
+                    "",
+                    fields.join(","),
+                    truncate(e, 110),
+                    w = w
+                );
+            }
         }
     })
 }

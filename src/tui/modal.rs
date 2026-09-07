@@ -191,6 +191,47 @@ impl Modal {
             }),
         )
     }
+    /// Delete a directory that is not a usable skill. The common cause is a
+    /// `git checkout` or `git clean` that removed the files but left the
+    /// directory behind, since git does not track directories.
+    pub fn discard_invalid(skill: &str, reason: &str) -> Self {
+        let k = skill.to_string();
+        let empty = reason.contains("missing SKILL.md");
+        let mut lines = vec![format!("Delete the directory \"{skill}\"?")];
+        lines.push(format!("It is not a usable skill: {reason}."));
+        if empty {
+            lines.push(
+                "A directory left with no SKILL.md is usually what git leaves behind when \
+                 the files are discarded, because git does not remove empty directories."
+                    .into(),
+            );
+        }
+        lines.push("Its metadata, if any, goes with it.".into());
+        Self::confirm_write(
+            format!(" discard {skill} "),
+            lines,
+            Box::new(move |ws| {
+                let snap = ws.scan()?;
+                edit::remove(ws, &snap, &k, false).map(|_| format!("discarded {k}"))
+            }),
+        )
+    }
+
+    /// Forget the tags and notes of a skill whose directory is gone.
+    pub fn forget_missing(skill: &str) -> Self {
+        let k = skill.to_string();
+        Self::confirm_write(
+            format!(" forget {skill} "),
+            vec![
+                format!("Forget the metadata of \"{skill}\"?"),
+                "Its directory is already gone; this discards the tags and note you wrote \
+                 for it. Keep it instead if you intend to reinstall the skill."
+                    .into(),
+            ],
+            Box::new(move |ws| ws.meta.remove(&k).map(|_| format!("forgot {k}"))),
+        )
+    }
+
     pub fn agent_pick(skill: &str) -> Self {
         let mut list = ListNav::default();
         list.select(Some(0));

@@ -3,6 +3,7 @@
 use super::{View, status_glyph, status_text, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::event::Task;
+use crate::tui::modal::Modal;
 use crate::tui::widgets::{ListNav, pad};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -146,16 +147,25 @@ impl View for HealthView {
                 },
                 None => vec![],
             },
-            KeyCode::Char('x') => match self.selected(ctx) {
-                Some(r) if r.status == SkillStatus::Missing => {
-                    let key = r.key.clone();
-                    vec![Action::Write(Box::new(move |ws| {
-                        ws.meta
-                            .remove(&key)
-                            .map(|_| format!("dropped metadata of {key}"))
-                    }))]
+            // Clean up an entry that is not a working skill. What that means
+            // depends on which half is missing: the directory or the files in it.
+            KeyCode::Char('x') => match self
+                .selected(ctx)
+                .map(|r| (r.key.clone(), r.status.clone()))
+            {
+                Some((key, SkillStatus::Missing)) => {
+                    vec![Action::OpenModal(Box::new(Modal::forget_missing(&key)))]
                 }
-                _ => vec![Action::Error("drop applies to missing skills".into())],
+                Some((key, SkillStatus::Invalid { reason })) => {
+                    vec![Action::OpenModal(Box::new(Modal::discard_invalid(
+                        &key, &reason,
+                    )))]
+                }
+                Some((_, s)) => vec![Action::Error(format!(
+                    "nothing to clean up: this skill is {}",
+                    s.label()
+                ))],
+                None => vec![],
             },
             _ => vec![],
         }
@@ -250,7 +260,7 @@ impl View for HealthView {
             ("U", "update"),
             ("a", "accept"),
             ("m", "migrate"),
-            ("x", "drop meta"),
+            ("x", "clean up"),
             ("Enter", "open"),
             ("q", "quit"),
         ]
