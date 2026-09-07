@@ -152,6 +152,28 @@ impl AgentsView {
         managed
     }
 
+    fn preview_entry(&mut self, ctx: &Ctx) {
+        let rows = self.rows(ctx);
+        let Some(row) = self.entries.selected().and_then(|i| rows.get(i)) else {
+            return;
+        };
+        let Some(agent) = ctx.snap.agent(&self.scope) else {
+            return;
+        };
+        self.preview.open_agent(
+            row.name.to_string(),
+            agent.name.clone(),
+            agent.skills_dir.join(row.name),
+            if row.managed {
+                "managed link to central skill".into()
+            } else {
+                row.state
+                    .map(entry_note)
+                    .unwrap_or_else(|| "unknown".into())
+            },
+        );
+    }
+
     fn selected_preset(&self) -> Option<&(Preset, PresetStatus)> {
         self.presets.get(self.preset_cursor)
     }
@@ -440,13 +462,7 @@ impl View for AgentsView {
                     KeyCode::End | KeyCode::Char('G') => {
                         self.entries.last(n);
                     }
-                    KeyCode::Enter => {
-                        if let Some(Row { name, .. }) =
-                            self.entries.selected().and_then(|i| rows.get(i))
-                        {
-                            self.preview.open(name.to_string());
-                        }
-                    }
+                    KeyCode::Enter => self.preview_entry(ctx),
                     // Only an entry the root knows nothing about can be taken
                     // in; everything else here is either already ours or the
                     // agent's to keep.
@@ -534,7 +550,9 @@ impl View for AgentsView {
             }
             if self.left.contains(at) {
                 self.set_focus(Focus::Entries);
-                self.entries.click(m.column, m.row);
+                if let Some((_, true)) = self.entries.click(m.column, m.row) {
+                    self.preview_entry(ctx);
+                }
             }
         }
         vec![]
@@ -1009,6 +1027,81 @@ mod overflow_tests {
     use crate::tui::theme::Theme;
     use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::AgentConfig};
+
+    #[test]
+    fn agent_preview_reads_the_selected_entry_instead_of_its_root_namesake() {
+        let root =
+            std::env::temp_dir().join(format!("skills-agent-preview-{}", std::process::id()));
+        let central = root.join("central");
+        let agent_dir = root.join("agent");
+        std::fs::create_dir_all(&central).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let put = |dir: &std::path::Path, body: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: printer\ndescription: Print documents\n---\n{body}\n"),
+            )
+            .unwrap();
+        };
+        put(&central.join("printer"), "CENTRAL CONTENT");
+        put(&agent_dir.join("printer"), "AGENT COPY CONTENT");
+        put(&agent_dir.join("reader"), "AGENT ONLY CONTENT");
+        put(&root.join("external"), "EXTERNAL CONTENT");
+        std::os::unix::fs::symlink(root.join("external"), agent_dir.join("external")).unwrap();
+        std::os::unix::fs::symlink(root.join("absent"), agent_dir.join("broken")).unwrap();
+        std::fs::create_dir_all(agent_dir.join("invalid")).unwrap();
+        std::fs::write(agent_dir.join("invalid/SKILL.md"), "invalid frontmatter").unwrap();
+        let mut ws = Workspace::open(&central).unwrap();
+        ws.config.agents = vec![AgentConfig {
+            key: "sample".into(),
+            name: "Sample Agent".into(),
+            skills_dir: agent_dir.display().to_string(),
+        }];
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = AgentsView {
+            scope: "sample".into(),
+            ..AgentsView::default()
+        };
+        view.refresh(&ctx);
+        view.set_focus(Focus::Entries);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for (name, expected) in [
+            ("printer", "AGENT COPY CONTENT"),
+            ("reader", "AGENT ONLY CONTENT"),
+            ("external", "EXTERNAL CONTENT"),
+            ("broken", "missing SKILL.md"),
+            ("invalid", "no YAML frontmatter"),
+        ] {
+            let rows = view.rows(&ctx);
+            let index = rows.iter().position(|r| r.name == name).unwrap();
+            view.entries.first(rows.len());
+            view.entries.move_by(index as i32, rows.len());
+            assert!(view.handle_key(key(KeyCode::Enter), &ctx).is_empty());
+            terminal
+                .draw(|f| view.preview.draw(f, f.area(), &ctx))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let text = (0..40)
+                .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(expected), "{name}: {text}");
+            assert!(text.contains("Sample Agent"));
+            assert!(text.contains(&format!("{name}/SKILL.md")));
+            assert!(!text.contains("CENTRAL CONTENT"));
+            assert!(view.handle_key(key(KeyCode::Esc), &ctx).is_empty());
+        }
+        assert!(!central.join(".skills-meta").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn selected_pill_is_visible_and_mouse_targets_are_clipped() {

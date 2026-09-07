@@ -23,18 +23,45 @@ use skills::search::highlight_ranges;
 #[derive(Default)]
 pub struct Overlay {
     key: Option<String>,
+    agent_preview: Option<AgentPreview>,
     scroll: u16,
     rect: Rect,
     lines: usize,
     height: u16,
 }
 
+struct AgentPreview {
+    agent: String,
+    path: std::path::PathBuf,
+    ownership: String,
+    doc: Result<skills::skill::SkillDoc, String>,
+}
+
 impl Overlay {
     pub fn open(&mut self, key: String) {
+        self.agent_preview = None;
         self.key = Some(key);
         self.scroll = 0;
     }
+    /// Read the selected agent entry once, never substitute a same-named root skill.
+    pub fn open_agent(
+        &mut self,
+        key: String,
+        agent: String,
+        path: std::path::PathBuf,
+        ownership: String,
+    ) {
+        self.open(key);
+        let doc = skills::skill::SkillDoc::load(&path).map_err(|e| format!("{e:#}"));
+        self.agent_preview = Some(AgentPreview {
+            agent,
+            path,
+            ownership,
+            doc,
+        });
+    }
     pub fn close(&mut self) {
+        self.agent_preview = None;
         self.key = None;
     }
     pub fn is_open(&self) -> bool {
@@ -111,14 +138,32 @@ impl Overlay {
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         self.height = inner.height;
-        let Some(r) = ctx.snap.get(key) else {
-            f.render_widget(
-                Paragraph::new(Span::styled("not in the skills root", th.err())),
-                inner,
-            );
-            return;
+        let lines = if let Some(preview) = &self.agent_preview {
+            let mut lines = vec![
+                kv("agent", &preview.agent, th),
+                kv(
+                    "path",
+                    preview.path.join("SKILL.md").display().to_string(),
+                    th,
+                ),
+                kv("entry", &preview.ownership, th),
+                Line::from(""),
+            ];
+            match &preview.doc {
+                Ok(doc) => {
+                    lines.push(kv("name", &doc.name, th));
+                    lines.push(kv("summary", &doc.description, th));
+                    lines.push(Line::from(""));
+                    lines.extend(tui_markdown::from_str(&doc.body).lines);
+                }
+                Err(error) => lines.push(Line::from(Span::styled(error.clone(), th.err()))),
+            }
+            lines
+        } else if let Some(r) = ctx.snap.get(key) {
+            preview_lines(r, ctx, &[])
+        } else {
+            vec![Line::from(Span::styled("not in the skills root", th.err()))]
         };
-        let lines = preview_lines(r, ctx, &[]);
         let wrap_w = inner.width.max(1) as usize;
         self.lines = lines
             .iter()
