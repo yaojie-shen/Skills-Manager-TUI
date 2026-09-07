@@ -13,7 +13,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
-use skills::config::{UiDensity, UiLayout};
+use skills::config::UiLayout;
 use skills::ops::edit;
 use skills::reconcile::{SkillRecord, SkillStatus};
 use skills::search::{Hit, Query, Searcher};
@@ -44,7 +44,6 @@ pub struct SearchView {
     /// try a layout on for size; what the next start looks like stays the file's
     /// business, so neither is written back.
     layout: Option<UiLayout>,
-    density: Option<UiDensity>,
     /// Grid layout has no standing preview pane, so it opens over the results.
     overlay: Overlay,
     searcher: Searcher,
@@ -67,7 +66,6 @@ impl Default for SearchView {
             preview_rect: Rect::default(),
             esc_armed: false,
             layout: None,
-            density: None,
             overlay: Overlay::default(),
             searcher: Searcher::new(),
         }
@@ -94,9 +92,6 @@ impl SearchView {
 
     fn layout(&self, ctx: &Ctx) -> UiLayout {
         self.layout.unwrap_or(ctx.ws.config.ui.layout)
-    }
-    fn density(&self, ctx: &Ctx) -> UiDensity {
-        self.density.unwrap_or(ctx.ws.config.ui.density)
     }
 
     fn selected<'a>(&self, ctx: &'a Ctx) -> Option<&'a SkillRecord> {
@@ -347,7 +342,10 @@ impl SearchView {
         let agents = &ctx.snap.agents;
         let searching = !self.input.value().trim().is_empty()
             && !Query::parse(self.input.value()).text.is_empty();
-        let cards = self.density(ctx) == UiDensity::Cards;
+        // The layout decides the shape too: a grid is made of cards, and the
+        // split is a plain list beside its preview. One column of framed cards
+        // is a list wearing frames, which is the worst of both.
+        let cards = self.layout(ctx) == UiLayout::Grid;
 
         let mut legend = vec![Span::raw(" skills ")];
         for a in agents {
@@ -372,11 +370,7 @@ impl SearchView {
         // One column is always kept back for the scrollbar so the column count
         // does not change under the user the moment the list grows past a screen.
         let usable = inner.width.saturating_sub(1);
-        let cols = if self.layout(ctx) == UiLayout::Grid && cards {
-            cols_for(usable)
-        } else {
-            1
-        };
+        let cols = if cards { cols_for(usable) } else { 1 };
         let gap = if cols > 1 { 1 } else { 0 };
         let content = Rect {
             width: usable,
@@ -611,13 +605,7 @@ impl View for SearchView {
                 KeyCode::Char('u') => acts = self.act_check(ctx),
                 KeyCode::Char('U') => acts = self.act_update(ctx),
                 KeyCode::Char('x') => acts = self.act_remove(ctx),
-                KeyCode::Char('v') => {
-                    self.density = Some(match self.density(ctx) {
-                        UiDensity::Cards => UiDensity::Rows,
-                        UiDensity::Rows => UiDensity::Cards,
-                    })
-                }
-                KeyCode::Char('V') => {
+                KeyCode::Char('v') | KeyCode::Char('V') => {
                     self.layout = Some(match self.layout(ctx) {
                         UiLayout::Split => UiLayout::Grid,
                         UiLayout::Grid => UiLayout::Split,

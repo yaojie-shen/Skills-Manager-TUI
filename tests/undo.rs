@@ -518,3 +518,239 @@ fn setting_a_source_goes_back_and_forth_with_its_revision() {
         "the file stays; only the source went"
     );
 }
+
+fn description(ws: &Workspace, name: &str) -> Option<String> {
+    ws.presets.load(name).unwrap().unwrap().description
+}
+
+fn describe(ws: &Workspace, log: &mut History, name: &str, text: Option<&str>) -> String {
+    let (message, intent) = history::preset_description_edit(ws, name, text).unwrap();
+    if let Some(intent) = intent {
+        log.record(intent);
+    }
+    message
+}
+
+#[test]
+fn a_preset_description_goes_back_and_forth() {
+    let fx = Fixture::new("preset-description");
+    let ws = fx.ws();
+    let mut log = History::default();
+    ws.presets
+        .save(&Preset {
+            name: "commute".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert_eq!(
+        describe(&ws, &mut log, "commute", Some("rides to work")),
+        "description saved on commute"
+    );
+    describe(&ws, &mut log, "commute", Some("  weekend rides  "));
+    assert_eq!(
+        description(&ws, "commute").as_deref(),
+        Some("weekend rides"),
+        "the prompt's padding is not part of the sentence"
+    );
+    assert!(
+        history::preset_description_edit(&ws, "commute", Some("weekend rides"))
+            .unwrap()
+            .1
+            .is_none(),
+        "saving the same text is not a step"
+    );
+
+    step(&ws, &mut log, true);
+    assert_eq!(
+        description(&ws, "commute").as_deref(),
+        Some("rides to work")
+    );
+    step(&ws, &mut log, true);
+    assert_eq!(
+        description(&ws, "commute"),
+        None,
+        "there was no description to go back to"
+    );
+    step(&ws, &mut log, false);
+    assert_eq!(
+        description(&ws, "commute").as_deref(),
+        Some("rides to work")
+    );
+    step(&ws, &mut log, false);
+    assert_eq!(
+        description(&ws, "commute").as_deref(),
+        Some("weekend rides")
+    );
+
+    // Clearing through the prompt is an empty field, and comes back too.
+    assert_eq!(
+        describe(&ws, &mut log, "commute", Some("   ")),
+        "description cleared on commute"
+    );
+    assert_eq!(description(&ws, "commute"), None);
+    step(&ws, &mut log, true);
+    assert_eq!(
+        description(&ws, "commute").as_deref(),
+        Some("weekend rides")
+    );
+}
+
+#[test]
+fn a_preset_description_edited_behind_the_tools_back_is_left_alone() {
+    let fx = Fixture::new("preset-description-behind");
+    let ws = fx.ws();
+    let mut log = History::default();
+    ws.presets
+        .save(&Preset {
+            name: "commute".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    describe(&ws, &mut log, "commute", Some("rides to work"));
+    describe(&ws, &mut log, "commute", Some("weekend rides"));
+
+    // As if the file were edited in $EDITOR, or pulled in from another machine.
+    let path = ws.presets.path("commute");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, text.replace("weekend rides", "rides in the rain")).unwrap();
+
+    let message = step(&ws, &mut log, true);
+    assert_eq!(
+        description(&ws, "commute").as_deref(),
+        Some("rides in the rain"),
+        "undo must not discard what someone else wrote"
+    );
+    assert!(
+        message.contains("changed since"),
+        "the reason has to reach the user: {message}"
+    );
+}
+
+/// A config written by hand: the auto-deploy list names the preset and
+/// carries a comment, which a rename has to leave in place.
+fn config_by_hand(fx: &Fixture) {
+    let agent = fx.base.join("agent-a").display().to_string();
+    std::fs::write(
+        Config::path(&fx.root),
+        format!(
+            "schema = 1\n\n[[agents]]\nkey = \"a\"\nname = \"Agent A\"\nskills_dir = \"{agent}\"\n\n\
+             [deploy]\nall_to_all = false\n# the everyday set\npresets = [\"commute\"] # goes first\n"
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn renaming_a_preset_goes_back_and_forth_with_its_auto_deploy_entry() {
+    let fx = Fixture::new("preset-rename");
+    config_by_hand(&fx);
+    let ws = fx.ws();
+    let mut log = History::default();
+    ws.presets
+        .save(&Preset {
+            name: "commute".into(),
+            description: Some("rides to work".into()),
+            skills: vec!["bicycle".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(ws.config.deploy.presets, ["commute"]);
+
+    let (message, intent) = history::preset_rename(&ws, "commute", "errands").unwrap();
+    assert_eq!(
+        message,
+        "renamed preset commute to errands, config.toml too"
+    );
+    log.record(intent.unwrap());
+    let moved = ws.presets.load("errands").unwrap().unwrap();
+    assert_eq!(moved.name, "errands", "the name inside the file moved too");
+    assert_eq!(moved.description.as_deref(), Some("rides to work"));
+    assert_eq!(moved.skills, ["bicycle"]);
+    assert!(ws.presets.load("commute").unwrap().is_none());
+    assert_eq!(Config::load(&fx.root).unwrap().deploy.presets, ["errands"]);
+    let text = std::fs::read_to_string(Config::path(&fx.root)).unwrap();
+    assert!(
+        text.contains("# the everyday set\npresets = [\"errands\"] # goes first"),
+        "only the name changed; the comments around it stay: {text}"
+    );
+
+    // Back: the file and the config entry both return to the old name.
+    let message = step(&ws, &mut log, true);
+    assert_eq!(
+        message,
+        "renamed preset errands to commute, config.toml too"
+    );
+    assert_eq!(
+        ws.presets.load("commute").unwrap().unwrap().skills,
+        ["bicycle"]
+    );
+    assert!(ws.presets.load("errands").unwrap().is_none());
+    assert_eq!(Config::load(&fx.root).unwrap().deploy.presets, ["commute"]);
+
+    // And forward again.
+    step(&ws, &mut log, false);
+    assert!(ws.presets.load("errands").unwrap().is_some());
+    assert!(ws.presets.load("commute").unwrap().is_none());
+    assert_eq!(Config::load(&fx.root).unwrap().deploy.presets, ["errands"]);
+
+    // A preset the config does not list leaves the config alone.
+    let before = std::fs::read_to_string(Config::path(&fx.root)).unwrap();
+    ws.presets
+        .save(&Preset {
+            name: "weekend".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let (message, _) = history::preset_rename(&ws, "weekend", "sunday").unwrap();
+    assert_eq!(message, "renamed preset weekend to sunday");
+    assert_eq!(
+        std::fs::read_to_string(Config::path(&fx.root)).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn undoing_a_preset_rename_stops_when_the_old_name_is_taken() {
+    let fx = Fixture::new("preset-rename-taken");
+    let ws = fx.ws();
+    let mut log = History::default();
+    ws.presets
+        .save(&Preset {
+            name: "commute".into(),
+            skills: vec!["bicycle".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    let (_, intent) = history::preset_rename(&ws, "commute", "errands").unwrap();
+    log.record(intent.unwrap());
+
+    // Something new has moved in under the old name since.
+    ws.presets
+        .save(&Preset {
+            name: "commute".into(),
+            description: Some("the new one".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let message = step(&ws, &mut log, true);
+    assert!(message.contains("preset commute is taken"), "{message}");
+    assert_eq!(
+        description(&ws, "commute").as_deref(),
+        Some("the new one"),
+        "the preset that took the name is left alone"
+    );
+    assert_eq!(
+        ws.presets.load("errands").unwrap().unwrap().skills,
+        ["bicycle"],
+        "and the renamed one stays put"
+    );
+    assert!(log.is_empty(), "a step with nothing to do is dropped");
+
+    // Renaming onto a name that exists is refused outright, before anything
+    // moves.
+    let err = history::preset_rename(&ws, "errands", "commute").unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err:#}");
+    assert!(ws.presets.load("errands").unwrap().is_some());
+}

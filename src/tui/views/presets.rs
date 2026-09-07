@@ -5,7 +5,8 @@
 //! cards on the left say, per agent, how much of the preset is in place, so
 //! the definition and its effect can be read together without switching tabs.
 
-use super::cards::{self, CARD_H, cols_for, frame, frame_styled, skill_card};
+use super::cards::{self, CARD_H, cols_for, frame, frame_styled, rule, skill_card};
+use super::matrix::Matrix;
 use super::preview::Overlay;
 use super::{View, split_panes, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
@@ -36,6 +37,12 @@ pub struct PresetsView {
     drag: Option<Pane>,
     /// A member opened for reading, over the page rather than instead of it.
     preview: Overlay,
+    /// The whole preset × agent picture, over the page.
+    matrix: Matrix,
+    /// A preset to land on when the list next reloads, by name, because the
+    /// list is sorted and a preset just created or renamed can appear
+    /// anywhere in it.
+    pending: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +54,22 @@ enum Pane {
 impl PresetsView {
     fn selected(&self) -> Option<&Preset> {
         self.list.selected().and_then(|i| self.presets.get(i))
+    }
+
+    /// Land on `name` once it shows up in the list.
+    pub fn select(&mut self, name: &str) {
+        self.pending = Some(name.to_string());
+    }
+
+    /// Prompts that need a preset under the cursor, or say what to do
+    /// instead.
+    fn with_selected(&self, open: impl FnOnce(&Preset) -> Modal) -> Vec<Action> {
+        match self.selected() {
+            Some(p) => vec![Action::OpenModal(Box::new(open(p)))],
+            None => vec![Action::Error(
+                "no preset selected; press c to create one".into(),
+            )],
+        }
     }
 
     fn member_count(&self) -> usize {
@@ -72,14 +95,7 @@ impl PresetsView {
     fn add_members(&self, ctx: &Ctx) -> Vec<Action> {
         // Membership is edited by picking from the library, never by typing
         // a name from memory.
-        match self.selected() {
-            Some(p) => vec![Action::OpenModal(Box::new(Modal::preset_members(
-                p, ctx.snap,
-            )))],
-            None => vec![Action::Error(
-                "no preset selected; press c to create one".into(),
-            )],
-        }
+        self.with_selected(|p| Modal::preset_members(p, ctx.snap))
     }
 
     /// Reading a member must not cost the place on this page, so it opens in a
@@ -145,7 +161,7 @@ impl PresetsView {
         vec![
             Line::from(head),
             Line::from(vec![Span::raw("  "), body]),
-            Line::from(""),
+            rule(inner_w, th),
             Line::from(foot),
         ]
     }
@@ -331,13 +347,31 @@ fn draw_track(
 
 impl View for PresetsView {
     fn refresh(&mut self, ctx: &Ctx) {
+        // The list is sorted by name, so a preset keeps its place only by
+        // name: one created or deleted above the cursor would otherwise move
+        // the selection onto a neighbour.
+        let keep = self
+            .pending
+            .clone()
+            .or_else(|| self.selected().map(|p| p.name.clone()));
         self.presets = ctx.ws.presets.list().unwrap_or_default();
+        if let Some(i) = keep.and_then(|k| self.presets.iter().position(|p| p.name == k)) {
+            self.list.select(Some(i));
+            self.pending = None;
+        }
         self.list.clamp(self.presets.len());
         self.members.clamp(self.member_count());
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         if self.preview.handle_key(k) {
+            return vec![];
+        }
+        if let Some(acts) = self.matrix.handle_key(k, ctx) {
+            return acts;
+        }
+        if k.code == KeyCode::Char('M') {
+            self.matrix.open(ctx);
             return vec![];
         }
         let n = self.presets.len();
@@ -423,6 +457,10 @@ impl View for PresetsView {
             }
             KeyCode::Char('c') => vec![Action::OpenModal(Box::new(Modal::new_preset()))],
             KeyCode::Char('a') => self.add_members(ctx),
+            KeyCode::Char('e') => {
+                self.with_selected(|p| Modal::preset_description(&p.name, p.description.as_deref()))
+            }
+            KeyCode::Char('r') => self.with_selected(|p| Modal::rename_preset(&p.name)),
             // Deleting a whole preset is the one destructive key here, and it
             // is the capital so a slip on `x` in the member list cannot reach it.
             KeyCode::Char('D') => match self.selected() {
@@ -436,6 +474,9 @@ impl View for PresetsView {
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
         if self.preview.handle_mouse(m) {
             return vec![];
+        }
+        if let Some(acts) = self.matrix.handle_mouse(m, ctx) {
+            return acts;
         }
         let at = (m.column, m.row).into();
         let mcount = self.member_count();
@@ -508,6 +549,7 @@ impl View for PresetsView {
         self.draw_presets(f, left, ctx);
         self.draw_members(f, right, ctx);
         self.preview.draw(f, area, ctx);
+        self.matrix.draw(f, area, ctx);
     }
 
     fn hints(&self) -> Hints {
@@ -521,7 +563,10 @@ impl View for PresetsView {
         } else {
             &[
                 ("c", "create"),
+                ("M", "matrix"),
                 ("a", "add skills"),
+                ("e", "description"),
+                ("r", "rename"),
                 ("Enter/→", "members"),
                 ("D", "delete preset"),
                 ("q", "quit"),

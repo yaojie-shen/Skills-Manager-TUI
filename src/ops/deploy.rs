@@ -1,6 +1,7 @@
 //! Symlink deployment: deploy, undeploy, sync to desired state, convert dir-linked agents.
 
 use crate::Workspace;
+use crate::hash::hash_directory;
 use crate::preset::Preset;
 use crate::reconcile::{AgentDirMode, DeployState, EntryState, Snapshot};
 use crate::util::is_symlink;
@@ -27,6 +28,15 @@ pub enum Action {
         skill: String,
         path: PathBuf,
     },
+    /// Delete a real directory the agent holds and put a link to the root in
+    /// its place. Only planned for a copy whose content matches the root, and
+    /// checked again on apply, since deleting is the part that cannot be undone.
+    Relink {
+        agent: String,
+        skill: String,
+        path: PathBuf,
+        target: PathBuf,
+    },
     Skip {
         agent: String,
         skill: String,
@@ -52,6 +62,15 @@ impl Action {
             Action::Unlink { agent, skill, path } => {
                 format!("unlink {agent}/{skill} ({})", path.display())
             }
+            Action::Relink {
+                agent,
+                skill,
+                target,
+                ..
+            } => format!(
+                "relink {agent}/{skill} -> {} (deleting the agent's own copy)",
+                crate::paths::contract_tilde(target)
+            ),
             Action::Skip {
                 agent,
                 skill,
@@ -206,6 +225,142 @@ pub fn plan_undeploy(
                     reason: "agent dir missing or foreign".into(),
                 }),
             }
+        }
+    }
+    Ok(actions)
+}
+
+/// The entries of `agent` that `skills` names, or every entry when it names
+/// none. A name with no entry behind it is reported rather than dropped, so a
+/// typo in a CLI argument does not pass as "nothing to do".
+fn entries_of<'a>(
+    report: &'a crate::reconcile::AgentReport,
+    agent: &str,
+    skills: &[String],
+) -> (Vec<(&'a str, &'a EntryState)>, Vec<Action>) {
+    if skills.is_empty() {
+        return (
+            report
+                .entries
+                .iter()
+                .map(|(k, v)| (k.as_str(), v))
+                .collect(),
+            Vec::new(),
+        );
+    }
+    let mut found = Vec::new();
+    let mut skips = Vec::new();
+    for s in skills {
+        match report.entries.get_key_value(s) {
+            Some((k, v)) => found.push((k.as_str(), v)),
+            None => skips.push(Action::Skip {
+                agent: agent.into(),
+                skill: s.clone(),
+                reason: format!("not in {agent}"),
+            }),
+        }
+    }
+    (found, skips)
+}
+
+/// Whether `agent` has a directory of its own to repair entries in. Anything
+/// else has no per-skill entries, and the skip says which shape it is in.
+fn repairable(report: &crate::reconcile::AgentReport, agent: &str) -> Option<Action> {
+    let reason = match &report.mode {
+        AgentDirMode::Real => return None,
+        AgentDirMode::DirLinked => {
+            "agent dir is a whole-directory link; run `agents convert` first".to_string()
+        }
+        AgentDirMode::DirForeign { target } => {
+            format!("agent dir is a symlink to {}", target.display())
+        }
+        AgentDirMode::Missing => "agent dir does not exist".to_string(),
+    };
+    Some(Action::Skip {
+        agent: agent.into(),
+        skill: "*".into(),
+        reason,
+    })
+}
+
+/// Plan removing the broken links of `agent`: those of `skills`, or all of
+/// them when none is named. A broken link is one whose target is gone, which
+/// is nearly always a skill deleted from the root; the link itself carries no
+/// content, so removing it loses nothing. Recorded as an ordinary unlink, so
+/// undo puts the link back if the skill has returned and says why not otherwise.
+pub fn plan_clean(
+    ws: &Workspace,
+    snap: &Snapshot,
+    agent: &str,
+    skills: &[String],
+) -> Result<Vec<Action>> {
+    let (agent, dir) = agent_dirs(ws, std::slice::from_ref(&agent.to_string()))?.remove(0);
+    let report = snap.agent(&agent).context("agent not scanned")?;
+    if let Some(skip) = repairable(report, &agent) {
+        return Ok(vec![skip]);
+    }
+    let (entries, mut actions) = entries_of(report, &agent, skills);
+    for (name, state) in entries {
+        match state {
+            EntryState::Broken { .. } => actions.push(Action::Unlink {
+                agent: agent.clone(),
+                skill: name.into(),
+                path: dir.join(name),
+            }),
+            // With nothing named, the healthy entries are simply not the
+            // subject; with a name given, the answer is why it does not apply.
+            _ if skills.is_empty() => {}
+            other => actions.push(Action::Skip {
+                agent: agent.clone(),
+                skill: name.into(),
+                reason: format!("entry is {}; only broken links are cleaned", other.label()),
+            }),
+        }
+    }
+    Ok(actions)
+}
+
+/// Plan replacing the agent's own copies of `skills` (or of every skill, when
+/// none is named) with links to the root. Only a copy whose content matches the
+/// root byte for byte is replaced: that one is a link in all but form, and the
+/// root has everything it holds. A copy that differs is the agent's to keep,
+/// and the plan says so rather than choosing a side.
+pub fn plan_relink(
+    ws: &Workspace,
+    snap: &Snapshot,
+    agent: &str,
+    skills: &[String],
+) -> Result<Vec<Action>> {
+    let (agent, dir) = agent_dirs(ws, std::slice::from_ref(&agent.to_string()))?.remove(0);
+    let report = snap.agent(&agent).context("agent not scanned")?;
+    if let Some(skip) = repairable(report, &agent) {
+        return Ok(vec![skip]);
+    }
+    let (entries, mut actions) = entries_of(report, &agent, skills);
+    for (name, state) in entries {
+        match state {
+            EntryState::Shadow { same_content: true } => actions.push(Action::Relink {
+                agent: agent.clone(),
+                skill: name.into(),
+                path: dir.join(name),
+                target: ws.skill_path(name),
+            }),
+            EntryState::Shadow {
+                same_content: false,
+            } => actions.push(Action::Skip {
+                agent: agent.clone(),
+                skill: name.into(),
+                reason: "the agent's copy differs from the root; not touching it".into(),
+            }),
+            _ if skills.is_empty() => {}
+            other => actions.push(Action::Skip {
+                agent: agent.clone(),
+                skill: name.into(),
+                reason: format!(
+                    "entry is {}; only same-content copies are relinked",
+                    other.label()
+                ),
+            }),
         }
     }
     Ok(actions)
@@ -416,6 +571,38 @@ pub fn apply(actions: &[Action]) -> Result<usize> {
                 })?;
                 done += 1;
             }
+            Action::Relink { path, target, .. } => {
+                // The plan was drawn from a snapshot, and deleting is the one
+                // step here that cannot be taken back, so the copy is compared
+                // with the root again now rather than trusted to still match.
+                match std::fs::symlink_metadata(path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        bail!("{} is gone; nothing to relink", path.display())
+                    }
+                    Ok(m) if !m.file_type().is_dir() => {
+                        bail!("{} is not a directory; nothing to relink", path.display())
+                    }
+                    _ => {}
+                }
+                if !target.is_dir() {
+                    bail!(
+                        "{} is not in the root; nothing to relink to",
+                        target.display()
+                    );
+                }
+                if hash_directory(path)? != hash_directory(target)? {
+                    bail!(
+                        "{} no longer matches the root; refusing to delete it",
+                        path.display()
+                    );
+                }
+                std::fs::remove_dir_all(path)
+                    .with_context(|| format!("removing {}", path.display()))?;
+                std::os::unix::fs::symlink(target, path).with_context(|| {
+                    format!("linking {} -> {}", path.display(), target.display())
+                })?;
+                done += 1;
+            }
             Action::Unlink { path, .. } => {
                 match std::fs::symlink_metadata(path) {
                     // Already gone, by another session or by hand. The state
@@ -605,6 +792,7 @@ fn phrase(items: &[String], max: usize, plural: &str) -> String {
 pub fn summarize(actions: &[Action]) -> String {
     let mut added = (Vec::new(), Vec::new());
     let mut removed = (Vec::new(), Vec::new());
+    let mut relinked = (Vec::new(), Vec::new());
     let mut skipped: Vec<String> = Vec::new();
     for a in actions {
         match a {
@@ -615,6 +803,10 @@ pub fn summarize(actions: &[Action]) -> String {
             Action::Unlink { skill, agent, .. } => {
                 removed.0.push(skill.clone());
                 removed.1.push(agent.clone());
+            }
+            Action::Relink { skill, agent, .. } => {
+                relinked.0.push(skill.clone());
+                relinked.1.push(agent.clone());
             }
             Action::Skip { skill, reason, .. } => {
                 let s = format!("{skill} ({reason})");
@@ -645,6 +837,13 @@ pub fn summarize(actions: &[Action]) -> String {
             "removed {} from {}",
             phrase(&removed.0, 3, "skills"),
             phrase(&removed.1, 2, "agents")
+        ));
+    }
+    if !relinked.0.is_empty() {
+        parts.push(format!(
+            "relinked {} in {}",
+            phrase(&relinked.0, 3, "skills"),
+            phrase(&relinked.1, 2, "agents")
         ));
     }
     if parts.is_empty() {

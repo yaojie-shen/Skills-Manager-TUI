@@ -7,7 +7,8 @@
 //! ours to add and remove, anything else the agent brought itself is shown but
 //! never written to.
 
-use super::cards::{self, CARD_H, cols_for, frame, skill_card};
+use super::cards::{self, CARD_H, cols_for, frame, rule, skill_card};
+use super::matrix::Matrix;
 use super::preview::Overlay;
 use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
@@ -46,6 +47,27 @@ struct Row<'a> {
     managed: bool,
 }
 
+/// Which repairs an entry admits. Kept one per row from the last refresh so
+/// the footer can be filtered without a context in hand, the way the Health
+/// page keeps its own. The two never hold at once: an entry is either a link
+/// or a directory.
+#[derive(Debug, Clone, Copy, Default)]
+struct Caps {
+    /// A link with nothing behind it; removing it loses nothing.
+    clean: bool,
+    /// The agent's own copy, byte for byte what the root has.
+    relink: bool,
+}
+
+impl Caps {
+    fn of(state: Option<&EntryState>) -> Caps {
+        Caps {
+            clean: matches!(state, Some(EntryState::Broken { .. })),
+            relink: matches!(state, Some(EntryState::Shadow { same_content: true })),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct AgentsView {
     /// Key of the agent on show. Empty only while none is configured.
@@ -54,6 +76,8 @@ pub struct AgentsView {
     presets: Vec<(Preset, PresetStatus)>,
     preset_cursor: usize,
     entries: CardGrid,
+    /// One per entry row, in the grid's order.
+    caps: Vec<Caps>,
     /// Session override for `[ui].density`; flipping it never writes back.
     density: Option<UiDensity>,
     scope_rects: Vec<(Rect, String)>,
@@ -63,6 +87,8 @@ pub struct AgentsView {
     left: Rect,
     /// An entry opened for reading, over the page rather than instead of it.
     preview: Overlay,
+    /// The whole preset × agent picture, over the page.
+    matrix: Matrix,
 }
 
 /// `Focus` needs a default for `#[derive(Default)]` on the view.
@@ -128,6 +154,56 @@ impl AgentsView {
         self.presets.get(self.preset_cursor)
     }
 
+    fn selected_caps(&self) -> Caps {
+        self.entries
+            .selected()
+            .and_then(|i| self.caps.get(i))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Plan one repair on the selected entry and put it up for confirmation.
+    /// Both repairs delete something — a link with nothing behind it, or a
+    /// copy the root already has — so unlike a pill they stop to show the
+    /// plan first. The planner is handed the one name, so the plan is exactly
+    /// the row in hand and nothing beside it.
+    fn repair(&self, ctx: &Ctx, rows: &[Row], clean: bool) -> Vec<Action> {
+        let Some(row) = self.entries.selected().and_then(|i| rows.get(i)) else {
+            return vec![Action::Error("nothing selected".into())];
+        };
+        let caps = Caps::of(row.state);
+        if clean && !caps.clean {
+            return vec![Action::Error(format!(
+                "{}: clean applies to links whose target is gone",
+                row.name
+            ))];
+        }
+        if !clean && !caps.relink {
+            return vec![Action::Error(format!(
+                "{}: relink applies to the agent's own copies that match the root",
+                row.name
+            ))];
+        }
+        let skill = vec![row.name.to_string()];
+        let plan = if clean {
+            deploy::plan_clean(ctx.ws, ctx.snap, &self.scope, &skill)
+        } else {
+            deploy::plan_relink(ctx.ws, ctx.snap, &self.scope, &skill)
+        };
+        match plan {
+            Ok(actions) => vec![Action::ConfirmLinks {
+                title: format!(
+                    "{} {}/{}",
+                    if clean { "clean" } else { "relink" },
+                    self.scope,
+                    row.name
+                ),
+                actions,
+            }],
+            Err(e) => vec![Action::Error(format!("{e:#}"))],
+        }
+    }
+
     fn activate(&self, ctx: &Ctx, on: bool) -> Vec<Action> {
         let Some((preset, status)) = self.selected_preset() else {
             return vec![Action::Error("no preset here yet".into())];
@@ -179,6 +255,15 @@ impl AgentsView {
 }
 
 impl View for AgentsView {
+    /// Coming back to this page puts the keyboard on the pills, whatever it
+    /// was doing when the user left: that band is what the page is for, and a
+    /// focus left in the grid is invisible until Enter does the wrong thing.
+    fn enter(&mut self) {
+        self.set_focus(Focus::Presets);
+        self.preview.close();
+        self.matrix.close();
+    }
+
     fn refresh(&mut self, ctx: &Ctx) {
         // A scope pinned to an agent that is gone from the config, or never set,
         // falls back to the first one there is.
@@ -205,6 +290,7 @@ impl View for AgentsView {
             .collect();
         self.preset_cursor = self.preset_cursor.min(self.presets.len().saturating_sub(1));
         let rows = self.rows(ctx);
+        self.caps = rows.iter().map(|r| Caps::of(r.state)).collect();
         self.entries.clamp(rows.len());
     }
 
@@ -212,9 +298,16 @@ impl View for AgentsView {
         if self.preview.handle_key(k) {
             return vec![];
         }
+        if let Some(acts) = self.matrix.handle_key(k, ctx) {
+            return acts;
+        }
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
             KeyCode::Char('q') => return vec![Action::Quit],
+            KeyCode::Char('M') => {
+                self.matrix.open(ctx);
+                return vec![];
+            }
             KeyCode::Esc => return vec![Action::SwitchTab(Tab::Search)],
             // Scope is switchable from anywhere: it frames everything else.
             KeyCode::Char('[') => {
@@ -322,8 +415,19 @@ impl View for AgentsView {
                             self.entries.move_rows(-1, n);
                         }
                     }
-                    KeyCode::Right | KeyCode::Char('l') => self.entries.move_by(1, n),
+                    KeyCode::Right => self.entries.move_by(1, n),
+                    // On a copy that can be relinked, `l` is the relink key;
+                    // everywhere else it is the vim way of moving right. The
+                    // footer says which it is on the row in hand, and the
+                    // arrow still moves regardless.
+                    KeyCode::Char('l') => {
+                        if self.selected_caps().relink {
+                            return self.repair(ctx, &rows, false);
+                        }
+                        self.entries.move_by(1, n)
+                    }
                     KeyCode::Left | KeyCode::Char('h') => self.entries.move_by(-1, n),
+                    KeyCode::Char('x') => return self.repair(ctx, &rows, true),
                     KeyCode::Home | KeyCode::Char('g') => {
                         self.entries.first(n);
                     }
@@ -369,6 +473,9 @@ impl View for AgentsView {
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
         if self.preview.handle_mouse(m) {
             return vec![];
+        }
+        if let Some(acts) = self.matrix.handle_mouse(m, ctx) {
+            return acts;
         }
         let at = (m.column, m.row).into();
         if let Some(d) = wheel(&m) {
@@ -658,7 +765,7 @@ impl View for AgentsView {
                                     th.dim(),
                                 ),
                             ]),
-                            Line::from(""),
+                            rule(ci.width as usize, th),
                             Line::from(vec![
                                 Span::raw("  "),
                                 Span::styled(label, th.dim().add_modifier(Modifier::ITALIC)),
@@ -714,6 +821,7 @@ impl View for AgentsView {
             );
         }
         self.preview.draw(f, area, ctx);
+        self.matrix.draw(f, area, ctx);
     }
 
     fn hints(&self) -> Hints {
@@ -721,21 +829,46 @@ impl View for AgentsView {
             Focus::Presets => &[
                 ("Enter", "deploy / undeploy"),
                 ("x", "undeploy"),
+                ("M", "matrix"),
                 ("←→", "pick preset"),
                 ("↓", "entries"),
                 ("[ ]", "scope"),
                 ("s", "sync"),
                 ("v", "density"),
             ],
-            Focus::Entries => &[
-                ("j/k", "move"),
-                ("↑", "back to presets"),
-                ("Enter", "preview"),
-                ("a", "adopt"),
-                ("[ ]", "agent"),
-                ("c", "convert dir-link"),
-                ("v", "density"),
-            ],
+            // A repair key is shown only on a row it applies to, so the footer
+            // never offers something the page would refuse.
+            Focus::Entries => match self.selected_caps() {
+                Caps { clean: true, .. } => &[
+                    ("j/k", "move"),
+                    ("↑", "back to presets"),
+                    ("Enter", "preview"),
+                    ("x", "clean"),
+                    ("a", "adopt"),
+                    ("[ ]", "agent"),
+                    ("c", "convert dir-link"),
+                    ("v", "density"),
+                ],
+                Caps { relink: true, .. } => &[
+                    ("j/k", "move"),
+                    ("↑", "back to presets"),
+                    ("Enter", "preview"),
+                    ("l", "relink"),
+                    ("a", "adopt"),
+                    ("[ ]", "agent"),
+                    ("c", "convert dir-link"),
+                    ("v", "density"),
+                ],
+                Caps { .. } => &[
+                    ("j/k", "move"),
+                    ("↑", "back to presets"),
+                    ("Enter", "preview"),
+                    ("a", "adopt"),
+                    ("[ ]", "agent"),
+                    ("c", "convert dir-link"),
+                    ("v", "density"),
+                ],
+            },
             Focus::Agents => &[
                 ("←→", "pick agent"),
                 ("↓", "presets"),

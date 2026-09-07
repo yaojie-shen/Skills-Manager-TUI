@@ -2,8 +2,10 @@
 
 use skills::Workspace;
 use skills::config::{AgentConfig, Config, DeployConfig};
+use skills::history::{self, Intent, Plan};
 use skills::ops::deploy::{self, Action};
 use skills::ops::{edit, install};
+use skills::preset::Preset;
 use skills::reconcile::{AgentDirMode, DeployState, EntryState, SkillStatus};
 use std::path::{Path, PathBuf};
 
@@ -630,4 +632,221 @@ fn apply_tolerates_the_state_it_wanted_and_still_guards_the_agents_own() {
         std::fs::read_to_string(f.agent_a.join("one/SKILL.md")).unwrap(),
         "---\nname: one\n---\nmine\n"
     );
+}
+
+/// Whether anything at all is at `path`, a dangling link included.
+fn entry_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+#[test]
+fn clean_removes_a_broken_link_and_undo_relinks_once_the_skill_is_back() {
+    let f = Fixture::new("clean");
+    let dir = f.add_skill("printer", "prints");
+    f.add_skill("bicycle", "rides");
+    let ws = f.ws();
+    let snap = ws.scan().unwrap();
+    let deploy = deploy::plan_deploy(
+        &ws,
+        &snap,
+        &["printer".into(), "bicycle".into()],
+        &["a".into()],
+    )
+    .unwrap();
+    deploy::apply(&deploy).unwrap();
+
+    // The skill leaves the root behind the agent's back.
+    std::fs::remove_dir_all(&dir).unwrap();
+    let snap = ws.scan().unwrap();
+    assert!(matches!(
+        snap.agent("a").unwrap().entries["printer"],
+        EntryState::Broken { .. }
+    ));
+
+    // Naming nothing cleans every broken link and leaves the healthy ones
+    // out of it; naming a healthy one is answered rather than ignored.
+    let plan = deploy::plan_clean(&ws, &snap, "a", &[]).unwrap();
+    assert_eq!(
+        plan,
+        vec![Action::Unlink {
+            agent: "a".into(),
+            skill: "printer".into(),
+            path: f.agent_a.join("printer"),
+        }]
+    );
+    let named = deploy::plan_clean(&ws, &snap, "a", &["bicycle".into()]).unwrap();
+    assert!(matches!(&named[0], Action::Skip { skill, .. } if skill == "bicycle"));
+
+    assert_eq!(deploy::apply(&plan).unwrap(), 1);
+    assert!(!entry_exists(&f.agent_a.join("printer")));
+    assert!(entry_exists(&f.agent_a.join("bicycle")));
+
+    // To the log a clean is an unlink. While the skill is still gone there
+    // is nothing undo can do, and it says so instead of failing.
+    let intent = Intent::from_actions(&plan).unwrap();
+    assert!(matches!(
+        &intent,
+        Intent::Links { added, removed }
+            if added.is_empty() && removed == &[("printer".to_string(), "a".to_string())]
+    ));
+    let snap = ws.scan().unwrap();
+    assert!(matches!(
+        history::undo_plan(&ws, &snap, &intent).unwrap(),
+        Plan::Nothing(_)
+    ));
+
+    // Once the skill is back, undo puts the link back.
+    f.add_skill("printer", "prints again");
+    let snap = ws.scan().unwrap();
+    let Plan::Links(actions) = history::undo_plan(&ws, &snap, &intent).unwrap() else {
+        panic!("undo of a clean should plan links");
+    };
+    assert_eq!(deploy::apply(&actions).unwrap(), 1);
+    assert_eq!(
+        link_state(&f.agent_a, "printer").unwrap(),
+        f.root.join("printer")
+    );
+}
+
+#[test]
+fn relink_replaces_a_same_content_copy_and_refuses_one_that_differs() {
+    let f = Fixture::new("relink");
+    f.add_skill("etcd", "keys");
+    f.add_skill("msgpack", "bytes");
+    std::fs::create_dir_all(f.agent_a.join("etcd")).unwrap();
+    std::fs::copy(
+        f.root.join("etcd/SKILL.md"),
+        f.agent_a.join("etcd/SKILL.md"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(f.agent_a.join("msgpack")).unwrap();
+    std::fs::write(
+        f.agent_a.join("msgpack/SKILL.md"),
+        "---\nname: msgpack\ndescription: my own notes\n---\n",
+    )
+    .unwrap();
+    let ws = f.ws();
+    let snap = ws.scan().unwrap();
+    let entries = &snap.agent("a").unwrap().entries;
+    assert_eq!(entries["etcd"], EntryState::Shadow { same_content: true });
+    assert_eq!(
+        entries["msgpack"],
+        EntryState::Shadow {
+            same_content: false
+        }
+    );
+
+    // One copy is relinked, the other named and left alone; and none of it
+    // is offered to the log, since the directory deleted cannot come back.
+    let plan = deploy::plan_relink(&ws, &snap, "a", &[]).unwrap();
+    assert_eq!(plan.len(), 2);
+    assert!(matches!(&plan[0], Action::Relink { skill, .. } if skill == "etcd"));
+    assert!(matches!(&plan[1], Action::Skip { skill, .. } if skill == "msgpack"));
+    assert!(Intent::from_actions(&plan).is_none());
+
+    // A copy edited between plan and apply no longer matches, and is kept.
+    std::fs::write(f.agent_a.join("etcd/notes.txt"), "mine").unwrap();
+    assert!(deploy::apply(&plan).is_err());
+    assert!(f.agent_a.join("etcd/notes.txt").exists());
+    std::fs::remove_file(f.agent_a.join("etcd/notes.txt")).unwrap();
+
+    assert_eq!(deploy::apply(&plan).unwrap(), 1);
+    assert_eq!(link_state(&f.agent_a, "etcd").unwrap(), f.root.join("etcd"));
+    assert!(f.agent_a.join("msgpack").is_dir());
+    assert!(link_state(&f.agent_a, "msgpack").is_none());
+    let snap = ws.scan().unwrap();
+    assert_eq!(snap.get("etcd").unwrap().deploy["a"], DeployState::Deployed);
+
+    // Asked for by name, the copy that differs is still refused.
+    let named = deploy::plan_relink(&ws, &snap, "a", &["msgpack".into()]).unwrap();
+    assert!(matches!(&named[0], Action::Skip { .. }));
+    let unknown = deploy::plan_relink(&ws, &snap, "a", &["yaml-reader".into()]).unwrap();
+    assert!(matches!(&unknown[0], Action::Skip { skill, .. } if skill == "yaml-reader"));
+}
+
+/// Run the binary against `root` with `--json` and parse what it printed.
+fn skills_json(root: &Path, args: &[&str]) -> Result<serde_json::Value, String> {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_skills"))
+        .arg("--root")
+        .arg(root)
+        .arg("--json")
+        .args(args)
+        .output()
+        .unwrap();
+    if out.status.success() {
+        Ok(serde_json::from_slice(&out.stdout).unwrap())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+#[test]
+fn cli_repairs_and_preset_edits_round_trip_as_json() {
+    let f = Fixture::new("cli");
+    let dir = f.add_skill("yaml-reader", "reads");
+    f.add_skill("printer", "prints");
+    let ws = f.ws();
+    let snap = ws.scan().unwrap();
+    let plan = deploy::plan_deploy(&ws, &snap, &["yaml-reader".into()], &["a".into()]).unwrap();
+    deploy::apply(&plan).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(f.agent_a.join("printer")).unwrap();
+    std::fs::copy(
+        f.root.join("printer/SKILL.md"),
+        f.agent_a.join("printer/SKILL.md"),
+    )
+    .unwrap();
+
+    // A plan with changes needs --yes; --dry-run shows it and touches nothing.
+    let err = skills_json(&f.root, &["agents", "clean", "a"]).unwrap_err();
+    assert!(err.contains("--yes"), "{err}");
+    let v = skills_json(&f.root, &["agents", "clean", "a", "--dry-run"]).unwrap();
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["applied"], 0);
+    assert_eq!(v["actions"][0]["op"], "unlink");
+    assert_eq!(v["actions"][0]["skill"], "yaml-reader");
+    assert!(entry_exists(&f.agent_a.join("yaml-reader")));
+    let v = skills_json(&f.root, &["agents", "clean", "a", "--yes"]).unwrap();
+    assert_eq!(v["applied"], 1);
+    assert!(!entry_exists(&f.agent_a.join("yaml-reader")));
+
+    let v = skills_json(&f.root, &["agents", "relink", "a", "printer", "--yes"]).unwrap();
+    assert_eq!(v["applied"], 1);
+    assert_eq!(v["actions"][0]["op"], "relink");
+    assert_eq!(
+        link_state(&f.agent_a, "printer").unwrap(),
+        f.root.join("printer")
+    );
+    // With nothing left to delete there is nothing to consent to, and the
+    // skips are the answer.
+    let v = skills_json(&f.root, &["agents", "relink", "a", "printer"]).unwrap();
+    assert_eq!(v["applied"], 0);
+    assert_eq!(v["actions"][0]["op"], "skip");
+
+    // Presets: describe, clear, rename, each visible through `show` after.
+    ws.presets
+        .save(&Preset {
+            name: "daily".into(),
+            description: None,
+            skills: vec!["printer".into()],
+            agents: vec![],
+        })
+        .unwrap();
+    let v = skills_json(
+        &f.root,
+        &["preset", "describe", "daily", "what I reach for every day"],
+    )
+    .unwrap();
+    assert_eq!(v["preset"]["description"], "what I reach for every day");
+    let v = skills_json(&f.root, &["preset", "show", "daily"]).unwrap();
+    assert_eq!(v["description"], "what I reach for every day");
+    let v = skills_json(&f.root, &["preset", "describe", "daily", ""]).unwrap();
+    assert!(v["preset"]["description"].is_null());
+    let v = skills_json(&f.root, &["preset", "rename", "daily", "weekly"]).unwrap();
+    assert_eq!(v["renamed"]["from"], "daily");
+    assert_eq!(v["renamed"]["to"], "weekly");
+    assert!(ws.presets.load("daily").unwrap().is_none());
+    let v = skills_json(&f.root, &["preset", "show", "weekly"]).unwrap();
+    assert_eq!(v["skills"][0], "printer");
+    assert!(skills_json(&f.root, &["preset", "rename", "daily", "weekly"]).is_err());
 }

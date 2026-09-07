@@ -15,14 +15,15 @@
 //! be put back because the skill and the agent directory between them still say
 //! what it was; a note that was overwritten exists nowhere else the moment the
 //! file is saved. So a metadata entry carries the values themselves — for tags
-//! and preset members the two sets the write added and took off, for a note or
-//! a source the value on either side — and only the *reversal* is re-derived
-//! against the file as it stands. Sets are undone element by element, so a tag
-//! added by hand in between survives, and undoing "add a tag that was already
-//! there" removes nothing, because adding it changed nothing to begin with. A
-//! note or a source has no such structure: it is put back only while the file
-//! still holds what this step wrote, and anything else means someone edited it
-//! since, so it is left alone.
+//! and preset members the two sets the write added and took off, for a note, a
+//! source or a preset description the value on either side — and only the
+//! *reversal* is re-derived against the file as it stands. Sets are undone
+//! element by element, so a tag added by hand in between survives, and undoing
+//! "add a tag that was already there" removes nothing, because adding it
+//! changed nothing to begin with. A note, a source or a description has no
+//! such structure: it is put back only while the file still holds what this
+//! step wrote, and anything else means someone edited it since, so it is left
+//! alone.
 //!
 //! The history lives only as long as the process. Replaying an intent against a
 //! tree that git or another session has moved on is not something a stored log
@@ -33,6 +34,7 @@ use crate::meta;
 use crate::ops::deploy::{self, Action};
 use crate::ops::edit;
 use crate::ops::install::{self, InstallRef};
+use crate::preset;
 use crate::reconcile::Snapshot;
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,6 +62,11 @@ pub enum Intent {
     /// afresh when it is asked for, so a skill gone or a name taken in the
     /// meantime stops it rather than being written over.
     Rename { from: String, to: String },
+    /// A preset moved to a new name: its file, and its entry in the
+    /// auto-deploy list if it had one. Undone the way a skill rename is, by
+    /// planning the move back when it is asked for, so the old name being
+    /// taken since stops it.
+    PresetRename { from: String, to: String },
     /// Something that discarded content and so cannot be taken back. Kept so
     /// the log stays honest about everything that happened.
     OneWay { what: String },
@@ -75,7 +82,11 @@ impl Intent {
             match a {
                 Action::Link { skill, agent, .. } => added.push((skill.clone(), agent.clone())),
                 Action::Unlink { skill, agent, .. } => removed.push((skill.clone(), agent.clone())),
-                Action::Skip { .. } | Action::Mkdir { .. } => {}
+                // A relink deleted a directory. Taking the link out again would
+                // not bring the directory back, and the link planners have no
+                // way to say "a real directory with this content"; a step that
+                // only half reverses is worse than none, so it is not recorded.
+                Action::Relink { .. } | Action::Skip { .. } | Action::Mkdir { .. } => {}
             }
         }
         (!added.is_empty() || !removed.is_empty()).then_some(Intent::Links { added, removed })
@@ -97,6 +108,7 @@ impl Intent {
             Intent::Meta(changes) => describe_changes(changes),
             Intent::Install { skill } => format!("installed {skill}"),
             Intent::Rename { from, to } => format!("renamed {from} to {to}"),
+            Intent::PresetRename { from, to } => format!("renamed preset {from} to {to}"),
             Intent::OneWay { what } => what.clone(),
         }
     }
@@ -175,6 +187,14 @@ pub enum MetaChange {
         added: Vec<String>,
         removed: Vec<String>,
     },
+    /// The description of one preset: one sentence with no structure to
+    /// merge, so it is handled exactly as a note is, with `None` for no
+    /// description at all.
+    PresetDescription {
+        name: String,
+        before: Option<String>,
+        after: Option<String>,
+    },
 }
 
 /// What applying one change would do to the files as they stand now.
@@ -225,6 +245,15 @@ impl MetaChange {
                 added: removed,
                 removed: added,
             },
+            MetaChange::PresetDescription {
+                name,
+                before,
+                after,
+            } => MetaChange::PresetDescription {
+                name,
+                before: after,
+                after: before,
+            },
         }
     }
 
@@ -261,6 +290,10 @@ impl MetaChange {
                     format!("take {} out of preset {name}", some(removed, 3, "skills"))
                 }
                 _ => format!("change the members of preset {name}"),
+            },
+            MetaChange::PresetDescription { name, after, .. } => match after {
+                Some(t) => format!("set the description of preset {name} to \"{}\"", snippet(t)),
+                None => format!("clear the description of preset {name}"),
             },
         }
     }
@@ -322,6 +355,18 @@ impl MetaChange {
                         Fate::Done
                     },
                 ),
+            },
+            MetaChange::PresetDescription {
+                name,
+                before,
+                after,
+            } => match ws.presets.load(name)? {
+                None => Ok(Fate::Blocked(format!("preset {name} is gone"))),
+                Some(p) if &p.description == after => Ok(Fate::Done),
+                Some(p) if &p.description == before => Ok(Fate::Ready),
+                Some(_) => Ok(Fate::Blocked(format!(
+                    "the description of preset {name} was changed since"
+                ))),
             },
         }
     }
@@ -405,6 +450,22 @@ impl MetaChange {
                 }
                 ws.presets.save(&p)?;
                 Ok(format!("{name}: {} skill(s)", p.skills.len()))
+            }
+            MetaChange::PresetDescription { name, after, .. } => {
+                let mut p = ws
+                    .presets
+                    .load(name)?
+                    .with_context(|| format!("no such preset: {name}"))?;
+                p.description = after.clone();
+                ws.presets.save(&p)?;
+                Ok(format!(
+                    "description {} on preset {name}",
+                    if after.is_some() {
+                        "restored"
+                    } else {
+                        "cleared"
+                    }
+                ))
             }
         }
     }
@@ -593,6 +654,65 @@ pub fn preset_edit(
     ))
 }
 
+/// Write a preset's description, keeping the text it replaced. An empty
+/// string is no description: the field is one sentence or nothing, and a
+/// blank one would show as a blank line on the card.
+pub fn preset_description_edit(
+    ws: &Workspace,
+    name: &str,
+    text: Option<&str>,
+) -> Result<(String, Option<Intent>)> {
+    let mut p = ws
+        .presets
+        .load(name)?
+        .with_context(|| format!("no such preset: {name}"))?;
+    let before = p.description.clone();
+    let after = text
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    if after == before {
+        return Ok((format!("description of {name} unchanged"), None));
+    }
+    p.description = after.clone();
+    ws.presets.save(&p)?;
+    let message = format!(
+        "description {} on {name}",
+        if after.is_some() { "saved" } else { "cleared" }
+    );
+    Ok((
+        message,
+        Some(Intent::Meta(vec![MetaChange::PresetDescription {
+            name: name.to_string(),
+            before,
+            after,
+        }])),
+    ))
+}
+
+/// Move a preset to a new name, taking its auto-deploy entry with it, and
+/// record the move. The two writes are not one transaction; the file is
+/// moved first because a rename that fails there has changed nothing, and a
+/// config that then cannot be rewritten is reported with the preset already
+/// under its new name, which the message says.
+pub fn preset_rename(ws: &Workspace, from: &str, to: &str) -> Result<(String, Option<Intent>)> {
+    ws.presets.rename(from, to)?;
+    let listed = preset::rename_deploy_reference(&ws.root, from, to)
+        .with_context(|| format!("preset renamed to {to}, but its auto-deploy entry was not"))?;
+    let message = if listed {
+        format!("renamed preset {from} to {to}, config.toml too")
+    } else {
+        format!("renamed preset {from} to {to}")
+    };
+    Ok((
+        message,
+        Some(Intent::PresetRename {
+            from: from.to_string(),
+            to: to.to_string(),
+        }),
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub intent: Intent,
@@ -624,6 +744,11 @@ pub enum WriteBack {
         from: String,
         to: String,
     },
+    /// A preset to move, likewise.
+    PresetRename {
+        from: String,
+        to: String,
+    },
 }
 
 impl WriteBack {
@@ -639,6 +764,9 @@ impl WriteBack {
             WriteBack::Rename { from, to } => {
                 let snap = ws.scan()?;
                 edit::rename(ws, &snap, from, to).map(|_| format!("renamed {from} to {to}"))
+            }
+            WriteBack::PresetRename { from, to } => {
+                preset_rename(ws, from, to).map(|(message, _)| message)
             }
             WriteBack::Meta(changes) => {
                 let mut done = Vec::new();
@@ -729,11 +857,26 @@ fn plan_pairs(
                 continue;
             }
             let scope = [agent.to_string()];
-            actions.extend(if deploying {
-                deploy::plan_deploy(ws, snap, &skills, &scope)?
-            } else {
-                deploy::plan_undeploy(ws, snap, &skills, &scope)?
-            });
+            if !deploying {
+                actions.extend(deploy::plan_undeploy(ws, snap, &skills, &scope)?);
+                continue;
+            }
+            // To the deploy planner a name the snapshot has no record of is a
+            // caller's mistake, and it stops. Here it means the skill left the
+            // root, metadata and all, after the step was taken: putting a link
+            // back is off the table, and that is a reason to skip, not to stop.
+            let (known, gone): (Vec<String>, Vec<String>) =
+                skills.into_iter().partition(|s| snap.get(s).is_some());
+            for skill in gone {
+                actions.push(Action::Skip {
+                    agent: agent.to_string(),
+                    skill,
+                    reason: "not in the skills root".into(),
+                });
+            }
+            if !known.is_empty() {
+                actions.extend(deploy::plan_deploy(ws, snap, &known, &scope)?);
+            }
         }
     }
     Ok(actions)
@@ -763,6 +906,7 @@ pub fn undo_plan(ws: &Workspace, snap: &Snapshot, intent: &Intent) -> Result<Pla
             })
         }
         Intent::Rename { from, to } => rename(ws, snap, to, from),
+        Intent::PresetRename { from, to } => preset_rename_plan(ws, to, from),
         Intent::OneWay { what } => bail!("{what} cannot be taken back"),
     }
 }
@@ -775,6 +919,7 @@ pub fn redo_plan(ws: &Workspace, snap: &Snapshot, intent: &Intent) -> Result<Pla
         // Fetching is a fresh network operation, not a reversal of a removal.
         Intent::Install { skill } => bail!("install {skill} again to bring it back"),
         Intent::Rename { from, to } => rename(ws, snap, from, to),
+        Intent::PresetRename { from, to } => preset_rename_plan(ws, from, to),
         Intent::OneWay { what } => bail!("{what} cannot be redone"),
     }
 }
@@ -803,6 +948,32 @@ fn rename(ws: &Workspace, snap: &Snapshot, from: &str, to: &str) -> Result<Plan>
     Ok(Plan::Write {
         describe: format!("rename {from} to {to}"),
         apply: WriteBack::Rename {
+            from: from.to_string(),
+            to: to.to_string(),
+        },
+    })
+}
+
+/// The same reasoning as `rename`, for a preset. A file is what counts as
+/// taken, whether or not it parses: a preset this tool cannot read is still
+/// not one it may write over.
+fn preset_rename_plan(ws: &Workspace, from: &str, to: &str) -> Result<Plan> {
+    let present = |name: &str| ws.presets.path(name).exists();
+    if !present(from) {
+        return Ok(Plan::Nothing(if present(to) {
+            format!("already done: renamed preset {from} to {to}")
+        } else {
+            format!("preset {from} is gone")
+        }));
+    }
+    if present(to) {
+        return Ok(Plan::Nothing(format!(
+            "preset {to} is taken; {from} left as it is"
+        )));
+    }
+    Ok(Plan::Write {
+        describe: format!("rename preset {from} to {to}"),
+        apply: WriteBack::PresetRename {
             from: from.to_string(),
             to: to.to_string(),
         },
@@ -988,6 +1159,21 @@ mod tests {
         );
         assert_eq!(source.reverse().describe(), "clear the source of etcd");
         assert_eq!(source.reverse().reverse(), source);
+
+        let description = MetaChange::PresetDescription {
+            name: "commute".into(),
+            before: None,
+            after: Some("rides to work".into()),
+        };
+        assert_eq!(
+            description.describe(),
+            "set the description of preset commute to \"rides to work\""
+        );
+        assert_eq!(
+            description.reverse().describe(),
+            "clear the description of preset commute"
+        );
+        assert_eq!(description.reverse().reverse(), description);
     }
 
     #[test]

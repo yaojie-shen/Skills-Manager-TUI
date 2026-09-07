@@ -1,6 +1,7 @@
 //! Metadata edits (tags, notes, baseline), rename and remove.
 
 use crate::Workspace;
+use crate::config::Config;
 use crate::hash::{HASH_ALGO, hash_directory};
 use crate::meta::{Baseline, SkillMeta};
 use crate::ops::{deploy, require_key};
@@ -75,10 +76,17 @@ pub fn tag_set(ws: &Workspace, key: &str, tags: &[String]) -> Result<SkillMeta> 
 }
 
 /// Rename a tag across every skill. Returns the number of skills touched.
+///
+/// Renaming onto a tag that already exists is a merge: a skill carrying both
+/// ends up with one copy of the new name. The tag's `[[tags]]` entry in the
+/// config follows it, so a rename does not cost the tag its colour.
 pub fn tag_rename(ws: &Workspace, old: &str, new: &str) -> Result<usize> {
     let new = normalize_tag(new);
     if new.is_empty() {
         bail!("new tag name is empty");
+    }
+    if new == old {
+        return Ok(0);
     }
     let mut n = 0;
     for key in ws.meta.list_keys()? {
@@ -91,6 +99,7 @@ pub fn tag_rename(ws: &Workspace, old: &str, new: &str) -> Result<usize> {
             n += 1;
         }
     }
+    Config::rename_tag_entry(&ws.root, old, &new)?;
     Ok(n)
 }
 

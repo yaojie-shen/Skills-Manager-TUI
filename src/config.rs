@@ -8,6 +8,7 @@ use crate::paths::{expand_tilde, meta_dir};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 pub const CONFIG_FILE: &str = "config.toml";
 
@@ -33,11 +34,14 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UiLayout {
-    /// Results on the left, a preview pane always open on the right.
-    #[default]
+    /// Results on the left, a preview pane always open on the right. One
+    /// column of cards, which is a list wearing frames; kept for anyone who
+    /// wants the preview in view the whole time.
     Split,
     /// Results across the full width in as many columns as fit; the preview
-    /// opens over them when asked for.
+    /// opens over them when asked for. The default: cards only earn their
+    /// frames once there are several to a row.
+    #[default]
     Grid,
 }
 
@@ -327,6 +331,106 @@ impl Config {
         std::fs::create_dir_all(path.parent().unwrap())?;
         let text = toml::to_string_pretty(self)?;
         crate::util::write_atomic(&path, text.as_bytes())
+    }
+
+    /// Change `config.toml` on disk without disturbing the rest of it. The
+    /// file is meant to be edited by hand, so anything the tool writes has to
+    /// keep the comments and order the user put there; `save` is a serde
+    /// round trip and would drop them. `edit` says whether it changed anything,
+    /// so a no-op leaves the file untouched.
+    fn edit_document(
+        root: &Path,
+        edit: impl FnOnce(&mut DocumentMut) -> Result<bool>,
+    ) -> Result<()> {
+        let path = Self::path(root);
+        let mut doc = match std::fs::read_to_string(&path) {
+            Ok(text) => text
+                .parse::<DocumentMut>()
+                .with_context(|| format!("invalid config: {}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => DocumentMut::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        if edit(&mut doc)? {
+            crate::util::write_atomic(&path, doc.to_string().as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// The `[[tags]]` entries of a document, created when there are none yet.
+    /// `save` writes an empty list as `tags = []`, and a hand-written file may
+    /// use inline tables; either is turned into `[[tags]]` tables first.
+    fn tag_tables(doc: &mut DocumentMut) -> Result<&mut ArrayOfTables> {
+        if let Some(arr) = doc.get("tags").and_then(Item::as_array) {
+            let mut tables = ArrayOfTables::new();
+            for v in arr.iter() {
+                let t = v
+                    .as_inline_table()
+                    .context("an entry of `tags` in config.toml is not a table")?;
+                tables.push(t.clone().into_table());
+            }
+            doc["tags"] = Item::ArrayOfTables(tables);
+        }
+        doc.entry("tags")
+            .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
+            .as_array_of_tables_mut()
+            .context("`tags` in config.toml is not a list of [[tags]] tables")
+    }
+
+    fn tag_index(tables: &ArrayOfTables, name: &str) -> Option<usize> {
+        tables
+            .iter()
+            .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+    }
+
+    /// Give a tag a colour, adding its `[[tags]]` entry when it has none, or
+    /// take the colour away again with `None`. The value is written as given;
+    /// what counts as a colour is the caller's business.
+    pub fn set_tag_color(root: &Path, name: &str, color: Option<&str>) -> Result<()> {
+        Self::edit_document(root, |doc| {
+            let tables = Self::tag_tables(doc)?;
+            match (Self::tag_index(tables, name), color) {
+                (Some(i), Some(c)) => {
+                    tables.get_mut(i).context("tag entry vanished")?["color"] = value(c);
+                }
+                (Some(i), None) => {
+                    let t = tables.get_mut(i).context("tag entry vanished")?;
+                    if t.remove("color").is_none() {
+                        return Ok(false);
+                    }
+                    // An entry with nothing left but its name says nothing, so
+                    // it goes rather than accumulate.
+                    if t.len() == 1 {
+                        tables.remove(i);
+                    }
+                }
+                (None, Some(c)) => {
+                    let mut t = Table::new();
+                    t["name"] = value(name);
+                    t["color"] = value(c);
+                    tables.push(t);
+                }
+                (None, None) => return Ok(false),
+            }
+            Ok(true)
+        })
+    }
+
+    /// Carry a tag's `[[tags]]` entry over to its new name. When the new name
+    /// already has an entry of its own, that one wins and the old is dropped:
+    /// the tag is being merged into it, not replacing it.
+    pub fn rename_tag_entry(root: &Path, old: &str, new: &str) -> Result<()> {
+        Self::edit_document(root, |doc| {
+            let tables = Self::tag_tables(doc)?;
+            let Some(i) = Self::tag_index(tables, old) else {
+                return Ok(false);
+            };
+            if Self::tag_index(tables, new).is_some() {
+                tables.remove(i);
+            } else {
+                tables.get_mut(i).context("tag entry vanished")?["name"] = value(new);
+            }
+            Ok(true)
+        })
     }
 
     pub fn agent(&self, key: &str) -> Option<&AgentConfig> {

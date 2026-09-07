@@ -17,6 +17,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use skills::Workspace;
+use skills::config::Config;
 use skills::history::{self, History, Plan};
 use skills::ops::deploy;
 use skills::reconcile::Snapshot;
@@ -72,6 +73,9 @@ pub enum Action {
     OpenModal(Box<Modal>),
     CloseModal,
     SwitchTab(Tab),
+    /// Land on a preset by name once the list next reloads: after creating
+    /// or renaming one, the card to look at is the one that has just changed.
+    SelectPreset(String),
     /// Jump to the search tab with this query; `focus_list` selects the list pane.
     Search {
         query: String,
@@ -324,7 +328,10 @@ impl App {
         if let Some(m) = self.modal.as_mut() {
             return m.handle_key(k, &ctx);
         }
-        let in_search_input = self.tab == Tab::Search && self.search.input_focused();
+        // Any text field that holds the keyboard keeps its digits and slashes;
+        // the Tags page has one of its own for colours and merge targets.
+        let in_search_input = (self.tab == Tab::Search && self.search.input_focused())
+            || (self.tab == Tab::Tags && self.tags.input_focused());
         match (k.code, k.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return vec![Action::Quit],
             (KeyCode::Char('z'), KeyModifiers::CONTROL) => return self.step(Step::Undo),
@@ -407,13 +414,14 @@ impl App {
             Action::OpenModal(m) => self.modal = Some(*m),
             Action::CloseModal => self.modal = None,
             Action::SwitchTab(t) => {
-                self.tab = t;
+                self.switch_tab(t);
                 if t == Tab::Search {
                     self.search.focus_input();
                 }
             }
+            Action::SelectPreset(name) => self.presets.select(&name),
             Action::Search { query, focus_list } => {
-                self.tab = Tab::Search;
+                self.switch_tab(Tab::Search);
                 let ctx = Ctx {
                     ws: &self.ws,
                     snap: &self.snap,
@@ -486,6 +494,24 @@ impl App {
         }
     }
 
+    /// Make `t` the active tab. The view is told only when the tab actually
+    /// changes: a key for the tab already showing is not a return to it, and
+    /// must not throw away a focus the user has just set.
+    fn switch_tab(&mut self, t: Tab) {
+        if t == self.tab {
+            return;
+        }
+        self.tab = t;
+        let view: &mut dyn View = match t {
+            Tab::Search => &mut self.search,
+            Tab::Tags => &mut self.tags,
+            Tab::Presets => &mut self.presets,
+            Tab::Agents => &mut self.agents,
+            Tab::Health => &mut self.health,
+        };
+        view.enter();
+    }
+
     /// Take one step back or forward. The plan is worked out against the tree
     /// as it stands, so anything changed since is skipped rather than forced.
     fn step(&mut self, dir: Step) -> Vec<Action> {
@@ -549,6 +575,17 @@ impl App {
     }
 
     pub fn rescan(&mut self) {
+        // The config is read once when the workspace opens, and the scan
+        // works from that copy. A preset rename rewrites `[deploy].presets`
+        // on disk behind it, so the file is read again before every rescan:
+        // that is what keeps the `auto` mark on a preset card, and the
+        // desired state `sync` plans from, in step with what is written. A
+        // file that no longer parses is reported and the last good copy kept,
+        // since a hand edit in progress should not take the program down.
+        match Config::load(&self.ws.root) {
+            Ok(config) => self.ws.config = config,
+            Err(e) => self.toast(format!("{e:#}"), Level::Error),
+        }
         self.spawn(Task::Scan);
     }
 

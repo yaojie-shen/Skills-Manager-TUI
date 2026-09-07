@@ -23,10 +23,16 @@ pub const MIN_CARD_W: u16 = 40;
 /// Most columns worth having: past this a card holds less than it costs to scan.
 pub const MAX_COLS: usize = 4;
 /// Four lines of content and the frame around them: identity, description, a
-/// blank line, and the tags. The blank one is not padding — the tag pills are
-/// filled shapes, and pressed straight up against the description they read as
-/// a smudge under the text rather than as a row of labels.
+/// rule, and the tags. The rule is not padding — the tag pills are filled
+/// shapes, and pressed straight up against the description they read as a
+/// smudge under the text; a bare blank line left the card looking half empty,
+/// so the gap is drawn as a thin line instead.
 pub const CARD_H: u16 = 6;
+
+/// The line between a card's text and its tags.
+pub fn rule(inner_w: usize, th: &Theme) -> Line<'static> {
+    Line::from(Span::styled("─".repeat(inner_w), th.dim()))
+}
 
 /// Columns that fit in `width`, always at least one.
 pub fn cols_for(width: u16) -> usize {
@@ -90,7 +96,7 @@ pub fn ink(fill: Color) -> Color {
 
 /// The colour a tag is filled with: the one `[[tags]]` gives it in the config,
 /// else the theme's tag colour, so untitled tags still read as tags.
-fn tag_fill(name: &str, ctx: &Ctx) -> Color {
+pub fn tag_fill(name: &str, ctx: &Ctx) -> Color {
     ctx.ws
         .config
         .tags
@@ -185,7 +191,7 @@ pub fn skill_card(
     vec![
         Line::from(head),
         Line::from(body_line),
-        Line::from(""),
+        rule(inner_w, th),
         Line::from(foot),
     ]
 }

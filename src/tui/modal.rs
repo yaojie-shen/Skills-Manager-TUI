@@ -44,6 +44,8 @@ impl PickAction {
 pub enum InputKind {
     Tags { skill: String },
     PresetName,
+    PresetDescription { name: String },
+    RenamePreset { old: String },
     RenameTag { old: String },
     Install,
     Rename { skill: String },
@@ -198,6 +200,37 @@ impl Modal {
             input: Input::default(),
             kind: InputKind::PresetName,
             hint: "name · Enter create · Esc cancel".into(),
+            rect: Rect::default(),
+        }
+    }
+
+    /// Edit what a preset is for. A single-line prompt, prefilled, rather
+    /// than `$EDITOR` or editing on the card: a preset description is one
+    /// sentence, like the description in a SKILL.md, and leaving the screen
+    /// for an editor is a heavy round trip for that; editing inside a grid
+    /// cell that is laid out again every frame is fragile; and create, tags
+    /// and install already ask through this same box, so it is the one the
+    /// user knows. Prefilled because a description is usually corrected, not
+    /// replaced, and clearing the field is how it is removed.
+    pub fn preset_description(name: &str, current: Option<&str>) -> Self {
+        Modal::Input {
+            title: format!(" description of {name} "),
+            input: Input::with_value(current.unwrap_or_default()),
+            kind: InputKind::PresetDescription { name: name.into() },
+            hint: "one sentence · Enter save · empty clears · Esc cancel".into(),
+            rect: Rect::default(),
+        }
+    }
+
+    /// Ask for a preset's new name, starting from the old one as the skill
+    /// rename does. No confirmation follows: unlike a skill, a preset is one
+    /// file and at most one line of `config.toml`, and undo has it.
+    pub fn rename_preset(name: &str) -> Self {
+        Modal::Input {
+            title: format!(" rename preset {name} "),
+            input: Input::with_value(name),
+            kind: InputKind::RenamePreset { old: name.into() },
+            hint: "new name · Enter rename · Esc cancel".into(),
             rect: Rect::default(),
         }
     }
@@ -483,10 +516,16 @@ impl Modal {
         .with_step(dir)
     }
 
-    /// Carry the history move onto a write confirmation.
+    /// Carry the history move onto a write confirmation. The Apply button
+    /// takes the focus here: a destructive confirmation starts on Cancel so a
+    /// second Enter cannot delete anything, but an undo was asked for with
+    /// Ctrl-Z a moment ago, and Enter should do what was asked rather than
+    /// quietly cancel it. `Modal::Confirm`, used for link steps, already
+    /// starts on Apply.
     fn with_step(mut self, dir: Step) -> Self {
-        if let Modal::ConfirmWrite { then, .. } = &mut self {
+        if let Modal::ConfirmWrite { then, btn, .. } = &mut self {
             *then = Some(dir);
+            *btn = 0;
         }
         self
     }
@@ -588,15 +627,17 @@ impl Modal {
                 ..
             } => match k.code {
                 KeyCode::Char('y') => apply_links(std::mem::take(actions), then.take()),
+                // Cancelling is not an event: the dialog goes and nothing is
+                // said, since a notice for it would only pile up.
                 KeyCode::Enter => {
                     if *btn == 0 {
                         apply_links(std::mem::take(actions), then.take())
                     } else {
-                        vec![Action::CloseModal, Action::Toast("cancelled".into())]
+                        vec![Action::CloseModal]
                     }
                 }
                 KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
-                    vec![Action::CloseModal, Action::Toast("cancelled".into())]
+                    vec![Action::CloseModal]
                 }
                 KeyCode::Left
                 | KeyCode::Right
@@ -630,11 +671,11 @@ impl Modal {
                             .map(|w| write_actions(w, then.take()))
                             .unwrap_or_default()
                     } else {
-                        vec![Action::CloseModal, Action::Toast("cancelled".into())]
+                        vec![Action::CloseModal]
                     }
                 }
                 KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
-                    vec![Action::CloseModal, Action::Toast("cancelled".into())]
+                    vec![Action::CloseModal]
                 }
                 KeyCode::Left
                 | KeyCode::Right
@@ -647,7 +688,7 @@ impl Modal {
                 _ => vec![],
             },
             Modal::Input { input, kind, .. } => match k.code {
-                KeyCode::Esc => vec![Action::CloseModal, Action::Toast("cancelled".into())],
+                KeyCode::Esc => vec![Action::CloseModal],
                 KeyCode::Enter => {
                     let value = input.value().to_string();
                     let mut acts = vec![Action::CloseModal];
@@ -855,7 +896,7 @@ impl Modal {
                         return apply_links(std::mem::take(actions), then.take());
                     }
                     if btn_rects.get(1).is_some_and(|r| r.contains(at)) || !rect.contains(at) {
-                        return vec![Action::CloseModal, Action::Toast("cancelled".into())];
+                        return vec![Action::CloseModal];
                     }
                 }
                 vec![]
@@ -875,7 +916,7 @@ impl Modal {
                             .unwrap_or_default();
                     }
                     if btn_rects.get(1).is_some_and(|r| r.contains(at)) || !rect.contains(at) {
-                        return vec![Action::CloseModal, Action::Toast("cancelled".into())];
+                        return vec![Action::CloseModal];
                     }
                 }
                 vec![]
@@ -883,7 +924,7 @@ impl Modal {
             Modal::Input { input, rect, .. } => {
                 if click {
                     if !rect.contains(at) {
-                        return vec![Action::CloseModal, Action::Toast("cancelled".into())];
+                        return vec![Action::CloseModal];
                     }
                     input.click(m.column);
                 }
@@ -1503,21 +1544,54 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
                 })
             }))]
         }
+        // Name only. What comes next — members, a description — is done on
+        // the card the new preset lands on, and the notice says which keys;
+        // a second prompt here would be one more thing to dismiss before
+        // seeing the result.
         InputKind::PresetName => {
             let name = value.trim().to_string();
             if name.is_empty() {
                 return vec![];
             }
-            vec![Action::Write(Box::new(move |ws| {
-                if ws.presets.load(&name)?.is_some() {
-                    anyhow::bail!("preset {name} already exists");
-                }
-                ws.presets.save(&skills::preset::Preset {
-                    name: name.clone(),
-                    ..Default::default()
-                })?;
-                Ok(format!("created preset {name}"))
+            let land_on = name.clone();
+            vec![
+                Action::Write(Box::new(move |ws| {
+                    if ws.presets.load(&name)?.is_some() {
+                        anyhow::bail!("preset {name} already exists");
+                    }
+                    ws.presets.save(&skills::preset::Preset {
+                        name: name.clone(),
+                        ..Default::default()
+                    })?;
+                    Ok(format!(
+                        "created {name} — a adds skills, e sets the description"
+                    ))
+                })),
+                Action::SelectPreset(land_on),
+            ]
+        }
+        InputKind::PresetDescription { name } => {
+            let name = name.clone();
+            vec![Action::WriteMeta(Box::new(move |ws| {
+                history::preset_description_edit(ws, &name, Some(&value))
             }))]
+        }
+        InputKind::RenamePreset { old } => {
+            let new = value.trim().to_string();
+            if new.is_empty() || new == *old {
+                return vec![];
+            }
+            // Preset files share the naming rule of skill directories, since
+            // the name is the file name.
+            if !skills::util::valid_skill_key(&new) {
+                return vec![Action::Error(format!("invalid preset name: {new:?}"))];
+            }
+            let old = old.clone();
+            let land_on = new.clone();
+            vec![
+                Action::WriteMeta(Box::new(move |ws| history::preset_rename(ws, &old, &new))),
+                Action::SelectPreset(land_on),
+            ]
         }
         InputKind::Install => {
             let reference = value.trim().to_string();
@@ -1631,7 +1705,6 @@ const HELP: &str = "Search
   i                 install a skill from a repo or a local path
   t  n  d           tags / note in $EDITOR / deploy picker
   r  s              rename the skill / set where it came from
-  Ctrl-1..9         toggle deploy on agent N directly
   a  m  x           accept local changes / migrate renamed metadata / remove
   u  U              check upstream / update from upstream (git sources)
 Agents

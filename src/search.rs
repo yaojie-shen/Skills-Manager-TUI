@@ -319,12 +319,17 @@ impl Index {
             out.insert(q.to_string(), 1.0);
         }
         let qchars = q.chars().count();
-        if cfg.prefix && qchars >= 2 {
+        // A single character expands too, only more cheaply: `number 0` has to
+        // reach `number 01`, and letting the last word fail would fail the
+        // whole query, since every unit must match. The vocabulary of a skills
+        // root is small enough that the wide fan-out costs nothing.
+        if cfg.prefix && qchars >= 1 {
             let start = self.vocab.partition_point(|v| v.as_str() < q);
             for v in self.vocab[start..].iter().take_while(|v| v.starts_with(q)) {
                 if v != q {
                     let extra = v.chars().count() - qchars;
-                    let w = (0.85 - 0.05 * extra as f32).max(0.5);
+                    let base = if qchars == 1 { 0.6 } else { 0.85 };
+                    let w = (base - 0.05 * extra as f32).max(0.4);
                     out.entry(v.clone()).or_insert(w);
                 }
             }
@@ -913,6 +918,25 @@ mod tests {
         );
         assert_eq!(s.search(&records, &Query::parse("etcd")).len(), 2);
         assert!(s.search(&records, &Query::parse("etcd nothing")).is_empty());
+    }
+
+    #[test]
+    fn a_single_character_still_matches_by_prefix() {
+        let recs = vec![
+            rec("counter", "number 01 in a long list", "", &[]),
+            rec("other", "nothing here", "", &[]),
+        ];
+        let mut s = Searcher::new();
+        s.index(&recs);
+        let hits = s.search(&recs, &Query::parse("number 0"));
+        assert_eq!(
+            hits.len(),
+            1,
+            "the trailing 0 must reach 01, not sink the query"
+        );
+        assert_eq!(recs[hits[0].index].key, "counter");
+        let hits = s.search(&recs, &Query::parse("0"));
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]

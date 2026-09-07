@@ -4,6 +4,7 @@
 pub mod agents;
 pub mod cards;
 pub mod health;
+pub mod matrix;
 pub mod presets;
 pub mod preview;
 pub mod search;
@@ -17,6 +18,11 @@ use ratatui::layout::Rect;
 pub trait View {
     /// Called after every new snapshot.
     fn refresh(&mut self, ctx: &Ctx);
+    /// Called when the tab becomes the active one after being away, before
+    /// any key reaches it. A view that keeps a focus of its own can put it
+    /// back where someone returning expects to find it; most have nothing to
+    /// reset, so the default does nothing.
+    fn enter(&mut self) {}
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action>;
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action>;
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx);

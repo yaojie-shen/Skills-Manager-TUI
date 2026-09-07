@@ -4,6 +4,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
+use skills::history;
 use skills::ops::deploy::{self, Action};
 use skills::ops::update::Take;
 use skills::ops::{edit, install, update};
@@ -241,6 +242,24 @@ pub enum AgentsCommand {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Remove links whose target is gone; all of them when no skill is named
+    Clean {
+        agent: String,
+        skills: Vec<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Replace the agent's own copies that match the root with links to it
+    Relink {
+        agent: String,
+        skills: Vec<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, short)]
+        yes: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -290,6 +309,16 @@ pub enum PresetCommand {
         agents: Vec<String>,
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Move a preset to a new name, taking its auto-deploy entry with it
+    Rename {
+        old: String,
+        new: String,
+    },
+    /// Set the one-line description; empty or omitted text clears it
+    Describe {
+        name: String,
+        text: Option<String>,
     },
 }
 
@@ -1004,7 +1033,44 @@ fn cmd_agents(ctx: &Ctx, c: Option<AgentsCommand>) -> Result<()> {
             }
             run_actions(ctx, &actions, dry_run)
         }
+        AgentsCommand::Clean {
+            agent,
+            skills,
+            dry_run,
+            yes,
+        } => {
+            let snap = ctx.ws.scan()?;
+            let actions = deploy::plan_clean(&ctx.ws, &snap, &agent, &skills)?;
+            gate(&actions, dry_run, yes, "cleaning removes links")?;
+            run_actions(ctx, &actions, dry_run)
+        }
+        AgentsCommand::Relink {
+            agent,
+            skills,
+            dry_run,
+            yes,
+        } => {
+            let snap = ctx.ws.scan()?;
+            let actions = deploy::plan_relink(&ctx.ws, &snap, &agent, &skills)?;
+            gate(
+                &actions,
+                dry_run,
+                yes,
+                "relinking deletes the agent's own copies",
+            )?;
+            run_actions(ctx, &actions, dry_run)
+        }
     }
+}
+
+/// The `--yes` check for a plan that deletes something. A plan with nothing
+/// in it but skips is let through without the flag: there is nothing to
+/// consent to, and the skips are the answer being asked for.
+fn gate(actions: &[Action], dry_run: bool, yes: bool, what: &str) -> Result<()> {
+    if !dry_run && !yes && actions.iter().any(|a| a.is_change()) {
+        bail!("{what}; re-run with --yes (or --dry-run to preview)");
+    }
+    Ok(())
 }
 
 fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
@@ -1099,6 +1165,25 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
             agents,
             dry_run,
         } => preset_links(ctx, &name, &agents, dry_run, false),
+        // Both go through the same functions the TUI uses, so the message and
+        // the config follow-through are the same from either side.
+        PresetCommand::Rename { old, new } => {
+            let (message, _) = history::preset_rename(&ctx.ws, &old, &new)?;
+            ctx.out(
+                &serde_json::json!({"renamed": {"from": old, "to": new}, "message": message}),
+                || println!("{message}"),
+            )
+        }
+        PresetCommand::Describe { name, text } => {
+            let (message, _) = history::preset_description_edit(&ctx.ws, &name, text.as_deref())?;
+            let p = store
+                .load(&name)?
+                .with_context(|| format!("no such preset: {name}"))?;
+            ctx.out(
+                &serde_json::json!({"preset": p, "message": message}),
+                || println!("{message}"),
+            )
+        }
     }
 }
 
