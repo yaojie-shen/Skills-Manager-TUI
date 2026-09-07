@@ -24,6 +24,7 @@ impl Fixture {
         let agent_a = base.join("agent-a");
         let agent_b = base.join("agent-b");
         std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
         let cfg = Config {
             schema: 1,
             agents: vec![
@@ -849,4 +850,44 @@ fn cli_repairs_and_preset_edits_round_trip_as_json() {
     let v = skills_json(&f.root, &["preset", "show", "weekly"]).unwrap();
     assert_eq!(v["skills"][0], "printer");
     assert!(skills_json(&f.root, &["preset", "rename", "daily", "weekly"]).is_err());
+}
+
+#[test]
+fn aliased_roots_use_the_same_identity_for_adopt_and_deployment() {
+    let f = Fixture::new("root-alias");
+    let skill = f.add_skill("printer", "prints");
+    let alias = f.base.join("root-alias");
+    std::os::unix::fs::symlink(&f.root, &alias).unwrap();
+    let ws = Workspace::open(&alias).unwrap();
+    assert_eq!(ws.root, f.root);
+
+    // Adopting an existing central skill must not try to move it onto itself.
+    let before = std::fs::read(skill.join("SKILL.md")).unwrap();
+    install::adopt(&ws, &alias.join("printer"), None).unwrap();
+    assert_eq!(std::fs::read(skill.join("SKILL.md")).unwrap(), before);
+    assert!(ws.meta.exists("printer"));
+
+    std::fs::create_dir_all(&f.agent_a).unwrap();
+    std::os::unix::fs::symlink(alias.join("printer"), f.agent_a.join("printer")).unwrap();
+    std::os::unix::fs::symlink(&alias, &f.agent_b).unwrap();
+    std::os::unix::fs::symlink(alias.join("printer"), f.agent_a.join("other-name")).unwrap();
+    let foreign = f.base.join("foreign");
+    std::fs::create_dir_all(&foreign).unwrap();
+    std::os::unix::fs::symlink(&foreign, f.agent_a.join("foreign")).unwrap();
+    std::os::unix::fs::symlink(alias.join("missing"), f.agent_a.join("missing")).unwrap();
+
+    // Also exercise the public scan entry point with an unnormalized path.
+    let snap = skills::reconcile::scan(&alias, &ws.config).unwrap();
+    assert_eq!(snap.root, f.root);
+    assert_eq!(snap.agent("b").unwrap().mode, AgentDirMode::DirLinked);
+    for agent in ["a", "b"] {
+        assert_eq!(
+            snap.get("printer").unwrap().deploy[agent],
+            DeployState::Deployed
+        );
+    }
+    let entries = &snap.agent("a").unwrap().entries;
+    assert!(matches!(entries["other-name"], EntryState::Foreign { .. }));
+    assert!(matches!(entries["foreign"], EntryState::Foreign { .. }));
+    assert!(matches!(entries["missing"], EntryState::Broken { .. }));
 }

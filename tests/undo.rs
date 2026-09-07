@@ -21,6 +21,7 @@ impl Fixture {
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("skills");
         std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
         let cfg = Config {
             schema: 1,
             agents: vec![AgentConfig {

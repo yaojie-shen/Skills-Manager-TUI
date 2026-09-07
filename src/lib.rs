@@ -29,12 +29,15 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn open(root: &Path) -> Result<Self> {
-        let config = config::Config::load(root)?;
+        // Library callers need the same canonical root as the CLI. In
+        // particular, macOS /var and /private/var can name the same directory.
+        let root = paths::resolve_root(Some(root))?;
+        let config = config::Config::load(&root)?;
         Ok(Self {
-            root: root.to_path_buf(),
+            meta: meta::MetaStore::new(&root),
+            presets: preset::PresetStore::new(&root),
+            root,
             config,
-            meta: meta::MetaStore::new(root),
-            presets: preset::PresetStore::new(root),
         })
     }
 

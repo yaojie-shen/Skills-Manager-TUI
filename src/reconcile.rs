@@ -181,6 +181,10 @@ impl Snapshot {
 
 /// Scan the root and every agent. Pure read.
 pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
+    // Compare canonical symlink targets with a canonical root, including when
+    // this public function is called directly instead of through Workspace.
+    let root = crate::paths::resolve_root(Some(root))?;
+    let root = root.as_path();
     let store = MetaStore::new(root);
     let mut records: BTreeMap<String, SkillRecord> = BTreeMap::new();
 
