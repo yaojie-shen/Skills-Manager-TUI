@@ -21,6 +21,7 @@ use skills::config::Config;
 use skills::history::{self, History, Plan};
 use skills::ops::deploy;
 use skills::reconcile::Snapshot;
+use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +144,7 @@ pub struct App {
     pub agents: AgentsView,
     pub health: HealthView,
     pub modal: Option<Modal>,
+    pending_task_ui: VecDeque<Action>,
     pub toasts: Toasts,
     pub history: History,
     tasks_running: usize,
@@ -168,6 +170,7 @@ impl App {
             agents: AgentsView::default(),
             health: HealthView::default(),
             modal: None,
+            pending_task_ui: VecDeque::new(),
             toasts: Toasts::default(),
             history: History::default(),
             tasks_running: 0,
@@ -240,6 +243,7 @@ impl App {
     // ---- messages ---------------------------------------------------------
 
     pub fn handle(&mut self, msg: Msg) {
+        let background = matches!(&msg, Msg::Task(_));
         let actions = match msg {
             Msg::Tick => {
                 self.spinner = (self.spinner + 1) % SPINNER.len();
@@ -254,9 +258,36 @@ impl App {
             Msg::Key(k) => self.on_key(k),
             Msg::Mouse(m) => self.on_mouse(m),
         };
-        for a in actions {
-            self.apply(a);
+        let mut queued = false;
+        for action in actions {
+            if background
+                && matches!(action, Action::OpenModal(_) | Action::Search { .. })
+                && (self.task_ui_blocked() || !self.pending_task_ui.is_empty())
+            {
+                self.pending_task_ui.push_back(action);
+                queued = true;
+            } else {
+                self.apply(action);
+            }
         }
+        if queued {
+            self.toast(
+                "task ready — waiting for the current dialog",
+                Level::Info,
+            );
+        }
+        // Drain only after the whole event, so CloseModal + OpenModal transitions
+        // and failed input submissions cannot expose a queued dialog in between.
+        while !self.quit && !self.task_ui_blocked() {
+            let Some(action) = self.pending_task_ui.pop_front() else {
+                break;
+            };
+            self.apply(action);
+        }
+    }
+
+    fn task_ui_blocked(&self) -> bool {
+        self.modal.is_some() || (self.tab == Tab::Tags && self.tags.input_focused())
     }
 
     fn on_task(&mut self, out: TaskOutput) -> Vec<Action> {
@@ -730,6 +761,67 @@ pub type Hints = &'static [(&'static str, &'static str)];
 #[cfg(test)]
 mod matrix_key_tests {
     use super::*;
+
+    #[test]
+    fn background_dialogs_wait_for_editing_and_keep_arrival_order() {
+        let root = std::env::temp_dir().join(format!("skills-task-dialogs-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        app.modal = Some(Modal::new_preset());
+        let key = |code| Msg::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        app.handle(key(KeyCode::Char('a')));
+        app.handle(key(KeyCode::Char('/')));
+        app.handle(key(KeyCode::Left));
+        for reference in ["first", "second"] {
+            app.handle(Msg::Task(Box::new(TaskOutput::Installed(
+                reference.into(),
+                Err(skills::ops::install::NotOneSkill {
+                    choices: vec!["printer".into(), "reader".into()],
+                }
+                .into()),
+            ))));
+        }
+        assert_eq!(app.pending_task_ui.len(), 2);
+        app.handle(key(KeyCode::Enter)); // Invalid preset name: keep editing.
+        assert!(matches!(&app.modal, Some(Modal::Input { .. })));
+        assert_eq!(app.pending_task_ui.len(), 2);
+        app.handle(key(KeyCode::Char('b')));
+        let Some(Modal::Input { input, .. }) = &app.modal else {
+            panic!("lost input")
+        };
+        assert_eq!(input.value(), "ab/");
+        app.handle(key(KeyCode::Delete));
+        app.handle(key(KeyCode::Enter)); // Save; only the first task may appear.
+        assert!(app.ws.presets.load("ab").unwrap().is_some());
+        let Some(Modal::Picker {
+            action: super::super::modal::PickAction::InstallFrom { reference },
+            ..
+        }) = &app.modal
+        else {
+            panic!("expected first result")
+        };
+        assert_eq!(reference, "first");
+        app.handle(key(KeyCode::Esc));
+        let Some(Modal::Picker {
+            action: super::super::modal::PickAction::InstallFrom { reference },
+            ..
+        }) = &app.modal
+        else {
+            panic!("expected second result")
+        };
+        assert_eq!(reference, "second");
+        app.handle(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert!(app.pending_task_ui.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn failed_inputs_keep_their_text_and_cursor_until_a_successful_retry() {
