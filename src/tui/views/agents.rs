@@ -103,6 +103,11 @@ impl Default for FocusState {
 }
 
 impl AgentsView {
+    /// An open matrix owns keyboard input before application shortcuts.
+    pub fn handle_matrix_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Option<Vec<Action>> {
+        self.matrix.handle_key(k, ctx)
+    }
+
     /// The scope as the planners want it: one key, or nothing at all.
     fn scope_agents(&self) -> Vec<String> {
         if self.scope.is_empty() {

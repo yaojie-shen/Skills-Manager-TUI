@@ -328,6 +328,11 @@ impl App {
         if let Some(m) = self.modal.as_mut() {
             return m.handle_key(k, &ctx);
         }
+        if self.tab == Tab::Agents
+            && let Some(actions) = self.agents.handle_matrix_key(k, &ctx)
+        {
+            return actions;
+        }
         // Any text field that holds the keyboard keeps its digits and slashes;
         // the Tags page has one of its own for colours and merge targets.
         let in_search_input = (self.tab == Tab::Search && self.search.input_focused())
@@ -687,3 +692,46 @@ impl App {
 
 /// Key hint pairs shown in the footer.
 pub type Hints = &'static [(&'static str, &'static str)];
+
+#[cfg(test)]
+mod matrix_key_tests {
+    use super::*;
+
+    #[test]
+    fn matrix_receives_keys_before_global_shortcuts() {
+        let root =
+            std::env::temp_dir().join(format!("skills-matrix-routing-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(ws, tx).unwrap();
+        app.tab = Tab::Agents;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(app.on_key(key(KeyCode::Char('M'))).is_empty());
+        for code in [
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Char('/'),
+            KeyCode::Char('1'),
+        ] {
+            assert!(app.on_key(key(code)).is_empty());
+            assert_eq!(app.tab, Tab::Agents);
+        }
+        assert!(app.on_key(key(KeyCode::Esc)).is_empty());
+        assert!(matches!(
+            app.on_key(key(KeyCode::Tab)).as_slice(),
+            [Action::SwitchTab(Tab::Health)]
+        ));
+        assert!(matches!(
+            app.on_key(key(KeyCode::BackTab)).as_slice(),
+            [Action::SwitchTab(Tab::Presets)]
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

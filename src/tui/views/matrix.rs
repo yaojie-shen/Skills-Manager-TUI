@@ -330,6 +330,11 @@ mod tests {
                 .collect(),
             ..Matrix::default()
         };
+        matrix.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &ctx);
+        assert_eq!(matrix.col, 1);
+        matrix.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &ctx);
+        assert_eq!(matrix.col, 0);
+
         for (w, h) in [(100, 30), (80, 24), (120, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             for (r, c) in [(0, 0), (39, 11), (20, 5), (0, 0)] {
