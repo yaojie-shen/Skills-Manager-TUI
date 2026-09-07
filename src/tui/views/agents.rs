@@ -1,6 +1,8 @@
 //! Agents tab: what a given agent actually has, and the presets that fill it.
 //!
-//! Everything on this page is scoped to one agent or to all of them at once.
+//! The page always looks at exactly one agent. Rolling several together needs
+//! a preset to be counted against a set of agents rather than one, which reads
+//! as a fraction of a fraction and answers nothing an agent's own page does not.
 //! Entries are split by who owns them: skills linked from the central root are
 //! ours to add and remove, anything else the agent brought itself is shown but
 //! never written to.
@@ -22,10 +24,12 @@ use skills::ops::deploy::{
 use skills::preset::Preset;
 use skills::reconcile::{AgentDirMode, EntryState};
 
+/// The three bands of the page, top to bottom. Arrows move between them, so
+/// there is never a control the keyboard cannot reach. `[` and `]` still switch
+/// agent from anywhere, since that is the frame everything else sits in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Only two things take the keyboard. The scope is switched by `[` and `]`
-/// from anywhere, so it never needs to hold focus.
 enum Focus {
+    Agents,
     Presets,
     Entries,
 }
@@ -33,26 +37,25 @@ enum Focus {
 /// One row of the entry list: either a section header or an entry under it.
 enum Row<'a> {
     Header(String),
-    /// One skill name, with the state it has in each agent of the scope.
-    /// A skill present in several agents is one row, not one row per agent.
+    /// One skill name and the state it has in the agent on show.
     Entry {
         name: &'a str,
-        states: Vec<Option<&'a EntryState>>,
+        state: Option<&'a EntryState>,
         managed: bool,
     },
 }
 
 #[derive(Default)]
 pub struct AgentsView {
-    /// None = all agents.
-    scope: Option<String>,
+    /// Key of the agent on show. Empty only while none is configured.
+    scope: String,
     focus: FocusState,
     presets: Vec<(Preset, PresetStatus)>,
     preset_cursor: usize,
     entries: ListNav,
     /// Compact rows are one line each; the default card gives an entry three.
     compact: bool,
-    scope_rects: Vec<(Rect, Option<String>)>,
+    scope_rects: Vec<(Rect, String)>,
     preset_rects: Vec<Rect>,
     /// The one column the entry scrollbar occupies, empty while it all fits.
     entries_track: Rect,
@@ -72,16 +75,13 @@ impl Default for FocusState {
 }
 
 impl AgentsView {
-    /// Agents the current scope covers.
-    fn scope_agents(&self, ctx: &Ctx) -> Vec<String> {
-        match &self.scope {
-            Some(k) => vec![k.clone()],
-            None => ctx.ws.config.agent_keys(),
+    /// The scope as the planners want it: one key, or nothing at all.
+    fn scope_agents(&self) -> Vec<String> {
+        if self.scope.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.scope.clone()]
         }
-    }
-
-    fn scope_label(&self) -> &str {
-        self.scope.as_deref().unwrap_or("all agents")
     }
 
     fn focus(&self) -> Focus {
@@ -126,34 +126,21 @@ impl AgentsView {
     }
 
     fn rows<'a>(&self, ctx: &'a Ctx) -> Vec<Row<'a>> {
-        let agents = self.scope_agents(ctx);
-        // Collect names first so a skill deployed to several agents stays one row.
-        let mut names: Vec<&str> = Vec::new();
-        for key in &agents {
-            if let Some(report) = ctx.snap.agent(key) {
-                for name in report.entries.keys() {
-                    if !names.contains(&name.as_str()) {
-                        names.push(name);
-                    }
-                }
-            }
-        }
+        let Some(report) = ctx.snap.agent(&self.scope) else {
+            return Vec::new();
+        };
+        let mut names: Vec<&str> = report.entries.keys().map(String::as_str).collect();
         names.sort_unstable();
         let mut managed: Vec<Row> = Vec::new();
         let mut local: Vec<Row> = Vec::new();
         for name in names {
-            let states: Vec<Option<&EntryState>> = agents
-                .iter()
-                .map(|key| ctx.snap.agent(key).and_then(|r| r.entries.get(name)))
-                .collect();
-            // Ours as soon as any agent links it into the root; otherwise the
-            // agent's own, however many agents happen to carry a copy.
-            let is_managed = states
-                .iter()
-                .any(|s| matches!(s, Some(EntryState::Deployed)));
+            let state = report.entries.get(name);
+            // Ours as soon as it links into the root; otherwise the agent's own,
+            // whatever shape it takes.
+            let is_managed = matches!(state, Some(EntryState::Deployed));
             let row = Row::Entry {
                 name,
-                states,
+                state,
                 managed: is_managed,
             };
             if is_managed {
@@ -185,19 +172,22 @@ impl AgentsView {
         let Some((preset, status)) = self.selected_preset() else {
             return vec![Action::Error("no preset here yet".into())];
         };
-        let scope = self.scope_agents(ctx);
+        let scope = self.scope_agents();
         let plan = if on {
             plan_preset_activate(ctx.ws, ctx.snap, preset, &scope)
         } else {
             plan_preset_deactivate(ctx.ws, ctx.snap, preset, &scope)
         };
         match plan {
-            Ok(actions) => vec![Action::ConfirmLinks {
+            // A pill is a switch, and a switch that stops to ask is a bad
+            // switch. What happened is said in the notification, and undo takes
+            // it back; a dialog here would only be in the way of trying things.
+            Ok(actions) => vec![Action::ApplyLinks {
                 title: format!(
                     "{} {} · {}",
                     if on { "activate" } else { "deactivate" },
                     preset.name,
-                    self.scope_label()
+                    self.scope
                 ),
                 actions,
             }],
@@ -219,32 +209,29 @@ impl AgentsView {
 
     fn move_scope(&mut self, delta: i32, ctx: &Ctx) {
         let keys = ctx.ws.config.agent_keys();
-        let cur = match &self.scope {
-            None => 0i32,
-            Some(k) => keys
-                .iter()
-                .position(|x| x == k)
-                .map(|i| i as i32 + 1)
-                .unwrap_or(0),
-        };
-        let next = (cur + delta).rem_euclid(keys.len() as i32 + 1);
-        self.scope = if next == 0 {
-            None
-        } else {
-            keys.get((next - 1) as usize).cloned()
-        };
+        if keys.is_empty() {
+            return;
+        }
+        let cur = keys.iter().position(|x| *x == self.scope).unwrap_or(0) as i32;
+        let next = (cur + delta).rem_euclid(keys.len() as i32);
+        self.scope = keys[next as usize].clone();
     }
 }
 
 impl View for AgentsView {
     fn refresh(&mut self, ctx: &Ctx) {
-        // A scope pinned to an agent that no longer exists falls back to all.
-        if let Some(k) = &self.scope
-            && ctx.ws.config.agent(k).is_none()
-        {
-            self.scope = None;
+        // A scope pinned to an agent that is gone from the config, or never set,
+        // falls back to the first one there is.
+        if ctx.ws.config.agent(&self.scope).is_none() {
+            self.scope = ctx
+                .ws
+                .config
+                .agent_keys()
+                .first()
+                .cloned()
+                .unwrap_or_default();
         }
-        let scope = self.scope_agents(ctx);
+        let scope = self.scope_agents();
         self.presets = ctx
             .ws
             .presets
@@ -289,9 +276,10 @@ impl View for AgentsView {
                 };
             }
             KeyCode::Char('c') => {
-                let Some(agent) = self.scope.clone() else {
-                    return vec![Action::Error("pick a single agent to convert".into())];
-                };
+                let agent = self.scope.clone();
+                if agent.is_empty() {
+                    return vec![Action::Error("no agent is configured".into())];
+                }
                 return match deploy::plan_convert(ctx.ws, ctx.snap, &agent) {
                     Ok(actions) => vec![Action::ConfirmLinks {
                         title: format!("convert {agent} to per-skill links"),
@@ -303,7 +291,26 @@ impl View for AgentsView {
             _ => {}
         }
         match self.focus() {
+            Focus::Agents => match k.code {
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.move_scope(-1, ctx);
+                    vec![Action::Rescan]
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.move_scope(1, ctx);
+                    vec![Action::Rescan]
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter | KeyCode::Tab => {
+                    self.set_focus(Focus::Presets);
+                    vec![]
+                }
+                _ => vec![],
+            },
             Focus::Presets => match k.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.set_focus(Focus::Agents);
+                    vec![]
+                }
                 KeyCode::Left | KeyCode::Char('h') => {
                     self.preset_cursor = self.preset_cursor.saturating_sub(1);
                     vec![]
@@ -413,6 +420,7 @@ impl View for AgentsView {
                 .map(|(r, s)| (*r, s.clone()))
             {
                 self.scope = scope;
+                self.set_focus(Focus::Agents);
                 return vec![Action::Rescan];
             }
             if let Some(i) = self.preset_rects.iter().position(|r| r.contains(at)) {
@@ -443,56 +451,76 @@ impl View for AgentsView {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
+                Constraint::Length(4),
                 Constraint::Length(2),
                 Constraint::Min(1),
             ])
             .split(area);
 
-        // Scope chips.
+        // Agent picker. Big enough to aim at, and it takes the keyboard like
+        // anything else on the page rather than hiding behind a bracket key.
         self.scope_rects.clear();
-        let mut spans = vec![Span::styled(" scope ", th.dim())];
-        let mut x = rows[0].x + width(" scope ") as u16;
-        let chip = |label: String,
-                    key: Option<String>,
-                    on: bool,
-                    spans: &mut Vec<Span<'static>>,
-                    x: &mut u16,
-                    rects: &mut Vec<(Rect, Option<String>)>| {
-            let text = format!(" {label} ");
-            let w = width(&text) as u16;
-            rects.push((Rect::new(*x, rows[0].y, w, 1), key));
-            spans.push(Span::styled(
-                text,
-                if on {
-                    th.selected().fg(th.accent)
-                } else {
-                    th.dim()
-                },
-            ));
-            spans.push(Span::raw(" "));
-            *x += w + 1;
-        };
-        chip(
-            "all".into(),
-            None,
-            self.scope.is_none(),
-            &mut spans,
-            &mut x,
-            &mut self.scope_rects,
-        );
-        for a in &ctx.ws.config.agents {
-            let on = self.scope.as_deref() == Some(a.key.as_str());
-            chip(
-                a.key.clone(),
-                Some(a.key.clone()),
-                on,
-                &mut spans,
-                &mut x,
-                &mut self.scope_rects,
+        let mut x = rows[0].x + 1;
+        if ctx.ws.config.agents.is_empty() {
+            f.render_widget(
+                Paragraph::new(Span::styled(" no agent configured", th.dim())),
+                rows[0],
             );
         }
-        f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+        for a in &ctx.ws.config.agents {
+            let report = ctx.snap.agent(&a.key);
+            let sub = match report.map(|r| {
+                (
+                    &r.mode,
+                    r.count(|s| matches!(s, EntryState::Deployed)),
+                    r.entries.len(),
+                )
+            }) {
+                None | Some((AgentDirMode::Missing, ..)) => "no directory".to_string(),
+                Some((AgentDirMode::DirLinked, ..)) => "whole dir linked".into(),
+                Some((AgentDirMode::DirForeign { .. }, ..)) => "dir links elsewhere".into(),
+                Some((AgentDirMode::Real, linked, total)) if total > linked => {
+                    format!("{linked} linked · {} own", total - linked)
+                }
+                Some((AgentDirMode::Real, linked, _)) => format!("{linked} linked"),
+            };
+            let name = a.display_name().to_string();
+            let w = (width(&name).max(width(&sub)) + 4).max(14) as u16;
+            if x + w > rows[0].right() {
+                break;
+            }
+            let rect = Rect::new(x, rows[0].y, w, 4);
+            let on = a.key == self.scope;
+            let holding = on && self.focus() == Focus::Agents;
+            let border = if on { th.accent() } else { th.dim() };
+            let block = ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .border_type(if holding {
+                    ratatui::widgets::BorderType::Thick
+                } else {
+                    ratatui::widgets::BorderType::Rounded
+                })
+                .border_style(border);
+            let inner = block.inner(rect).inner(ratatui::layout::Margin {
+                horizontal: 1,
+                vertical: 0,
+            });
+            f.render_widget(block, rect);
+            let title = if on {
+                th.bold().fg(th.accent)
+            } else {
+                th.dim()
+            };
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(name, title)),
+                    Line::from(Span::styled(sub, th.dim())),
+                ]),
+                inner,
+            );
+            self.scope_rects.push((rect, a.key.clone()));
+            x += w + 1;
+        }
 
         // Preset pills.
         self.preset_rects.clear();
@@ -508,15 +536,21 @@ impl View for AgentsView {
             ));
         }
         for (i, (preset, status)) in self.presets.iter().enumerate() {
-            // Every glyph here is East Asian Width N, so the caps and the text
-            // keep their column count in terminals that widen ambiguous ones.
+            // Part way on is a circle filled from the left, the way a gauge
+            // fills: the top-and-bottom split (U+25D2) reads as a different
+            // shape rather than as a fraction of the same one. It is one of the
+            // two glyphs here whose width is Ambiguous, alongside the caps, so
+            // a terminal that widens those shifts this row either way.
             let mark = match status.state() {
                 PresetState::Active => "✓ ",
-                PresetState::Partial => "◒ ",
+                PresetState::Partial => "◐ ",
                 PresetState::Inactive => "◌ ",
                 PresetState::Empty => "◦ ",
             };
-            let body = format!(" {mark}{} {} ", preset.name, status.label());
+            let body = match status.progress() {
+                Some(count) => format!(" {mark}{} {count} ", preset.name),
+                None => format!(" {mark}{} ", preset.name),
+            };
             // The caps belong to the pill as far as the mouse is concerned.
             let (lcap, rcap) = ctx.ws.config.ui.pill_caps.glyphs();
             let w = width(&body) as u16 + width(lcap) as u16 + width(rcap) as u16;
@@ -556,8 +590,6 @@ impl View for AgentsView {
         self.left = left;
         self.right = right;
         let rows_data = self.rows(ctx);
-        let show_agent = self.scope.is_none();
-        let scope_agents = self.scope_agents(ctx);
         let inner_w = left.width.saturating_sub(4) as usize; // borders + highlight symbol
         self.entries.item_height = if self.compact { 1 } else { 3 };
         let items: Vec<ListItem> = rows_data
@@ -577,40 +609,28 @@ impl View for AgentsView {
                 }
                 Row::Entry {
                     name,
-                    states,
+                    state,
                     managed,
                 } => {
                     if !self.compact {
-                        return entry_card(name, states, *managed, &scope_agents, ctx, inner_w);
+                        return entry_card(name, *state, *managed, ctx, inner_w);
                     }
-                    let mut spans = vec![Span::raw("  ")];
-                    spans.push(Span::styled(
-                        pad(name, 26),
-                        if *managed { Style::default() } else { th.dim() },
-                    ));
-                    if show_agent {
-                        // One column per agent, so a skill in both reads at a glance.
-                        for (i, state) in states.iter().enumerate() {
-                            let (glyph, style) = glyph_for(*state, th);
-                            spans.push(Span::styled(
-                                format!("{glyph} {} ", abbrev(&scope_agents[i])),
-                                style,
-                            ));
-                        }
-                    } else {
-                        let state = states.first().copied().flatten();
-                        let (glyph, style) = glyph_for(state, th);
-                        spans.insert(1, Span::styled(format!("{glyph} "), style));
-                        spans.push(Span::styled(
-                            state.map(entry_note).unwrap_or_default(),
-                            th.dim(),
-                        ));
-                    }
-                    ListItem::new(Line::from(spans))
+                    let (glyph, style) = glyph_for(*state, th);
+                    ListItem::new(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(format!("{glyph} "), style),
+                        Span::styled(
+                            pad(name, 26),
+                            if *managed { Style::default() } else { th.dim() },
+                        ),
+                        Span::styled(state.map(entry_note).unwrap_or_default(), th.dim()),
+                    ]))
                 }
             })
             .collect();
-        let title = format!(" {} ", self.scope_label());
+        // The picker above already says which agent this is; repeating it here
+        // would only take up room the section headings use better.
+        let title = " skills ".to_string();
         self.entries.set_area_from_block(left);
         let list = List::new(items)
             .block(th.block(title, self.focus() == Focus::Entries))
@@ -673,7 +693,14 @@ impl View for AgentsView {
                 ("j/k", "move"),
                 ("↑", "back to presets"),
                 ("Enter", "open in search"),
-                ("[ ]", "scope"),
+                ("[ ]", "agent"),
+                ("c", "convert dir-link"),
+                ("v", "density"),
+            ],
+            Focus::Agents => &[
+                ("←→", "pick agent"),
+                ("↓", "presets"),
+                ("s", "sync"),
                 ("c", "convert dir-link"),
                 ("v", "density"),
             ],
@@ -702,11 +729,6 @@ fn ink(fill: Color) -> Color {
         Color::DarkGray | Color::Black | Color::Blue | Color::Red | Color::Magenta => Color::White,
         _ => Color::Black,
     }
-}
-
-/// Two-letter agent label used as a column head.
-fn abbrev(key: &str) -> String {
-    key.chars().take(2).collect()
 }
 
 /// Marker for one agent's relationship to a skill; `None` means that agent
@@ -767,41 +789,23 @@ fn state_label(state: Option<&EntryState>) -> &'static str {
 /// A three-line card: the name and who has it, what the skill is, how it is filed.
 fn entry_card(
     name: &str,
-    states: &[Option<&EntryState>],
+    state: Option<&EntryState>,
     managed: bool,
-    scope_agents: &[String],
     ctx: &Ctx,
     inner_w: usize,
 ) -> ListItem<'static> {
     let th = ctx.theme;
-    let mut marks: Vec<Span> = Vec::new();
-    for (i, state) in states.iter().enumerate() {
-        let (glyph, style) = glyph_for(*state, th);
-        marks.push(Span::styled(format!("{glyph} "), style));
-        marks.push(Span::styled(
-            format!("{}  ", abbrev(&scope_agents[i])),
-            th.dim(),
-        ));
-    }
-    let marks_w: usize = marks.iter().map(|s| width(&s.content)).sum();
-    let name_w = inner_w.saturating_sub(marks_w + 2);
-    let mut head = vec![
+    let (glyph, glyph_style) = glyph_for(state, th);
+    let mark = Span::styled(format!("{glyph}  "), glyph_style);
+    let name_w = inner_w.saturating_sub(width(&mark.content) + 2);
+    let head = vec![
         Span::raw("  "),
         Span::styled(
             pad(name, name_w),
             if managed { th.bold() } else { th.dim() },
         ),
+        mark,
     ];
-    head.extend(marks);
-
-    // A skill several agents carry is filed by its root state, not by whichever
-    // agent happens to come first in the scope.
-    let state = states
-        .iter()
-        .flatten()
-        .copied()
-        .find(|s| matches!(s, EntryState::Deployed))
-        .or_else(|| states.iter().flatten().copied().next());
     let record = ctx.snap.get(name);
     let body = match record.and_then(|r| r.description.clone()) {
         Some(d) => d,
@@ -875,7 +879,7 @@ impl AgentsView {
             lines.push(Line::from(""));
         }
         for a in &ctx.snap.agents {
-            if self.scope.as_deref().is_some_and(|k| k != a.key) {
+            if a.key != self.scope {
                 continue;
             }
             let mode = match &a.mode {

@@ -537,15 +537,22 @@ fn preset_status_activation_and_overlap() {
     let st = preset_status(&snap, &extra, &["b".to_string()]);
     assert_eq!((st.installed, st.total), (2, 2));
     assert_eq!(st.state(), PresetState::Active);
-    assert_eq!(st.label(), "2");
+    assert_eq!(
+        st.progress(),
+        None,
+        "a preset that is all the way on says so by its colour, not by a count"
+    );
 
     // Deactivating removes every member, including ones shared with daily.
     let actions = plan_preset_deactivate(&ws, &snap, &extra, &scope).unwrap();
     deploy::apply(&actions).unwrap();
     let snap = ws.scan().unwrap();
+    let extra_after = preset_status(&snap, &extra, &scope);
+    assert_eq!(extra_after.state(), PresetState::Inactive);
     assert_eq!(
-        preset_status(&snap, &extra, &scope).state(),
-        PresetState::Inactive
+        extra_after.progress(),
+        None,
+        "nor does one that is all the way off"
     );
     let daily_after = preset_status(&snap, &daily, &scope);
     assert_eq!(

@@ -56,7 +56,10 @@ impl PresetsView {
                         reason: "not in skills root".into(),
                     });
                 }
-                vec![Action::ConfirmLinks {
+                // Toggling a preset goes through without asking, the same as
+                // on the Agents page: it is one gesture, it says what it did,
+                // and undo takes it back.
+                vec![Action::ApplyLinks {
                     title: format!(
                         "{} preset {}",
                         if on { "deploy" } else { "undeploy" },

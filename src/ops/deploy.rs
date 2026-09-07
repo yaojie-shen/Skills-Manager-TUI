@@ -476,12 +476,15 @@ impl PresetStatus {
         }
     }
 
-    /// `8/8`, or just `8` once complete.
-    pub fn label(&self) -> String {
+    /// How far along a preset is that is neither on nor off, `5/12`. All the
+    /// way on or all the way off is already told by the colour and the mark, so
+    /// a count there says nothing and only makes the pills harder to read.
+    /// A preset with nothing deployable is worth a word of its own.
+    pub fn progress(&self) -> Option<String> {
         match self.state() {
-            PresetState::Empty => "empty".into(),
-            PresetState::Active => format!("{}", self.total),
-            _ => format!("{}/{}", self.installed, self.total),
+            PresetState::Partial => Some(format!("{}/{}", self.installed, self.total)),
+            PresetState::Empty => Some("empty".into()),
+            PresetState::Active | PresetState::Inactive => None,
         }
     }
 }
