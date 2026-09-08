@@ -106,6 +106,18 @@ impl Input {
         self.value = v.to_string();
         self.cursor = self.value.chars().count();
     }
+    /// Cursor position as a byte boundary, for token-aware completion.
+    pub fn cursor_byte(&self) -> usize {
+        self.byte_at(self.cursor)
+    }
+
+    /// Replace a token while retaining the text and cursor after it.
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, replacement: &str) {
+        let cursor_byte = range.start + replacement.len();
+        self.value.replace_range(range, replacement);
+        self.cursor = self.value[..cursor_byte].chars().count();
+    }
+
     pub fn clear(&mut self) {
         self.value.clear();
         self.cursor = 0;

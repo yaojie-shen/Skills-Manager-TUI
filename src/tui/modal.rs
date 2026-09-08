@@ -516,7 +516,7 @@ impl Modal {
                             .count();
                         PickItem {
                             id: r.alias.clone(),
-                            label: r.alias,
+                            label: skills::repository::source_name(&r.url).unwrap_or(r.alias),
                             sub: format!("{count} skills · {} · {}", r.branch, r.url),
                         }
                     })
@@ -840,7 +840,7 @@ impl Modal {
                             return vec![
                                 Action::CloseModal,
                                 Action::Search {
-                                    query: format!("repo:{alias}"),
+                                    query: repository_query(alias, ctx),
                                     focus_list: true,
                                 },
                             ];
@@ -1133,7 +1133,7 @@ impl Modal {
                             return vec![
                                 Action::CloseModal,
                                 Action::Search {
-                                    query: format!("repo:{}", items[i].id),
+                                    query: repository_query(&items[i].id, ctx),
                                     focus_list: true,
                                 },
                             ];
@@ -1973,6 +1973,20 @@ Global
   Ctrl-Z  Ctrl-Y    undo and redo the last change
   1-5  Tab          switch tabs (Alt+1..5 while typing in the search box)
   /                 back to search      Ctrl-R  rescan      Ctrl-C  quit";
+
+fn repository_query(alias: &str, ctx: &Ctx) -> String {
+    let name = ctx
+        .snap
+        .skills
+        .iter()
+        .filter(|r| skills::repository::alias_of(&r.key) == Some(alias))
+        .find_map(|r| match &r.source {
+            Some(skills::meta::Source::Git { url, .. }) => skills::repository::source_name(url),
+            _ => None,
+        })
+        .unwrap_or_else(|| alias.to_string());
+    format!("repo:{name}")
+}
 
 #[cfg(test)]
 mod picker_tests {

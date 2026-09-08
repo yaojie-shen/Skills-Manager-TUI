@@ -7,6 +7,7 @@
 
 mod app;
 mod event;
+mod markdown;
 mod modal;
 mod repository_picker;
 mod theme;

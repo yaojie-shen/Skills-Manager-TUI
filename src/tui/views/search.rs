@@ -1,6 +1,7 @@
 //! Search tab: input, result list, preview.
 
 use super::cards::{self, CARD_H, cols_for, frame, skill_card};
+use super::completion::Completion;
 use super::preview::{Overlay, highlight_spans, preview_lines};
 use super::{View, split_panes, status_glyph, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
@@ -27,6 +28,7 @@ pub enum Focus {
 
 pub struct SearchView {
     input: Input,
+    completion: Completion,
     focus: Focus,
     hits: Vec<Hit>,
     grid: CardGrid,
@@ -53,6 +55,7 @@ impl Default for SearchView {
     fn default() -> Self {
         Self {
             input: Input::default(),
+            completion: Completion::default(),
             focus: Focus::Input,
             hits: Vec::new(),
             grid: CardGrid::default(),
@@ -87,6 +90,7 @@ impl SearchView {
     }
     pub fn set_query(&mut self, q: &str, ctx: &Ctx) {
         self.input.set(q);
+        self.completion.close();
         self.run_search(ctx, false);
     }
 
@@ -329,7 +333,7 @@ impl SearchView {
             f,
             field,
             self.focus == Focus::Input,
-            "search skills…   tag:x  agent:y  status:modified  untagged",
+            "search skills…   repo:owner/repo  tag:x  agent:y  status:modified  untagged",
             th,
         );
     }
@@ -547,7 +551,7 @@ impl SearchView {
             return;
         };
         let terms: Vec<String> = self.selected_terms().to_vec();
-        let lines = preview_lines(r, ctx, &terms);
+        let lines = preview_lines(r, ctx, &terms, inner.width as usize);
         // Count wrapped lines for scroll clamping (approximate: by display width).
         let w = inner.width.max(1) as usize;
         self.preview_lines = lines
@@ -594,6 +598,29 @@ impl View for SearchView {
         if self.overlay.handle_key(k) {
             return vec![];
         }
+        if self.focus == Focus::Input && self.completion.active() {
+            match k.code {
+                KeyCode::Up | KeyCode::Down => {
+                    self.completion
+                        .move_by(if k.code == KeyCode::Up { -1 } else { 1 });
+                    return vec![];
+                }
+                KeyCode::Tab => {
+                    self.completion.accept(&mut self.input);
+                    self.run_search(ctx, false);
+                    if self.input.value()[..self.input.cursor_byte()].ends_with(':') {
+                        self.completion.update(&self.input, ctx);
+                    }
+                    return vec![];
+                }
+                KeyCode::Esc => {
+                    self.completion.close();
+                    self.esc_armed = false;
+                    return vec![];
+                }
+                _ => {}
+            }
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let mut acts = Vec::new();
         match self.focus {
@@ -616,8 +643,13 @@ impl View for SearchView {
                 KeyCode::Char('n') if ctrl => self.move_sel(1),
                 KeyCode::Char('p') if ctrl => self.move_sel(-1),
                 _ => {
-                    if self.input.handle_key(k) {
+                    let cursor = self.input.cursor_byte();
+                    let changed = self.input.handle_key(k);
+                    if changed {
                         self.run_search(ctx, false);
+                    }
+                    if changed || cursor != self.input.cursor_byte() {
+                        self.completion.update(&self.input, ctx);
                     }
                 }
             },
@@ -697,6 +729,18 @@ impl View for SearchView {
         if self.overlay.handle_mouse(m) {
             return vec![];
         }
+        if self.focus == Focus::Input {
+            let (consumed, accepted) = self.completion.mouse(m, &mut self.input);
+            if consumed {
+                if accepted {
+                    self.run_search(ctx, false);
+                    if self.input.value()[..self.input.cursor_byte()].ends_with(':') {
+                        self.completion.update(&self.input, ctx);
+                    }
+                }
+                return vec![];
+            }
+        }
         let at = (m.column, m.row).into();
         if let Some(d) = wheel(&m) {
             if self.preview_rect.contains(at) {
@@ -727,6 +771,7 @@ impl View for SearchView {
             if self.input_rect.contains(at) {
                 self.focus = Focus::Input;
                 self.input.click(m.column);
+                self.completion.update(&self.input, ctx);
             } else if self.preview_rect.contains(at) {
                 self.focus = Focus::Preview;
             } else if self.list_rect.contains(at) {
@@ -774,12 +819,16 @@ impl View for SearchView {
             self.preview_rect = right;
             self.draw_preview(f, right, ctx);
         }
+        if self.focus == Focus::Input && !self.overlay.is_open() {
+            self.completion.draw(f, rows[1], ctx);
+        }
     }
 
     fn hints(&self) -> Hints {
         match self.focus {
             Focus::Input => &[
                 ("↑↓", "select"),
+                ("Tab", "complete/list"),
                 ("Enter", "list"),
                 ("Esc", "clear/quit"),
                 ("Alt-1..5", "tabs"),
@@ -884,4 +933,62 @@ fn row_lines<'a>(
         ))
     }
     vec![Line::from(spans), Line::from(sub)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filter_completion_keeps_query_on_escape_and_enter_enters_results() {
+        let root =
+            std::env::temp_dir().join(format!("skills-search-completion-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = skills::Workspace::open(&root).unwrap();
+        let snap = skills::reconcile::scan(&root, &ws.config).unwrap();
+        let theme = crate::tui::theme::Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = SearchView::default();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for c in "status:mod".chars() {
+            view.handle_key(key(KeyCode::Char(c)), &ctx);
+        }
+        assert!(view.completion.active());
+        view.handle_key(key(KeyCode::Down), &ctx);
+        assert_eq!(view.focus, Focus::Input);
+        view.handle_key(key(KeyCode::Esc), &ctx);
+        assert_eq!(view.query(), "status:mod");
+        assert!(!view.completion.active());
+        view.handle_key(key(KeyCode::Char('i')), &ctx);
+        view.handle_key(key(KeyCode::Tab), &ctx);
+        assert_eq!(view.query(), "status:modified ");
+        assert_eq!(view.focus, Focus::Input);
+        assert!(!view.completion.active());
+        view.handle_key(key(KeyCode::Enter), &ctx);
+        assert_eq!(view.focus, Focus::List);
+        view.focus_input();
+        view.set_query("status:unknown", &ctx);
+        view.handle_key(key(KeyCode::Tab), &ctx);
+        assert_eq!(view.focus, Focus::List);
+        view.focus_input();
+        view.set_query("status:mod 中文", &ctx);
+        for _ in 0..3 {
+            view.handle_key(key(KeyCode::Left), &ctx);
+        }
+        assert!(view.completion.active());
+        view.handle_key(key(KeyCode::Tab), &ctx);
+        assert_eq!(view.query(), "status:modified 中文");
+        assert!(!view.completion.active());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

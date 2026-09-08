@@ -323,7 +323,11 @@ impl App {
                             keys.len()
                         )),
                         Action::Search {
-                            query: format!("repo:{}", selection.fetched.repository.alias),
+                            query: format!(
+                                "repo:{}",
+                                skills::repository::source_name(&selection.fetched.repository.url)
+                                    .unwrap_or_else(|| selection.fetched.repository.alias.clone())
+                            ),
                             focus_list: true,
                         },
                     ]);

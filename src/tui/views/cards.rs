@@ -150,16 +150,10 @@ pub fn display_name(r: &SkillRecord) -> &str {
 
 /// A readable Git source badge, separate from the skill's own name.
 pub fn repository_badge(r: &SkillRecord) -> Option<String> {
-    if let Some(skills::meta::Source::Git { url, .. }) = &r.source {
-        let url = url.trim_end_matches('/').trim_end_matches(".git");
-        let parts: Vec<_> = url
-            .rsplit(['/', ':'])
-            .filter(|s| !s.is_empty())
-            .take(2)
-            .collect();
-        if parts.len() == 2 {
-            return Some(format!("⎇ {}/{}", parts[1], parts[0]));
-        }
+    if let Some(skills::meta::Source::Git { url, .. }) = &r.source
+        && let Some(name) = skills::repository::source_name(url)
+    {
+        return Some(format!("⎇ {name}"));
     }
     skills::repository::alias_of(&r.key).map(|alias| format!("⎇ {alias}"))
 }
@@ -278,6 +272,13 @@ mod tests {
         assert!(!lines[0].to_string().contains("skills--"));
         assert!(lines[3].to_string().contains("⎇ sampleorg/kit"));
         assert!(lines[3].to_string().contains("name"));
+        let preview = super::super::preview::preview_lines(&record, &ctx, &[], 60);
+        assert!(preview[0].to_string().starts_with("mock-calendar"));
+        assert!(
+            !preview
+                .iter()
+                .any(|line| line.to_string().contains("≠ directory name"))
+        );
         assert_eq!(record.key, key);
         assert_eq!(
             record.deployment_name(),

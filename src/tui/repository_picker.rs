@@ -135,6 +135,39 @@ impl RepositoryPicker {
             .and_then(|i| self.shown.get(i))
             .cloned()
     }
+    fn resolved_name(&self, path: &str, ctx: &Ctx) -> String {
+        let mut paths: Vec<_> = self
+            .selection
+            .paths
+            .iter()
+            .filter(|p| self.matches_filter(p))
+            .cloned()
+            .collect();
+        if !paths.iter().any(|p| p == path) {
+            paths.push(path.to_string());
+        }
+        let occupied = ctx
+            .snap
+            .skills
+            .iter()
+            .filter(|r| {
+                skills::repository::alias_of(&r.key)
+                    == Some(self.selection.fetched.repository.alias.as_str())
+            })
+            .filter_map(|r| r.key.rsplit('/').next().map(str::to_string))
+            .collect();
+        skills::repository::resolve_local_names(
+            &paths,
+            &self.selection.names,
+            &occupied,
+            &self.selection.fetched.local_name(""),
+        )
+        .ok()
+        .and_then(|names| names.get(path).cloned())
+        .or_else(|| self.selection.names.get(path).cloned())
+        .unwrap_or_else(|| self.selection.fetched.local_name(path))
+    }
+
     fn disabled(&self, path: &str, ctx: &Ctx) -> Option<String> {
         if let Some(error) = self.selection.fetched.invalid.get(path) {
             return Some(format!("invalid: {error}"));
@@ -257,14 +290,7 @@ impl RepositoryPicker {
                 if let Some(path) = self.selected()
                     && self.selection.fetched.choices.contains(&path)
                 {
-                    self.name = Input::with_value(
-                        &self
-                            .selection
-                            .names
-                            .get(&path)
-                            .cloned()
-                            .unwrap_or_else(|| self.selection.fetched.local_name(&path)),
-                    );
+                    self.name = Input::with_value(&self.resolved_name(&path, ctx));
                     self.focus = 3;
                 }
             }
@@ -285,6 +311,13 @@ impl RepositoryPicker {
                     return vec![Action::Error(
                         "select at least one skill in the current filter".into(),
                     )];
+                }
+                match selection
+                    .fetched
+                    .resolved_names(ctx.ws, &selection.paths, &selection.names)
+                {
+                    Ok(names) => selection.names = names,
+                    Err(error) => return vec![Action::Error(format!("{error:#}"))],
                 }
                 return vec![
                     Action::CloseModal,
@@ -393,12 +426,7 @@ impl RepositoryPicker {
         if self.focus == 3 {
             self.name.render(f, self.fields[2], true, "", th);
         } else if let Some(path) = self.selected() {
-            let name = self
-                .selection
-                .names
-                .get(&path)
-                .cloned()
-                .unwrap_or_else(|| self.selection.fetched.local_name(&path));
+            let name = self.resolved_name(&path, ctx);
             f.render_widget(
                 Paragraph::new(fit(&name, self.fields[2].width as usize)),
                 self.fields[2],

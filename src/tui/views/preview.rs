@@ -132,7 +132,16 @@ impl Overlay {
         f.render_widget(Clear, rect);
         let title = Line::from(vec![
             Span::raw(" "),
-            Span::styled(key.clone(), th.bold()),
+            Span::styled(
+                self.agent_preview
+                    .as_ref()
+                    .and_then(|p| p.doc.as_ref().ok())
+                    .map(|d| d.name.as_str())
+                    .or_else(|| ctx.snap.get(key).map(super::cards::display_name))
+                    .unwrap_or(key)
+                    .to_string(),
+                th.bold(),
+            ),
             Span::styled("  Esc closes ", th.dim()),
         ]);
         let block = th.block(title, true);
@@ -155,13 +164,16 @@ impl Overlay {
                     lines.push(kv("name", &doc.name, th));
                     lines.push(kv("summary", &doc.description, th));
                     lines.push(Line::from(""));
-                    lines.extend(tui_markdown::from_str(&doc.body).lines);
+                    lines.extend(crate::tui::markdown::render(
+                        &doc.body,
+                        inner.width as usize,
+                    ));
                 }
                 Err(error) => lines.push(Line::from(Span::styled(error.clone(), th.err()))),
             }
             lines
         } else if let Some(r) = ctx.snap.get(key) {
-            preview_lines(r, ctx, &[])
+            preview_lines(r, ctx, &[], inner.width as usize)
         } else {
             vec![Line::from(Span::styled("not in the skills root", th.err()))]
         };
@@ -202,22 +214,20 @@ pub fn kv<'a>(k: &'a str, v: impl Into<String>, th: &Theme) -> Line<'a> {
     ])
 }
 
-pub fn preview_lines<'a>(r: &'a SkillRecord, ctx: &'a Ctx, terms: &[String]) -> Vec<Line<'a>> {
+pub fn preview_lines<'a>(
+    r: &'a SkillRecord,
+    ctx: &'a Ctx,
+    terms: &[String],
+    available_width: usize,
+) -> Vec<Line<'a>> {
     let th = ctx.theme;
     let mut lines = vec![Line::from(vec![
-        Span::styled(r.key.as_str(), th.bold().fg(th.accent)),
+        Span::styled(super::cards::display_name(r), th.bold().fg(th.accent)),
         Span::raw("  "),
         status_glyph(&r.status, th),
         Span::raw(" "),
         Span::styled(status_text(&r.status), th.dim()),
     ])];
-    if r.name_mismatch {
-        lines.push(kv(
-            "name",
-            format!("{}  ≠ directory name", r.name.as_deref().unwrap_or("")),
-            th,
-        ));
-    }
     let mut tag_line = vec![Span::styled(format!("{:<9}", "tags"), th.dim())];
     if r.tags.is_empty() {
         tag_line.push(Span::styled("none", th.dim()));
@@ -281,7 +291,7 @@ pub fn preview_lines<'a>(r: &'a SkillRecord, ctx: &'a Ctx, terms: &[String]) -> 
             th.bold().fg(th.accent),
         )));
         lines.push(Line::from(Span::styled("─".repeat(24), th.dim())));
-        for line in tui_markdown::from_str(b).lines {
+        for line in crate::tui::markdown::render(b, available_width) {
             lines.push(highlight_line(line, terms, th));
         }
     }

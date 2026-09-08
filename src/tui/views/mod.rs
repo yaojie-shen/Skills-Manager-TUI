@@ -3,6 +3,7 @@
 
 pub mod agents;
 pub mod cards;
+mod completion;
 pub mod health;
 pub mod matrix;
 pub mod presets;
