@@ -190,7 +190,7 @@ impl RepositoryPicker {
                 ("Enter", "install"),
                 ("a", "repo alias"),
                 ("e", "local name"),
-                ("/", "search"),
+                ("/", "filter"),
                 ("Esc", "cancel"),
             ],
             _ => &[
@@ -283,7 +283,7 @@ impl RepositoryPicker {
                 selection.paths.retain(|p| self.matches_filter(p));
                 if selection.paths.is_empty() {
                     return vec![Action::Error(
-                        "select at least one skill in the current results".into(),
+                        "select at least one skill in the current filter".into(),
                     )];
                 }
                 return vec![
@@ -345,7 +345,7 @@ impl RepositoryPicker {
         f.render_widget(OverlayClear, r);
         let block = th.block(
             format!(
-                " install · {} selected in results · {} outside filter (excluded) ",
+                " install · {} selected to install · {} outside filter (excluded) ",
                 self.selection
                     .paths
                     .iter()
@@ -364,7 +364,7 @@ impl RepositoryPicker {
         if inner.height < 6 {
             return;
         }
-        for (i, label) in [(0, "repo alias"), (1, "search"), (2, "local name")] {
+        for (i, label) in [(0, "repo alias"), (1, "filter"), (2, "local name")] {
             let y = if i == 2 {
                 inner.bottom() - 1
             } else {
@@ -387,7 +387,7 @@ impl RepositoryPicker {
             f,
             self.fields[1],
             self.focus == 1,
-            "keyword or root path, e.g. skills/",
+            "filter by keyword or root path, e.g. skills/",
             th,
         );
         if self.focus == 3 {
