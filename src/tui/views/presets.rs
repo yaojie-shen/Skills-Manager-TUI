@@ -76,6 +76,17 @@ impl PresetsView {
         self.selected().map(|p| p.skills.len()).unwrap_or(0)
     }
 
+    fn select_skills(&self, checked: Option<String>) -> Vec<Action> {
+        let Some(preset) = self.selected().filter(|preset| !preset.skills.is_empty()) else {
+            return vec![];
+        };
+        vec![Action::SelectSkills {
+            keys: preset.skills.clone(),
+            title: format!("Preset: {}", preset.name),
+            checked,
+        }]
+    }
+
     fn selected_member(&self) -> Option<String> {
         self.selected()
             .and_then(|p| self.members.selected().and_then(|i| p.skills.get(i)))
@@ -377,6 +388,7 @@ impl View for PresetsView {
         let m = self.member_count();
         if self.focus_members {
             return match k.code {
+                KeyCode::Char('m') => self.select_skills(None),
                 KeyCode::Esc | KeyCode::Char('h') | KeyCode::BackTab => {
                     self.focus_members = false;
                     vec![]
@@ -529,9 +541,14 @@ impl View for PresetsView {
                     self.members.clamp(self.member_count());
                 }
             } else if self.right.contains(at)
-                && let Some((_, double)) = self.members.click(m.column, m.row)
+                && let Some((index, double)) = self.members.click(m.column, m.row)
             {
                 self.focus_members = true;
+                if self.members.cell(index).is_some_and(|cell| {
+                    m.row == cell.y + 1 && (cell.x + 2..cell.x + 5).contains(&m.column)
+                }) {
+                    return self.select_skills(self.selected_member());
+                }
                 if double {
                     return self.open_member();
                 }
@@ -562,6 +579,7 @@ impl View for PresetsView {
             &[
                 ("a", "add skills"),
                 ("x", "remove"),
+                ("m", "multi-select"),
                 ("Enter", "preview"),
                 ("←/Esc", "presets"),
             ]
@@ -627,7 +645,12 @@ mod tests {
         let mut view = PresetsView::default();
         view.refresh(&ctx);
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(view.handle_key(key(KeyCode::Char('m')), &ctx).is_empty());
         assert!(view.handle_key(key(KeyCode::Right), &ctx).is_empty());
+        let actions = view.handle_key(key(KeyCode::Char('m')), &ctx);
+        assert!(
+            matches!(&actions[..], [Action::SelectSkills { keys, title, checked: None }] if keys == &["printer"] && title == "Preset: reading")
+        );
         assert!(view.handle_key(key(KeyCode::Enter), &ctx).is_empty());
         assert!(view.preview.is_open());
 

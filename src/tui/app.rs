@@ -65,7 +65,18 @@ pub type MetaFn = Box<dyn FnOnce(&Workspace) -> Result<(String, Option<history::
 
 /// Requests a view or modal hands back to the app.
 pub enum Action {
+    SelectAgentSkills {
+        keys: Vec<String>,
+        title: String,
+        checked: Option<String>,
+        agent: String,
+    },
     Quit,
+    SelectSkills {
+        keys: Vec<String>,
+        title: String,
+        checked: Option<String>,
+    },
     Toast(String),
     Error(String),
     /// Re-scan in the background.
@@ -100,6 +111,12 @@ pub enum Action {
     Write(WriteFn),
     /// Run a write that can be taken back, and log what it changed.
     WriteMeta(MetaFn),
+    BatchMeta(MetaFn, Vec<String>),
+    BatchLinks {
+        title: String,
+        actions: Vec<deploy::Action>,
+        keys: Vec<String>,
+    },
     /// Log something that has already happened.
     Record(history::Intent),
     /// Move the history after a confirmed undo or redo went through.
@@ -145,6 +162,7 @@ pub struct App {
     pub health: HealthView,
     pub modal: Option<Modal>,
     pending_task_ui: VecDeque<Action>,
+    batch_running: bool,
     pub toasts: Toasts,
     pub history: History,
     tasks_running: usize,
@@ -172,6 +190,7 @@ impl App {
             health: HealthView::default(),
             modal: None,
             pending_task_ui: VecDeque::new(),
+            batch_running: false,
             toasts: Toasts::default(),
             history: History::default(),
             tasks_running: 0,
@@ -296,6 +315,36 @@ impl App {
 
     fn on_task(&mut self, out: TaskOutput) -> Vec<Action> {
         match out {
+            TaskOutput::Batch(outcome) => {
+                self.batch_running = false;
+                if let Some(intent) = outcome.intent {
+                    self.history.record(intent);
+                }
+                self.search.batch_finished(&outcome.failed);
+                if outcome.errors.is_empty() {
+                    self.modal = None;
+                    self.toast(outcome.message, Level::Ok);
+                } else {
+                    self.modal = Some(Modal::message(
+                        format!(
+                            "Batch result · {} skills need attention",
+                            outcome.failed.len()
+                        ),
+                        outcome.errors,
+                    ));
+                    self.toast(
+                        format!(
+                            "{}; {} skills need attention",
+                            outcome.message,
+                            outcome.failed.len()
+                        ),
+                        Level::Error,
+                    );
+                }
+                self.rescan();
+                vec![]
+            }
+
             TaskOutput::RepositoryFetched(_, Ok(fetched)) => {
                 let ctx = Ctx {
                     ws: &self.ws,
@@ -348,6 +397,7 @@ impl App {
             }
             TaskOutput::Scan(Err(e)) => vec![Action::Error(format!("scan failed: {e:#}"))],
             TaskOutput::Check(results) => {
+                self.search.remember_checks(&results);
                 let ctx = Ctx {
                     ws: &self.ws,
                     snap: &self.snap,
@@ -402,6 +452,9 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) -> Vec<Action> {
+        if self.batch_running {
+            return vec![];
+        }
         let ctx = Ctx {
             ws: &self.ws,
             snap: &self.snap,
@@ -466,6 +519,9 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) -> Vec<Action> {
+        if self.batch_running {
+            return vec![];
+        }
         let ctx = Ctx {
             ws: &self.ws,
             snap: &self.snap,
@@ -496,7 +552,33 @@ impl App {
 
     fn apply(&mut self, action: Action) {
         match action {
+            Action::SelectAgentSkills {
+                keys,
+                title,
+                checked,
+                agent,
+            } => {
+                self.apply(Action::SelectSkills {
+                    keys,
+                    title,
+                    checked,
+                });
+                self.search.restrict_agent(agent);
+            }
             Action::Quit => self.quit = true,
+            Action::SelectSkills {
+                keys,
+                title,
+                checked,
+            } => {
+                self.switch_tab(Tab::Search);
+                let ctx = Ctx {
+                    ws: &self.ws,
+                    snap: &self.snap,
+                    theme: &self.theme,
+                };
+                self.search.select_scope(keys, title, checked, &ctx);
+            }
             Action::Toast(t) => self.toast(t, Level::Ok),
             Action::Error(t) => self.toast(t, Level::Error),
             Action::Rescan => self.rescan(),
@@ -616,6 +698,19 @@ impl App {
                 }
                 self.rescan();
             }
+            Action::BatchMeta(write, keys) => {
+                self.spawn_batch(
+                    super::event::BatchWork::Metadata(write, keys.clone()),
+                    format!("Applying metadata to {} skills…", keys.len()),
+                );
+            }
+            Action::BatchLinks {
+                title,
+                actions,
+                keys,
+            } => {
+                self.spawn_batch(super::event::BatchWork::Links(actions, keys), title);
+            }
             Action::WriteMeta(f) => {
                 match f(&self.ws) {
                     Ok((msg, intent)) => {
@@ -639,6 +734,7 @@ impl App {
         if t == self.tab {
             return;
         }
+        self.search.clear_selection();
         self.tab = t;
         let view: &mut dyn View = match t {
             Tab::Search => &mut self.search,
@@ -704,6 +800,29 @@ impl App {
                 vec![Action::Toast(why)]
             }
             Err(e) => vec![Action::Error(format!("{e:#}"))],
+        }
+    }
+
+    fn spawn_batch(&mut self, work: super::event::BatchWork, title: String) {
+        if self.batch_running {
+            return;
+        }
+        self.batch_running = true;
+        self.next_task_id += 1;
+        let id = self.next_task_id;
+        self.tasks_running += 1;
+        self.toasts.start(id, title);
+        if let Some(Modal::Batch(batch)) = self.modal.as_mut() {
+            batch.set_busy(true);
+        }
+        if let Err(e) = super::event::spawn_batch(self.ws.clone(), work, id, self.tx.clone()) {
+            self.batch_running = false;
+            self.tasks_running = self.tasks_running.saturating_sub(1);
+            self.toasts.finish(id);
+            if let Some(Modal::Batch(batch)) = self.modal.as_mut() {
+                batch.set_busy(false);
+            }
+            self.toast(format!("Cannot start batch: {e}"), Level::Error);
         }
     }
 
@@ -844,6 +963,51 @@ pub type Hints = &'static [(&'static str, &'static str)];
 #[cfg(test)]
 mod matrix_key_tests {
     use super::*;
+
+    #[test]
+    fn batch_worker_keeps_ticks_live_and_rejects_duplicate_submission() {
+        let root = std::env::temp_dir().join(format!("skills-async-batch-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        app.apply(Action::BatchMeta(
+            Box::new(move |_| {
+                wait.recv().unwrap();
+                Ok(("done".into(), None))
+            }),
+            vec![],
+        ));
+        assert!(app.batch_running);
+        let tick = app.spinner;
+        app.handle(Msg::Tick);
+        assert_ne!(tick, app.spinner);
+        let id = app.next_task_id;
+        app.apply(Action::BatchMeta(
+            Box::new(|_| panic!("duplicate work must not execute")),
+            vec![],
+        ));
+        assert_eq!(id, app.next_task_id);
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.quit);
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.batch_running || app.tasks_running > 0 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            app.handle(rx.recv_timeout(remaining).unwrap());
+        }
+        assert!(app.modal.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn background_dialogs_wait_for_editing_and_keep_arrival_order() {

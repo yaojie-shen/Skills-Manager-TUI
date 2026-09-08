@@ -193,6 +193,17 @@ impl TagsView {
             .map(str::to_string)
     }
 
+    fn select_skills(&self, checked: Option<String>) -> Vec<Action> {
+        if self.members.is_empty() {
+            return vec![];
+        }
+        vec![Action::SelectSkills {
+            keys: self.members.clone(),
+            title: format!("Tag: {}", self.selected_tag().unwrap_or("untagged")),
+            checked,
+        }]
+    }
+
     fn selected_member(&self) -> Option<String> {
         self.grid
             .selected()
@@ -657,6 +668,7 @@ impl View for TagsView {
         let m = self.members.len();
         if self.focus_grid {
             return match k.code {
+                KeyCode::Char('m') => self.select_skills(None),
                 KeyCode::Esc | KeyCode::Char('h') | KeyCode::BackTab => {
                     self.focus_grid = false;
                     vec![]
@@ -813,9 +825,14 @@ impl View for TagsView {
                     }
                 }
             } else if self.right.contains(at)
-                && let Some((_, double)) = self.grid.click(m.column, m.row)
+                && let Some((index, double)) = self.grid.click(m.column, m.row)
             {
                 self.focus_grid = true;
+                if self.grid.cell(index).is_some_and(|cell| {
+                    m.row == cell.y + 1 && (cell.x + 2..cell.x + 5).contains(&m.column)
+                }) {
+                    return self.select_skills(self.selected_member());
+                }
                 if double {
                     return self.open_member();
                 }
@@ -855,9 +872,12 @@ impl View for TagsView {
                 ("Enter", "apply"),
                 ("Esc", "cancel"),
             ],
-            None if self.focus_grid => {
-                &[("Enter", "preview"), ("t", "edit tags"), ("←/Esc", "tags")]
-            }
+            None if self.focus_grid => &[
+                ("Enter", "preview"),
+                ("t", "edit tags"),
+                ("m", "multi-select"),
+                ("←/Esc", "tags"),
+            ],
             None => &[
                 ("r", "rename"),
                 ("m", "merge"),

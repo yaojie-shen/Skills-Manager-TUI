@@ -5,7 +5,6 @@
 //! painted over.
 
 use super::preview::highlight_spans;
-use super::status_glyph;
 use crate::tui::app::Ctx;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::{fit, pad, width};
@@ -14,28 +13,22 @@ use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
-use skills::reconcile::{DeployState, SkillRecord};
+use skills::reconcile::SkillRecord;
 
 /// Narrowest a card may get before the grid gives up a column. Below this the
 /// name and description become too cramped to read.
 pub const MIN_CARD_W: u16 = 40;
-/// Most columns worth having: past this a card holds less than it costs to scan.
-pub const MAX_COLS: usize = 4;
-/// Four lines of content and the frame around them: identity, description, a
-/// rule, and the tags. The rule is not padding — the tag pills are filled
-/// shapes, and pressed straight up against the description they read as a
-/// smudge under the text; a bare blank line left the card looking half empty,
-/// so the gap is drawn as a thin line instead.
+/// Four content lines: identity, two description lines, and source with tags.
 pub const CARD_H: u16 = 6;
 
-/// The line between a card's text and its tags.
+/// Separator retained for non-skill cards such as presets and agent entries.
 pub fn rule(inner_w: usize, th: &Theme) -> Line<'static> {
     Line::from(Span::styled("─".repeat(inner_w), th.dim()))
 }
 
 /// Columns that fit in `width`, always at least one.
 pub fn cols_for(width: u16) -> usize {
-    ((width / MIN_CARD_W) as usize).clamp(1, MAX_COLS)
+    ((width / MIN_CARD_W) as usize).max(1)
 }
 
 /// Draw the frame of one card and hand back the padded area inside it.
@@ -68,21 +61,6 @@ pub fn frame_styled(f: &mut Frame, cell: Rect, border: Style) -> Rect {
     });
     f.render_widget(b, cell);
     inner
-}
-
-/// How a skill stands with one agent.
-pub fn deploy_glyph(state: Option<&DeployState>, th: &Theme) -> (&'static str, Style) {
-    match state {
-        Some(DeployState::Deployed) => ("✓", th.ok()),
-        Some(DeployState::Broken) => ("!", th.err()),
-        Some(DeployState::Shadow { .. }) | Some(DeployState::Foreign) => ("~", th.warn()),
-        _ => ("○", th.dim()),
-    }
-}
-
-/// Two-letter agent abbreviation used beside a deployment mark.
-pub fn abbrev(key: &str) -> String {
-    key.chars().take(2).collect()
 }
 
 /// Text colour that stays legible on a filled pill.
@@ -120,10 +98,15 @@ pub fn tag_pills(tags: &[String], ctx: &Ctx, max_w: usize) -> Vec<Span<'static>>
         // Keep room for the "+n" so the last thing on the line is never a
         // pill cut in half.
         let rest = tags.len() - i - 1;
-        let reserve = if rest > 0 { 4 } else { 0 };
+        let reserve = if rest > 0 {
+            width(&format!(" +{rest}"))
+        } else {
+            0
+        };
         if used + w + reserve > max_w {
-            if rest + 1 > 0 {
-                out.push(Span::styled(format!(" +{}", rest + 1), ctx.theme.dim()));
+            let count = fit(&format!(" +{}", rest + 1), max_w.saturating_sub(used));
+            if !count.is_empty() {
+                out.push(Span::styled(count, ctx.theme.dim()));
             }
             break;
         }
@@ -161,11 +144,79 @@ pub fn repository_badge(r: &SkillRecord, icons: skills::config::Icons) -> Option
     }
 }
 
-/// The lines of a skill card. `body` replaces the description when the page
-/// has something better to show there (the search page puts the matching
-/// excerpt); `tail` sits at the right of the last line: the source kind, or
-/// whatever the page wants to say about this skill in particular; `terms`
-/// are highlighted wherever they appear in the name or the body.
+/// A fixed-width leading slot, replaced by a checkbox in selection mode.
+pub fn health_marker(r: &SkillRecord, th: &Theme) -> Span<'static> {
+    use skills::reconcile::SkillStatus::*;
+    let (glyph, style) = match &r.status {
+        Managed { no_baseline: false } => ("●  ", th.ok()),
+        Managed { no_baseline: true } => ("●  ", th.warn()),
+        Unmanaged => ("○  ", th.dim()),
+        Modified => ("~  ", th.warn()),
+        Missing | Invalid { .. } | CorruptMeta { .. } => ("!  ", th.err()),
+        Renamed { .. } => ("!  ", th.warn()),
+    };
+    Span::styled(glyph, style)
+}
+
+/// Render Markdown as readable text and wrap at words where possible. CJK and
+/// long unbroken tokens wrap at grapheme boundaries, never splitting an emoji.
+fn summary_lines(markdown: &str, columns: usize) -> [String; 2] {
+    let plain = tui_markdown::from_str(markdown)
+        .lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if columns == 0 {
+        return [String::new(), String::new()];
+    }
+    let span = Span::raw(plain.as_str());
+    let mut used = 0;
+    let mut end = 0;
+    for g in span.styled_graphemes(Style::default()) {
+        let next = width(g.symbol);
+        if used + next > columns {
+            break;
+        }
+        used += next;
+        end += g.symbol.len();
+    }
+    if end == plain.len() {
+        return [plain, String::new()];
+    }
+    // Prefer a word boundary unless it would leave more than half a line blank.
+    if let Some(space) = plain[..end].rfind(' ')
+        && width(&plain[..space]) >= columns / 2
+    {
+        end = space;
+    }
+    let first = plain[..end].trim_end().to_owned();
+    let rest = plain[end..].trim_start();
+    let second = if width(rest) <= columns {
+        rest.to_owned()
+    } else {
+        let span = Span::raw(rest);
+        let mut result = String::new();
+        let mut used = 0;
+        for g in span.styled_graphemes(Style::default()) {
+            let next = width(g.symbol);
+            if used + next > columns.saturating_sub(1) {
+                break;
+            }
+            used += next;
+            result.push_str(g.symbol);
+        }
+        result.push('…');
+        result
+    };
+    [first, second]
+}
+
+/// Identity, a two-line readable summary, and source beside right-aligned tags.
+/// `body` supplies a search excerpt; `tail` can add page-specific context.
 pub fn skill_card(
     r: &SkillRecord,
     ctx: &Ctx,
@@ -175,39 +226,43 @@ pub fn skill_card(
     terms: &[String],
 ) -> Vec<Line<'static>> {
     let th = ctx.theme;
-    let source = match repository_badge(r, ctx.ws.config.ui.icons) {
-        Some(badge) if tail.is_empty() || tail == "git" || tail == "local" => badge,
-        Some(badge) => format!("{badge} · {tail}"),
-        None => tail.to_string(),
+    let source = repository_badge(r, ctx.ws.config.ui.icons)
+        .unwrap_or_else(|| crate::tui::icons::local(ctx.ws.config.ui.icons).into());
+    let source = if tail.is_empty() || tail == "git" || tail == "local" {
+        source
+    } else {
+        format!("{source} · {tail}")
     };
-    let tail = fit(&source, inner_w.saturating_sub(4));
-    let tail = tail.as_str();
-    let label = display_name(r);
-    let name_w = inner_w.saturating_sub(3);
-    let mut head = vec![status_glyph(&r.status, th), Span::raw(" ")];
-    head.extend(highlight_spans(&pad(label, name_w), terms, th.bold(), th));
-
-    let body: Vec<Span> = match body.or(r.description.as_deref()) {
-        Some(d) => highlight_spans(&fit(d, inner_w.saturating_sub(2)), terms, th.dim(), th),
-        None => vec![Span::styled("no description", th.dim())],
-    };
-
-    let tags_w = inner_w.saturating_sub(width(tail) + 3);
-    let mut foot = vec![Span::raw("  ")];
-    let pills = tag_pills(&r.tags, ctx, tags_w);
-    let pills_w: usize = pills.iter().map(|s| width(&s.content)).sum();
-    foot.extend(pills);
-    foot.push(Span::raw(" ".repeat(tags_w.saturating_sub(pills_w) + 1)));
-    foot.push(Span::styled(
-        tail.to_string(),
-        th.dim().add_modifier(Modifier::ITALIC),
+    let mut head = vec![health_marker(r, th)];
+    if inner_w < 3 {
+        head[0].content = fit(&head[0].content, inner_w).into();
+    }
+    head.extend(highlight_spans(
+        &pad(display_name(r), inner_w.saturating_sub(3)),
+        terms,
+        th.bold(),
+        th,
     ));
-    let mut body_line = vec![Span::raw("  ")];
-    body_line.extend(body);
+
+    let summary = summary_lines(
+        body.or(r.description.as_deref())
+            .unwrap_or("No description"),
+        inner_w,
+    );
+    let tags_budget = if r.tags.is_empty() { 0 } else { inner_w / 2 };
+    let pills = tag_pills(&r.tags, ctx, tags_budget);
+    let pills_w: usize = pills.iter().map(|s| width(&s.content)).sum();
+    let source_budget = inner_w.saturating_sub(pills_w + usize::from(pills_w > 0));
+    let source = fit(&source, source_budget);
+    let mut foot = vec![Span::styled(source.clone(), th.dim())];
+    foot.push(Span::raw(
+        " ".repeat(inner_w.saturating_sub(width(&source) + pills_w)),
+    ));
+    foot.extend(pills);
     vec![
         Line::from(head),
-        Line::from(body_line),
-        rule(inner_w, th),
+        Line::from(highlight_spans(&summary[0], terms, th.dim(), th)),
+        Line::from(highlight_spans(&summary[1], terms, th.dim(), th)),
         Line::from(foot),
     ]
 }
@@ -215,6 +270,21 @@ pub fn skill_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summaries_wrap_readable_markdown_and_keep_graphemes_intact() {
+        assert_eq!(summary_lines("**Hello** `world`", 20), ["Hello world", ""]);
+        assert_eq!(
+            summary_lines("中文测试日历管理", 8),
+            ["中文测试", "日历管理"]
+        );
+        assert_eq!(
+            summary_lines("one two three four five", 10),
+            ["one two", "three fou…"]
+        );
+        assert_eq!(summary_lines("👩‍💻👩‍💻👩‍💻", 4), ["👩‍💻👩‍💻", "👩‍💻"]);
+        assert_eq!(cols_for(280), 7);
+    }
 
     #[test]
     fn cards_use_frontmatter_names_and_keep_repository_identity_separate() {
@@ -293,7 +363,8 @@ mod tests {
             "sampleorg--kit--skills--mock-calendar"
         );
         record.name = Some("中文日历".into());
-        for width in [16, 24, 40, 80] {
+        record.tags = vec!["A very long tag".into(), "中文标签".into(), "third".into()];
+        for width in [0, 1, 2, 3, 8, 16, 24, 40, 80] {
             for line in skill_card(&record, &ctx, width, None, "git", &[]) {
                 assert!(line.width() <= width);
             }

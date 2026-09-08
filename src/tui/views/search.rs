@@ -3,7 +3,7 @@
 use super::cards::{self, CARD_H, cols_for, frame, skill_card};
 use super::completion::Completion;
 use super::preview::{Overlay, highlight_spans, preview_lines};
-use super::{View, split_panes, status_glyph, wheel};
+use super::{View, split_panes, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::event::Task;
 use crate::tui::modal::Modal;
@@ -18,6 +18,7 @@ use skills::config::UiLayout;
 use skills::ops::edit;
 use skills::reconcile::{SkillRecord, SkillStatus};
 use skills::search::{Hit, Query, Searcher};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -49,6 +50,12 @@ pub struct SearchView {
     /// Grid layout has no standing preview pane, so it opens over the results.
     overlay: Overlay,
     searcher: Searcher,
+    multi: bool,
+    scope_agent: Option<String>,
+    scope: Option<(BTreeSet<String>, String)>,
+    checked: BTreeSet<String>,
+    batch_buttons: Vec<(Rect, char)>,
+    updates: BTreeMap<String, String>,
 }
 
 impl Default for SearchView {
@@ -71,11 +78,147 @@ impl Default for SearchView {
             layout: None,
             overlay: Overlay::default(),
             searcher: Searcher::new(),
+            multi: false,
+            scope_agent: None,
+            scope: None,
+            checked: BTreeSet::new(),
+            batch_buttons: Vec::new(),
+            updates: BTreeMap::new(),
         }
     }
 }
 
 impl SearchView {
+    pub fn clear_selection(&mut self) {
+        self.multi = false;
+        self.checked.clear();
+        self.scope = None;
+        self.scope_agent = None;
+    }
+
+    pub fn restrict_agent(&mut self, agent: String) {
+        self.scope_agent = Some(agent);
+    }
+
+    pub fn select_scope(
+        &mut self,
+        keys: Vec<String>,
+        title: String,
+        checked: Option<String>,
+        ctx: &Ctx,
+    ) {
+        self.clear_selection();
+        self.scope = Some((keys.into_iter().collect(), title));
+        self.multi = true;
+        self.input.clear();
+        self.completion.close();
+        if let Some(key) = checked {
+            self.checked.insert(key);
+        }
+        self.focus = Focus::List;
+        self.run_search(ctx, false);
+    }
+
+    pub fn batch_finished(&mut self, failed: &[String]) {
+        if failed.is_empty() {
+            self.clear_selection();
+        } else {
+            self.multi = true;
+            self.checked = failed.iter().cloned().collect();
+        }
+    }
+
+    fn toggle_current(&mut self, ctx: &Ctx) {
+        if let Some(key) = self.selected(ctx).map(|r| r.key.clone()) {
+            self.multi = true;
+            if !self.checked.remove(&key) {
+                self.checked.insert(key);
+            }
+        }
+    }
+
+    fn visible_checked(&self, ctx: &Ctx) -> Vec<String> {
+        self.hits
+            .iter()
+            .map(|h| &ctx.snap.skills[h.index].key)
+            .filter(|key| self.checked.contains(*key))
+            .cloned()
+            .collect()
+    }
+
+    fn batch_action(&self, operation: char, ctx: &Ctx) -> Vec<Action> {
+        let keys = self.visible_checked(ctx);
+        if keys.is_empty() {
+            return vec![Action::Error(
+                "No selected skills in the current filter".into(),
+            )];
+        }
+        let modal = match operation {
+            't' => Modal::batch_tags(keys, ctx),
+            'd' => match &self.scope_agent {
+                Some(agent) => Modal::batch_deploy_agent(keys, agent, ctx),
+                None => Modal::batch_deploy(keys, ctx),
+            },
+            'p' => Modal::batch_presets(keys, ctx),
+            _ => return vec![],
+        };
+        vec![Action::OpenModal(Box::new(modal))]
+    }
+
+    fn decorate(&self, lines: &mut [Line<'static>], r: &SkillRecord, ctx: &Ctx) {
+        if let Some(line) = lines.first_mut()
+            && let Some(marker) = line.spans.first_mut()
+        {
+            if self.multi {
+                *marker = Span::styled(
+                    if self.checked.contains(&r.key) {
+                        "[✓]"
+                    } else {
+                        "[ ]"
+                    },
+                    if self.checked.contains(&r.key) {
+                        ctx.theme.accent()
+                    } else {
+                        ctx.theme.dim()
+                    },
+                );
+                if !r.status.is_healthy() {
+                    marker.style = ctx.theme.warn();
+                }
+            } else if r.status.is_healthy() && self.updates.contains_key(&r.key) {
+                *marker = Span::styled("↑  ", ctx.theme.accent());
+            }
+        }
+        if self.multi
+            && !r.status.is_healthy()
+            && let Some(line) = lines.first_mut()
+        {
+            let warning = format!(" ! {}", r.status.label());
+            let available = line.width().saturating_sub(3);
+            if available > width(&warning) + 8 {
+                let name = pad(cards::display_name(r), available - width(&warning));
+                line.spans.truncate(1);
+                line.spans.push(Span::styled(name, ctx.theme.bold()));
+                line.spans.push(Span::styled(warning, ctx.theme.warn()));
+            }
+        }
+    }
+
+    pub fn remember_checks(
+        &mut self,
+        results: &[(String, anyhow::Result<skills::ops::update::CheckResult>)],
+    ) {
+        for (key, result) in results {
+            if let Ok(check) = result {
+                if check.update_available {
+                    self.updates.insert(key.clone(), check.remote.clone());
+                } else {
+                    self.updates.remove(key);
+                }
+            }
+        }
+    }
+
     pub fn query(&self) -> String {
         self.input.value().to_string()
     }
@@ -115,6 +258,10 @@ impl SearchView {
         };
         let q = Query::parse(self.input.value());
         self.hits = self.searcher.search(&ctx.snap.skills, &q);
+        if let Some((keys, _)) = &self.scope {
+            self.hits
+                .retain(|hit| keys.contains(&ctx.snap.skills[hit.index].key));
+        }
         let idx = key.and_then(|k| {
             self.hits
                 .iter()
@@ -343,7 +490,6 @@ impl SearchView {
     /// lets a card carry its own frame and lets several sit on a row.
     fn draw_results(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let th = ctx.theme;
-        let agents = &ctx.snap.agents;
         let searching = !self.input.value().trim().is_empty()
             && !Query::parse(self.input.value()).text.is_empty();
         // The layout decides the shape too: a grid is made of cards, and the
@@ -352,13 +498,10 @@ impl SearchView {
         let layout = self.layout(ctx);
         let cards = layout == UiLayout::Grid;
 
-        let mut legend = vec![Span::raw(" skills ")];
-        for a in agents {
-            legend.push(Span::styled(
-                format!("{} ", cards::abbrev(&a.key)),
-                th.dim(),
-            ));
-        }
+        let legend = vec![Span::raw(match &self.scope {
+            Some((_, title)) => format!(" {title} "),
+            None => " skills ".into(),
+        })];
         let block = th.block(Line::from(legend), self.focus == Focus::List);
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -368,7 +511,7 @@ impl SearchView {
         // something to say.
         let cell_h = match layout {
             UiLayout::Grid => CARD_H,
-            UiLayout::List => 3,
+            UiLayout::List => 4,
             UiLayout::Compact if searching => 2,
             UiLayout::Compact => 1,
         };
@@ -431,10 +574,14 @@ impl SearchView {
                         .map(|s| s.kind().to_string())
                         .unwrap_or_default()
                 };
-                f.render_widget(
-                    Paragraph::new(skill_card(r, ctx, ci.width as usize, body, &tail, &h.terms)),
-                    ci,
-                );
+                let mut lines = skill_card(r, ctx, ci.width as usize, body, &tail, &h.terms);
+                self.decorate(&mut lines, r, ctx);
+                let style = if self.multi && self.checked.contains(&r.key) {
+                    th.selected_unfocused()
+                } else {
+                    Style::default()
+                };
+                f.render_widget(Paragraph::new(lines).style(style), ci);
             } else if layout == UiLayout::List {
                 // The card's lines without its frame or rule; the selection is
                 // the marker and a background, as in any list.
@@ -465,7 +612,7 @@ impl SearchView {
                     &tail,
                     &h.terms,
                 );
-                lines.remove(2);
+                self.decorate(&mut lines, r, ctx);
                 let lines: Vec<Line> = lines
                     .into_iter()
                     .enumerate()
@@ -489,15 +636,30 @@ impl SearchView {
                 } else {
                     Style::default()
                 };
-                let lines = row_lines(
+                let mut lines = row_lines(
                     r,
                     h,
                     ctx,
-                    agents,
                     cell.width.saturating_sub(2) as usize,
                     searching,
                     on,
                 );
+                if self.multi
+                    && let Some(line) = lines.first_mut()
+                {
+                    // Compact rows reserve two columns for focus, then the marker.
+                    line.spans.splice(
+                        1..2,
+                        [Span::styled(
+                            if self.checked.contains(&r.key) {
+                                "[✓]"
+                            } else {
+                                "[ ]"
+                            },
+                            th.accent(),
+                        )],
+                    );
+                }
                 f.render_widget(Paragraph::new(lines).style(style), cell);
             }
         }
@@ -577,6 +739,10 @@ impl View for SearchView {
         );
         self.searcher.index(&ctx.snap.skills);
         self.run_search(ctx, true);
+        self.checked.retain(|key| ctx.snap.get(key).is_some());
+        self.updates.retain(|key, remote| ctx.snap.get(key).is_some_and(|r| {
+            !matches!(&r.source, Some(skills::meta::Source::Git { revision: Some(revision), .. }) if revision == remote)
+        }));
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
@@ -602,6 +768,50 @@ impl View for SearchView {
                     self.completion.close();
                     self.esc_armed = false;
                     return vec![];
+                }
+                _ => {}
+            }
+        }
+        if self.multi && k.code == KeyCode::Esc {
+            self.clear_selection();
+            self.run_search(ctx, true);
+            return vec![];
+        }
+        if self.multi
+            && self.focus == Focus::Preview
+            && matches!(k.code, KeyCode::Char('n' | 'u' | 'U'))
+            && !k.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return vec![Action::Toast(
+                "Finish or cancel multi-select before a single-skill action".into(),
+            )];
+        }
+        if self.multi && self.focus == Focus::List {
+            match k.code {
+                KeyCode::Char(' ') => {
+                    self.toggle_current(ctx);
+                    return vec![];
+                }
+                KeyCode::Char('a') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.checked.extend(
+                        self.hits
+                            .iter()
+                            .map(|h| ctx.snap.skills[h.index].key.clone()),
+                    );
+                    return vec![];
+                }
+                KeyCode::Char(op @ ('t' | 'd' | 'p')) if k.modifiers.is_empty() => {
+                    return self.batch_action(op, ctx);
+                }
+                KeyCode::Char('m') => {
+                    self.clear_selection();
+                    self.run_search(ctx, true);
+                    return vec![];
+                }
+                KeyCode::Char('n' | 'r' | 's' | 'a' | 'u' | 'U' | 'x' | 'i' | 'M') => {
+                    return vec![Action::Toast(
+                        "Finish or cancel multi-select before a single-skill action".into(),
+                    )];
                 }
                 _ => {}
             }
@@ -658,13 +868,26 @@ impl View for SearchView {
                 KeyCode::Tab | KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                     self.open_preview(ctx)
                 }
-                KeyCode::Char('t') => acts = self.act_tags(ctx),
+                KeyCode::Char('t') => {
+                    acts = if self.multi {
+                        self.batch_action('t', ctx)
+                    } else {
+                        self.act_tags(ctx)
+                    }
+                }
                 KeyCode::Char('n') => acts = self.act_note(ctx),
-                KeyCode::Char('d') => acts = self.act_deploy(ctx),
+                KeyCode::Char('d') => {
+                    acts = if self.multi {
+                        self.batch_action('d', ctx)
+                    } else {
+                        self.act_deploy(ctx)
+                    }
+                }
                 KeyCode::Char('r') => acts = self.act_rename(ctx),
                 KeyCode::Char('s') => acts = self.act_set_source(ctx),
                 KeyCode::Char('a') => acts = self.act_accept(ctx),
-                KeyCode::Char('m') => acts = self.act_migrate(ctx),
+                KeyCode::Char('m') => self.multi = true,
+                KeyCode::Char('M') => acts = self.act_migrate(ctx),
                 KeyCode::Char('u') => acts = self.act_check(ctx),
                 KeyCode::Char('U') => acts = self.act_update(ctx),
                 KeyCode::Char('x') => acts = self.act_remove(ctx),
@@ -698,9 +921,21 @@ impl View for SearchView {
                 }
                 KeyCode::Home | KeyCode::Char('g') => self.preview_scroll = 0,
                 KeyCode::End | KeyCode::Char('G') => self.scroll_preview(i32::MAX / 2),
-                KeyCode::Char('t') => acts = self.act_tags(ctx),
+                KeyCode::Char('t') => {
+                    acts = if self.multi {
+                        self.batch_action('t', ctx)
+                    } else {
+                        self.act_tags(ctx)
+                    }
+                }
                 KeyCode::Char('n') => acts = self.act_note(ctx),
-                KeyCode::Char('d') => acts = self.act_deploy(ctx),
+                KeyCode::Char('d') => {
+                    acts = if self.multi {
+                        self.batch_action('d', ctx)
+                    } else {
+                        self.act_deploy(ctx)
+                    }
+                }
                 KeyCode::Char('u') => acts = self.act_check(ctx),
                 KeyCode::Char('U') => acts = self.act_update(ctx),
                 _ => {}
@@ -724,6 +959,26 @@ impl View for SearchView {
                     }
                 }
                 return vec![];
+            }
+        }
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some((_, command)) = self
+                .batch_buttons
+                .iter()
+                .find(|(rect, _)| rect.contains((m.column, m.row).into()))
+        {
+            match *command {
+                'm' => {
+                    self.multi = true;
+                    self.focus = Focus::List;
+                    return vec![];
+                }
+                'e' => {
+                    self.clear_selection();
+                    self.run_search(ctx, true);
+                    return vec![];
+                }
+                operation => return self.batch_action(operation, ctx),
             }
         }
         let at = (m.column, m.row).into();
@@ -761,9 +1016,21 @@ impl View for SearchView {
                 self.focus = Focus::Preview;
             } else if self.list_rect.contains(at) {
                 self.focus = Focus::List;
-                if let Some((_, double)) = self.grid.click(m.column, m.row) {
+                if let Some((index, double)) = self.grid.click(m.column, m.row) {
                     self.preview_scroll = 0;
-                    if double {
+                    let marker = self.grid.cell(index).is_some_and(|cell| {
+                        let (x, y) = if self.layout(ctx) == UiLayout::Grid {
+                            (cell.x + 2, cell.y + 1)
+                        } else {
+                            (cell.x + 2, cell.y)
+                        };
+                        m.row == y && m.column >= x && m.column < x + 3
+                    });
+                    if self.multi || marker {
+                        if !double {
+                            self.toggle_current(ctx);
+                        }
+                    } else if double {
                         self.open_preview(ctx);
                     }
                 }
@@ -774,7 +1041,11 @@ impl View for SearchView {
             && self.grid.click(m.column, m.row).is_some()
         {
             self.focus = Focus::List;
-            return self.act_deploy(ctx);
+            return if self.multi {
+                self.batch_action('d', ctx)
+            } else {
+                self.act_deploy(ctx)
+            };
         }
         vec![]
     }
@@ -782,7 +1053,11 @@ impl View for SearchView {
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(1)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
             .split(area);
         self.draw_input(f, rows[0], ctx);
 
@@ -804,6 +1079,65 @@ impl View for SearchView {
             self.preview_rect = right;
             self.draw_preview(f, right, ctx);
         }
+        self.batch_buttons.clear();
+        let bar = rows[2];
+        let mut x = bar.x;
+        let selected = self.visible_checked(ctx).len();
+        let status = if self.multi {
+            let hidden = self.checked.len().saturating_sub(selected);
+            format!(
+                " Multi-select · {selected} selected{} ",
+                if hidden > 0 {
+                    format!(" · {hidden} hidden (excluded)")
+                } else {
+                    String::new()
+                }
+            )
+        } else {
+            self.selected(ctx)
+                .map(|r| format!(" {} ", r.status.label()))
+                .unwrap_or_default()
+        };
+        let status = fit(&status, bar.width as usize / 2);
+        let w = width(&status) as u16;
+        f.render_widget(
+            Paragraph::new(Span::styled(status, ctx.theme.dim())),
+            Rect::new(x, bar.y, w, 1),
+        );
+        x += w;
+        let buttons: &[(&str, char)] = if self.multi {
+            &[
+                ("[Tags t]", 't'),
+                ("[Deploy d]", 'd'),
+                ("[Preset p]", 'p'),
+                ("[Cancel Esc]", 'e'),
+            ]
+        } else {
+            &[("[Multi-select m]", 'm')]
+        };
+        for (label, command) in buttons {
+            let w = width(label) as u16;
+            if x + w > bar.right() {
+                break;
+            }
+            let rect = Rect::new(x, bar.y, w, 1);
+            let enabled = !self.multi || selected > 0 || *command == 'e';
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    *label,
+                    if enabled {
+                        ctx.theme.accent()
+                    } else {
+                        ctx.theme.dim()
+                    },
+                )),
+                rect,
+            );
+            if enabled {
+                self.batch_buttons.push((rect, *command));
+            }
+            x += w + 1;
+        }
         if self.focus == Focus::Input && !self.overlay.is_open() {
             self.completion.draw(f, rows[1], ctx);
         }
@@ -812,6 +1146,18 @@ impl View for SearchView {
     fn hints(&self) -> Hints {
         if let Some(hints) = self.overlay.hints() {
             return hints;
+        }
+        if self.multi && self.focus == Focus::List {
+            return &[
+                ("Space", "select"),
+                ("Ctrl+A", "select all results"),
+                ("t", "tags"),
+                ("d", "deploy"),
+                ("p", "preset"),
+                ("/", "filter"),
+                ("Enter", "preview"),
+                ("Esc", "cancel selection"),
+            ];
         }
         match self.focus {
             Focus::Input if self.completion.active() => &[
@@ -829,6 +1175,7 @@ impl View for SearchView {
                 ("F1", "help"),
             ],
             Focus::List => &[
+                ("m", "multi-select"),
                 ("t", "tags"),
                 ("n", "note"),
                 ("d", "deploy"),
@@ -861,15 +1208,13 @@ fn row_lines<'a>(
     r: &'a SkillRecord,
     h: &'a Hit,
     ctx: &'a Ctx,
-    agents: &'a [skills::reconcile::AgentReport],
     inner_w: usize,
     searching: bool,
     on: bool,
 ) -> Vec<Line<'a>> {
     let th = ctx.theme;
-    let dep_w = agents.len() * 3;
     let badge = cards::repository_badge(r, ctx.ws.config.ui.icons);
-    let content_w = inner_w.saturating_sub(dep_w + 5);
+    let content_w = inner_w.saturating_sub(5);
     let badge_w = badge
         .as_deref()
         .map(|text| width(text).min(content_w / 2))
@@ -878,8 +1223,7 @@ fn row_lines<'a>(
     let key_w = 26.min(content_w.saturating_sub(badge_space));
     let mut spans = vec![
         Span::styled(if on { "▸ " } else { "  " }, th.accent()),
-        status_glyph(&r.status, th),
-        Span::raw(" "),
+        cards::health_marker(r, th),
     ];
     spans.extend(highlight_spans(
         &pad(cards::display_name(r), key_w),
@@ -904,10 +1248,6 @@ fn row_lines<'a>(
         spans.push(Span::raw(" ".repeat(tags_w)));
     }
     spans.push(Span::raw(" "));
-    for a in agents {
-        let (g, style) = cards::deploy_glyph(r.deploy.get(&a.key), th);
-        spans.push(Span::styled(format!("{g}  "), style));
-    }
     if !searching {
         return vec![Line::from(spans)];
     }
@@ -932,6 +1272,77 @@ fn row_lines<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_select_filters_targets_and_keeps_identity_and_scope() {
+        let root = std::env::temp_dir().join(format!("skills-multi-select-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        for name in ["printer", "calendar", "document"] {
+            let path = root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: tools\n---\nBody"),
+            )
+            .unwrap();
+        }
+        let ws = skills::Workspace::open(&root).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = crate::tui::theme::Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = SearchView::default();
+        view.refresh(&ctx);
+        view.focus_list();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        view.handle_key(key(KeyCode::Char('m')), &ctx);
+        assert!(view.multi);
+        assert!(view.checked.is_empty());
+        view.handle_key(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            &ctx,
+        );
+        assert_eq!(view.checked.len(), 3);
+        view.set_query("printer", &ctx);
+        assert_eq!(view.visible_checked(&ctx), vec!["printer"]);
+        assert_eq!(view.checked.len(), 3);
+        view.set_query("no-match-at-all", &ctx);
+        assert!(matches!(
+            view.batch_action('t', &ctx).as_slice(),
+            [Action::Error(_)]
+        ));
+        view.set_query("", &ctx);
+        assert_eq!(view.visible_checked(&ctx).len(), 3);
+        view.handle_key(key(KeyCode::Esc), &ctx);
+        assert!(!view.multi);
+        assert!(view.checked.is_empty());
+        view.select_scope(vec!["printer".into()], "Preset: tools".into(), None, &ctx);
+        assert_eq!(view.hits.len(), 1);
+        view.handle_key(key(KeyCode::Char(' ')), &ctx);
+        assert_eq!(view.visible_checked(&ctx), vec!["printer"]);
+        let record = ctx.snap.get("printer").unwrap();
+        let mut lines = skill_card(record, &ctx, 40, None, "", &[]);
+        let before = lines[0].to_string();
+        view.decorate(&mut lines, record, &ctx);
+        assert!(lines[0].to_string().starts_with("[✓]printer"));
+        assert_eq!(lines[0].width(), width(&before));
+        view.handle_key(key(KeyCode::Esc), &ctx);
+        assert_eq!(view.hits.len(), 3);
+        view.batch_finished(&["printer".into()]);
+        assert_eq!(view.visible_checked(&ctx), vec!["printer"]);
+        view.batch_finished(&[]);
+        assert!(!view.multi);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn filter_completion_keeps_query_on_escape_and_enter_enters_results() {

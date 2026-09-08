@@ -6,6 +6,7 @@
 //! implements overlays. All writes go through `skills::ops`, like the CLI.
 
 mod app;
+mod batch;
 mod event;
 mod icons;
 mod markdown;

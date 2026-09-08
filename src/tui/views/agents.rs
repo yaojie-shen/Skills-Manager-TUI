@@ -54,6 +54,7 @@ struct Row<'a> {
 struct Caps {
     /// A link with nothing behind it; removing it loses nothing.
     clean: bool,
+    managed: bool,
     /// The agent's own copy, byte for byte what the root has.
     relink: bool,
 }
@@ -61,6 +62,7 @@ struct Caps {
 impl Caps {
     fn of(state: Option<&EntryState>) -> Caps {
         Caps {
+            managed: matches!(state, Some(EntryState::Deployed)),
             clean: matches!(state, Some(EntryState::Broken { .. })),
             relink: matches!(state, Some(EntryState::Shadow { same_content: true })),
         }
@@ -150,6 +152,30 @@ impl AgentsView {
         }
         managed.append(&mut local);
         managed
+    }
+
+    fn select_skills(&self, ctx: &Ctx, checked: Option<String>) -> Vec<Action> {
+        let keys: Vec<_> = self
+            .rows(ctx)
+            .into_iter()
+            .filter(|row| row.managed)
+            .filter_map(|row| {
+                ctx.snap
+                    .skills
+                    .iter()
+                    .find(|skill| skill.deployment_name() == row.name)
+            })
+            .map(|skill| skill.key.clone())
+            .collect();
+        if keys.is_empty() {
+            return vec![];
+        }
+        vec![Action::SelectAgentSkills {
+            keys,
+            title: format!("Agent: {}", self.scope),
+            agent: self.scope.clone(),
+            checked,
+        }]
     }
 
     fn preview_entry(&mut self, ctx: &Ctx) {
@@ -430,6 +456,7 @@ impl View for AgentsView {
                 let rows = self.rows(ctx);
                 let n = rows.len();
                 match k.code {
+                    KeyCode::Char('m') => return self.select_skills(ctx, None),
                     // Down and up cross a whole row of cards; left and right
                     // walk along one, and only mean anything once there is more
                     // than one column to walk.
@@ -550,8 +577,26 @@ impl View for AgentsView {
             }
             if self.left.contains(at) {
                 self.set_focus(Focus::Entries);
-                if let Some((_, true)) = self.entries.click(m.column, m.row) {
-                    self.preview_entry(ctx);
+                if let Some((index, double)) = self.entries.click(m.column, m.row) {
+                    if !self.compact
+                        && self.entries.cell(index).is_some_and(|cell| {
+                            m.row == cell.y + 1 && (cell.x + 2..cell.x + 5).contains(&m.column)
+                        })
+                    {
+                        let rows = self.rows(ctx);
+                        if let Some(row) = rows.get(index).filter(|row| row.managed)
+                            && let Some(skill) = ctx
+                                .snap
+                                .skills
+                                .iter()
+                                .find(|skill| skill.deployment_name() == row.name)
+                        {
+                            return self.select_skills(ctx, Some(skill.key.clone()));
+                        }
+                    }
+                    if double {
+                        self.preview_entry(ctx);
+                    }
                 }
             }
         }
@@ -944,6 +989,14 @@ impl View for AgentsView {
                     ("c", "convert dir-link"),
                     ("v", "layout"),
                 ],
+                Caps { managed: true, .. } => &[
+                    ("j/k", "move"),
+                    ("↑", "back to presets"),
+                    ("Enter", "preview"),
+                    ("m", "multi-select"),
+                    ("[ ]", "agent"),
+                    ("v", "layout"),
+                ],
                 Caps { .. } => &[
                     ("j/k", "move"),
                     ("↑", "back to presets"),
@@ -1110,6 +1163,10 @@ mod overflow_tests {
         };
         view.refresh(&ctx);
         view.set_focus(Focus::Entries);
+        assert!(
+            view.select_skills(&ctx, None).is_empty(),
+            "agent-owned entries must not enter central skill selection"
+        );
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         for (name, expected) in [

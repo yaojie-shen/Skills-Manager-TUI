@@ -59,6 +59,7 @@ pub enum InputKind {
 }
 
 pub enum Modal {
+    Batch(Box<super::batch::Batch>),
     NameConflict {
         title: String,
         actions: Vec<deploy::Action>,
@@ -139,6 +140,21 @@ pub enum Modal {
 
 impl Modal {
     // ---- constructors -----------------------------------------------------
+
+    pub fn batch_tags(keys: Vec<String>, ctx: &Ctx) -> Self {
+        Self::Batch(Box::new(super::batch::Batch::tags(keys, ctx)))
+    }
+    pub fn batch_deploy(keys: Vec<String>, ctx: &Ctx) -> Self {
+        Self::Batch(Box::new(super::batch::Batch::deploy(keys, ctx)))
+    }
+    pub fn batch_deploy_agent(keys: Vec<String>, agent: &str, ctx: &Ctx) -> Self {
+        Self::Batch(Box::new(super::batch::Batch::deploy_agent(
+            keys, agent, ctx,
+        )))
+    }
+    pub fn batch_presets(keys: Vec<String>, ctx: &Ctx) -> Self {
+        Self::Batch(Box::new(super::batch::Batch::presets(keys, ctx)))
+    }
 
     pub fn help() -> Self {
         Modal::Help { scroll: 0 }
@@ -633,6 +649,7 @@ impl Modal {
     pub fn hints(&self) -> Hints {
         match self {
             Modal::NameConflict { .. } => &[("c", "coexist"), ("r", "replace"), ("Esc", "cancel")],
+            Modal::Batch(p) => p.hints(),
             Modal::Repository(p) => p.hints(),
             Modal::Help { .. } | Modal::Message { .. } => &[("Esc", "close")],
             Modal::Confirm { .. } | Modal::ConfirmWrite { .. } => {
@@ -707,6 +724,7 @@ impl Modal {
                 },
                 _ => vec![],
             },
+            Modal::Batch(p) => p.key(k, ctx),
             Modal::Repository(p) => p.key(k, ctx),
             Modal::Help { scroll } | Modal::Message { scroll, .. } => match k.code {
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -1040,6 +1058,7 @@ impl Modal {
                 }
                 vec![]
             }
+            Modal::Batch(p) => p.mouse(m, ctx),
             Modal::Repository(p) => p.mouse(m, ctx),
             Modal::Help { scroll } | Modal::Message { scroll, .. } => {
                 if let Some(d) = wheel {
@@ -1276,6 +1295,7 @@ impl Modal {
                     ),
                 );
             }
+            Modal::Batch(p) => p.draw(f, area, ctx),
             Modal::Repository(p) => p.draw(f, area, ctx),
             Modal::Help { scroll } => {
                 let lines: Vec<Line> = HELP.lines().map(|l| help_line(l, th)).collect();
@@ -1985,7 +2005,11 @@ const HELP: &str = "Search
   i                 install a skill from a repo or a local path
   t  n  d           tags / note in $EDITOR / deploy picker
   r  s              rename the skill / set where it came from
-  a  m  x           accept local changes / migrate renamed metadata / remove
+  a  x              accept local changes / remove
+  m                 enter multi-select (status marker also starts selection)
+  Space  Ctrl-A     toggle skill / select current results in multi-select
+  t  d  p           selected skills: tags / deploy / add to preset
+  Esc               cancel multi-select; hidden selections never participate
   u  U              check upstream / update from upstream (git sources)
 Agents
   a                 adopt an entry the agent has but the root does not

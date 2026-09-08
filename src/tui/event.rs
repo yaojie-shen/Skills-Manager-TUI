@@ -37,6 +37,7 @@ pub enum Task {
 }
 
 pub enum TaskOutput {
+    Batch(BatchOutcome),
     RepositoryFetched(String, Result<skills::repository::FetchedRepository>),
     RepositoryInstalled(
         Box<super::repository_picker::InstallSelection>,
@@ -192,4 +193,220 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
             let _ = tx.send(Msg::Task(id, Box::new(out)));
         })
         .expect("spawn task thread");
+}
+
+/// Batch closures are not cloneable, so they use a dedicated worker rather than Task.
+pub enum BatchWork {
+    Metadata(super::app::MetaFn, Vec<String>),
+    Links(Vec<skills::ops::deploy::Action>, Vec<String>),
+}
+pub struct BatchOutcome {
+    pub message: String,
+    pub intent: Option<skills::history::Intent>,
+    pub failed: Vec<String>,
+    pub errors: Vec<String>,
+}
+impl BatchWork {
+    fn keys(&self) -> &[String] {
+        match self {
+            Self::Metadata(_, keys) | Self::Links(_, keys) => keys,
+        }
+    }
+    fn run(self, ws: &Workspace, progress: &mut dyn FnMut(&str)) -> BatchOutcome {
+        match self {
+            Self::Metadata(write, keys) => match write(ws) {
+                Ok((message, intent)) => BatchOutcome {
+                    message,
+                    intent,
+                    failed: vec![],
+                    errors: vec![],
+                },
+                Err(e) => BatchOutcome {
+                    message: "Batch metadata edit failed".into(),
+                    intent: None,
+                    failed: keys,
+                    errors: vec![format!("{e:#}")],
+                },
+            },
+            Self::Links(actions, keys) => {
+                use skills::{history, ops::deploy};
+                // Recheck names in the worker against the current filesystem.
+                match ws.scan() {
+                    Ok(snap) if deploy::name_conflicts(&snap, &actions).is_empty() => {}
+                    result => {
+                        let error = match result {
+                            Err(e) => format!("{e:#}"),
+                            Ok(_) => {
+                                "Conflicting skill names: resolve them before batch deployment"
+                                    .into()
+                            }
+                        };
+                        return BatchOutcome {
+                            message: "Batch deployment failed".into(),
+                            intent: None,
+                            failed: keys,
+                            errors: vec![error],
+                        };
+                    }
+                }
+                let mut completed = Vec::new();
+                let mut failed = std::collections::BTreeSet::new();
+                let mut errors = Vec::new();
+                for (i, action) in actions.iter().enumerate() {
+                    progress(&format!(
+                        "Deploy {}/{}: {}",
+                        i + 1,
+                        actions.len(),
+                        action.describe()
+                    ));
+                    let key = match action {
+                        deploy::Action::Link { skill, .. }
+                        | deploy::Action::Unlink { skill, .. }
+                        | deploy::Action::Relink { skill, .. }
+                        | deploy::Action::Skip { skill, .. } => Some(skill),
+                        _ => None,
+                    };
+                    let result = if let deploy::Action::Skip { reason, .. } = action {
+                        Err(anyhow::anyhow!(reason.clone()))
+                    } else {
+                        apply_batch_link(ws, action)
+                    };
+                    match result {
+                        Ok(changes) if changes > 0 => completed.push(action.clone()),
+                        Ok(_) => {}
+                        Err(error) => {
+                            if let Some(key) = key {
+                                failed.insert(key.clone());
+                            } else {
+                                failed.extend(keys.iter().cloned());
+                            }
+                            errors.push(format!("{}: {error:#}", action.describe()));
+                        }
+                    }
+                }
+                BatchOutcome {
+                    message: deploy::summarize(&completed),
+                    intent: history::Intent::from_actions(&completed),
+                    failed: failed.into_iter().collect(),
+                    errors,
+                }
+            }
+        }
+    }
+}
+pub fn spawn_batch(
+    ws: Workspace,
+    work: BatchWork,
+    id: u64,
+    tx: Sender<Msg>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new().name("batch".into()).spawn(move || {
+        let keys = work.keys().to_vec();
+        let mut progress = |text: &str| { let _ = tx.send(Msg::Progress(id, text.into())); };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.run(&ws, &mut progress)))
+            .unwrap_or_else(|_| BatchOutcome { message: "Batch worker failed".into(), intent: None, failed: keys, errors: vec!["The worker stopped unexpectedly. Refresh and inspect affected skills before retrying.".into()] });
+        let _ = tx.send(Msg::Task(id, Box::new(TaskOutput::Batch(outcome))));
+    }).map(|_| ())
+}
+
+fn apply_batch_link(ws: &Workspace, action: &skills::ops::deploy::Action) -> Result<usize> {
+    use skills::ops::deploy;
+    match action {
+        deploy::Action::Link { path, target, .. } => {
+            if path.parent().is_some_and(|p| p.is_symlink()) {
+                anyhow::bail!("Agent directory became a symlink; refresh before deploying");
+            }
+            if !target.is_dir() {
+                anyhow::bail!(
+                    "Skill directory is no longer available: {}",
+                    target.display()
+                );
+            }
+            if path.is_symlink()
+                && skills::util::link_target_abs(path).as_deref() == Some(target.as_path())
+            {
+                return Ok(0);
+            }
+            // Creating directly is deliberately exclusive: never unlink an entry
+            // that appeared after the plan was made, even if it is a symlink.
+            std::os::unix::fs::symlink(target, path)?;
+            Ok(1)
+        }
+        deploy::Action::Unlink { path, skill, .. } => {
+            if path.parent().is_some_and(|p| p.is_symlink()) {
+                anyhow::bail!("Agent directory became a symlink; refresh before undeploying");
+            }
+            if path.is_symlink() {
+                let expected = ws.skill_path(skill);
+                if skills::util::link_target_abs(path).as_deref() != Some(expected.as_path()) {
+                    anyhow::bail!("Link target changed; refusing to remove {}", path.display());
+                }
+            }
+            deploy::apply(std::slice::from_ref(action))
+        }
+        deploy::Action::Mkdir { path, .. } if path.is_symlink() => {
+            anyhow::bail!("Agent directory became a symlink; refresh before deploying")
+        }
+        _ => deploy::apply(std::slice::from_ref(action)),
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    #[test]
+    fn batch_keeps_foreign_links_and_records_only_successful_targets() {
+        let root = std::env::temp_dir().join(format!("skills-batch-links-{}", std::process::id()));
+        for key in ["alpha", "beta"] {
+            std::fs::create_dir_all(root.join(key)).unwrap();
+            std::fs::write(
+                root.join(key).join("SKILL.md"),
+                format!("---\nname: {key}\ndescription: test\n---\nBody\n"),
+            )
+            .unwrap();
+        }
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let agent = root.join("agent");
+        std::fs::create_dir(&agent).unwrap();
+        let foreign = root.join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        std::os::unix::fs::symlink(&foreign, agent.join("beta")).unwrap();
+        let actions = ["alpha", "beta"]
+            .iter()
+            .map(|key| skills::ops::deploy::Action::Link {
+                agent: "test".into(),
+                skill: (*key).into(),
+                path: agent.join(key),
+                target: ws.skill_path(key),
+            })
+            .collect();
+        let outcome =
+            BatchWork::Links(actions, vec!["alpha".into(), "beta".into()]).run(&ws, &mut |_| {});
+        assert_eq!(outcome.failed, vec!["beta"]);
+        assert_eq!(std::fs::read_link(agent.join("beta")).unwrap(), foreign);
+        assert_eq!(
+            std::fs::read_link(agent.join("alpha")).unwrap(),
+            ws.skill_path("alpha")
+        );
+        let Some(skills::history::Intent::Links { added, removed }) = outcome.intent else {
+            panic!("expected successful link history")
+        };
+        assert_eq!(added, vec![("alpha".into(), "test".into())]);
+        assert!(removed.is_empty());
+        assert_eq!(outcome.errors.len(), 1);
+        let unlink = skills::ops::deploy::Action::Unlink {
+            agent: "test".into(),
+            skill: "beta".into(),
+            path: agent.join("beta"),
+        };
+        assert!(apply_batch_link(&ws, &unlink).is_err());
+        assert_eq!(std::fs::read_link(agent.join("beta")).unwrap(), foreign);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
