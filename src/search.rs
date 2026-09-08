@@ -22,6 +22,7 @@ pub struct Query {
     pub agents: Vec<String>,
     pub statuses: Vec<String>,
     pub sources: Vec<String>,
+    pub repositories: Vec<String>,
     pub untagged: bool,
 }
 
@@ -49,6 +50,8 @@ impl Query {
                 if !v.is_empty() {
                     q.sources.push(v.to_lowercase());
                 }
+            } else if let Some(v) = tok.strip_prefix("repo:") {
+                q.repositories.push(v.to_string());
             } else if tok == "untagged" {
                 q.untagged = true;
             } else {
@@ -65,6 +68,7 @@ impl Query {
             && self.agents.is_empty()
             && self.statuses.is_empty()
             && self.sources.is_empty()
+            && self.repositories.is_empty()
             && !self.untagged
     }
 
@@ -88,6 +92,14 @@ impl Query {
             if !self.statuses.iter().any(|s| s == label) {
                 return false;
             }
+        }
+        if !self.repositories.is_empty()
+            && !self
+                .repositories
+                .iter()
+                .any(|a| crate::repository::alias_of(&r.key) == Some(a.as_str()))
+        {
+            return false;
         }
         if !self.sources.is_empty() {
             let kind = r.source.as_ref().map(|s| s.kind()).unwrap_or("none");

@@ -27,6 +27,9 @@ pub struct Cli {
     /// Machine-readable JSON output
     #[arg(long, global = true)]
     pub json: bool,
+    /// Resolve duplicate frontmatter names when deploying
+    #[arg(long, global = true, value_parser = ["coexist", "replace"])]
+    pub same_name: Option<String>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -51,6 +54,8 @@ pub enum Command {
     Migrate { old: String, new: String },
     /// Install a skill from a git repo, GitHub shorthand, or local path
     Install(InstallArgs),
+    /// List registered Git repositories and their installed skills
+    Repos,
     /// Bring an existing skill directory under management
     Adopt {
         path: PathBuf,
@@ -74,6 +79,8 @@ pub enum Command {
         skill: Option<String>,
         #[arg(long)]
         all: bool,
+        #[arg(long, conflicts_with_all = ["skill", "all"])]
+        repo: Option<String>,
     },
     /// Update git-sourced skills
     Update(UpdateArgs),
@@ -168,6 +175,21 @@ pub enum NoteCommand {
 
 #[derive(Args, Debug)]
 pub struct InstallArgs {
+    /// Local repository alias; defaults to owner--repository
+    #[arg(long)]
+    pub repo_alias: Option<String>,
+    /// List discovered skill paths without installing
+    #[arg(long)]
+    pub list: bool,
+    /// Install the outermost skills in all independent branches
+    #[arg(long)]
+    pub all: bool,
+    /// Repository-relative skill paths to install (repeatable; . is the root)
+    #[arg(long = "select")]
+    pub select: Vec<String>,
+    /// Override a local name: upstream/path=local-name
+    #[arg(long = "local-name")]
+    pub local_names: Vec<String>,
     /// Path, owner/repo[/subpath], GitHub tree URL, or git URL
     pub reference: String,
     #[arg(long)]
@@ -193,6 +215,8 @@ pub struct SetSourceArgs {
 
 #[derive(Args, Debug)]
 pub struct UpdateArgs {
+    #[arg(long, conflicts_with_all = ["skill", "all"])]
+    pub repo: Option<String>,
     pub skill: Option<String>,
     #[arg(long)]
     pub all: bool,
@@ -326,6 +350,7 @@ pub enum PresetCommand {
 
 pub struct Ctx {
     pub ws: Workspace,
+    pub same_name: Option<String>,
     pub json: bool,
 }
 
@@ -349,7 +374,11 @@ pub fn run(cli: Cli) -> Result<()> {
         return cmd_init(&root, cli.json);
     }
     let ws = Workspace::open(&root)?;
-    let ctx = Ctx { ws, json: cli.json };
+    let ctx = Ctx {
+        ws,
+        json: cli.json,
+        same_name: cli.same_name,
+    };
     match command {
         Command::Init => unreachable!(),
         Command::List(a) => cmd_list(&ctx, a),
@@ -414,7 +443,40 @@ pub fn run(cli: Cli) -> Result<()> {
                 )
             })
         }
-        Command::Check { skill, all } => cmd_check(&ctx, skill, all),
+        Command::Check { skill, all, repo } => {
+            if let Some(alias) = repo {
+                let snap = ctx.ws.scan()?;
+                let results: Vec<_> = snap
+                    .skills
+                    .iter()
+                    .filter(|s| skills::repository::alias_of(&s.key) == Some(alias.as_str()))
+                    .map(|s| update::check(&ctx.ws, &s.key))
+                    .collect::<Result<_>>()?;
+                ctx.out(&results, || {
+                    for result in &results {
+                        println!(
+                            "{}: {}",
+                            result.skill,
+                            if result.update_available {
+                                "update available"
+                            } else {
+                                "up to date"
+                            }
+                        );
+                    }
+                })
+            } else {
+                cmd_check(&ctx, skill, all)
+            }
+        }
+        Command::Repos => {
+            let repositories = skills::repository::Repository::list(&ctx.ws.root)?;
+            ctx.out(&repositories, || {
+                for repo in &repositories {
+                    println!("{}  {}  {}", repo.alias, repo.url, repo.branch);
+                }
+            })
+        }
         Command::Update(a) => cmd_update(&ctx, a),
         Command::Deploy(a) => cmd_deploy(&ctx, a, true),
         Command::Undeploy(a) => cmd_deploy(&ctx, a, false),
@@ -796,11 +858,94 @@ pub fn edit_in_editor(initial: &str) -> Result<String> {
 
 fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
     let r = install::parse_ref(&a.reference, a.branch.as_deref(), a.subpath.as_deref())?;
+    if matches!(r, install::InstallRef::Git { .. }) {
+        let fetched =
+            skills::repository::FetchedRepository::fetch(&ctx.ws, &r, a.repo_alias.as_deref())?;
+        let result = (|| {
+            let paths: Vec<String> = if a.all {
+                fetched
+                    .choices
+                    .iter()
+                    .filter(|p| {
+                        !fetched
+                            .choices
+                            .iter()
+                            .any(|ancestor| skills::repository::overlaps(ancestor, p))
+                    })
+                    .cloned()
+                    .collect()
+            } else if !a.select.is_empty() {
+                a.select
+                    .iter()
+                    .map(|s| if s == "." { String::new() } else { s.clone() })
+                    .collect()
+            } else if let install::InstallRef::Git {
+                subpath: Some(path),
+                ..
+            } = &r
+            {
+                if fetched.choices.contains(path) {
+                    vec![path.clone()]
+                } else {
+                    vec![]
+                }
+            } else if fetched.choices.len() == 1 {
+                fetched.choices.clone()
+            } else {
+                vec![]
+            };
+            if a.list || paths.is_empty() {
+                return ctx.out(&serde_json::json!({"repository": fetched.repository, "choices": fetched.choices, "installed": []}), || {
+                    println!("{} — select paths with --select PATH or --all", fetched.repository.alias);
+                    for path in &fetched.choices { println!("{}", if path.is_empty() { "." } else { path }); }
+                });
+            }
+            let mut names = BTreeMap::new();
+            for pair in &a.local_names {
+                let (path, name) = pair.split_once('=').context("expected PATH=NAME")?;
+                names.insert(
+                    if path == "." {
+                        String::new()
+                    } else {
+                        path.into()
+                    },
+                    name.into(),
+                );
+            }
+            if let Some(name) = &a.name {
+                if paths.len() != 1 {
+                    bail!("--name requires exactly one selection")
+                }
+                names.insert(paths[0].clone(), name.clone());
+            }
+            let keys = fetched.install(&ctx.ws, &paths, &names)?;
+            let actions = if a.deploy_to.is_empty() {
+                vec![]
+            } else {
+                let snap = ctx.ws.scan()?;
+                let plan = deploy::plan_deploy(&ctx.ws, &snap, &keys, &a.deploy_to)?;
+                let actions = deploy::resolve_names(&snap, &plan, ctx.same_name.as_deref())?;
+                deploy::apply(&actions)?;
+                actions
+            };
+            ctx.out(
+                &serde_json::json!({"installed": keys, "actions": actions}),
+                || {
+                    for key in &keys {
+                        println!("installed {key}");
+                    }
+                },
+            )
+        })();
+        fetched.cleanup();
+        return result;
+    }
     let key = install::install(&ctx.ws, &r, a.name.as_deref())?;
     let mut actions = Vec::new();
     if !a.deploy_to.is_empty() {
         let snap = ctx.ws.scan()?;
         actions = deploy::plan_deploy(&ctx.ws, &snap, std::slice::from_ref(&key), &a.deploy_to)?;
+        actions = deploy::resolve_names(&snap, &actions, ctx.same_name.as_deref())?;
         deploy::apply(&actions)?;
     }
     ctx.out(
@@ -865,7 +1010,13 @@ fn cmd_check(ctx: &Ctx, skill: Option<String>, all: bool) -> Result<()> {
 
 fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
     let snap = ctx.ws.scan()?;
-    let keys: Vec<String> = if a.all {
+    let keys: Vec<String> = if let Some(alias) = &a.repo {
+        snap.skills
+            .iter()
+            .filter(|s| skills::repository::alias_of(&s.key) == Some(alias.as_str()))
+            .map(|s| s.key.clone())
+            .collect()
+    } else if a.all {
         snap.skills
             .iter()
             .filter(|s| matches!(s.source, Some(skills::meta::Source::Git { .. })))
@@ -970,10 +1121,18 @@ fn cmd_deploy(ctx: &Ctx, a: DeployArgs, on: bool) -> Result<()> {
 }
 
 fn run_actions(ctx: &Ctx, actions: &[Action], dry_run: bool) -> Result<()> {
+    let snap = ctx.ws.scan()?;
+    let conflicts = deploy::name_conflicts(&snap, actions);
+    let resolved = if dry_run && ctx.same_name.is_none() {
+        actions.to_vec()
+    } else {
+        deploy::resolve_names(&snap, actions, ctx.same_name.as_deref())?
+    };
+    let actions = resolved.as_slice();
     let applied = if dry_run { 0 } else { deploy::apply(actions)? };
     let changes = actions.iter().filter(|a| a.is_change()).count();
     ctx.out(
-        &serde_json::json!({"dry_run": dry_run, "applied": applied, "actions": actions}),
+        &serde_json::json!({"dry_run": dry_run, "applied": applied, "actions": actions, "name_conflicts": conflicts}),
         || {
             for a in actions {
                 println!("{}", a.describe());

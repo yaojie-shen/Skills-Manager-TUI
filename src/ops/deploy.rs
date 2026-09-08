@@ -123,8 +123,7 @@ pub fn plan_deploy(
                 AgentDirMode::DirLinked => actions.push(Action::Skip {
                     agent: agent.clone(),
                     skill: skill.clone(),
-                    reason: "agent dir is a whole-directory link to the root; already deployed"
-                        .into(),
+                    reason: if skill.starts_with("repos/") { "repository skill requires per-skill links; convert the agent directory first" } else { "agent dir is a whole-directory link to the root; already deployed" }.into(),
                 }),
                 AgentDirMode::DirForeign { target } => actions.push(Action::Skip {
                     agent: agent.clone(),
@@ -141,15 +140,15 @@ pub fn plan_deploy(
                     actions.push(Action::Link {
                         agent: agent.clone(),
                         skill: skill.clone(),
-                        path: dir.join(skill),
+                        path: dir.join(crate::repository::default_deploy_name(skill)),
                         target: rec.path.clone(),
                     });
                 }
-                AgentDirMode::Real => match report.entries.get(skill) {
+                AgentDirMode::Real => match report.entries.get(&crate::repository::default_deploy_name(skill)) {
                     None => actions.push(Action::Link {
                         agent: agent.clone(),
                         skill: skill.clone(),
-                        path: dir.join(skill),
+                        path: dir.join(crate::repository::default_deploy_name(skill)),
                         target: rec.path.clone(),
                     }),
                     Some(EntryState::Deployed) => actions.push(Action::Skip {
@@ -161,12 +160,12 @@ pub fn plan_deploy(
                         actions.push(Action::Unlink {
                             agent: agent.clone(),
                             skill: skill.clone(),
-                            path: dir.join(skill),
+                            path: dir.join(crate::repository::default_deploy_name(skill)),
                         });
                         actions.push(Action::Link {
                             agent: agent.clone(),
                             skill: skill.clone(),
-                            path: dir.join(skill),
+                            path: dir.join(crate::repository::default_deploy_name(skill)),
                             target: rec.path.clone(),
                         });
                     }
@@ -200,12 +199,15 @@ pub fn plan_undeploy(
                     reason: "agent dir is a whole-directory link; run `agents convert` first"
                         .into(),
                 }),
-                AgentDirMode::Real => match report.entries.get(skill) {
+                AgentDirMode::Real => match report
+                    .entries
+                    .get(&crate::repository::default_deploy_name(skill))
+                {
                     Some(EntryState::Deployed) | Some(EntryState::Broken { .. }) => {
                         actions.push(Action::Unlink {
                             agent: agent.clone(),
                             skill: skill.clone(),
-                            path: dir.join(skill),
+                            path: dir.join(crate::repository::default_deploy_name(skill)),
                         })
                     }
                     None => actions.push(Action::Skip {
@@ -304,7 +306,12 @@ pub fn plan_clean(
         match state {
             EntryState::Broken { .. } => actions.push(Action::Unlink {
                 agent: agent.clone(),
-                skill: name.into(),
+                skill: snap
+                    .skills
+                    .iter()
+                    .find(|s| s.deployment_name() == name)
+                    .map(|s| s.key.clone())
+                    .unwrap_or_else(|| name.into()),
                 path: dir.join(name),
             }),
             // With nothing named, the healthy entries are simply not the
@@ -341,9 +348,19 @@ pub fn plan_relink(
         match state {
             EntryState::Shadow { same_content: true } => actions.push(Action::Relink {
                 agent: agent.clone(),
-                skill: name.into(),
+                skill: snap
+                    .skills
+                    .iter()
+                    .find(|s| s.deployment_name() == name)
+                    .map(|s| s.key.clone())
+                    .unwrap_or_else(|| name.into()),
                 path: dir.join(name),
-                target: ws.skill_path(name),
+                target: snap
+                    .skills
+                    .iter()
+                    .find(|s| s.deployment_name() == name)
+                    .map(|s| s.path.clone())
+                    .unwrap_or_else(|| ws.skill_path(name)),
             }),
             EntryState::Shadow {
                 same_content: false,
@@ -448,18 +465,21 @@ pub fn plan_sync(ws: &Workspace, snap: &Snapshot) -> Result<Vec<Action>> {
                     actions.push(Action::Link {
                         agent: a.key.clone(),
                         skill: s.clone(),
-                        path: dir.join(s),
+                        path: dir.join(crate::repository::default_deploy_name(s)),
                         target: ws.skill_path(s),
                     });
                 }
             }
             AgentDirMode::Real => {
                 for s in &wanted {
-                    match report.entries.get(s) {
+                    match report
+                        .entries
+                        .get(&crate::repository::default_deploy_name(s))
+                    {
                         None => actions.push(Action::Link {
                             agent: a.key.clone(),
                             skill: s.clone(),
-                            path: dir.join(s),
+                            path: dir.join(crate::repository::default_deploy_name(s)),
                             target: ws.skill_path(s),
                         }),
                         Some(EntryState::Deployed) => {}
@@ -467,12 +487,12 @@ pub fn plan_sync(ws: &Workspace, snap: &Snapshot) -> Result<Vec<Action>> {
                             actions.push(Action::Unlink {
                                 agent: a.key.clone(),
                                 skill: s.clone(),
-                                path: dir.join(s),
+                                path: dir.join(crate::repository::default_deploy_name(s)),
                             });
                             actions.push(Action::Link {
                                 agent: a.key.clone(),
                                 skill: s.clone(),
-                                path: dir.join(s),
+                                path: dir.join(crate::repository::default_deploy_name(s)),
                                 target: ws.skill_path(s),
                             });
                         }
@@ -484,16 +504,28 @@ pub fn plan_sync(ws: &Workspace, snap: &Snapshot) -> Result<Vec<Action>> {
                     }
                 }
                 for (name, state) in &report.entries {
-                    let is_wanted = wanted.iter().any(|w| w == name);
+                    let is_wanted = wanted
+                        .iter()
+                        .any(|w| crate::repository::default_deploy_name(w) == *name);
                     match state {
                         EntryState::Deployed if !is_wanted => actions.push(Action::Unlink {
                             agent: a.key.clone(),
-                            skill: name.clone(),
+                            skill: snap
+                                .skills
+                                .iter()
+                                .find(|s| s.deployment_name() == *name)
+                                .map(|s| s.key.clone())
+                                .unwrap_or_else(|| name.clone()),
                             path: dir.join(name),
                         }),
                         EntryState::Broken { .. } if !is_wanted => actions.push(Action::Unlink {
                             agent: a.key.clone(),
-                            skill: name.clone(),
+                            skill: snap
+                                .skills
+                                .iter()
+                                .find(|s| s.deployment_name() == *name)
+                                .map(|s| s.key.clone())
+                                .unwrap_or_else(|| name.clone()),
                             path: dir.join(name),
                         }),
                         _ => {}
@@ -534,7 +566,7 @@ pub fn plan_convert(ws: &Workspace, snap: &Snapshot, agent: &str) -> Result<Vec<
         actions.push(Action::Link {
             agent: agent.into(),
             skill: s.key.clone(),
-            path: dir.join(&s.key),
+            path: dir.join(s.deployment_name()),
             target: s.path.clone(),
         });
     }
@@ -927,5 +959,130 @@ mod tests {
             summarize(&[link("one", "claude"), skip()]),
             "added one to claude; skipped s (because)"
         );
+    }
+}
+
+/// A filesystem alias does not necessarily disambiguate an agent's skill name.
+#[derive(Debug, Clone, Serialize)]
+pub struct NameConflict {
+    pub agent: String,
+    pub skill: String,
+    pub name: String,
+    pub other_path: PathBuf,
+    pub other_skill: Option<String>,
+}
+
+pub fn name_conflicts(snap: &Snapshot, actions: &[Action]) -> Vec<NameConflict> {
+    let mut conflicts = Vec::new();
+    for action in actions {
+        let Action::Link {
+            agent, skill, path, ..
+        } = action
+        else {
+            continue;
+        };
+        let Some(record) = snap.get(skill) else {
+            continue;
+        };
+        let Some(name) = record.name.as_ref() else {
+            continue;
+        };
+        let Some(report) = snap.agent(agent) else {
+            continue;
+        };
+        for (alias, state) in &report.entries {
+            let other_path = report.skills_dir.join(alias);
+            if &other_path == path
+                || actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Unlink {path,..} if *path == other_path))
+            {
+                continue;
+            }
+            let other = snap.skills.iter().find(|s| s.deployment_name() == *alias);
+            let actual_name = crate::skill::SkillDoc::load(&other_path)
+                .ok()
+                .map(|d| d.name);
+            if actual_name.as_ref() == Some(name) {
+                conflicts.push(NameConflict {
+                    agent: agent.clone(),
+                    skill: skill.clone(),
+                    name: name.clone(),
+                    other_path,
+                    other_skill: if matches!(state, EntryState::Deployed) {
+                        other.map(|s| s.key.clone())
+                    } else {
+                        None
+                    },
+                });
+            }
+        }
+        for other in actions {
+            if let Action::Link {
+                agent: oa,
+                skill: os,
+                path: op,
+                ..
+            } = other
+                && oa == agent
+                && os != skill
+                && snap.get(os).and_then(|r| r.name.as_ref()) == Some(name)
+            {
+                conflicts.push(NameConflict {
+                    agent: agent.clone(),
+                    skill: skill.clone(),
+                    name: name.clone(),
+                    other_path: op.clone(),
+                    other_skill: Some(os.clone()),
+                });
+            }
+        }
+    }
+    conflicts
+}
+
+/// None requires an explicit decision; replace only unlinks managed entries.
+pub fn resolve_names(
+    snap: &Snapshot,
+    actions: &[Action],
+    policy: Option<&str>,
+) -> Result<Vec<Action>> {
+    let conflicts = name_conflicts(snap, actions);
+    if conflicts.is_empty() {
+        return Ok(actions.to_vec());
+    }
+    match policy {
+        Some("coexist") => Ok(actions.to_vec()),
+        Some("replace") => {
+            let mut resolved = Vec::new();
+            let mut seen = BTreeSet::new();
+            for conflict in conflicts {
+                let skill = conflict.other_skill.context("cannot replace an agent-owned or foreign entry; choose coexist or manage it explicitly")?;
+                if actions.iter().any(|a| matches!(a,Action::Link {skill:s,agent,..} if *s == skill && *agent == conflict.agent)) { bail!("cannot replace when the batch selects multiple skills with the same name; choose one or coexist") }
+                if seen.insert(conflict.other_path.clone()) {
+                    resolved.push(Action::Unlink {
+                        agent: conflict.agent,
+                        skill,
+                        path: conflict.other_path,
+                    });
+                }
+            }
+            resolved.extend_from_slice(actions);
+            Ok(resolved)
+        }
+        _ => bail!(
+            "skill name conflict: {}; choose --same-name coexist or --same-name replace",
+            conflicts
+                .iter()
+                .map(|c| format!(
+                    "{}: {} and {} both declare {}",
+                    c.agent,
+                    c.skill,
+                    c.other_path.display(),
+                    c.name
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
     }
 }

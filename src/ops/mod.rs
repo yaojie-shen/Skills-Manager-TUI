@@ -52,7 +52,7 @@ pub fn swap_dir(root: &Path, dest: &Path, new_dir: &Path) -> Result<()> {
 }
 
 pub fn require_key(key: &str) -> Result<()> {
-    if !crate::util::valid_skill_key(key) {
+    if !crate::repository::valid_id(key) {
         bail!("invalid skill name: {key:?}");
     }
     Ok(())
@@ -77,4 +77,63 @@ pub fn git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Stream Git's carriage-return progress records without exposing terminal control
+/// characters. Clone stdout is unused; stderr is drained before waiting on Git.
+pub fn git_progress(args: &[&str], progress: &mut dyn FnMut(&str)) -> Result<()> {
+    use std::io::{BufReader, Read};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut child = Command::new("git")
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut record = Vec::new();
+    let mut tail = std::collections::VecDeque::new();
+    let mut last = Instant::now() - Duration::from_secs(1);
+    let mut emit = |record: &mut Vec<u8>| {
+        let text: String = String::from_utf8_lossy(record)
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        record.clear();
+        let text = text.trim();
+        if !text.is_empty() {
+            if last.elapsed() >= Duration::from_millis(100) {
+                progress(&format!("Clone: {text}"));
+                last = Instant::now();
+            }
+            tail.push_back(text.to_string());
+            if tail.len() > 8 {
+                tail.pop_front();
+            }
+        }
+    };
+    let read_result = (|| -> std::io::Result<()> {
+        for byte in BufReader::new(child.stderr.take().expect("piped stderr")).bytes() {
+            let byte = byte?;
+            if byte == b'\r' || byte == b'\n' {
+                emit(&mut record);
+            } else if record.len() < 8192 {
+                record.push(byte);
+            }
+        }
+        emit(&mut record);
+        Ok(())
+    })();
+    if read_result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    read_result?;
+    if !status.success() {
+        bail!(
+            "git clone failed: {}",
+            tail.into_iter().collect::<Vec<_>>().join("\n")
+        );
+    }
+    Ok(())
 }

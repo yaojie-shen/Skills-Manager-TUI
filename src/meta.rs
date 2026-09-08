@@ -143,14 +143,25 @@ impl MetaStore {
         };
         for entry in rd {
             let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name == crate::config::CONFIG_FILE || name.starts_with('.') {
-                continue;
-            }
-            if let Some(stem) = name.strip_suffix(".toml") {
+            if name == "repos" && entry.file_type()?.is_dir() {
+                for file in walkdir::WalkDir::new(entry.path()).follow_links(false) {
+                    let file = file?;
+                    if file.file_type().is_file()
+                        && file.path().extension().is_some_and(|e| e == "toml")
+                    {
+                        let relative = file.path().strip_prefix(&self.dir)?.to_string_lossy();
+                        let key = relative.trim_end_matches(".toml");
+                        if crate::repository::valid_id(key) {
+                            keys.push(key.to_string());
+                        }
+                    }
+                }
+            } else if entry.file_type()?.is_file()
+                && name != crate::config::CONFIG_FILE
+                && !name.starts_with('.')
+                && let Some(stem) = name.strip_suffix(".toml")
+            {
                 keys.push(stem.to_string());
             }
         }
@@ -244,6 +255,7 @@ impl MetaStore {
         if !from.exists() {
             return Ok(());
         }
+        std::fs::create_dir_all(self.path(new).parent().context("metadata parent missing")?)?;
         std::fs::rename(&from, self.path(new))
             .with_context(|| format!("renaming metadata {old} -> {new}"))
     }

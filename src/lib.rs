@@ -11,6 +11,7 @@ pub mod ops;
 pub mod paths;
 pub mod preset;
 pub mod reconcile;
+pub mod repository;
 pub mod search;
 pub mod skill;
 pub mod util;

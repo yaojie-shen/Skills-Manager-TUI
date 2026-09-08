@@ -1,0 +1,379 @@
+//! Git repository identities and discovery. Aliases are labels, never URL encodings.
+use crate::{
+    Workspace,
+    meta::Source,
+    ops::{fresh_staging, git},
+    util::{valid_skill_key, write_atomic},
+};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Repository {
+    pub alias: String,
+    pub url: String,
+    pub branch: String,
+}
+
+impl Repository {
+    pub fn path(root: &Path, alias: &str) -> PathBuf {
+        crate::paths::meta_dir(root)
+            .join(".repositories")
+            .join(format!("{alias}.toml"))
+    }
+    pub fn list(root: &Path) -> Result<Vec<Self>> {
+        let dir = crate::paths::meta_dir(root).join(".repositories");
+        if !dir.exists() {
+            return Ok(vec![]);
+        }
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.path().extension().is_some_and(|e| e == "toml") {
+                let repo: Self = toml::from_str(&std::fs::read_to_string(entry.path())?)?;
+                if !valid_skill_key(&repo.alias) {
+                    bail!("invalid repository alias")
+                }
+                out.push(repo);
+            }
+        }
+        out.sort_by(|a, b| a.alias.cmp(&b.alias));
+        Ok(out)
+    }
+    pub fn validate(&self, ws: &Workspace) -> Result<()> {
+        if !valid_skill_key(&self.alias) {
+            bail!("invalid repository alias: {:?}", self.alias)
+        }
+        if ws.root.join("repos/SKILL.md").exists()
+            || crate::util::is_symlink(&ws.root.join("repos"))
+        {
+            bail!("repos is already a local skill or symlink; cannot use it for repository storage")
+        }
+        if let Some(existing) = Self::list(&ws.root)?
+            .into_iter()
+            .find(|r| r.alias == self.alias)
+        {
+            if existing != *self {
+                bail!(
+                    "repository alias {} is already assigned to {} on {}; choose another alias",
+                    self.alias,
+                    existing.url,
+                    existing.branch
+                )
+            }
+        } else if ws.root.join("repos").join(&self.alias).exists() {
+            bail!(
+                "repository directory {} already exists without a matching source record",
+                self.alias
+            )
+        }
+        Ok(())
+    }
+    pub fn save(&self, ws: &Workspace) -> Result<()> {
+        self.validate(ws)?;
+        if Self::path(&ws.root, &self.alias).exists() {
+            return Ok(());
+        }
+        write_atomic(
+            &Self::path(&ws.root, &self.alias),
+            toml::to_string_pretty(self)?.as_bytes(),
+        )
+    }
+}
+
+pub fn default_alias(url: &str) -> String {
+    let url = url.trim_end_matches('/').trim_end_matches(".git");
+    let pieces: Vec<_> = url.split(['/', ':']).filter(|s| !s.is_empty()).collect();
+    let n = pieces.len();
+    if n >= 2 {
+        format!("{}--{}", pieces[n - 2], pieces[n - 1])
+    } else {
+        "repository".into()
+    }
+}
+
+/// Relative identities preserve the upstream path; old flat keys remain valid.
+pub fn valid_id(key: &str) -> bool {
+    if !key.contains('/') {
+        return valid_skill_key(key);
+    }
+    key.starts_with("repos/") && key.split('/').all(valid_skill_key) && key.split('/').count() == 3
+}
+pub fn alias_of(key: &str) -> Option<&str> {
+    key.strip_prefix("repos/")?.split('/').next()
+}
+pub fn default_deploy_name(key: &str) -> String {
+    key.strip_prefix("repos/").unwrap_or(key).replace('/', "--")
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchedRepository {
+    pub repository: Repository,
+    pub revision: String,
+    pub workdir: PathBuf,
+    pub choices: Vec<String>,
+}
+impl FetchedRepository {
+    pub fn cleanup(&self) {
+        let _ = std::fs::remove_dir_all(&self.workdir);
+    }
+    pub fn fetch(
+        ws: &Workspace,
+        reference: &crate::ops::install::InstallRef,
+        alias: Option<&str>,
+    ) -> Result<Self> {
+        Self::fetch_with_progress(ws, reference, alias, &mut |_| {})
+    }
+    pub fn fetch_with_progress(
+        ws: &Workspace,
+        reference: &crate::ops::install::InstallRef,
+        alias: Option<&str>,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Self> {
+        let crate::ops::install::InstallRef::Git {
+            url,
+            branch,
+            subpath,
+        } = reference
+        else {
+            bail!("expected a Git repository")
+        };
+        if let Some(path) = subpath {
+            validate_subpath(path)?;
+        }
+        let workdir = fresh_staging(&ws.root, "repository")?;
+        let result = (|| {
+            let mut args = vec!["clone", "--progress", "--depth", "1"];
+            if let Some(branch) = branch {
+                args.extend(["--branch", branch]);
+            }
+            args.extend([url, workdir.to_str().context("invalid staging path")?]);
+            progress("Clone: connecting to remote…");
+            crate::ops::git_progress(&args, progress)?;
+            progress("Scan: looking for SKILL.md…");
+            let revision = git(&["rev-parse", "HEAD"], Some(&workdir))?
+                .trim()
+                .to_string();
+            let branch = branch.clone().unwrap_or(
+                git(&["rev-parse", "--abbrev-ref", "HEAD"], Some(&workdir))?
+                    .trim()
+                    .to_string(),
+            );
+            let mut choices = Vec::new();
+            for entry in walkdir::WalkDir::new(&workdir)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|e| {
+                    e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.')
+                })
+            {
+                let entry = entry?;
+                if entry.file_type().is_file() && entry.file_name() == "SKILL.md" {
+                    let rel = entry
+                        .path()
+                        .parent()
+                        .unwrap()
+                        .strip_prefix(&workdir)?
+                        .to_string_lossy()
+                        .to_string();
+                    if subpath
+                        .as_ref()
+                        .is_none_or(|s| rel == *s || rel.starts_with(&format!("{s}/")))
+                    {
+                        progress(&format!(
+                            "Scan: found {} — {} skills",
+                            if rel.is_empty() { "." } else { &rel },
+                            choices.len() + 1
+                        ));
+                        choices.push(rel);
+                    }
+                }
+            }
+            choices.sort();
+            if choices.is_empty() {
+                bail!("no SKILL.md found at the requested repository path")
+            }
+            let alias = match alias {
+                Some(a) => a.to_string(),
+                None => Repository::list(&ws.root)?
+                    .into_iter()
+                    .find(|r| r.url == *url && r.branch == branch)
+                    .map(|r| r.alias)
+                    .unwrap_or_else(|| default_alias(url)),
+            };
+            Ok(Self {
+                repository: Repository {
+                    alias,
+                    url: url.clone(),
+                    branch,
+                },
+                revision,
+                workdir: workdir.clone(),
+                choices,
+            })
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&workdir);
+        }
+        result
+    }
+    pub fn local_name(&self, path: &str) -> String {
+        if path.is_empty() {
+            self.repository
+                .url
+                .trim_end_matches('/')
+                .trim_end_matches(".git")
+                .rsplit('/')
+                .next()
+                .unwrap_or("skill")
+                .to_string()
+        } else {
+            path.replace('/', "--")
+        }
+    }
+    pub fn install(
+        &self,
+        ws: &Workspace,
+        paths: &[String],
+        names: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<String>> {
+        self.install_with_progress(ws, paths, names, &mut |_| {})
+    }
+    pub fn install_with_progress(
+        &self,
+        ws: &Workspace,
+        paths: &[String],
+        names: &std::collections::BTreeMap<String, String>,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Vec<String>> {
+        progress("Install: validating selection…");
+
+        if paths.is_empty() {
+            bail!("select at least one skill")
+        }
+        self.repository.validate(ws)?;
+        let mut keys = Vec::new();
+        for path in paths {
+            validate_subpath(path)?;
+            if !self.choices.contains(path) {
+                bail!("skill path was not discovered: {path}")
+            }
+            let name = names
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| self.local_name(path));
+            if !valid_skill_key(&name) {
+                bail!("invalid local skill name: {name:?}")
+            }
+            let key = format!("repos/{}/{}", self.repository.alias, name);
+            if keys.contains(&key) {
+                bail!("duplicate selection: {path}")
+            }
+            let dest = ws.skill_path(&key);
+            if dest.exists() || ws.meta.exists(&key) {
+                bail!("{key} is already installed")
+            }
+            for parent in dest.ancestors().skip(1).take_while(|p| *p != ws.root) {
+                if parent.join("SKILL.md").exists() {
+                    bail!(
+                        "cannot install inside another installed skill: {}",
+                        parent.display()
+                    )
+                }
+                if crate::util::is_symlink(parent) {
+                    bail!("repository storage must not traverse a symlink")
+                }
+            }
+            crate::skill::SkillDoc::load(&self.workdir.join(path))?;
+            keys.push(key);
+        }
+        for a in paths {
+            for b in paths {
+                if overlaps(a, b) {
+                    bail!(
+                        "overlapping skill selections: {a:?} and {b:?}; select either the ancestor or descendants"
+                    )
+                }
+            }
+        }
+        // Check all name collisions before placing anything.
+        let existing = ws.scan()?;
+        let mut names: std::collections::BTreeSet<String> = existing
+            .skills
+            .iter()
+            .map(|s| s.deployment_name())
+            .collect();
+        for key in &keys {
+            if !names.insert(default_deploy_name(key)) {
+                bail!("deployment alias collision for {key}; choose a different repository alias")
+            }
+        }
+        // Prepare every copy before publishing any skill directory.
+        let transaction = fresh_staging(&ws.root, "repository-install")?;
+        std::fs::create_dir_all(&transaction)?;
+        let result = (|| {
+            let mut metas = Vec::new();
+            for (i, path) in paths.iter().enumerate() {
+                progress(&format!("Copy: {}/{} — {}", i + 1, paths.len(), path));
+                let staged = transaction.join(i.to_string());
+                crate::util::copy_dir(&self.workdir.join(path), &staged)?;
+                let _ = std::fs::remove_dir_all(staged.join(".git"));
+                metas.push(crate::meta::SkillMeta {
+                    source: Some(Source::Git {
+                        url: self.repository.url.clone(),
+                        branch: Some(self.repository.branch.clone()),
+                        subpath: Some(path.clone()),
+                        revision: Some(self.revision.clone()),
+                    }),
+                    baseline: Some(crate::meta::Baseline {
+                        hash: crate::hash::hash_directory(&staged)?,
+                        hash_algo: crate::hash::HASH_ALGO,
+                    }),
+                    ..Default::default()
+                });
+            }
+            self.repository.save(ws)?;
+            let mut published = Vec::new();
+            let publish = (|| {
+                for (i, key) in keys.iter().enumerate() {
+                    progress(&format!("Save: {}/{} — {key}", i + 1, keys.len()));
+                    let dest = ws.skill_path(key);
+                    if dest.exists() || crate::util::is_symlink(&dest) || ws.meta.exists(key) {
+                        bail!("{key} appeared during installation; refusing to overwrite")
+                    }
+                    std::fs::create_dir_all(dest.parent().context("skill parent missing")?)?;
+                    std::fs::rename(transaction.join(i.to_string()), &dest)?;
+                    published.push(key);
+                    ws.meta.save(key, &metas[i])?;
+                }
+                Ok(())
+            })();
+            if publish.is_err() {
+                for key in published {
+                    let _ = std::fs::remove_dir_all(ws.skill_path(key));
+                    let _ = ws.meta.remove(key);
+                }
+            }
+            publish
+        })();
+        let _ = std::fs::remove_dir_all(transaction);
+        result?;
+        Ok(keys)
+    }
+}
+
+pub fn validate_subpath(path: &str) -> Result<()> {
+    if !path.is_empty() && !path.split('/').all(valid_skill_key) {
+        bail!("invalid repository skill path: {path:?}")
+    }
+    Ok(())
+}
+
+/// Strict ancestry only: siblings and descendants of siblings are independent.
+pub fn overlaps(a: &str, b: &str) -> bool {
+    a != b && (a.is_empty() || b.starts_with(&format!("{a}/")))
+}
+pub fn related(a: &str, b: &str) -> bool {
+    overlaps(a, b) || overlaps(b, a)
+}
