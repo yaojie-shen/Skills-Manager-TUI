@@ -316,6 +316,10 @@ impl SearchView {
         };
         let q = Query::parse(self.input.value());
         self.hits = self.searcher.search(&ctx.snap.skills, &q);
+        // Keep relevance within each group; repository installs follow local skills.
+        self.hits.sort_by_key(|hit| {
+            skills::repository::alias_of(&ctx.snap.skills[hit.index].key).is_some()
+        });
         if let Some((keys, _)) = &self.scope {
             self.hits
                 .retain(|hit| keys.contains(&ctx.snap.skills[hit.index].key));
@@ -514,7 +518,26 @@ impl SearchView {
         let title = Line::from(vec![
             Span::raw(" "),
             Span::styled(
-                format!("{}/{}", self.hits.len(), ctx.snap.skills.len()),
+                {
+                    let local_total = ctx
+                        .snap
+                        .skills
+                        .iter()
+                        .filter(|r| skills::repository::alias_of(&r.key).is_none())
+                        .count();
+                    let local_matches = self
+                        .hits
+                        .iter()
+                        .filter(|h| {
+                            skills::repository::alias_of(&ctx.snap.skills[h.index].key).is_none()
+                        })
+                        .count();
+                    format!(
+                        "{local_matches}/{local_total} local · {}/{} repository installs",
+                        self.hits.len() - local_matches,
+                        ctx.snap.skills.len() - local_total
+                    )
+                },
                 th.dim(),
             ),
             Span::raw(" "),
@@ -1407,6 +1430,80 @@ fn row_lines<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_installs_follow_local_results_without_changing_filtering() {
+        let root =
+            std::env::temp_dir().join(format!("skills-search-groups-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        for name in ["printer", "repos/sampleorg--kit/calendar"] {
+            let path = root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("SKILL.md"),
+                format!(
+                    "---\nname: {}\ndescription: shared tools\n---\nBody",
+                    name.rsplit('/').next().unwrap()
+                ),
+            )
+            .unwrap();
+        }
+        let ws = skills::Workspace::open(&root).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = crate::tui::theme::Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = SearchView::default();
+        view.refresh(&ctx);
+        for query in ["", "shared"] {
+            view.set_query(query, &ctx);
+            let keys: Vec<_> = view
+                .hits
+                .iter()
+                .map(|h| snap.skills[h.index].key.as_str())
+                .collect();
+            assert_eq!(keys, ["printer", "repos/sampleorg--kit/calendar"]);
+        }
+        view.set_query("calendar", &ctx);
+        assert_eq!(view.hits.len(), 1);
+        assert_eq!(
+            view.selected(&ctx).unwrap().key,
+            "repos/sampleorg--kit/calendar"
+        );
+        view.focus_list();
+        assert!(
+            view.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &ctx)
+                .is_empty()
+        );
+        assert_eq!(view.focus, Focus::Input);
+        view.layout = Some(UiLayout::List);
+        view.focus = Focus::Preview;
+        view.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), &ctx);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("e fields · Esc closes"),
+            "expanded fields must render over split layouts"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn multi_select_filters_targets_and_keeps_identity_and_scope() {
