@@ -1190,7 +1190,8 @@ mod overflow_tests {
         let root =
             std::env::temp_dir().join(format!("skills-agent-preview-{}", std::process::id()));
         let central = root.join("central");
-        let agent_dir = root.join("agent");
+        // Exercise truncation on every platform, even when temp_dir() is short.
+        let agent_dir = root.join("long-agent-directory-".repeat(6));
         std::fs::create_dir_all(&central).unwrap();
         std::fs::create_dir_all(&agent_dir).unwrap();
         let put = |dir: &std::path::Path, body: &str| {
@@ -1256,8 +1257,33 @@ mod overflow_tests {
                 .join("\n");
             assert!(text.contains(expected), "{name}: {text}");
             assert!(text.contains("Sample Agent"));
-            assert!(text.contains(&format!("{name}/SKILL.md")));
+            let path_line = text
+                .lines()
+                .find(|line| line.contains("path     "))
+                .unwrap();
+            assert!(
+                path_line.contains('…'),
+                "long paths should be collapsed: {path_line}"
+            );
             assert!(!text.contains("CENTRAL CONTENT"));
+
+            assert!(view.handle_key(key(KeyCode::Char('e')), &ctx).is_empty());
+            terminal
+                .draw(|f| view.preview.draw(f, f.area(), &ctx))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            // Join wrapped rows without terminal padding or the overlay border.
+            let expanded = (0..40)
+                .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .map(|line| line.trim().trim_matches('│').trim().to_owned())
+                .collect::<String>();
+            let expected_path = agent_dir.join(name).join("SKILL.md");
+            assert!(
+                expanded.contains(&expected_path.display().to_string()),
+                "{name}: {expanded}"
+            );
+            assert!(expanded.contains(expected), "{name}: {expanded}");
+            assert!(!expanded.contains("CENTRAL CONTENT"));
             assert!(view.handle_key(key(KeyCode::Esc), &ctx).is_empty());
         }
         assert!(!central.join(".skills-meta").exists());
