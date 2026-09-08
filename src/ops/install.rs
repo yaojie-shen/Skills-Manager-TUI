@@ -3,7 +3,7 @@
 use crate::Workspace;
 use crate::hash::{HASH_ALGO, hash_directory};
 use crate::meta::{Baseline, SkillMeta, Source};
-use crate::ops::{fresh_staging, git, require_key, swap_dir};
+use crate::ops::{DownloadDir, fresh_staging, git, require_key, swap_dir};
 use crate::skill::{SKILL_FILE, SkillDoc};
 use crate::util::copy_dir;
 use anyhow::{Context, Result, bail};
@@ -122,7 +122,8 @@ pub fn fetch(ws: &Workspace, r: &InstallRef) -> Result<Fetched> {
             branch,
             subpath,
         } => {
-            let work = fresh_staging(&ws.root, "git")?;
+            let download = DownloadDir::new("git")?;
+            let work = download.path().to_path_buf();
             let mut args = vec!["clone", "--quiet", "--depth", "1"];
             if let Some(b) = branch {
                 args.push("--branch");
@@ -159,7 +160,6 @@ pub fn fetch(ws: &Workspace, r: &InstallRef) -> Result<Fetched> {
                         }
                     })
                     .collect();
-                let _ = std::fs::remove_dir_all(&work);
                 if choices.is_empty() {
                     bail!(
                         "no {SKILL_FILE} at {} in {url}",
@@ -170,7 +170,7 @@ pub fn fetch(ws: &Workspace, r: &InstallRef) -> Result<Fetched> {
             }
             Ok(Fetched {
                 skill_dir,
-                workdir: work,
+                workdir: download.keep(),
                 source: Source::Git {
                     url: url.clone(),
                     subpath: subpath.clone().filter(|s| !s.is_empty()),
@@ -258,10 +258,22 @@ pub fn install(ws: &Workspace, r: &InstallRef, name: Option<&str>) -> Result<Str
         SkillDoc::load(&fetched.skill_dir).context("fetched skill is invalid")?;
         // Strip a nested .git when the skill is the repo root.
         let _ = std::fs::remove_dir_all(fetched.skill_dir.join(".git"));
-        // Move the skill dir into place; when it is nested inside workdir, rename works on the same FS.
-        std::fs::rename(&fetched.skill_dir, &dest)
-            .or_else(|_| copy_dir(&fetched.skill_dir, &dest))
-            .with_context(|| format!("placing {}", dest.display()))?;
+        // Downloads may be on another filesystem. Publish only a complete
+        // skill copied into the central root's staging area, never a partial
+        // cross-filesystem copy directly into its final destination.
+        if matches!(r, InstallRef::Git { .. }) {
+            let staged = fresh_staging(&ws.root, "install")?;
+            let placed = (|| -> Result<()> {
+                copy_dir(&fetched.skill_dir, &staged)?;
+                std::fs::rename(&staged, &dest)?;
+                Ok(())
+            })();
+            let _ = std::fs::remove_dir_all(&staged);
+            placed.with_context(|| format!("placing {}", dest.display()))?;
+        } else {
+            std::fs::rename(&fetched.skill_dir, &dest)
+                .with_context(|| format!("placing {}", dest.display()))?;
+        }
         let meta = SkillMeta {
             schema: crate::meta::SCHEMA,
             tags: Vec::new(),

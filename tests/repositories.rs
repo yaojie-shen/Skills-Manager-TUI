@@ -332,6 +332,12 @@ fn repository_work_reports_clone_scan_and_install_stages() {
             messages.push(s.to_string())
         })
         .unwrap();
+    assert!(fetched.workdir.starts_with(std::env::temp_dir()));
+    assert!(!fetched.workdir.starts_with(&f.ws.root));
+    assert!(
+        !f.ws.root.join(".skills-meta/.staging").exists(),
+        "discovery should not write staging in the managed root"
+    );
     assert!(messages.iter().any(|s| s.starts_with("Clone:")));
     assert!(
         messages
@@ -348,5 +354,26 @@ fn repository_work_reports_clone_scan_and_install_stages() {
         .unwrap();
     assert!(messages.iter().any(|s| s.starts_with("Copy: 1/1")));
     assert!(messages.iter().any(|s| s.starts_with("Save: 1/1")));
+    assert!(
+        f.ws.root
+            .join("repos/progress/tools--printer/SKILL.md")
+            .is_file()
+    );
     fetched.cleanup();
+    assert!(!fetched.workdir.exists());
+}
+
+#[test]
+fn download_workspace_cleans_up_on_error_and_can_transfer_ownership() {
+    let path = {
+        let dir = skills::ops::DownloadDir::new("test-cleanup").unwrap();
+        let path = dir.path().to_path_buf();
+        std::fs::write(path.join("partial-download"), "partial").unwrap();
+        path
+    };
+    assert!(!path.exists());
+    let dir = skills::ops::DownloadDir::new("test-keep").unwrap();
+    let path = dir.keep();
+    assert!(path.is_dir());
+    std::fs::remove_dir_all(path).unwrap();
 }

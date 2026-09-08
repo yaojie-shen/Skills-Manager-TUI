@@ -2,7 +2,7 @@
 use crate::{
     Workspace,
     meta::Source,
-    ops::{fresh_staging, git},
+    ops::{DownloadDir, fresh_staging, git},
     util::{valid_skill_key, write_atomic},
 };
 use anyhow::{Context, Result, bail};
@@ -142,7 +142,8 @@ impl FetchedRepository {
         if let Some(path) = subpath {
             validate_subpath(path)?;
         }
-        let workdir = fresh_staging(&ws.root, "repository")?;
+        let download = DownloadDir::new("repository")?;
+        let workdir = download.path().to_path_buf();
         let result = (|| {
             let mut args = vec!["clone", "--progress", "--depth", "1"];
             if let Some(branch) = branch {
@@ -213,8 +214,8 @@ impl FetchedRepository {
                 choices,
             })
         })();
-        if result.is_err() {
-            let _ = std::fs::remove_dir_all(&workdir);
+        if result.is_ok() {
+            download.keep();
         }
         result
     }

@@ -318,6 +318,15 @@ fn check_and_update_without_local_changes() {
     );
     assert_eq!(prepared.from_revision.as_deref(), Some(rev1.as_str()));
     assert_eq!(prepared.to_revision, rev2);
+    assert!(!prepared.workdir.starts_with(&ws.root));
+    assert_eq!(
+        prepared.workdir.parent(),
+        Some(std::env::temp_dir().as_path())
+    );
+    assert!(
+        f.staging_empty(),
+        "preparing an update writes nothing to central staging"
+    );
     update::apply(&ws, &prepared, Take::Upstream, &Default::default()).unwrap();
 
     assert_eq!(
@@ -349,6 +358,10 @@ fn check_and_update_without_local_changes() {
         other => panic!("unexpected source {other:?}"),
     }
     assert!(!update::check(&ws, "up").unwrap().update_available);
+    assert!(
+        !prepared.workdir.exists(),
+        "download cleaned after applying"
+    );
     assert!(f.staging_empty(), "staging cleaned");
 }
 
@@ -394,4 +407,49 @@ fn install_from_local_directory_copies() {
         Some(hash_directory(&dir).unwrap().as_str())
     );
     assert!(f.staging_empty(), "staging cleaned");
+}
+
+/// Downloading and preparing are independent of the destination filesystem;
+/// only publishing requires its staging directory.
+#[test]
+fn git_download_and_update_prepare_do_not_need_central_staging() {
+    let f = Fixture::new("download-local");
+    let ws = f.ws();
+    let up = f.base.join("upstream");
+    write(&up.join("SKILL.md"), &skill_md("local-download", "v1"));
+    init_repo(&up);
+    commit(&up, "another revision");
+    let r = install::parse_ref(&url_of(&up), Some("main"), None).unwrap();
+    let staging = f.root.join(".skills-meta/.staging");
+    write(&staging, "staging unavailable");
+    let fetched = install::fetch(&ws, &r).unwrap();
+    assert_eq!(
+        fetched.workdir.parent(),
+        Some(std::env::temp_dir().as_path())
+    );
+    assert!(!fetched.workdir.starts_with(&ws.root));
+    assert_eq!(git(&["rev-list", "--count", "HEAD"], &fetched.workdir), "1");
+    std::fs::remove_dir_all(&fetched.workdir).unwrap();
+    std::fs::remove_file(&staging).unwrap();
+    install::install(&ws, &r, None).unwrap();
+
+    write(&up.join("SKILL.md"), &skill_md("local-download", "v2"));
+    commit(&up, "v2");
+    std::fs::remove_dir_all(&staging).unwrap();
+    write(&staging, "staging unavailable");
+    let prepared = update::prepare(&ws, &ws.scan().unwrap(), "local-download").unwrap();
+    assert!(!prepared.workdir.starts_with(&ws.root));
+    assert!(update::apply(&ws, &prepared, Take::Upstream, &Default::default()).is_err());
+    assert_eq!(
+        std::fs::read_to_string(ws.skill_path("local-download").join("SKILL.md")).unwrap(),
+        skill_md("local-download", "v1")
+    );
+    std::fs::remove_file(&staging).unwrap();
+    update::apply(&ws, &prepared, Take::Upstream, &Default::default()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(ws.skill_path("local-download").join("SKILL.md")).unwrap(),
+        skill_md("local-download", "v2")
+    );
+    assert!(!prepared.workdir.exists());
+    assert!(f.staging_empty());
 }

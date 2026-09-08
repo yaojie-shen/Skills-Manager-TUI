@@ -8,6 +8,53 @@ pub mod update;
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
+/// Download and inspection workspace outside the managed root. Keep final
+/// installation staging on the root filesystem so publication stays atomic.
+pub struct DownloadDir {
+    path: Option<std::path::PathBuf>,
+}
+
+impl DownloadDir {
+    pub fn new(label: &str) -> Result<Self> {
+        for _ in 0..10 {
+            let path = std::env::temp_dir().join(format!(
+                "skills-download-{label}-{}-{}",
+                std::process::id(),
+                nanos()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self { path: Some(path) }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        bail!("could not allocate a temporary download directory")
+    }
+
+    pub fn path(&self) -> &Path {
+        self.path.as_deref().expect("download directory owned")
+    }
+
+    /// Transfer cleanup responsibility to a fetched/prepared result.
+    pub fn keep(mut self) -> std::path::PathBuf {
+        self.path.take().expect("download directory owned")
+    }
+}
+
+impl Drop for DownloadDir {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
 /// Staging area on the same filesystem as the root so directory swaps are atomic renames.
 pub fn staging_dir(root: &Path) -> Result<PathBuf> {
     let dir = crate::paths::meta_dir(root).join(".staging");
