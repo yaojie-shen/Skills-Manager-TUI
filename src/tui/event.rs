@@ -175,15 +175,20 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                     TaskOutput::RepositoryInstalled(selection, result)
                 }
                 Task::Scan => TaskOutput::Scan(ws.scan()),
-                Task::Check(keys) => TaskOutput::Check(
-                    keys.into_iter()
-                        .map(|k| {
-                            progress(&format!("Check: querying upstream for {k}…"));
-                            let r = update::check(&ws, &k);
-                            (k, r)
-                        })
-                        .collect(),
-                ),
+                Task::Check(keys) => {
+                    let total = keys.len();
+                    TaskOutput::Check(
+                        keys.into_iter()
+                            .enumerate()
+                            .map(|(done, k)| {
+                                progress(&format!("{done}/{total} complete · querying {k}…"));
+                                let r = update::check(&ws, &k);
+                                progress(&format!("{}/{total} complete", done + 1));
+                                (k, r)
+                            })
+                            .collect(),
+                    )
+                }
                 Task::Install { reference, subpath } => {
                     progress("Install: preparing source files…");
                     let out = skills::ops::install::parse_ref(&reference, None, subpath.as_deref())

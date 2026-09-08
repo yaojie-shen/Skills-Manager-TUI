@@ -360,7 +360,7 @@ impl View for AgentsView {
         }
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
-            KeyCode::Char('q') => return vec![Action::Quit],
+            KeyCode::Char('q') => return vec![Action::SwitchTab(Tab::Search)],
             KeyCode::Char('M') => {
                 self.matrix.open(ctx);
                 return vec![];

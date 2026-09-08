@@ -89,6 +89,19 @@ impl Toasts {
         }
     }
 
+    pub fn running_details(&self) -> Vec<String> {
+        self.running
+            .values()
+            .map(|task| {
+                format!(
+                    "{} — {}",
+                    task.text,
+                    task.detail.as_deref().unwrap_or("Running…")
+                )
+            })
+            .collect()
+    }
+
     pub fn finish(&mut self, id: u64) {
         self.running.remove(&id);
     }

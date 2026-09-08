@@ -935,7 +935,7 @@ impl View for SearchView {
             },
             Focus::List => match k.code {
                 KeyCode::Esc => self.focus = Focus::Input,
-                KeyCode::Char('q') => return vec![Action::Quit],
+                KeyCode::Char('q') => self.focus = Focus::Input,
                 KeyCode::Down | KeyCode::Char('j') => self.move_row(1),
                 KeyCode::Up | KeyCode::Char('k') => self.move_row(-1),
                 KeyCode::PageDown | KeyCode::Char('f') if k.code == KeyCode::PageDown || ctrl => {
@@ -993,7 +993,7 @@ impl View for SearchView {
                     self.focus = Focus::List;
                 }
                 KeyCode::Tab => self.focus = Focus::Input,
-                KeyCode::Char('q') => return vec![Action::Quit],
+                KeyCode::Char('q') => self.focus = Focus::Input,
                 KeyCode::Down | KeyCode::Char('j') => self.scroll_preview(1),
                 KeyCode::Up | KeyCode::Char('k') => self.scroll_preview(-1),
                 KeyCode::PageDown | KeyCode::Char(' ') => {

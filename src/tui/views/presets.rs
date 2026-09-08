@@ -459,7 +459,7 @@ impl View for PresetsView {
             };
         }
         match k.code {
-            KeyCode::Char('q') => vec![Action::Quit],
+            KeyCode::Char('q') => vec![Action::SwitchTab(Tab::Search)],
             // Esc means "back" everywhere else in the program, so here it goes
             // back to the search page rather than out of the door.
             KeyCode::Esc => vec![Action::SwitchTab(Tab::Search)],
@@ -616,7 +616,7 @@ impl View for PresetsView {
                 ("r", "rename"),
                 ("Enter/→", "members"),
                 ("D", "delete preset"),
-                ("q", "quit"),
+                ("q", "search"),
             ]
         }
     }

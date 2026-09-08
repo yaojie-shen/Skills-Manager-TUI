@@ -171,8 +171,82 @@ pub struct App {
     tx: Sender<Msg>,
     external: Option<External>,
     quit: bool,
+    quit_prompt: Option<QuitPrompt>,
     tab_rects: Vec<(Rect, Tab)>,
     body: Rect,
+}
+
+/// Kept separate from the editing modal so cancelling quit preserves its input.
+#[derive(Default)]
+struct QuitPrompt {
+    quit_selected: bool,
+    area: Rect,
+    quit_button: Rect,
+    cancel_button: Rect,
+}
+
+impl QuitPrompt {
+    fn draw(&mut self, f: &mut Frame, outer: Rect, th: &Theme, tasks: Vec<String>) {
+        use super::widgets::{OverlayClear, button, fit};
+        let w = outer.width.saturating_sub(2).min(86);
+        let h = outer
+            .height
+            .saturating_sub(2)
+            .min(tasks.len() as u16 + 6)
+            .max(1);
+        self.area = Rect::new(
+            outer.x + (outer.width - w) / 2,
+            outer.y + (outer.height - h) / 2,
+            w,
+            h,
+        );
+        f.render_widget(OverlayClear, self.area);
+        let block = th.block(" quit ", true);
+        let inner = block.inner(self.area);
+        f.render_widget(block, self.area);
+        let available = inner.height.saturating_sub(3) as usize;
+        let total = tasks.len();
+        let mut lines: Vec<Line> = tasks
+            .into_iter()
+            .take(available)
+            .map(|task| Line::raw(fit(&task, inner.width as usize)))
+            .collect();
+        if total == 0 {
+            lines.push(Line::raw("Background work has finished. Quit now?"));
+        } else {
+            if total > available
+                && let Some(last) = lines.last_mut()
+            {
+                *last = Line::raw(format!("… {} more tasks running", total - available + 1));
+            }
+            lines.push(Line::raw(fit(
+                "Quit now and abandon running work?",
+                inner.width as usize,
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+        let y = inner.bottom().saturating_sub(1);
+        self.cancel_button = Rect::new(
+            inner.right().saturating_sub(10).max(inner.x),
+            y,
+            inner.width.min(10),
+            u16::from(inner.height > 0),
+        );
+        self.quit_button = Rect::new(
+            self.cancel_button.x.saturating_sub(10).max(inner.x),
+            y,
+            self.cancel_button.x.saturating_sub(inner.x).min(8),
+            u16::from(inner.height > 0),
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(button("Quit", self.quit_selected, th))),
+            self.quit_button,
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(button("Cancel", !self.quit_selected, th))),
+            self.cancel_button,
+        );
+    }
 }
 
 impl App {
@@ -199,6 +273,7 @@ impl App {
             tx,
             external: None,
             quit: false,
+            quit_prompt: None,
             tab_rects: Vec::new(),
             body: Rect::default(),
         };
@@ -315,7 +390,9 @@ impl App {
     }
 
     fn task_ui_blocked(&self) -> bool {
-        self.modal.is_some() || (self.tab == Tab::Tags && self.tags.input_focused())
+        self.quit_prompt.is_some()
+            || self.modal.is_some()
+            || (self.tab == Tab::Tags && self.tags.input_focused())
     }
 
     fn on_task(&mut self, out: TaskOutput) -> Vec<Action> {
@@ -453,7 +530,7 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) -> Vec<Action> {
-        if self.batch_running {
+        if self.quit_prompt.is_some() || self.batch_running {
             return vec![];
         }
         let ctx = Ctx {
@@ -472,6 +549,23 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) -> Vec<Action> {
+        if let Some(prompt) = self.quit_prompt.as_mut() {
+            match k.code {
+                KeyCode::Esc => self.quit_prompt = None,
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                    prompt.quit_selected = !prompt.quit_selected;
+                }
+                KeyCode::Enter => {
+                    self.quit = prompt.quit_selected;
+                    self.quit_prompt = None;
+                }
+                _ => {}
+            }
+            return vec![];
+        }
+        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            return vec![Action::Quit];
+        }
         if self.batch_running {
             return vec![];
         }
@@ -539,6 +633,18 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) -> Vec<Action> {
+        if let Some(prompt) = self.quit_prompt.as_ref() {
+            if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                let point = (m.column, m.row).into();
+                if prompt.quit_button.contains(point) {
+                    self.quit = true;
+                    self.quit_prompt = None;
+                } else if prompt.cancel_button.contains(point) || !prompt.area.contains(point) {
+                    self.quit_prompt = None;
+                }
+            }
+            return vec![];
+        }
         if self.batch_running {
             return vec![];
         }
@@ -585,7 +691,13 @@ impl App {
                 });
                 self.search.restrict_agent(agent);
             }
-            Action::Quit => self.quit = true,
+            Action::Quit => {
+                if self.tasks_running == 0 {
+                    self.quit = true;
+                } else {
+                    self.quit_prompt = Some(QuitPrompt::default());
+                }
+            }
             Action::SelectSkills {
                 keys,
                 title,
@@ -913,6 +1025,14 @@ impl App {
         }
         // Above everything: a notification should be readable over a dialog.
         self.toasts.draw(f, area, &self.theme);
+        if let Some(prompt) = self.quit_prompt.as_mut() {
+            let mut tasks = self.toasts.running_details();
+            let scans = self.tasks_running.saturating_sub(tasks.len());
+            if scans > 0 {
+                tasks.push(format!("Scan skills: {scans} running"));
+            }
+            prompt.draw(f, area, &self.theme, tasks);
+        }
     }
 
     fn draw_header(&mut self, f: &mut Frame, area: Rect) {
@@ -983,6 +1103,7 @@ pub type Hints = &'static [(&'static str, &'static str)];
 #[cfg(test)]
 mod matrix_key_tests {
     use super::*;
+
     #[test]
     fn unchanged_editor_buffer_does_not_create_metadata_or_start_a_scan() {
         let root =
@@ -1018,6 +1139,95 @@ mod matrix_key_tests {
             .collect();
         assert!(rendered.contains("note unchanged on printer"));
         assert!(!rendered.contains("note saved"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quitting_running_work_requires_explicit_confirmation_and_preserves_input() {
+        let root = std::env::temp_dir().join(format!("skills-quit-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        app.tasks_running = 1;
+        app.toasts.start(1, "Check upstream: 30 skills".into());
+        app.handle(Msg::Progress(
+            1,
+            "12/30 complete · querying printer…".into(),
+        ));
+        for tab in [Tab::Tags, Tab::Presets, Tab::Agents, Tab::Health] {
+            app.switch_tab(tab);
+            app.handle(Msg::Key(KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+            )));
+            assert_eq!(app.tab, Tab::Search);
+            assert!(!app.quit);
+            assert!(app.quit_prompt.is_none());
+            assert_eq!(app.tasks_running, 1);
+        }
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        if app.quit_prompt.is_none() {
+            app.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        }
+        assert!(
+            app.quit_prompt.is_some(),
+            "empty Search Esc must use the quit guard"
+        );
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!app.quit);
+        app.modal = Some(Modal::set_source("printer", None));
+        app.handle(Msg::Paste("https://example.com/team/tools".into()));
+        app.batch_running = true;
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(app.quit_prompt.is_some());
+        assert!(!app.quit);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("12/30 complete"));
+        assert!(rendered.contains("Quit now and abandon running work?"));
+        app.handle(Msg::Paste("unexpected paste".into()));
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(!app.quit);
+        assert!(app.quit_prompt.is_none());
+        let Some(Modal::Input { input, .. }) = &app.modal else {
+            panic!("lost editing dialog")
+        };
+        assert_eq!(input.value(), "https://example.com/team/tools");
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        app.tasks_running = 0;
+        app.toasts.finish(1);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("Background work has finished"));
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(app.quit);
         std::fs::remove_dir_all(root).unwrap();
     }
 

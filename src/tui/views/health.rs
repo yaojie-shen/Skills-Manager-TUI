@@ -451,7 +451,7 @@ impl View for HealthView {
         let caps = self.selected_row().map(|r| r.caps).unwrap_or_default();
         match k.code {
             KeyCode::Char('M') => self.select_skills(None),
-            KeyCode::Char('q') => vec![Action::Quit],
+            KeyCode::Char('q') => vec![Action::SwitchTab(Tab::Search)],
             // Esc means "back" everywhere else in the program, so here it goes
             // back to the search page rather than out of the door.
             KeyCode::Esc => vec![Action::SwitchTab(Tab::Search)],
@@ -635,7 +635,7 @@ impl View for HealthView {
             return hints;
         }
         let Some(caps) = self.selected_row().map(|r| r.caps) else {
-            return &[("c", "check updates"), ("Esc", "search"), ("q", "quit")];
+            return &[("c", "check updates"), ("Esc", "search"), ("q", "search")];
         };
         match (caps.update, caps.accept, caps.migrate, caps.clean) {
             (true, true, _, _) => &[
@@ -645,7 +645,7 @@ impl View for HealthView {
                 ("Enter", "open"),
                 ("M", "multi-select"),
                 ("Esc", "search"),
-                ("q", "quit"),
+                ("q", "search"),
             ],
             (true, false, true, _) => &[
                 ("c", "check updates"),
@@ -654,7 +654,7 @@ impl View for HealthView {
                 ("Enter", "open"),
                 ("M", "multi-select"),
                 ("Esc", "search"),
-                ("q", "quit"),
+                ("q", "search"),
             ],
             (true, false, false, true) => &[
                 ("c", "check updates"),
@@ -663,7 +663,7 @@ impl View for HealthView {
                 ("Enter", "open"),
                 ("M", "multi-select"),
                 ("Esc", "search"),
-                ("q", "quit"),
+                ("q", "search"),
             ],
             (true, false, false, false) => &[
                 ("c", "check updates"),
@@ -671,7 +671,7 @@ impl View for HealthView {
                 ("Enter", "open"),
                 ("M", "multi-select"),
                 ("Esc", "search"),
-                ("q", "quit"),
+                ("q", "search"),
             ],
             (false, true, _, _) => &[
                 ("c", "check updates"),
@@ -679,7 +679,7 @@ impl View for HealthView {
                 ("Enter", "open"),
                 ("M", "multi-select"),
                 ("Esc", "search"),
-                ("q", "quit"),
+                ("q", "search"),
             ],
             (false, false, true, _) => &[
                 ("c", "check updates"),
@@ -687,7 +687,7 @@ impl View for HealthView {
                 ("Enter", "open"),
                 ("M", "multi-select"),
                 ("Esc", "search"),
-                ("q", "quit"),
+                ("q", "search"),
             ],
             (false, false, false, true) => &[
                 ("c", "check updates"),
@@ -695,14 +695,14 @@ impl View for HealthView {
                 ("Enter", "open"),
                 ("M", "multi-select"),
                 ("Esc", "search"),
-                ("q", "quit"),
+                ("q", "search"),
             ],
             (false, false, false, false) => &[
                 ("c", "check updates"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
                 ("Esc", "search"),
-                ("q", "quit"),
+                ("q", "search"),
             ],
         }
     }
