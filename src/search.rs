@@ -795,11 +795,11 @@ fn excerpt_for(r: &SkillRecord, terms: &[String], fields: &[Field]) -> Option<Ex
         }
         let Some(text) = text else { continue };
         let ranges = highlight_ranges(text, terms);
-        let Some(&(first, _)) = ranges.first() else {
+        let Some(&(first, first_end)) = ranges.first() else {
             continue;
         };
-        let start = back_chars(text, first, 40);
-        let end = fwd_chars(text, start, 140);
+        let start = excerpt_start(text, first);
+        let end = excerpt_end(text, start, first_end);
         let slice = &text[start..end];
         let collapsed: String = slice.split_whitespace().collect::<Vec<_>>().join(" ");
         let local = highlight_ranges(&collapsed, terms);
@@ -818,6 +818,69 @@ fn excerpt_for(r: &SkillRecord, terms: &[String], fields: &[Field]) -> Option<Ex
         });
     }
     None
+}
+
+// Avoid beginning or ending with a fragment that looks like a different
+// word. CJK has no spaces between words, so punctuation is a more useful
+// context boundary; without one, keep the hit instead of inventing a cut.
+fn excerpt_start(text: &str, first: usize) -> usize {
+    let mut start = back_chars(text, first, 40);
+    if start == 0 {
+        return start;
+    }
+    let previous = text[..start].chars().next_back().unwrap();
+    let current = text[start..].chars().next().unwrap();
+    if is_cjk(previous) && is_cjk(current) {
+        return text[start..first]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| excerpt_separator(*c))
+            .map_or(first, |(i, c)| start + i + c.len_utf8());
+    }
+    if excerpt_word(previous) && excerpt_word(current) {
+        while let Some((i, c)) = text[..start].char_indices().next_back() {
+            if !excerpt_word(c) {
+                break;
+            }
+            start = i;
+        }
+    }
+    start
+}
+
+fn excerpt_end(text: &str, start: usize, first_end: usize) -> usize {
+    let mut end = fwd_chars(text, start, 140).max(first_end);
+    if end == text.len() {
+        return end;
+    }
+    let previous = text[..end].chars().next_back().unwrap();
+    let current = text[end..].chars().next().unwrap();
+    if is_cjk(previous) && is_cjk(current) {
+        return text[first_end..end]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| excerpt_separator(*c))
+            .map_or(first_end, |(i, c)| first_end + i + c.len_utf8());
+    }
+    if excerpt_word(previous) && excerpt_word(current) {
+        for c in text[end..].chars() {
+            if !excerpt_word(c) {
+                break;
+            }
+            end += c.len_utf8();
+        }
+    }
+    end
+}
+
+fn excerpt_word(c: char) -> bool {
+    !is_cjk(c) && (c.is_alphanumeric() || c == '_' || c == '\'')
+}
+
+fn excerpt_separator(c: char) -> bool {
+    c.is_whitespace()
+        || c.is_ascii_punctuation()
+        || matches!(c, '，' | '。' | '；' | '：' | '！' | '？' | '、')
 }
 
 fn back_chars(text: &str, from: usize, n: usize) -> usize {
@@ -1013,6 +1076,47 @@ mod tests {
         let hits = Searcher::new().search(&records, &Query::parse("文件"));
         assert_eq!(keys(&records, &hits), ["x"]);
         let ex = hits[0].excerpt.as_ref().unwrap();
+        assert_eq!(&ex.text[ex.ranges[0].0..ex.ranges[0].1], "文件");
+    }
+
+    #[test]
+    fn excerpts_keep_latin_words_whole_and_highlight_the_hit() {
+        let body = format!(
+            "Older context. {}printer {}",
+            "configuration ".repeat(5),
+            "documentation ".repeat(20),
+        );
+        let r = rec("tool", "", &body, &[]);
+        let ex = excerpt_for(&r, &["printer".into()], &[Field::Body]).unwrap();
+        assert!(ex.text.starts_with("…configuration "));
+        assert!(ex.text.ends_with("documentation…"));
+        assert!(
+            ex.text
+                .trim_matches('…')
+                .split_whitespace()
+                .all(|word| matches!(word, "configuration" | "printer" | "documentation"))
+        );
+        assert_eq!(&ex.text[ex.ranges[0].0..ex.ranges[0].1], "printer");
+    }
+
+    #[test]
+    fn cjk_excerpts_prefer_punctuation_or_the_match_to_arbitrary_cuts() {
+        let body = format!(
+            "{}。用于文件系统的工具，{}。{}",
+            "背景".repeat(35),
+            "说明".repeat(35),
+            "后文".repeat(90)
+        );
+        let r = rec("tool", "", &body, &[]);
+        let ex = excerpt_for(&r, &["文件".into()], &[Field::Body]).unwrap();
+        assert!(ex.text.starts_with("…用于文件系统"));
+        assert!(ex.text.ends_with("说明。…"));
+        assert_eq!(&ex.text[ex.ranges[0].0..ex.ranges[0].1], "文件");
+
+        let body = format!("{}文件{}", "背景".repeat(35), "后文".repeat(90));
+        let r = rec("tool", "", &body, &[]);
+        let ex = excerpt_for(&r, &["文件".into()], &[Field::Body]).unwrap();
+        assert_eq!(ex.text, "…文件…");
         assert_eq!(&ex.text[ex.ranges[0].0..ex.ranges[0].1], "文件");
     }
 
