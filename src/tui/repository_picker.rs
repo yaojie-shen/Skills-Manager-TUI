@@ -52,7 +52,14 @@ impl RepositoryPicker {
         let paths = fetched
             .choices
             .iter()
-            .filter(|p| !installed(p) && !fetched.choices.iter().any(|a| overlaps(a, p)))
+            .filter(|p| {
+                !installed(p)
+                    && !fetched.invalid.contains_key(*p)
+                    && !fetched
+                        .choices
+                        .iter()
+                        .any(|a| !fetched.invalid.contains_key(a) && overlaps(a, p))
+            })
             .cloned()
             .collect();
         Self::restore(InstallSelection {
@@ -94,28 +101,26 @@ impl RepositoryPicker {
         }
         nodes.into_iter().collect()
     }
-    fn refilter(&mut self) {
+    fn matches_filter(&self, path: &str) -> bool {
         let query = self.search.value().trim().to_lowercase();
-        // A slash makes this a repository-relative path prefix, not a substring
-        // that could accidentally match fixtures under internal/.../skills/.
-        let matches = |path: &str| {
-            let path = path.to_lowercase();
-            if query.contains('/') {
-                let prefix = query
-                    .strip_prefix("./")
-                    .unwrap_or(&query)
-                    .trim_start_matches('/');
-                path.starts_with(prefix)
-            } else {
-                path.contains(&query)
-            }
-        };
+        let path = path.to_lowercase();
+        if query.contains('/') {
+            let prefix = query
+                .strip_prefix("./")
+                .unwrap_or(&query)
+                .trim_start_matches('/');
+            path.starts_with(prefix)
+        } else {
+            path.contains(&query)
+        }
+    }
+    fn refilter(&mut self) {
         let matching: Vec<_> = self
             .selection
             .fetched
             .choices
             .iter()
-            .filter(|p| matches(p))
+            .filter(|p| self.matches_filter(p))
             .collect();
         self.shown = self
             .tree()
@@ -131,7 +136,18 @@ impl RepositoryPicker {
             .cloned()
     }
     fn disabled(&self, path: &str, ctx: &Ctx) -> Option<String> {
-        if self.selection.paths.iter().any(|p| related(p, path)) {
+        if let Some(error) = self.selection.fetched.invalid.get(path) {
+            return Some(format!("invalid: {error}"));
+        }
+        if !self.matches_filter(path) {
+            return Some("outside current filter".into());
+        }
+        if self
+            .selection
+            .paths
+            .iter()
+            .any(|p| self.matches_filter(p) && related(p, path))
+        {
             return Some("ancestor or descendant selected".into());
         }
         if ctx.snap.skills.iter().any(|s| match &s.source {
@@ -160,6 +176,9 @@ impl RepositoryPicker {
         } else if let Some(reason) = self.disabled(path, ctx) {
             return vec![Action::Error(reason)];
         } else {
+            // An ancestor excluded by the filter no longer blocks this choice.
+            // Remove its stored check so clearing the filter cannot select both.
+            self.selection.paths.retain(|p| !related(p, path));
             self.selection.paths.push(path.into());
         }
         vec![]
@@ -260,12 +279,16 @@ impl RepositoryPicker {
                     return vec![Action::Error("invalid repository alias".into())];
                 }
                 self.selection.fetched.repository.alias = alias.into();
-                if self.selection.paths.is_empty() {
-                    return vec![Action::Error("select at least one skill".into())];
+                let mut selection = self.selection.clone();
+                selection.paths.retain(|p| self.matches_filter(p));
+                if selection.paths.is_empty() {
+                    return vec![Action::Error(
+                        "select at least one skill in the current results".into(),
+                    )];
                 }
                 return vec![
                     Action::CloseModal,
-                    Action::Spawn(Task::InstallRepository(Box::new(self.selection.clone()))),
+                    Action::Spawn(Task::InstallRepository(Box::new(selection))),
                 ];
             }
             _ => {}
@@ -322,12 +345,16 @@ impl RepositoryPicker {
         f.render_widget(OverlayClear, r);
         let block = th.block(
             format!(
-                " install from repository · {} selected · {} hidden ",
-                self.selection.paths.len(),
+                " install · {} selected in results · {} outside filter (excluded) ",
                 self.selection
                     .paths
                     .iter()
-                    .filter(|p| !self.shown.contains(p))
+                    .filter(|p| self.matches_filter(p))
+                    .count(),
+                self.selection
+                    .paths
+                    .iter()
+                    .filter(|p| !self.matches_filter(p))
                     .count()
             ),
             true,
@@ -388,8 +415,9 @@ impl RepositoryPicker {
             .shown
             .iter()
             .map(|path| {
-                let skill = self.selection.fetched.choices.contains(path);
-                let selected = self.selection.paths.contains(path);
+                let skill =
+                    self.selection.fetched.choices.contains(path) && self.matches_filter(path);
+                let selected = skill && self.selection.paths.contains(path);
                 let disabled = if skill && !selected {
                     self.disabled(path, ctx)
                 } else {
@@ -415,7 +443,9 @@ impl RepositoryPicker {
                     path.rsplit('/').next().unwrap_or(path)
                 };
                 let suffix = disabled.map(|s| format!("  ({s})")).unwrap_or_default();
-                let style = if !skill || !suffix.is_empty() {
+                let style = if self.selection.fetched.invalid.contains_key(path) {
+                    th.err()
+                } else if !skill || !suffix.is_empty() {
                     th.dim()
                 } else {
                     th.bold()
@@ -456,6 +486,7 @@ mod tests {
                     url: "https://github.com/sampleorg/kit".into(),
                     branch: "main".into(),
                 },
+                invalid: BTreeMap::new(),
                 revision: "test".into(),
                 workdir: std::path::PathBuf::new(),
                 choices: vec![
@@ -530,6 +561,7 @@ mod tests {
                 url: "https://example.com/sample/tools.git".into(),
                 branch: "main".into(),
             },
+            invalid: BTreeMap::new(),
             revision: "sample".into(),
             workdir: root.join("staging"),
             choices: vec![
@@ -577,6 +609,39 @@ mod tests {
             picker.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &ctx);
         }
         assert_eq!(picker.selection.paths, before); // Spaces in search never toggle.
+        picker.search = Input::with_value("tools/");
+        picker.refilter();
+        picker.focus = 2;
+        let actions = picker.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx);
+        let selection = actions
+            .into_iter()
+            .find_map(|a| match a {
+                Action::Spawn(Task::InstallRepository(s)) => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(selection.paths, vec!["tools/reader", "tools/sibling/leaf"]);
+        assert!(picker.selection.paths.contains(&"other/printer".into()));
+        picker.selection.paths = vec!["tools".into(), "other/printer".into()];
+        // A tree ancestor retained solely for context is not an installation result.
+        assert!(picker.shown.contains(&"tools".into()));
+        let actions = picker.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx);
+        assert!(matches!(&actions[0], Action::Error(_)));
+        assert!(picker.toggle("tools/reader", &ctx).is_empty());
+        assert!(!picker.selection.paths.contains(&"tools".into()));
+        picker.selection.fetched.invalid.insert(
+            "tools/sibling/leaf".into(),
+            "frontmatter has no `name`".into(),
+        );
+        assert!(!picker.toggle("tools/sibling/leaf", &ctx).is_empty());
+        let fetched = picker.selection.fetched.clone();
+        let defaults = RepositoryPicker::new(fetched, &ctx);
+        assert!(
+            !defaults
+                .selection
+                .paths
+                .contains(&"tools/sibling/leaf".into())
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

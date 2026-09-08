@@ -113,6 +113,8 @@ pub struct FetchedRepository {
     pub revision: String,
     pub workdir: PathBuf,
     pub choices: Vec<String>,
+    /// Discovered files that cannot be installed, keyed by upstream path.
+    pub invalid: std::collections::BTreeMap<String, String>,
 }
 impl FetchedRepository {
     pub fn cleanup(&self) {
@@ -162,6 +164,7 @@ impl FetchedRepository {
                     .to_string(),
             );
             let mut choices = Vec::new();
+            let mut invalid = std::collections::BTreeMap::new();
             for entry in walkdir::WalkDir::new(&workdir)
                 .follow_links(false)
                 .into_iter()
@@ -187,6 +190,11 @@ impl FetchedRepository {
                             if rel.is_empty() { "." } else { &rel },
                             choices.len() + 1
                         ));
+                        if let Err(error) =
+                            crate::skill::SkillDoc::load(entry.path().parent().unwrap())
+                        {
+                            invalid.insert(rel.clone(), format!("{error:#}"));
+                        }
                         choices.push(rel);
                     }
                 }
@@ -212,6 +220,7 @@ impl FetchedRepository {
                 revision,
                 workdir: workdir.clone(),
                 choices,
+                invalid,
             })
         })();
         if result.is_ok() {
@@ -286,7 +295,12 @@ impl FetchedRepository {
                     bail!("repository storage must not traverse a symlink")
                 }
             }
-            crate::skill::SkillDoc::load(&self.workdir.join(path))?;
+            crate::skill::SkillDoc::load(&self.workdir.join(path)).with_context(|| {
+                format!(
+                    "invalid skill at {}/SKILL.md",
+                    if path.is_empty() { "." } else { path }
+                )
+            })?;
             keys.push(key);
         }
         for a in paths {

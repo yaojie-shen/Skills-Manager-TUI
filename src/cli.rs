@@ -867,10 +867,11 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
                     .choices
                     .iter()
                     .filter(|p| {
-                        !fetched
-                            .choices
-                            .iter()
-                            .any(|ancestor| skills::repository::overlaps(ancestor, p))
+                        !fetched.invalid.contains_key(*p)
+                            && !fetched.choices.iter().any(|ancestor| {
+                                !fetched.invalid.contains_key(ancestor)
+                                    && skills::repository::overlaps(ancestor, p)
+                            })
                     })
                     .cloned()
                     .collect()
@@ -895,9 +896,13 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
                 vec![]
             };
             if a.list || paths.is_empty() {
-                return ctx.out(&serde_json::json!({"repository": fetched.repository, "choices": fetched.choices, "installed": []}), || {
+                return ctx.out(&serde_json::json!({"repository": fetched.repository, "choices": fetched.choices, "invalid": fetched.invalid, "installed": []}), || {
                     println!("{} — select paths with --select PATH or --all", fetched.repository.alias);
-                    for path in &fetched.choices { println!("{}", if path.is_empty() { "." } else { path }); }
+                    for path in &fetched.choices {
+                        let display = if path.is_empty() { "." } else { path };
+                        if let Some(error) = fetched.invalid.get(path) { println!("{display} [invalid: {error}]"); }
+                        else { println!("{display}"); }
+                    }
                 });
             }
             let mut names = BTreeMap::new();

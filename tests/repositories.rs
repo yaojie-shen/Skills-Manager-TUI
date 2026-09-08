@@ -377,3 +377,48 @@ fn download_workspace_cleans_up_on_error_and_can_transfer_ownership() {
     assert!(path.is_dir());
     std::fs::remove_dir_all(path).unwrap();
 }
+
+#[test]
+fn invalid_skill_fixtures_are_reported_with_paths_before_installation() {
+    let f = Fixture::new();
+    f.put("skills/good", "good", "real skill");
+    f.put("tests/bad", "bad", "fixture");
+    std::fs::write(
+        f.repo.join("tests/bad/SKILL.md"),
+        "---\ndescription: missing name\n---\nfixture",
+    )
+    .unwrap();
+    f.commit();
+    let fetched = f.fetch("validation");
+    assert!(fetched.choices.contains(&"tests/bad".into()));
+    assert_eq!(
+        fetched.invalid.get("tests/bad").unwrap(),
+        "frontmatter has no `name`"
+    );
+    let error = fetched
+        .install(&f.ws, &["tests/bad".into()], &BTreeMap::new())
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("tests/bad/SKILL.md"));
+    assert!(!f.ws.root.join("repos/validation").exists());
+    let output = Command::new(env!("CARGO_BIN_EXE_skills"))
+        .args(["--root", f.ws.root.to_str().unwrap(), "--json", "install"])
+        .arg(format!("file://{}", f.repo.display()))
+        .args(["--repo-alias", "cli-valid", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["installed"],
+        serde_json::json!(["repos/cli-valid/skills--good"])
+    );
+
+    fetched
+        .install(&f.ws, &["skills/good".into()], &BTreeMap::new())
+        .unwrap();
+    fetched.cleanup();
+}
