@@ -1053,12 +1053,19 @@ impl App {
             spans.push(Span::raw(" "));
             x += w + 1;
         }
-        let right = if self.tasks_running > 0 {
-            format!("{} working  ", SPINNER[self.spinner])
-        } else {
-            format!("{}  ", skills::paths::contract_tilde(&self.snap.root))
-        };
         let used = (x - area.x) as usize;
+        let available = (area.width as usize).saturating_sub(used);
+        let right = if self.tasks_running > 0 {
+            super::widgets::fit(&format!("{} working  ", SPINNER[self.spinner]), available)
+        } else {
+            let path = skills::paths::contract_tilde(&self.snap.root);
+            let tail_space = available.min(2);
+            format!(
+                "{}{}",
+                middle_ellipsis(&path, available - tail_space),
+                " ".repeat(tail_space)
+            )
+        };
         let pad = (area.width as usize).saturating_sub(used + width(&right));
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(right, th.dim()));
@@ -1100,9 +1107,52 @@ impl App {
 /// Key hint pairs shown in the footer.
 pub type Hints = &'static [(&'static str, &'static str)];
 
+/// Fit the root into its header allocation while keeping the directory tail.
+fn middle_ellipsis(text: &str, max: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    if width(text) <= max {
+        return text.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let prefix_budget = (max - 1) / 2;
+    let mut prefix = String::new();
+    for glyph in text.graphemes(true) {
+        if width(&prefix) + width(glyph) > prefix_budget {
+            break;
+        }
+        prefix.push_str(glyph);
+    }
+    let suffix_budget = max - 1 - width(&prefix);
+    let mut suffix = Vec::new();
+    let mut used = 0;
+    for glyph in text.graphemes(true).rev() {
+        if used + width(glyph) > suffix_budget {
+            break;
+        }
+        used += width(glyph);
+        suffix.push(glyph);
+    }
+    format!("{prefix}…{}", suffix.into_iter().rev().collect::<String>())
+}
+
 #[cfg(test)]
 mod matrix_key_tests {
     use super::*;
+
+    #[test]
+    fn header_paths_keep_the_tail_with_unicode_safe_middle_ellipsis() {
+        let path = "/temporary/long-parent-directory/project/skills";
+        let shortened = middle_ellipsis(path, 16);
+        assert!(shortened.starts_with("/tempor"));
+        assert!(shortened.ends_with("/skills"));
+        assert!(shortened.contains('…'));
+        for max in 0..50 {
+            assert!(width(&middle_ellipsis("/文件系统/打印机/skills", max)) <= max);
+        }
+        assert_eq!(middle_ellipsis("/skills", 30), "/skills");
+    }
 
     #[test]
     fn unchanged_editor_buffer_does_not_create_metadata_or_start_a_scan() {

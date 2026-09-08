@@ -47,6 +47,7 @@ pub struct SearchView {
     /// try a layout on for size; what the next start looks like stays the file's
     /// business, so neither is written back.
     layout: Option<UiLayout>,
+    rendered_layout: UiLayout,
     /// Grid layout has no standing preview pane, so it opens over the results.
     overlay: Overlay,
     searcher: Searcher,
@@ -78,6 +79,7 @@ impl Default for SearchView {
             preview_rect: Rect::default(),
             esc_armed: false,
             layout: None,
+            rendered_layout: UiLayout::Grid,
             overlay: Overlay::default(),
             searcher: Searcher::new(),
             multi: false,
@@ -565,9 +567,6 @@ impl SearchView {
         // The layout decides the shape too: a grid is made of cards, and the
         // two splits are lists beside a preview. One column of framed cards
         // would be a list wearing frames, which is the worst of both.
-        let layout = self.layout(ctx);
-        let cards = layout == UiLayout::Grid;
-
         let legend = vec![Span::raw(match &self.scope {
             Some((_, title)) => format!(" {title} "),
             None => " skills ".into(),
@@ -575,6 +574,16 @@ impl SearchView {
         let block = th.block(Line::from(legend), self.focus == Focus::List);
         let inner = block.inner(area);
         f.render_widget(block, area);
+        // Keep the chosen layout as a preference; a short pane needs enough
+        // rows to navigate, and returns to that preference after a resize.
+        let short = inner.height < 12;
+        let layout = if short {
+            UiLayout::Compact
+        } else {
+            self.layout(ctx)
+        };
+        self.rendered_layout = layout;
+        let cards = layout == UiLayout::Grid;
 
         // A framed card is its content plus the border; the list is the same
         // content bare; a compact row is one line, two while an excerpt has
@@ -582,7 +591,7 @@ impl SearchView {
         let cell_h = match layout {
             UiLayout::Grid => CARD_H,
             UiLayout::List => 4,
-            UiLayout::Compact if searching => 2,
+            UiLayout::Compact if searching && !short => 2,
             UiLayout::Compact => 1,
         };
         // One column is always kept back for the scrollbar so the column count
@@ -711,7 +720,7 @@ impl SearchView {
                     h,
                     ctx,
                     cell.width.saturating_sub(2) as usize,
-                    searching,
+                    searching && !short,
                     on,
                 );
                 if self.multi
@@ -1133,7 +1142,7 @@ impl View for SearchView {
                 if let Some((index, double)) = self.grid.click(m.column, m.row) {
                     self.preview_scroll = 0;
                     let marker = self.grid.cell(index).is_some_and(|cell| {
-                        let (x, y) = if self.layout(ctx) == UiLayout::Grid {
+                        let (x, y) = if self.rendered_layout == UiLayout::Grid {
                             (cell.x + 2, cell.y + 1)
                         } else {
                             (cell.x + 2, cell.y)
@@ -1412,6 +1421,69 @@ fn row_lines<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_result_panes_use_one_line_and_restore_the_chosen_layout() {
+        let root = std::env::temp_dir().join(format!("skills-short-pane-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        for n in 0..12 {
+            let path = root.join(format!("printer-{n:02}"));
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("SKILL.md"),
+                format!("---\nname: printer-{n:02}\ndescription: shared tools\n---\nshared body"),
+            )
+            .unwrap();
+        }
+        let ws = skills::Workspace::open(&root).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = crate::tui::theme::Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = SearchView::default();
+        view.refresh(&ctx);
+        view.layout = Some(UiLayout::List);
+        view.set_query("shared", &ctx);
+        view.grid.select(Some(3));
+        let selected = view.selected(&ctx).unwrap().key.clone();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| view.draw(f, Rect::new(0, 1, 80, 22), &ctx))
+            .unwrap();
+        assert_eq!(view.rendered_layout, UiLayout::Compact);
+        assert_eq!(view.layout, Some(UiLayout::List));
+        assert!(view.grid.visible().len() >= 4);
+        assert_eq!(view.grid.cell(3).unwrap().height, 1);
+        assert_eq!(view.selected(&ctx).unwrap().key, selected);
+        let shown: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(shown.matches("printer-").count() >= 4);
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| view.draw(f, Rect::new(0, 1, 120, 38), &ctx))
+            .unwrap();
+        assert_eq!(view.rendered_layout, UiLayout::List);
+        assert_eq!(view.grid.cell(3).unwrap().height, 4);
+        assert_eq!(view.selected(&ctx).unwrap().key, selected);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn repository_installs_follow_local_results_without_changing_filtering() {
