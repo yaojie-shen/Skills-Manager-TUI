@@ -843,7 +843,8 @@ impl View for TagsView {
             {
                 self.focus_grid = true;
                 if self.grid.cell(index).is_some_and(|cell| {
-                    m.row == cell.y + 1 && (cell.x + 2..cell.x + 5).contains(&m.column)
+                    m.row == cell.y + 1
+                        && (cell.x + 2..cell.x + 2 + cards::MARKER_W as u16).contains(&m.column)
                 }) {
                     return self.select_skills(self.selected_member());
                 }

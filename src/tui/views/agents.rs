@@ -580,7 +580,9 @@ impl View for AgentsView {
                 if let Some((index, double)) = self.entries.click(m.column, m.row) {
                     if !self.compact
                         && self.entries.cell(index).is_some_and(|cell| {
-                            m.row == cell.y + 1 && (cell.x + 2..cell.x + 5).contains(&m.column)
+                            m.row == cell.y + 1
+                                && (cell.x + 2..cell.x + 2 + cards::MARKER_W as u16)
+                                    .contains(&m.column)
                         })
                     {
                         let rows = self.rows(ctx);
@@ -837,10 +839,10 @@ impl View for AgentsView {
                     _ => {
                         let (glyph, gs) = glyph_for(row.state, th);
                         let label = state_label(row.state);
-                        let name_w = (ci.width as usize).saturating_sub(4);
+                        let name_w = (ci.width as usize).saturating_sub(cards::MARKER_W);
                         vec![
                             Line::from(vec![
-                                Span::styled(format!("{glyph} "), gs),
+                                Span::styled(format!("{glyph}   "), gs),
                                 Span::styled(pad(row.name, name_w), th.dim()),
                             ]),
                             Line::from(vec![
@@ -886,10 +888,10 @@ impl View for AgentsView {
                     Span::styled(if on { "▸ " } else { "  " }, th.accent()),
                     managed
                         .map(|r| cards::health_marker(r, th))
-                        .unwrap_or_else(|| Span::styled(format!("{glyph} "), gs)),
+                        .unwrap_or_else(|| Span::styled(format!("{glyph}   "), gs)),
                 ];
                 if let Some(r) = managed {
-                    let available = (cell.width as usize).saturating_sub(5);
+                    let available = (cell.width as usize).saturating_sub(2 + cards::MARKER_W);
                     let badge = cards::repository_badge(r, ctx.ws.config.ui.icons);
                     let badge_w = badge
                         .as_deref()

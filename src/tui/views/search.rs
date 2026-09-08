@@ -212,23 +212,12 @@ impl SearchView {
             && let Some(marker) = line.spans.first_mut()
         {
             if self.multi {
-                *marker = Span::styled(
-                    if self.checked.contains(&r.key) {
-                        "[✓]"
-                    } else {
-                        "[ ]"
-                    },
-                    if self.checked.contains(&r.key) {
-                        ctx.theme.accent()
-                    } else {
-                        ctx.theme.dim()
-                    },
-                );
+                *marker = cards::checkbox_marker(self.checked.contains(&r.key), ctx.theme);
                 if !r.status.is_healthy() {
                     marker.style = ctx.theme.warn();
                 }
             } else if r.status.is_healthy() && self.updates.contains_key(&r.key) {
-                *marker = Span::styled("↑  ", ctx.theme.accent());
+                *marker = Span::styled("↑   ", ctx.theme.accent());
             }
         }
         if self.multi
@@ -236,7 +225,7 @@ impl SearchView {
             && let Some(line) = lines.first_mut()
         {
             let warning = format!(" ! {}", r.status.label());
-            let available = line.width().saturating_sub(3);
+            let available = line.width().saturating_sub(cards::MARKER_W);
             if available > width(&warning) + 8 {
                 let name = pad(cards::display_name(r), available - width(&warning));
                 line.spans.truncate(1);
@@ -731,14 +720,7 @@ impl SearchView {
                     // Compact rows reserve two columns for focus, then the marker.
                     line.spans.splice(
                         1..2,
-                        [Span::styled(
-                            if self.checked.contains(&r.key) {
-                                "[✓]"
-                            } else {
-                                "[ ]"
-                            },
-                            th.accent(),
-                        )],
+                        [cards::checkbox_marker(self.checked.contains(&r.key), th)],
                     );
                 }
                 f.render_widget(Paragraph::new(lines).style(style), cell);
@@ -1156,7 +1138,7 @@ impl View for SearchView {
                         } else {
                             (cell.x + 2, cell.y)
                         };
-                        m.row == y && m.column >= x && m.column < x + 3
+                        m.row == y && m.column >= x && m.column < x + cards::MARKER_W as u16
                     });
                     if self.multi || marker {
                         if !double {
@@ -1372,7 +1354,7 @@ fn row_lines<'a>(
 ) -> Vec<Line<'a>> {
     let th = ctx.theme;
     let badge = cards::repository_badge(r, ctx.ws.config.ui.icons);
-    let content_w = inner_w.saturating_sub(5);
+    let content_w = inner_w.saturating_sub(2 + cards::MARKER_W);
     let badge_w = badge
         .as_deref()
         .map(|text| width(text).min(content_w / 2))
@@ -1565,8 +1547,27 @@ mod tests {
         let mut lines = skill_card(record, &ctx, 40, None, "", &[]);
         let before = lines[0].to_string();
         view.decorate(&mut lines, record, &ctx);
-        assert!(lines[0].to_string().starts_with("[✓]printer"));
+        assert!(lines[0].to_string().starts_with("[✓] printer"));
         assert_eq!(lines[0].width(), width(&before));
+        assert_eq!(
+            width(&before[..before.find("printer").unwrap()]),
+            cards::MARKER_W
+        );
+        let hit = view.hits.first().unwrap();
+        let compact = row_lines(record, hit, &ctx, 60, false, true);
+        let mut checked_compact = compact[0].clone();
+        checked_compact.spans[1] = cards::checkbox_marker(true, ctx.theme);
+        let normal = compact[0].to_string();
+        let selected = checked_compact.to_string();
+        assert!(selected.starts_with("▸ [✓] printer"));
+        assert_eq!(
+            width(&normal[..normal.find("printer").unwrap()]),
+            2 + cards::MARKER_W
+        );
+        assert_eq!(
+            width(&selected[..selected.find("printer").unwrap()]),
+            2 + cards::MARKER_W
+        );
         view.handle_key(key(KeyCode::Esc), &ctx);
         assert_eq!(view.hits.len(), 3);
         view.batch_finished(&["printer".into()]);

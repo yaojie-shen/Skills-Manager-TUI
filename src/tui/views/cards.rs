@@ -20,6 +20,8 @@ use skills::reconcile::SkillRecord;
 pub const MIN_CARD_W: u16 = 40;
 /// Four content lines: identity, two description lines, and source with tags.
 pub const CARD_H: u16 = 6;
+/// Status and selection share a slot, including a separator before the name.
+pub const MARKER_W: usize = 4;
 
 /// Separator retained for non-skill cards such as presets and agent entries.
 pub fn rule(inner_w: usize, th: &Theme) -> Line<'static> {
@@ -144,16 +146,24 @@ pub fn repository_badge(r: &SkillRecord, icons: skills::config::Icons) -> Option
     }
 }
 
+/// The checkbox preserves the status slot and separates it from the name.
+pub fn checkbox_marker(checked: bool, th: &Theme) -> Span<'static> {
+    Span::styled(
+        if checked { "[✓] " } else { "[ ] " },
+        if checked { th.accent() } else { th.dim() },
+    )
+}
+
 /// A fixed-width leading slot, replaced by a checkbox in selection mode.
 pub fn health_marker(r: &SkillRecord, th: &Theme) -> Span<'static> {
     use skills::reconcile::SkillStatus::*;
     let (glyph, style) = match &r.status {
-        Managed { no_baseline: false } => ("●  ", th.ok()),
-        Managed { no_baseline: true } => ("●  ", th.warn()),
-        Unmanaged => ("○  ", th.dim()),
-        Modified => ("~  ", th.warn()),
-        Missing | Invalid { .. } | CorruptMeta { .. } => ("!  ", th.err()),
-        Renamed { .. } => ("!  ", th.warn()),
+        Managed { no_baseline: false } => ("●   ", th.ok()),
+        Managed { no_baseline: true } => ("●   ", th.warn()),
+        Unmanaged => ("○   ", th.dim()),
+        Modified => ("~   ", th.warn()),
+        Missing | Invalid { .. } | CorruptMeta { .. } => ("!   ", th.err()),
+        Renamed { .. } => ("!   ", th.warn()),
     };
     Span::styled(glyph, style)
 }
@@ -234,11 +244,11 @@ pub fn skill_card(
         format!("{source} · {tail}")
     };
     let mut head = vec![health_marker(r, th)];
-    if inner_w < 3 {
+    if inner_w < MARKER_W {
         head[0].content = fit(&head[0].content, inner_w).into();
     }
     head.extend(highlight_spans(
-        &pad(display_name(r), inner_w.saturating_sub(3)),
+        &pad(display_name(r), inner_w.saturating_sub(MARKER_W)),
         terms,
         th.bold(),
         th,
@@ -327,6 +337,23 @@ mod tests {
             theme: &theme,
         };
         let mut record = snap.get(key).unwrap().clone();
+        for status in [
+            skills::reconcile::SkillStatus::Managed { no_baseline: false },
+            skills::reconcile::SkillStatus::Unmanaged,
+            skills::reconcile::SkillStatus::Modified,
+            skills::reconcile::SkillStatus::Missing,
+        ] {
+            let mut marker_record = record.clone();
+            marker_record.status = status;
+            let marker = health_marker(&marker_record, &theme);
+            assert_eq!(marker.width(), MARKER_W);
+            assert!(marker.content.ends_with(' '));
+        }
+        for checked in [false, true] {
+            let marker = checkbox_marker(checked, &theme);
+            assert_eq!(marker.width(), MARKER_W);
+            assert!(marker.content.ends_with("] "));
+        }
         let lines = skill_card(&record, &ctx, 60, None, "name", &[]);
         assert!(lines[0].to_string().contains("mock-calendar"));
         assert!(!lines[0].to_string().contains("skills--"));
