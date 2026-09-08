@@ -7,7 +7,69 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+/// Assign predictable directory names without changing an explicit user alias.
+/// Sorted paths claim their basename first; later collisions use the full path,
+/// then numeric suffixes. Reserve overrides before allocating any defaults.
+pub fn resolve_local_names(
+    paths: &[String],
+    overrides: &BTreeMap<String, String>,
+    occupied: &BTreeSet<String>,
+    root_name: &str,
+) -> Result<BTreeMap<String, String>> {
+    let sorted: BTreeSet<_> = paths.iter().collect();
+    if sorted.len() != paths.len() {
+        bail!("duplicate skill selection")
+    }
+    let mut used = occupied.clone();
+    let mut result = BTreeMap::new();
+    for path in &sorted {
+        validate_subpath(path)?;
+        if let Some(name) = overrides.get(*path) {
+            if !valid_skill_key(name) {
+                bail!("invalid local skill name for {path:?}: {name:?}")
+            }
+            if !used.insert(name.clone()) {
+                bail!(
+                    "local skill name {name:?} for {path:?} is already occupied; choose another name"
+                )
+            }
+            result.insert((*path).clone(), name.clone());
+        }
+    }
+    for path in sorted {
+        if result.contains_key(path) {
+            continue;
+        }
+        let base = if path.is_empty() {
+            root_name
+        } else {
+            path.rsplit('/').next().unwrap()
+        };
+        if !valid_skill_key(base) {
+            bail!("invalid default local skill name for {path:?}: {base:?}; choose a local name")
+        }
+        let mut name = base.to_string();
+        if used.contains(&name) {
+            let fallback = if path.is_empty() {
+                root_name.to_string()
+            } else {
+                path.replace('/', "--")
+            };
+            name = fallback.clone();
+            let mut suffix = 2;
+            while used.contains(&name) {
+                name = format!("{fallback}--{suffix}");
+                suffix += 1;
+            }
+        }
+        used.insert(name.clone());
+        result.insert(path.clone(), name);
+    }
+    Ok(result)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Repository {
@@ -80,6 +142,20 @@ impl Repository {
             toml::to_string_pretty(self)?.as_bytes(),
         )
     }
+}
+
+/// User-facing repository identity, independent of the chosen storage alias.
+pub fn source_name(url: &str) -> Option<String> {
+    if url.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let url = url.trim_end_matches('/').trim_end_matches(".git");
+    let parts: Vec<_> = url
+        .rsplit(['/', ':'])
+        .filter(|s| !s.is_empty())
+        .take(2)
+        .collect();
+    (parts.len() == 2).then(|| format!("{}/{}", parts[1], parts[0]))
 }
 
 pub fn default_alias(url: &str) -> String {
@@ -239,9 +315,34 @@ impl FetchedRepository {
                 .unwrap_or("skill")
                 .to_string()
         } else {
-            path.replace('/', "--")
+            path.rsplit('/').next().unwrap_or(path).to_string()
         }
     }
+
+    /// Preview the same collision resolution used when publishing the install.
+    pub fn resolved_names(
+        &self,
+        ws: &Workspace,
+        paths: &[String],
+        overrides: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>> {
+        self.repository.validate(ws)?;
+        let prefix = format!("repos/{}/", self.repository.alias);
+        let mut occupied: BTreeSet<String> = ws
+            .meta
+            .list_keys()?
+            .into_iter()
+            .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
+            .collect();
+        let dir = ws.root.join("repos").join(&self.repository.alias);
+        if dir.is_dir() {
+            for entry in std::fs::read_dir(dir)? {
+                occupied.insert(entry?.file_name().to_string_lossy().into_owned());
+            }
+        }
+        resolve_local_names(paths, overrides, &occupied, &self.local_name(""))
+    }
+
     pub fn install(
         &self,
         ws: &Workspace,
@@ -262,18 +363,23 @@ impl FetchedRepository {
         if paths.is_empty() {
             bail!("select at least one skill")
         }
-        self.repository.validate(ws)?;
+        let names = self.resolved_names(ws, paths, names)?;
+        let existing = ws.scan()?;
         let mut keys = Vec::new();
         for path in paths {
             validate_subpath(path)?;
             if !self.choices.contains(path) {
                 bail!("skill path was not discovered: {path}")
             }
-            let name = names
-                .get(path)
-                .cloned()
-                .unwrap_or_else(|| self.local_name(path));
-            if !valid_skill_key(&name) {
+            if existing.skills.iter().any(|r| {
+                crate::repository::alias_of(&r.key) == Some(self.repository.alias.as_str())
+                    && matches!(&r.source, Some(Source::Git { url, subpath, .. })
+                        if url == &self.repository.url && subpath.as_deref().unwrap_or("") == path)
+            }) {
+                bail!("skill at {path:?} is already installed in this repository")
+            }
+            let name = names.get(path).expect("resolved selected path");
+            if !valid_skill_key(name) {
                 bail!("invalid local skill name: {name:?}")
             }
             let key = format!("repos/{}/{}", self.repository.alias, name);
@@ -313,7 +419,6 @@ impl FetchedRepository {
             }
         }
         // Check all name collisions before placing anything.
-        let existing = ws.scan()?;
         let mut names: std::collections::BTreeSet<String> = existing
             .skills
             .iter()

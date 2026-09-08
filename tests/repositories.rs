@@ -110,7 +110,7 @@ fn repositories_preserve_sources_and_aliases_through_update_deployment_and_undo(
         keys,
         [
             "repos/sample--tools/frontend--review",
-            "repos/sample--tools/backend--review"
+            "repos/sample--tools/review"
         ]
     );
     let snap = f.ws.scan().unwrap();
@@ -176,7 +176,7 @@ fn repositories_preserve_sources_and_aliases_through_update_deployment_and_undo(
 }
 
 #[test]
-fn nested_choices_and_flattened_collisions_are_rejected_before_installing() {
+fn nested_choices_are_rejected_and_basename_installs_keep_nested_contents() {
     let f = Fixture::new();
     for path in [
         "tools",
@@ -198,11 +198,6 @@ fn nested_choices_and_flattened_collisions_are_rejected_before_installing() {
                 &["tools".into(), "tools/reader/formatter".into()],
                 &BTreeMap::new()
             )
-            .is_err()
-    );
-    assert!(
-        fetched
-            .install(&f.ws, &["a/b".into(), "a--b".into()], &BTreeMap::new())
             .is_err()
     );
     assert!(!f.ws.root.join("repos").exists());
@@ -354,11 +349,7 @@ fn repository_work_reports_clone_scan_and_install_stages() {
         .unwrap();
     assert!(messages.iter().any(|s| s.starts_with("Copy: 1/1")));
     assert!(messages.iter().any(|s| s.starts_with("Save: 1/1")));
-    assert!(
-        f.ws.root
-            .join("repos/progress/tools--printer/SKILL.md")
-            .is_file()
-    );
+    assert!(f.ws.root.join("repos/progress/printer/SKILL.md").is_file());
     fetched.cleanup();
     assert!(!fetched.workdir.exists());
 }
@@ -414,11 +405,109 @@ fn invalid_skill_fixtures_are_reported_with_paths_before_installation() {
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         result["installed"],
-        serde_json::json!(["repos/cli-valid/skills--good"])
+        serde_json::json!(["repos/cli-valid/good"])
     );
 
     fetched
         .install(&f.ws, &["skills/good".into()], &BTreeMap::new())
         .unwrap();
+    fetched.cleanup();
+}
+
+#[test]
+fn local_names_resolve_basename_collisions_deterministically() {
+    use skills::repository::resolve_local_names;
+    use std::collections::BTreeSet;
+    let paths = vec!["z/review".into(), "a/review".into(), "solo/printer".into()];
+    let names = resolve_local_names(&paths, &BTreeMap::new(), &BTreeSet::new(), "root").unwrap();
+    assert_eq!(names["a/review"], "review");
+    assert_eq!(names["z/review"], "z--review");
+    assert_eq!(names["solo/printer"], "printer");
+    let reversed: Vec<_> = paths.iter().rev().cloned().collect();
+    assert_eq!(
+        names,
+        resolve_local_names(&reversed, &BTreeMap::new(), &BTreeSet::new(), "root").unwrap()
+    );
+    let occupied = BTreeSet::from(["review".into(), "a--review".into(), "a--review--2".into()]);
+    let names = resolve_local_names(&paths, &BTreeMap::new(), &occupied, "root").unwrap();
+    assert_eq!(names["a/review"], "a--review--3");
+    assert_eq!(names["z/review"], "z--review");
+    let roots = resolve_local_names(
+        &["".into()],
+        &BTreeMap::new(),
+        &BTreeSet::from(["root".into()]),
+        "root",
+    )
+    .unwrap();
+    assert_eq!(roots[""], "root--2");
+}
+
+#[test]
+fn explicit_local_names_are_reserved_and_never_silently_changed() {
+    use skills::repository::resolve_local_names;
+    use std::collections::BTreeSet;
+    let paths = vec!["a/review".into(), "z/custom".into()];
+    let overrides = BTreeMap::from([
+        ("z/custom".into(), "review".into()),
+        ("not-selected".into(), "../ignored".into()),
+    ]);
+    let names = resolve_local_names(&paths, &overrides, &BTreeSet::new(), "root").unwrap();
+    assert_eq!(names["z/custom"], "review");
+    assert_eq!(names["a/review"], "a--review");
+    assert!(
+        resolve_local_names(
+            &paths,
+            &overrides,
+            &BTreeSet::from(["review".into()]),
+            "root"
+        )
+        .is_err()
+    );
+    let duplicate = BTreeMap::from([
+        ("a/review".into(), "chosen".into()),
+        ("z/custom".into(), "chosen".into()),
+    ]);
+    assert!(resolve_local_names(&paths, &duplicate, &BTreeSet::new(), "root").is_err());
+    let invalid = BTreeMap::from([("a/review".into(), "../escape".into())]);
+    assert!(resolve_local_names(&paths, &invalid, &BTreeSet::new(), "root").is_err());
+}
+
+#[test]
+fn later_installs_reserve_existing_files_symlinks_and_metadata_names() {
+    let f = Fixture::new();
+    for path in ["a/review", "b/review", "c/review"] {
+        f.put(path, "review", "body");
+    }
+    f.commit();
+    let fetched = f.fetch("reserved");
+    let first = fetched
+        .install(&f.ws, &["a/review".into()], &BTreeMap::new())
+        .unwrap();
+    assert_eq!(first, ["repos/reserved/review"]);
+    let root = f.ws.root.join("repos/reserved");
+    std::fs::write(root.join("b--review"), "keep this file").unwrap();
+    std::os::unix::fs::symlink(root.join("missing"), root.join("b--review--2")).unwrap();
+    f.ws.meta
+        .save("repos/reserved/b--review--3", &Default::default())
+        .unwrap();
+    let paths = vec!["b/review".into()];
+    let names = fetched
+        .resolved_names(&f.ws, &paths, &BTreeMap::new())
+        .unwrap();
+    assert_eq!(names["b/review"], "b--review--4");
+    let second = fetched.install(&f.ws, &paths, &BTreeMap::new()).unwrap();
+    assert_eq!(second, ["repos/reserved/b--review--4"]);
+    assert_eq!(
+        std::fs::read_to_string(root.join("b--review")).unwrap(),
+        "keep this file"
+    );
+    assert!(root.join("b--review--2").is_symlink());
+    assert!(f.ws.skill_path(&first[0]).join("SKILL.md").is_file());
+    let collision = BTreeMap::from([("c/review".into(), "review".into())]);
+    assert!(
+        fetched
+            .install(&f.ws, &["c/review".into()], &collision)
+            .is_err()
+    );
     fetched.cleanup();
 }

@@ -97,7 +97,11 @@ impl Query {
             && !self
                 .repositories
                 .iter()
-                .any(|a| crate::repository::alias_of(&r.key) == Some(a.as_str()))
+                .any(|a| {
+                    crate::repository::alias_of(&r.key) == Some(a.as_str())
+                        || matches!(&r.source, Some(crate::meta::Source::Git { url, .. })
+                            if crate::repository::source_name(url).is_some_and(|name| name.eq_ignore_ascii_case(a)))
+                })
         {
             return false;
         }
@@ -866,6 +870,28 @@ mod tests {
             deploy: BTreeMap::new(),
             meta: None,
         }
+    }
+
+    #[test]
+    fn repository_filter_uses_source_identity_not_storage_alias() {
+        let mut r = rec("repos/custom-label/skills--approval", "", "", &[]);
+        for url in [
+            "https://github.com/sampleorg/kit.git",
+            "git@github.com:sampleorg/kit.git",
+            "ssh://git@github.com/sampleorg/kit",
+        ] {
+            r.source = Some(crate::meta::Source::Git {
+                url: url.into(),
+                branch: None,
+                subpath: None,
+                revision: None,
+            });
+            assert!(Query::parse("repo:sampleorg/kit").filter(&r));
+            assert!(Query::parse("repo:custom-label").filter(&r));
+            assert!(!Query::parse("repo:other/cli").filter(&r));
+        }
+        r.key = "old-flat-install".into();
+        assert!(Query::parse("repo:sampleorg/kit").filter(&r));
     }
 
     /// One technical table at full weight, for tests that only need a mapping.
