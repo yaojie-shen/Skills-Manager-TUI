@@ -14,8 +14,11 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        static NEXT_FIXTURE: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let id = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "skills-repositories-{}-{}",
+            "skills-repositories-{}-{}-{id}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
