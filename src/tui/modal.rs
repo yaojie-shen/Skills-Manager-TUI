@@ -28,11 +28,16 @@ pub struct PickItem {
 }
 
 pub enum PickAction {
+    BrowseRepositories,
     /// Toggle skills in and out of a preset. Each toggle writes at once, so the
     /// list doubles as the preset's membership.
-    PresetMembers { preset: String },
+    PresetMembers {
+        preset: String,
+    },
     /// Pick one skill inside a fetched reference and install it.
-    InstallFrom { reference: String },
+    InstallFrom {
+        reference: String,
+    },
 }
 
 impl PickAction {
@@ -54,6 +59,12 @@ pub enum InputKind {
 }
 
 pub enum Modal {
+    NameConflict {
+        title: String,
+        actions: Vec<deploy::Action>,
+        rect: Rect,
+    },
+    Repository(Box<super::repository_picker::RepositoryPicker>),
     Help {
         scroll: u16,
     },
@@ -265,7 +276,7 @@ impl Modal {
     pub fn rename(skill: &str) -> Self {
         Modal::Input {
             title: format!(" rename {skill} "),
-            input: Input::with_value(skill),
+            input: Input::with_value(skill.rsplit('/').next().unwrap_or(skill)),
             kind: InputKind::Rename {
                 skill: skill.into(),
             },
@@ -488,6 +499,35 @@ impl Modal {
         )
     }
 
+    pub fn repositories(ctx: &Ctx) -> Self {
+        match skills::repository::Repository::list(&ctx.ws.root) {
+            Ok(repositories) => Self::picker(
+                " repositories ".into(),
+                repositories
+                    .into_iter()
+                    .map(|r| {
+                        let count = ctx
+                            .snap
+                            .skills
+                            .iter()
+                            .filter(|s| {
+                                skills::repository::alias_of(&s.key) == Some(r.alias.as_str())
+                            })
+                            .count();
+                        PickItem {
+                            id: r.alias.clone(),
+                            label: r.alias,
+                            sub: format!("{count} skills · {} · {}", r.branch, r.url),
+                        }
+                    })
+                    .collect(),
+                Default::default(),
+                PickAction::BrowseRepositories,
+            ),
+            Err(e) => Self::message("repositories", vec![format!("{e:#}")]),
+        }
+    }
+
     fn picker(
         title: String,
         items: Vec<PickItem>,
@@ -582,11 +622,33 @@ impl Modal {
 
     pub fn hints(&self) -> Hints {
         match self {
+            Modal::NameConflict { .. } => &[("c", "coexist"), ("r", "replace"), ("Esc", "cancel")],
+            Modal::Repository(p) => p.hints(),
             Modal::Help { .. } | Modal::Message { .. } => &[("Esc", "close")],
             Modal::Confirm { .. } | Modal::ConfirmWrite { .. } => {
                 &[("Enter/y", "apply"), ("Esc/n", "cancel"), ("←→", "buttons")]
             }
             Modal::Input { .. } => &[("Enter", "save"), ("Esc", "cancel")],
+            Modal::Picker {
+                action: PickAction::BrowseRepositories,
+                input_focus: true,
+                ..
+            } => &[
+                ("type", "filter"),
+                ("↓", "list"),
+                ("Enter", "browse"),
+                ("Esc", "close"),
+            ],
+            Modal::Picker {
+                action: PickAction::BrowseRepositories,
+                ..
+            } => &[
+                ("Enter", "browse"),
+                ("u", "check repo"),
+                ("U", "update repo"),
+                ("/", "filter"),
+                ("Esc", "close"),
+            ],
             Modal::Picker {
                 action,
                 input_focus: true,
@@ -619,6 +681,22 @@ impl Modal {
     pub fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match self {
+            Modal::NameConflict { title, actions, .. } => match k.code {
+                KeyCode::Esc => vec![Action::CloseModal],
+                KeyCode::Char(c @ ('c' | 'r')) => match deploy::resolve_names(
+                    ctx.snap,
+                    actions,
+                    Some(if c == 'c' { "coexist" } else { "replace" }),
+                ) {
+                    Ok(plan) => vec![Action::OpenModal(Box::new(Modal::confirm(
+                        title.clone(),
+                        plan,
+                    )))],
+                    Err(e) => vec![Action::Error(format!("{e:#}"))],
+                },
+                _ => vec![],
+            },
+            Modal::Repository(p) => p.key(k, ctx),
             Modal::Help { scroll } | Modal::Message { scroll, .. } => match k.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     *scroll = scroll.saturating_add(1);
@@ -744,6 +822,47 @@ impl Modal {
                 ..
             } => {
                 let multi = action.multi();
+                let browse = matches!(action, PickAction::BrowseRepositories);
+                if browse {
+                    if k.code == KeyCode::Down {
+                        *input_focus = false;
+                    }
+                    if k.code == KeyCode::Char('/') && !*input_focus {
+                        *input_focus = true;
+                        return vec![];
+                    }
+                    if (k.code == KeyCode::Enter
+                        || (!*input_focus && matches!(k.code, KeyCode::Char('u' | 'U'))))
+                        && let Some(i) = list.selected().and_then(|i| shown.get(i)).copied()
+                    {
+                        let alias = &items[i].id;
+                        if k.code == KeyCode::Enter {
+                            return vec![
+                                Action::CloseModal,
+                                Action::Search {
+                                    query: format!("repo:{alias}"),
+                                    focus_list: true,
+                                },
+                            ];
+                        }
+                        let keys: Vec<_> = ctx
+                            .snap
+                            .skills
+                            .iter()
+                            .filter(|s| {
+                                skills::repository::alias_of(&s.key) == Some(alias.as_str())
+                            })
+                            .map(|s| s.key.clone())
+                            .collect();
+                        return if k.code == KeyCode::Char('u') {
+                            vec![Action::Spawn(crate::tui::event::Task::Check(keys))]
+                        } else {
+                            keys.into_iter()
+                                .map(|key| Action::Spawn(crate::tui::event::Task::Prepare(key)))
+                                .collect()
+                        };
+                    }
+                }
                 match k.code {
                     KeyCode::Esc => return vec![Action::CloseModal],
                     KeyCode::Tab if multi => *input_focus = !*input_focus,
@@ -780,7 +899,6 @@ impl Modal {
                         {
                             return vec![
                                 Action::CloseModal,
-                                Action::Toast(format!("fetching {}…", items[i].label)),
                                 Action::Spawn(crate::tui::event::Task::Install {
                                     reference: reference.clone(),
                                     subpath: Some(items[i].id.clone()),
@@ -789,7 +907,7 @@ impl Modal {
                         }
                     }
                     _ => {
-                        if (!multi || *input_focus) && input.handle_key(k) {
+                        if ((!multi && !browse) || *input_focus) && input.handle_key(k) {
                             refilter(input.value(), items, shown);
                             list.clamp(shown.len());
                         }
@@ -891,6 +1009,26 @@ impl Modal {
         };
         let click = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
         match self {
+            Modal::NameConflict { rect, .. } => {
+                if click {
+                    if !rect.contains(at) {
+                        return vec![Action::CloseModal];
+                    }
+                    if m.row == rect.bottom().saturating_sub(2) {
+                        let code = if m.column < rect.x + rect.width / 2 {
+                            'c'
+                        } else {
+                            'r'
+                        };
+                        return self.handle_key(
+                            KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE),
+                            ctx,
+                        );
+                    }
+                }
+                vec![]
+            }
+            Modal::Repository(p) => p.mouse(m, ctx),
             Modal::Help { scroll } | Modal::Message { scroll, .. } => {
                 if let Some(d) = wheel {
                     *scroll = (*scroll as i32 + d).max(0) as u16;
@@ -991,6 +1129,15 @@ impl Modal {
                         && let Some(i) = shown.get(row).copied()
                     {
                         *input_focus = false;
+                        if double && matches!(action, PickAction::BrowseRepositories) {
+                            return vec![
+                                Action::CloseModal,
+                                Action::Search {
+                                    query: format!("repo:{}", items[i].id),
+                                    focus_list: true,
+                                },
+                            ];
+                        }
                         if action.multi() {
                             let on = !chosen.contains(&i);
                             if on {
@@ -1003,7 +1150,6 @@ impl Modal {
                         if double && let PickAction::InstallFrom { reference } = action {
                             return vec![
                                 Action::CloseModal,
-                                Action::Toast(format!("fetching {}…", items[i].label)),
                                 Action::Spawn(crate::tui::event::Task::Install {
                                     reference: reference.clone(),
                                     subpath: Some(items[i].id.clone()),
@@ -1056,6 +1202,63 @@ impl Modal {
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let th = ctx.theme;
         match self {
+            Modal::NameConflict {
+                title,
+                actions,
+                rect,
+            } => {
+                let conflicts = deploy::name_conflicts(ctx.snap, actions);
+                let mut lines = vec![
+                    Line::from("Different folders contain skills with the same frontmatter name."),
+                    Line::from("SKILL.md stays unchanged. Agent selection may be ambiguous."),
+                    Line::from(""),
+                ];
+                lines.extend(conflicts.iter().map(|c| {
+                    Line::from(format!(
+                        "{}: {} ↔ {} ({})",
+                        c.agent,
+                        c.skill,
+                        c.other_path.display(),
+                        c.name
+                    ))
+                }));
+                let r = centered(
+                    area,
+                    100,
+                    (lines.len() as u16 + 5).min(area.height.saturating_sub(2)),
+                );
+                *rect = r;
+                f.render_widget(Clear, r);
+                let block = th.block(format!(" name conflict · {title} "), true);
+                let inner = block.inner(r);
+                f.render_widget(block, r);
+                f.render_widget(
+                    Paragraph::new(lines).wrap(Wrap { trim: false }),
+                    Rect {
+                        height: inner.height.saturating_sub(2),
+                        ..inner
+                    },
+                );
+                f.render_widget(
+                    Paragraph::new("[c] Coexist"),
+                    Rect::new(
+                        inner.x,
+                        inner.bottom().saturating_sub(1),
+                        inner.width / 2,
+                        1,
+                    ),
+                );
+                f.render_widget(
+                    Paragraph::new("[r] Replace managed links"),
+                    Rect::new(
+                        inner.x + inner.width / 2,
+                        inner.bottom().saturating_sub(1),
+                        inner.width - inner.width / 2,
+                        1,
+                    ),
+                );
+            }
+            Modal::Repository(p) => p.draw(f, area, ctx),
             Modal::Help { scroll } => {
                 let lines: Vec<Line> = HELP.lines().map(|l| help_line(l, th)).collect();
                 let r = centered(area, 78, lines.len() as u16 + 2);
@@ -1531,13 +1734,24 @@ fn toggle_agent(ctx: &Ctx, skill: &str, idx: usize) -> Vec<Action> {
 fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
     match kind {
         InputKind::Rename { skill } => {
-            let new = value.trim().to_string();
+            let name = value.trim();
+            if name.is_empty() {
+                return vec![];
+            }
+            if !skills::util::valid_skill_key(name) {
+                return vec![Action::Error(format!("invalid local name: {name:?}"))];
+            }
+            let new = if skill.starts_with("repos/") {
+                format!("{}/{}", skill.rsplit_once('/').unwrap().0, name)
+            } else {
+                name.to_string()
+            };
             if new.is_empty() || new == *skill {
                 return vec![];
             }
             // Refused here rather than after the confirmation, which would
             // otherwise list moves that are never going to happen.
-            if !skills::util::valid_skill_key(&new) {
+            if !skills::repository::valid_id(&new) {
                 return vec![Action::Error(format!("invalid skill name: {new:?}"))];
             }
             vec![Action::OpenModal(Box::new(Modal::confirm_rename(
@@ -1634,13 +1848,18 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
             if reference.is_empty() {
                 return vec![];
             }
-            vec![
-                Action::Toast(format!("fetching {reference}…")),
-                Action::Spawn(crate::tui::event::Task::Install {
+            match install::parse_ref(&reference, None, None) {
+                Ok(install::InstallRef::Local(_)) => {
+                    vec![Action::Spawn(crate::tui::event::Task::Install {
+                        reference,
+                        subpath: None,
+                    })]
+                }
+                Ok(_) => vec![Action::Spawn(crate::tui::event::Task::DiscoverRepository(
                     reference,
-                    subpath: None,
-                }),
-            ]
+                ))],
+                Err(e) => vec![Action::Error(format!("{e:#}"))],
+            }
         }
         InputKind::RenameTag { old } => {
             let old = old.clone();

@@ -148,6 +148,7 @@ pub struct App {
     pub toasts: Toasts,
     pub history: History,
     tasks_running: usize,
+    next_task_id: u64,
     spinner: usize,
     tx: Sender<Msg>,
     external: Option<External>,
@@ -174,6 +175,7 @@ impl App {
             toasts: Toasts::default(),
             history: History::default(),
             tasks_running: 0,
+            next_task_id: 0,
             spinner: 0,
             tx,
             external: None,
@@ -243,7 +245,7 @@ impl App {
     // ---- messages ---------------------------------------------------------
 
     pub fn handle(&mut self, msg: Msg) {
-        let background = matches!(&msg, Msg::Task(_));
+        let background = matches!(&msg, Msg::Task(..));
         let actions = match msg {
             Msg::Tick => {
                 self.spinner = (self.spinner + 1) % SPINNER.len();
@@ -251,7 +253,12 @@ impl App {
                 Vec::new()
             }
             Msg::Resize => Vec::new(),
-            Msg::Task(out) => {
+            Msg::Progress(id, detail) => {
+                self.toasts.progress(id, detail);
+                Vec::new()
+            }
+            Msg::Task(id, out) => {
+                self.toasts.finish(id);
                 self.tasks_running = self.tasks_running.saturating_sub(1);
                 self.on_task(*out)
             }
@@ -289,6 +296,47 @@ impl App {
 
     fn on_task(&mut self, out: TaskOutput) -> Vec<Action> {
         match out {
+            TaskOutput::RepositoryFetched(_, Ok(fetched)) => {
+                let ctx = Ctx {
+                    ws: &self.ws,
+                    snap: &self.snap,
+                    theme: &self.theme,
+                };
+                vec![Action::OpenModal(Box::new(Modal::Repository(Box::new(
+                    super::repository_picker::RepositoryPicker::new(fetched, &ctx),
+                ))))]
+            }
+            TaskOutput::RepositoryFetched(reference, Err(e)) => {
+                vec![Action::Error(format!("discover {reference}: {e:#}"))]
+            }
+            TaskOutput::RepositoryInstalled(selection, result) => match result {
+                Ok(keys) => {
+                    selection.fetched.cleanup();
+                    let mut actions: Vec<Action> = keys
+                        .iter()
+                        .map(|key| Action::Record(history::Intent::Install { skill: key.clone() }))
+                        .collect();
+                    actions.extend([
+                        Action::Rescan,
+                        Action::Toast(format!(
+                            "installed {} skills — d deploys the selected skill",
+                            keys.len()
+                        )),
+                        Action::Search {
+                            query: format!("repo:{}", selection.fetched.repository.alias),
+                            focus_list: true,
+                        },
+                    ]);
+                    actions
+                }
+                Err(e) => vec![
+                    Action::Error(format!("install: {e:#}")),
+                    Action::OpenModal(Box::new(Modal::Repository(Box::new(
+                        super::repository_picker::RepositoryPicker::restore(*selection),
+                    )))),
+                ],
+            },
+
             TaskOutput::Scan(Ok(snap)) => {
                 self.snap = snap;
                 self.on_snapshot();
@@ -373,6 +421,9 @@ impl App {
             (KeyCode::Char('y'), KeyModifiers::CONTROL) => return self.step(Step::Redo),
             (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
                 return vec![Action::Rescan, Action::Toast("rescanning".into())];
+            }
+            (KeyCode::Char('R'), _) if !in_search_input => {
+                return vec![Action::OpenModal(Box::new(Modal::repositories(&ctx)))];
             }
             (KeyCode::F(1), _) => return vec![Action::OpenModal(Box::new(Modal::help()))],
             (KeyCode::Char('?'), _) if !in_search_input => {
@@ -510,6 +561,14 @@ impl App {
                 self.external = Some(External::EditNote { skill, initial });
             }
             Action::ApplyLinks { title, actions } => {
+                if !deploy::name_conflicts(&self.snap, &actions).is_empty() {
+                    self.modal = Some(Modal::NameConflict {
+                        title,
+                        actions,
+                        rect: Rect::default(),
+                    });
+                    return;
+                }
                 if !actions.iter().any(|a| a.is_change()) {
                     let reason = actions.iter().find_map(|a| match a {
                         deploy::Action::Skip { reason, .. } => Some(reason.clone()),
@@ -533,7 +592,15 @@ impl App {
                 self.rescan();
             }
             Action::ConfirmLinks { title, actions } => {
-                self.modal = Some(Modal::confirm(title, actions));
+                self.modal = Some(if deploy::name_conflicts(&self.snap, &actions).is_empty() {
+                    Modal::confirm(title, actions)
+                } else {
+                    Modal::NameConflict {
+                        title,
+                        actions,
+                        rect: Rect::default(),
+                    }
+                });
             }
             Action::Record(intent) => self.history.record(intent),
             Action::Step(Step::Undo) => self.history.commit_undo(),
@@ -638,7 +705,22 @@ impl App {
 
     fn spawn(&mut self, task: Task) {
         self.tasks_running += 1;
-        spawn_task(self.ws.clone(), task, self.tx.clone());
+        self.next_task_id += 1;
+        let id = self.next_task_id;
+        let label = match &task {
+            Task::Scan => None,
+            Task::DiscoverRepository(reference) => Some(format!("Clone {reference}")),
+            Task::InstallRepository(selection) => {
+                Some(format!("Install {}", selection.fetched.repository.alias))
+            }
+            Task::Install { reference, .. } => Some(format!("Install {reference}")),
+            Task::Check(keys) => Some(format!("Check upstream: {} skills", keys.len())),
+            Task::Prepare(key) => Some(format!("Prepare update: {key}")),
+        };
+        if let Some(label) = label {
+            self.toasts.start(id, label);
+        }
+        spawn_task(self.ws.clone(), task, id, self.tx.clone());
     }
 
     pub fn rescan(&mut self) {
@@ -777,13 +859,16 @@ mod matrix_key_tests {
         app.handle(key(KeyCode::Char('/')));
         app.handle(key(KeyCode::Left));
         for reference in ["first", "second"] {
-            app.handle(Msg::Task(Box::new(TaskOutput::Installed(
-                reference.into(),
-                Err(skills::ops::install::NotOneSkill {
-                    choices: vec!["printer".into(), "reader".into()],
-                }
-                .into()),
-            ))));
+            app.handle(Msg::Task(
+                0,
+                Box::new(TaskOutput::Installed(
+                    reference.into(),
+                    Err(skills::ops::install::NotOneSkill {
+                        choices: vec!["printer".into(), "reader".into()],
+                    }
+                    .into()),
+                )),
+            ));
         }
         assert_eq!(app.pending_task_ui.len(), 2);
         app.handle(key(KeyCode::Enter)); // Invalid preset name: keep editing.

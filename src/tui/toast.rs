@@ -2,6 +2,7 @@
 //!
 //! A fixed status marker identifies each result. A thin line below the message
 //! shrinks with its remaining lifetime; errors stay longer than ordinary results.
+//! Active tasks instead show live details and remain until explicitly finished.
 
 use super::app::Level;
 use super::theme::Theme;
@@ -24,6 +25,7 @@ pub struct Toast {
     pub text: String,
     pub level: Level,
     at: Instant,
+    detail: Option<String>,
 }
 
 impl Toast {
@@ -32,6 +34,7 @@ impl Toast {
             text: text.into(),
             level,
             at: Instant::now(),
+            detail: None,
         }
     }
 
@@ -44,10 +47,13 @@ impl Toast {
     }
 
     fn done(&self) -> bool {
-        self.at.elapsed() >= self.lifetime()
+        self.detail.is_none() && self.at.elapsed() >= self.lifetime()
     }
 
     fn marker(&self) -> &'static str {
+        if self.detail.is_some() {
+            return "↻";
+        }
         match self.level {
             Level::Info => "i",
             Level::Ok => "✓",
@@ -66,9 +72,26 @@ impl Toast {
 #[derive(Default)]
 pub struct Toasts {
     items: Vec<Toast>,
+    running: std::collections::BTreeMap<u64, Toast>,
 }
 
 impl Toasts {
+    pub fn start(&mut self, id: u64, text: String) {
+        let mut toast = Toast::new(text, Level::Info);
+        toast.detail = Some("Starting…".into());
+        self.running.insert(id, toast);
+    }
+
+    pub fn progress(&mut self, id: u64, detail: String) {
+        if let Some(toast) = self.running.get_mut(&id) {
+            toast.detail = Some(detail);
+        }
+    }
+
+    pub fn finish(&mut self, id: u64) {
+        self.running.remove(&id);
+    }
+
     pub fn push(&mut self, text: impl Into<String>, level: Level) {
         self.items.push(Toast::new(text, level));
         // Keep the newest; a burst of writes should not bury the last result.
@@ -84,25 +107,41 @@ impl Toasts {
     /// Draw the stack above the footer, hugging the right edge. Returns the
     /// area covered so callers can avoid drawing under it.
     pub fn draw(&self, f: &mut Frame, area: Rect, th: &Theme) -> Option<Rect> {
-        if self.items.is_empty() {
+        if self.items.is_empty() && self.running.is_empty() {
             return None;
         }
-        let max_text = (area.width as usize).saturating_sub(12).min(56);
-        // Keep the newest messages when the terminal cannot fit the whole stack.
-        let visible = self
-            .items
-            .len()
-            .min(area.height.saturating_sub(6) as usize / 2);
-        if visible == 0 {
+        let max_text = (area.width as usize)
+            .saturating_sub(12)
+            .min(if self.running.is_empty() { 56 } else { 100 });
+        // Reserve the last visible slot for active work, even during a burst
+        // of results or when a smaller terminal can only display one message.
+        let capacity = MAX_VISIBLE.min(area.height.saturating_sub(6) as usize / 2);
+        if capacity == 0 {
             return None;
         }
-        let lines: Vec<_> = self.items[self.items.len() - visible..]
+        let active = self.running.last_key_value().map(|(_, t)| Toast {
+            text: if self.running.len() > 1 {
+                format!("{} tasks running · {}", self.running.len(), t.text)
+            } else {
+                t.text.clone()
+            },
+            level: t.level,
+            at: t.at,
+            detail: t.detail.clone(),
+        });
+        let results = capacity
+            .saturating_sub(usize::from(active.is_some()))
+            .min(self.items.len());
+        let lines: Vec<_> = self.items[self.items.len() - results..]
             .iter()
+            .chain(active.as_ref())
             .map(|t| (fit(&t.text, max_text), t))
             .collect();
         let inner_w = lines
             .iter()
-            .map(|(text, ..)| width(text) + 4)
+            .map(|(text, t)| {
+                width(text).max(t.detail.as_ref().map_or(0, |d| width(&fit(d, max_text)))) + 4
+            })
             .max()
             .unwrap_or(10);
         let w = (inner_w + 2) as u16;
@@ -135,7 +174,13 @@ impl Toasts {
                     Line::from(vec![
                         Span::raw(" "),
                         Span::styled(
-                            "━".repeat(toast.bar_width(inner_w.saturating_sub(2))),
+                            toast
+                                .detail
+                                .as_ref()
+                                .map(|d| fit(d, max_text))
+                                .unwrap_or_else(|| {
+                                    "━".repeat(toast.bar_width(inner_w.saturating_sub(2)))
+                                }),
                             style,
                         ),
                     ]),
@@ -162,6 +207,47 @@ impl Toasts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_tasks_survive_expiry_and_results_until_the_matching_completion() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut ts = Toasts::default();
+        ts.start(1, "Clone first".into());
+        ts.start(2, "Clone second".into());
+        ts.progress(2, "Receiving objects: 42%".into());
+        for t in ts.running.values_mut() {
+            t.at = Instant::now() - Duration::from_secs(600);
+        }
+        for i in 0..5 {
+            ts.push(format!("saved {i}"), Level::Ok);
+        }
+        ts.expire();
+        let mut terminal = Terminal::new(TestBackend::new(100, 8)).unwrap();
+        terminal
+            .draw(|f| {
+                ts.draw(f, f.area(), &Theme::default());
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("2 tasks running"));
+        assert!(text.contains("Receiving objects: 42%"));
+        assert!(
+            !text.contains('━'),
+            "active progress must not look like an expiry timer"
+        );
+        ts.finish(2);
+        assert!(ts.running.contains_key(&1));
+        ts.progress(2, "late update".into());
+        assert_eq!(ts.running.len(), 1);
+        ts.finish(1);
+        assert!(ts.running.is_empty());
+    }
 
     #[test]
     fn the_line_shrinks_without_changing_the_status_marker() {

@@ -155,6 +155,19 @@ pub fn skill_card(
     terms: &[String],
 ) -> Vec<Line<'static>> {
     let th = ctx.theme;
+    let repo = skills::repository::alias_of(&r.key);
+    let tail = if tail == "git" {
+        repo.unwrap_or(tail)
+    } else {
+        tail
+    };
+    let tail = fit(tail, inner_w.saturating_sub(4));
+    let tail = tail.as_str();
+    let label = if repo.is_some() {
+        r.key.rsplit('/').next().unwrap_or(&r.key)
+    } else {
+        &r.key
+    };
     let deploy: Vec<Span> = agents
         .iter()
         .flat_map(|a| {
@@ -168,7 +181,7 @@ pub fn skill_card(
     let deploy_w: usize = deploy.iter().map(|s| width(&s.content)).sum();
     let name_w = inner_w.saturating_sub(deploy_w + 3);
     let mut head = vec![status_glyph(&r.status, th), Span::raw(" ")];
-    head.extend(highlight_spans(&pad(&r.key, name_w), terms, th.bold(), th));
+    head.extend(highlight_spans(&pad(label, name_w), terms, th.bold(), th));
     head.extend(deploy);
 
     let body: Vec<Span> = match body.or(r.description.as_deref()) {

@@ -770,7 +770,12 @@ impl View for AgentsView {
             let on = selected == Some(i);
             if cards {
                 let ci = frame(f, cell, on, self.focus() == Focus::Entries, th);
-                let lines = match ctx.snap.get(row.name) {
+                let lines = match ctx
+                    .snap
+                    .skills
+                    .iter()
+                    .find(|s| s.deployment_name() == row.name)
+                {
                     // A skill the root knows is drawn the way every page draws
                     // it. Being in this grid already says it is linked, so the
                     // tail says where it came from rather than "managed" again.

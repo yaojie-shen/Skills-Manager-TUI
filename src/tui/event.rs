@@ -15,12 +15,15 @@ pub enum Msg {
     Mouse(MouseEvent),
     Resize,
     Tick,
-    Task(Box<TaskOutput>),
+    Task(u64, Box<TaskOutput>),
+    Progress(u64, String),
 }
 
 /// Long-running work executed off the UI thread.
 #[derive(Debug, Clone)]
 pub enum Task {
+    DiscoverRepository(String),
+    InstallRepository(Box<super::repository_picker::InstallSelection>),
     Scan,
     Check(Vec<String>),
     Prepare(String),
@@ -34,6 +37,11 @@ pub enum Task {
 }
 
 pub enum TaskOutput {
+    RepositoryFetched(String, Result<skills::repository::FetchedRepository>),
+    RepositoryInstalled(
+        Box<super::repository_picker::InstallSelection>,
+        Result<Vec<String>>,
+    ),
     Scan(Result<Snapshot>),
     Check(Vec<(String, Result<CheckResult>)>),
     Prepared(String, Result<Prepared>),
@@ -130,31 +138,58 @@ pub fn spawn_ticker(tx: Sender<Msg>) {
         .expect("spawn ticker thread");
 }
 
-pub fn spawn_task(ws: Workspace, task: Task, tx: Sender<Msg>) {
+pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
     std::thread::Builder::new()
         .name("task".into())
         .spawn(move || {
+            let mut progress = |text: &str| {
+                let _ = tx.send(Msg::Progress(id, text.into()));
+            };
             let out = match task {
+                Task::DiscoverRepository(reference) => {
+                    let result =
+                        skills::ops::install::parse_ref(&reference, None, None).and_then(|r| {
+                            skills::repository::FetchedRepository::fetch_with_progress(
+                                &ws,
+                                &r,
+                                None,
+                                &mut progress,
+                            )
+                        });
+                    TaskOutput::RepositoryFetched(reference, result)
+                }
+                Task::InstallRepository(selection) => {
+                    let result = selection.fetched.install_with_progress(
+                        &ws,
+                        &selection.paths,
+                        &selection.names,
+                        &mut progress,
+                    );
+                    TaskOutput::RepositoryInstalled(selection, result)
+                }
                 Task::Scan => TaskOutput::Scan(ws.scan()),
                 Task::Check(keys) => TaskOutput::Check(
                     keys.into_iter()
                         .map(|k| {
+                            progress(&format!("Check: querying upstream for {k}…"));
                             let r = update::check(&ws, &k);
                             (k, r)
                         })
                         .collect(),
                 ),
                 Task::Install { reference, subpath } => {
+                    progress("Install: preparing source files…");
                     let out = skills::ops::install::parse_ref(&reference, None, subpath.as_deref())
                         .and_then(|r| skills::ops::install::install(&ws, &r, None));
                     TaskOutput::Installed(reference, out)
                 }
                 Task::Prepare(key) => {
+                    progress("Update: inspecting local files and fetching upstream…");
                     let r = ws.scan().and_then(|snap| update::prepare(&ws, &snap, &key));
                     TaskOutput::Prepared(key, r)
                 }
             };
-            let _ = tx.send(Msg::Task(Box::new(out)));
+            let _ = tx.send(Msg::Task(id, Box::new(out)));
         })
         .expect("spawn task thread");
 }

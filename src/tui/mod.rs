@@ -8,6 +8,7 @@
 mod app;
 mod event;
 mod modal;
+mod repository_picker;
 mod theme;
 mod toast;
 mod views;

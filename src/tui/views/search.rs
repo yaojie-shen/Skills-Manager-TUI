@@ -796,6 +796,7 @@ impl View for SearchView {
                 ("x", "remove"),
                 ("Enter", "preview"),
                 ("i", "install"),
+                ("R", "repos"),
                 ("v/V", "layout"),
             ],
             Focus::Preview => &[
