@@ -278,18 +278,7 @@ fn default_true() -> bool {
 }
 
 pub fn default_agents() -> Vec<AgentConfig> {
-    vec![
-        AgentConfig {
-            key: "claude".into(),
-            name: "Claude Code".into(),
-            skills_dir: "~/.claude/skills".into(),
-        },
-        AgentConfig {
-            key: "codex".into(),
-            name: "Codex".into(),
-            skills_dir: "~/.codex/skills".into(),
-        },
-    ]
+    crate::agents::defaults(false)
 }
 
 impl Default for Config {
@@ -306,6 +295,56 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn local_default() -> Self {
+        Self {
+            agents: crate::agents::defaults(true),
+            ..Self::default()
+        }
+    }
+
+    /// Append one agent without rewriting comments or activating other built-ins.
+    pub fn add_agent(root: &Path, agent: &AgentConfig, local: bool) -> Result<()> {
+        if !crate::util::valid_skill_key(&agent.key) || agent.skills_dir.trim().is_empty() {
+            anyhow::bail!("agent key and skills directory must be nonempty and valid");
+        }
+        let fallback = if local {
+            Self::local_default()
+        } else {
+            Self::default()
+        };
+        Self::edit_document(root, |doc| {
+            let parsed: Self = toml::from_str(&doc.to_string())?;
+            let existing = if doc.get("agents").is_some() {
+                &parsed.agents
+            } else {
+                &fallback.agents
+            };
+            if existing.iter().any(|a| a.key == agent.key) {
+                anyhow::bail!("agent already configured: {}", agent.key);
+            }
+            if doc.get("agents").is_none() {
+                let mut entries = ArrayOfTables::new();
+                for a in existing {
+                    entries.push(Self::agent_table(a));
+                }
+                doc["agents"] = Item::ArrayOfTables(entries);
+            }
+            doc["agents"]
+                .as_array_of_tables_mut()
+                .context("agents must use [[agents]] tables")?
+                .push(Self::agent_table(agent));
+            Ok(true)
+        })
+    }
+
+    fn agent_table(agent: &AgentConfig) -> Table {
+        let mut table = Table::new();
+        table["key"] = value(&agent.key);
+        table["name"] = value(&agent.name);
+        table["skills_dir"] = value(&agent.skills_dir);
+        table
+    }
+
     pub fn path(root: &Path) -> PathBuf {
         meta_dir(root).join(CONFIG_FILE)
     }

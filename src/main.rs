@@ -12,7 +12,7 @@ fn main() {
     let args = cli::Cli::parse();
     let json = args.json;
     let result = if args.command.is_none() {
-        tui::run(args.root.as_deref())
+        args.workspace(false).and_then(tui::run)
     } else {
         cli::run(args)
     };

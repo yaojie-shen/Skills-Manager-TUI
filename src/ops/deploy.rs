@@ -85,12 +85,17 @@ impl Action {
 
 fn agent_dirs(ws: &Workspace, agents: &[String]) -> Result<Vec<(String, PathBuf)>> {
     let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
     for a in agents {
         let cfg = ws
             .config
             .agent(a)
             .with_context(|| format!("unknown agent: {a}"))?;
-        out.push((cfg.key.clone(), cfg.skills_path()));
+        let path = cfg.skills_path();
+        let identity = std::fs::canonicalize(&path).unwrap_or(path.clone());
+        if seen.insert(identity) {
+            out.push((cfg.key.clone(), path));
+        }
     }
     Ok(out)
 }
@@ -123,7 +128,12 @@ pub fn plan_deploy(
                 AgentDirMode::DirLinked => actions.push(Action::Skip {
                     agent: agent.clone(),
                     skill: skill.clone(),
-                    reason: if skill.starts_with("repos/") { "repository skill requires per-skill links; convert the agent directory first" } else { "agent dir is a whole-directory link to the root; already deployed" }.into(),
+                    reason: if skill.contains('/') {
+                        "repository skill requires a separate per-skill deployment directory"
+                    } else {
+                        "agent reads the skills root directly; already deployed"
+                    }
+                    .into(),
                 }),
                 AgentDirMode::DirForeign { target } => actions.push(Action::Skip {
                     agent: agent.clone(),
@@ -144,7 +154,10 @@ pub fn plan_deploy(
                         target: rec.path.clone(),
                     });
                 }
-                AgentDirMode::Real => match report.entries.get(&crate::repository::default_deploy_name(skill)) {
+                AgentDirMode::Real | AgentDirMode::SharedRoot => match report
+                    .entries
+                    .get(&crate::repository::default_deploy_name(skill))
+                {
                     None => actions.push(Action::Link {
                         agent: agent.clone(),
                         skill: skill.clone(),
@@ -193,13 +206,20 @@ pub fn plan_undeploy(
         let report = snap.agent(&agent).context("agent not scanned")?;
         for skill in skills {
             match &report.mode {
+                AgentDirMode::SharedRoot if !skill.contains('/') => actions.push(Action::Skip {
+                    agent: agent.clone(),
+                    skill: skill.clone(),
+                    reason:
+                        "skill lives in the shared root; use remove to delete it for every reader"
+                            .into(),
+                }),
                 AgentDirMode::DirLinked => actions.push(Action::Skip {
                     agent: agent.clone(),
                     skill: skill.clone(),
                     reason: "agent dir is a whole-directory link; run `agents convert` first"
                         .into(),
                 }),
-                AgentDirMode::Real => match report
+                AgentDirMode::Real | AgentDirMode::SharedRoot => match report
                     .entries
                     .get(&crate::repository::default_deploy_name(skill))
                 {
@@ -270,6 +290,9 @@ fn entries_of<'a>(
 fn repairable(report: &crate::reconcile::AgentReport, agent: &str) -> Option<Action> {
     let reason = match &report.mode {
         AgentDirMode::Real => return None,
+        AgentDirMode::SharedRoot => {
+            "shared root contains source skills; per-agent repair is unavailable".to_string()
+        }
         AgentDirMode::DirLinked => {
             "agent dir is a whole-directory link; run `agents convert` first".to_string()
         }
@@ -386,6 +409,17 @@ pub fn plan_relink(
 /// Desired (skill, agent) pairs from config: all-to-all and/or auto-deployed presets.
 pub fn desired_pairs(ws: &Workspace, snap: &Snapshot) -> Result<BTreeSet<(String, String)>> {
     let mut pairs = BTreeSet::new();
+    let explicit = super::targets::registered_keys(&ws.root)?;
+    for record in snap.skills.iter().filter(|s| s.status.is_present()) {
+        for agent in snap.agents.iter().filter(|a| explicit.contains(&a.key)) {
+            if matches!(
+                agent.entries.get(&record.deployment_name()),
+                Some(EntryState::Deployed | EntryState::Broken { .. })
+            ) {
+                pairs.insert((record.key.clone(), agent.key.clone()));
+            }
+        }
+    }
     let agents = ws.config.agent_keys();
     let present: Vec<&str> = snap
         .skills
@@ -396,6 +430,9 @@ pub fn desired_pairs(ws: &Workspace, snap: &Snapshot) -> Result<BTreeSet<(String
     if ws.config.deploy.all_to_all {
         for s in &present {
             for a in &agents {
+                if explicit.contains(a) {
+                    continue;
+                }
                 pairs.insert((s.to_string(), a.clone()));
             }
         }
@@ -426,12 +463,27 @@ pub fn desired_pairs(ws: &Workspace, snap: &Snapshot) -> Result<BTreeSet<(String
 pub fn plan_sync(ws: &Workspace, snap: &Snapshot) -> Result<Vec<Action>> {
     let desired = desired_pairs(ws, snap)?;
     let mut actions = Vec::new();
+    let mut seen = BTreeSet::new();
     for a in &ws.config.agents {
         let report = snap.agent(&a.key).context("agent not scanned")?;
         let dir = a.skills_path();
-        let wanted: Vec<String> = desired
+        let identity = std::fs::canonicalize(&dir).unwrap_or(dir.clone());
+        if !seen.insert(identity.clone()) {
+            continue;
+        }
+        let readers: BTreeSet<_> = ws
+            .config
+            .agents
             .iter()
-            .filter(|(_, ag)| ag == &a.key)
+            .filter(|other| {
+                let path = other.skills_path();
+                std::fs::canonicalize(&path).unwrap_or(path) == identity
+            })
+            .map(|other| other.key.as_str())
+            .collect();
+        let wanted: BTreeSet<String> = desired
+            .iter()
+            .filter(|(_, ag)| readers.contains(ag.as_str()))
             .map(|(s, _)| s.clone())
             .collect();
         match &report.mode {
@@ -470,7 +522,7 @@ pub fn plan_sync(ws: &Workspace, snap: &Snapshot) -> Result<Vec<Action>> {
                     });
                 }
             }
-            AgentDirMode::Real => {
+            AgentDirMode::Real | AgentDirMode::SharedRoot => {
                 for s in &wanted {
                     match report
                         .entries
@@ -504,6 +556,9 @@ pub fn plan_sync(ws: &Workspace, snap: &Snapshot) -> Result<Vec<Action>> {
                     }
                 }
                 for (name, state) in &report.entries {
+                    if report.mode == AgentDirMode::SharedRoot && snap.get(name).is_some() {
+                        continue; // Source entries cannot be disabled for only one reader.
+                    }
                     let is_wanted = wanted
                         .iter()
                         .any(|w| crate::repository::default_deploy_name(w) == *name);

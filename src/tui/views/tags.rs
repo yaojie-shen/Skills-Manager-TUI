@@ -665,7 +665,7 @@ impl View for TagsView {
         self.rows.push((UNTAGGED.into(), untagged));
         self.list.clamp(self.rows.len());
         self.sync_members(ctx.snap);
-        self.fresh = Config::load(&ctx.ws.root).ok().map(|config| Workspace {
+        self.fresh = ctx.ws.load_config().ok().map(|config| Workspace {
             config,
             ..ctx.ws.clone()
         });

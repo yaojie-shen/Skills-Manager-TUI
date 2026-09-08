@@ -2,6 +2,7 @@
 //! per-skill metadata as TOML files, and deploying skills to agents via
 //! symlinks. Both the CLI and the TUI are thin layers over this crate.
 
+pub mod agents;
 pub mod config;
 pub mod dict;
 pub mod hash;
@@ -23,6 +24,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub root: PathBuf,
+    pub project: Option<PathBuf>,
     pub config: config::Config,
     pub meta: meta::MetaStore,
     pub presets: preset::PresetStore,
@@ -33,13 +35,66 @@ impl Workspace {
         // Library callers need the same canonical root as the CLI. In
         // particular, macOS /var and /private/var can name the same directory.
         let root = paths::resolve_root(Some(root))?;
-        let config = config::Config::load(&root)?;
+        let mut config = config::Config::load(&root)?;
+        ops::targets::extend(&root, &mut config.agents)?;
         Ok(Self {
             meta: meta::MetaStore::new(&root),
             presets: preset::PresetStore::new(&root),
             root,
+            project: None,
             config,
         })
+    }
+
+    /// Open an isolated project store; never consult the global root pointer.
+    pub fn open_local(project: &Path, create: bool) -> Result<Self> {
+        use anyhow::Context;
+        let project = std::fs::canonicalize(project).context("project directory does not exist")?;
+        anyhow::ensure!(project.is_dir(), "project is not a directory");
+        let root = project.join(".agents/skills");
+        paths::ensure_local_path(&project, &root)?;
+        if create {
+            std::fs::create_dir_all(&root)?;
+        }
+        // Do not load global defaults even when no local config exists yet.
+        let root = paths::resolve_root(Some(&root))?;
+        let mut ws = Self {
+            meta: meta::MetaStore::new(&root),
+            presets: preset::PresetStore::new(&root),
+            root,
+            project: Some(project),
+            config: config::Config::local_default(),
+        };
+        ws.config = ws.load_config()?;
+        Ok(ws)
+    }
+
+    pub fn load_config(&self) -> Result<config::Config> {
+        let Some(project) = &self.project else {
+            let mut config = config::Config::load(&self.root)?;
+            ops::targets::extend(&self.root, &mut config.agents)?;
+            return Ok(config);
+        };
+        let mut config = if config::Config::exists(&self.root) {
+            config::Config::load(&self.root)?
+        } else {
+            config::Config::local_default()
+        };
+        // An omitted agents table also means local defaults.
+        if config::Config::exists(&self.root) {
+            let text = std::fs::read_to_string(config::Config::path(&self.root))?;
+            let doc: toml::Value = toml::from_str(&text)?;
+            if doc.get("agents").is_none() {
+                config.agents = agents::defaults(true);
+            }
+        }
+        for agent in &mut config.agents {
+            let path = project.join(agent.skills_path());
+            paths::ensure_local_path(project, &path)?;
+            agent.skills_dir = path.to_string_lossy().into_owned();
+        }
+        ops::targets::extend(&self.root, &mut config.agents)?;
+        Ok(config)
     }
 
     pub fn scan(&self) -> Result<reconcile::Snapshot> {
