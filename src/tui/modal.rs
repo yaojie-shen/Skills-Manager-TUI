@@ -249,8 +249,7 @@ impl Modal {
             title: " install a skill ".into(),
             input: Input::default(),
             kind: InputKind::Install,
-            hint: "owner/repo[/path] · a git URL · a local path — Enter installs, Esc cancels"
-                .into(),
+            hint: "owner/repo[/path] · git URL · local path\nEnter install · Esc cancel".into(),
             rect: Rect::default(),
         }
     }
@@ -575,6 +574,10 @@ impl Modal {
             Modal::Confirm { .. } | Modal::ConfirmWrite { .. } => {
                 &[("Enter/y", "apply"), ("Esc/n", "cancel"), ("←→", "buttons")]
             }
+            Modal::Input {
+                kind: InputKind::Install,
+                ..
+            } => &[("Enter", "install"), ("Esc", "cancel")],
             Modal::Input { .. } => &[("Enter", "save"), ("Esc", "cancel")],
             Modal::Picker {
                 input_focus: true, ..
@@ -1266,7 +1269,12 @@ impl Modal {
                 rect,
                 ..
             } => {
-                let r = centered(area, 72, 4);
+                let width = centered(area, 72, 4).width.saturating_sub(4);
+                let hint_text = Paragraph::new(hint.as_str())
+                    .style(th.dim())
+                    .wrap(Wrap { trim: false });
+                let hint_height = hint_text.line_count(width).min(6) as u16;
+                let r = centered(area, 72, 3 + hint_height);
                 *rect = r;
                 f.render_widget(Clear, r);
                 let block = th.block(title.as_str(), true);
@@ -1280,12 +1288,12 @@ impl Modal {
                 };
                 input.render(f, field, true, "", th);
                 f.render_widget(
-                    Paragraph::new(Span::styled(fit(hint, inner.width as usize), th.dim())),
+                    hint_text,
                     Rect {
                         x: inner.x + 1,
                         y: inner.y + 1,
                         width: inner.width.saturating_sub(2),
-                        height: 1,
+                        height: inner.height.saturating_sub(1),
                     },
                 );
             }
@@ -1871,6 +1879,40 @@ mod picker_tests {
     use crate::tui::theme::Theme;
     use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::Config, preset::Preset};
+
+    #[test]
+    fn install_hint_wraps_without_losing_cancel_instruction() {
+        let root = std::env::temp_dir().join(format!("skills-install-hint-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        for width in [40, 60, 80] {
+            let mut modal = Modal::install();
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|f| modal.draw(f, f.area(), &ctx)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+            assert!(
+                text.contains("Enter install · Esc cancel"),
+                "{width}: {text}"
+            );
+            assert!(text.contains("owner/repo[/path]"));
+            assert!(!text.contains("Esc c…"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn repository_browser_moves_focus_without_skipping_and_mouse_focus_matches_keys() {

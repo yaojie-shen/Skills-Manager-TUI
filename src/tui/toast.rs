@@ -124,13 +124,15 @@ impl Toasts {
         if self.items.is_empty() && self.running.is_empty() {
             return None;
         }
-        let max_text = (area.width as usize)
-            .saturating_sub(12)
-            .min(if self.running.is_empty() { 56 } else { 100 });
-        // Reserve the last visible slot for active work, even during a burst
-        // of results or when a smaller terminal can only display one message.
-        let capacity = MAX_VISIBLE.min(area.height.saturating_sub(6) as usize / 2);
-        if capacity == 0 {
+        let max_text = (area.width as usize).saturating_sub(12).min(
+            if self.running.is_empty() && !self.items.iter().any(|t| t.level == Level::Error) {
+                56
+            } else {
+                100
+            },
+        );
+        let budget = area.height.saturating_sub(6) as usize;
+        if budget < 2 || max_text == 0 {
             return None;
         }
         let active = self.running.last_key_value().map(|(_, t)| Toast {
@@ -143,28 +145,64 @@ impl Toasts {
             at: t.at,
             detail: t.detail.clone(),
         });
-        let results = capacity
-            .saturating_sub(usize::from(active.is_some()))
-            .min(self.items.len());
-        let lines: Vec<_> = self.items[self.items.len() - results..]
+        // Reserve space for persistent work, then fit newest results from below.
+        let mut remaining = budget.saturating_sub(usize::from(active.is_some()) * 2);
+        let mut lines: Vec<(Vec<String>, &Toast)> = Vec::new();
+        for toast in self
+            .items
             .iter()
-            .chain(active.as_ref())
-            .map(|t| (fit(&t.text, max_text), t))
-            .collect();
+            .rev()
+            .take(MAX_VISIBLE - usize::from(active.is_some()))
+        {
+            if remaining < 2 {
+                break;
+            }
+            let mut message = if toast.level == Level::Error {
+                wrap_message(&toast.text, max_text)
+            } else {
+                vec![fit(&toast.text, max_text)]
+            };
+            if message.len() + 1 > remaining {
+                if !lines.is_empty() {
+                    break;
+                }
+                // On tiny terminals keep both the beginning and the final cause.
+                let tail = message.pop().unwrap_or_default();
+                message.truncate(remaining.saturating_sub(2));
+                message.push(tail);
+            }
+            remaining -= message.len() + 1;
+            lines.push((message, toast));
+        }
+        lines.reverse();
+        if let Some(toast) = active.as_ref() {
+            lines.push((vec![fit(&toast.text, max_text)], toast));
+        }
+        if lines.is_empty() {
+            return None;
+        }
         let inner_w = lines
             .iter()
-            .map(|(text, t)| {
-                width(text).max(t.detail.as_ref().map_or(0, |d| width(&fit(d, max_text)))) + 4
+            .map(|(message, t)| {
+                message
+                    .iter()
+                    .map(|line| width(line))
+                    .max()
+                    .unwrap_or(0)
+                    .max(t.detail.as_ref().map_or(0, |d| width(&fit(d, max_text))))
+                    + 4
             })
             .max()
             .unwrap_or(10);
         let w = (inner_w + 2) as u16;
-        let h = lines.len() as u16 * 2 + 2;
+        let h = (lines
+            .iter()
+            .map(|(message, _)| message.len() + 1)
+            .sum::<usize>()
+            + 2) as u16;
         if area.width < w + 4 || area.height < h + 4 {
             return None;
         }
-        // Bottom-right, clear of the footer and of the panel border below it,
-        // so the two frames do not run into each other.
         let rect = Rect::new(
             area.right().saturating_sub(w + 2),
             area.bottom().saturating_sub(h + 2),
@@ -172,35 +210,38 @@ impl Toasts {
             h,
         );
         f.render_widget(Clear, rect);
-        let body: Vec<Line> = lines
-            .iter()
-            .flat_map(|(text, toast)| {
-                let style = match toast.level {
-                    Level::Info => th.dim(),
-                    Level::Ok => th.ok(),
-                    Level::Error => th.err(),
-                };
-                [
-                    Line::from(vec![
-                        Span::styled(format!(" {} ", toast.marker()), style),
-                        Span::raw(text.clone()),
-                    ]),
-                    Line::from(vec![
-                        Span::raw(" "),
-                        Span::styled(
-                            toast
-                                .detail
-                                .as_ref()
-                                .map(|d| fit(d, max_text))
-                                .unwrap_or_else(|| {
-                                    "━".repeat(toast.bar_width(inner_w.saturating_sub(2)))
-                                }),
-                            style,
-                        ),
-                    ]),
-                ]
-            })
-            .collect();
+        let mut body = Vec::new();
+        for (message, toast) in &lines {
+            let style = match toast.level {
+                Level::Info => th.dim(),
+                Level::Ok => th.ok(),
+                Level::Error => th.err(),
+            };
+            for (i, line) in message.iter().enumerate() {
+                body.push(Line::from(vec![
+                    Span::styled(
+                        if i == 0 {
+                            format!(" {} ", toast.marker())
+                        } else {
+                            "   ".into()
+                        },
+                        style,
+                    ),
+                    Span::raw(line.clone()),
+                ]));
+            }
+            body.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    toast
+                        .detail
+                        .as_ref()
+                        .map(|d| fit(d, max_text))
+                        .unwrap_or_else(|| "━".repeat(toast.bar_width(inner_w.saturating_sub(2)))),
+                    style,
+                ),
+            ]));
+        }
         let border = match lines.last().map(|(_, t)| t.level) {
             Some(Level::Error) => th.err(),
             _ => th.dim(),
@@ -218,9 +259,66 @@ impl Toasts {
     }
 }
 
+/// Wrap without dropping the final error cause, measuring terminal cells.
+fn wrap_message(text: &str, columns: usize) -> Vec<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    for glyph in text.graphemes(true) {
+        if glyph.contains('\n') || glyph.contains('\r') {
+            lines.push(std::mem::take(&mut line));
+            used = 0;
+            continue;
+        }
+        let cells = width(glyph);
+        if used + cells > columns && !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+            used = 0;
+        }
+        line.push_str(glyph);
+        used += cells;
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn errors_wrap_through_the_final_cause_and_keep_active_progress() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let message = "install: cannot parse source 'https://example.com/team/tools': 路径解析失败: expected owner/repository (not a valid repository reference)";
+        let mut toasts = Toasts::default();
+        toasts.start(1, "Check upstream".into());
+        toasts.progress(1, "2/3 complete".into());
+        toasts.push(message, Level::Error);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                toasts.draw(f, f.area(), &Theme::default());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        for line in wrap_message(message, 68) {
+            assert!(
+                rendered.replace(' ', "").contains(&line.replace(' ', "")),
+                "missing error text: {line}"
+            );
+            assert!(width(&line) <= 68);
+        }
+        assert!(rendered.contains("2/3 complete"));
+        assert!(!rendered.contains('…'));
+        let text = "文件系统路径 👩‍💻 malformed value";
+        let wrapped = wrap_message(text, 9);
+        assert_eq!(wrapped.concat(), text);
+        assert!(wrapped.iter().all(|line| width(line) <= 9));
+    }
 
     #[test]
     fn active_tasks_survive_expiry_and_results_until_the_matching_completion() {

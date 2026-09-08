@@ -989,6 +989,12 @@ impl View for SearchView {
                 _ => {}
             },
             Focus::Preview => match k.code {
+                KeyCode::Char('e') => {
+                    if let Some(record) = self.selected(ctx) {
+                        self.overlay.open(record.key.clone());
+                        self.overlay.expand_fields();
+                    }
+                }
                 KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
                     self.focus = Focus::List;
                 }
@@ -1181,11 +1187,11 @@ impl View for SearchView {
         self.draw_results(f, left, ctx);
         if grid {
             self.preview_rect = Rect::default();
-            self.overlay.draw(f, rows[1], ctx);
         } else {
             self.preview_rect = right;
             self.draw_preview(f, right, ctx);
         }
+        self.overlay.draw(f, rows[1], ctx);
         self.batch_buttons.clear();
         let bar = rows[2];
         let mut x = bar.x;
@@ -1319,6 +1325,7 @@ impl View for SearchView {
             ],
             Focus::Preview => &[
                 ("j/k", "scroll"),
+                ("e", "expand fields"),
                 ("Esc", "back"),
                 ("t", "tags"),
                 ("n", "note"),

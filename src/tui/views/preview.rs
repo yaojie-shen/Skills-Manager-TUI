@@ -28,6 +28,7 @@ pub struct Overlay {
     rect: Rect,
     lines: usize,
     height: u16,
+    expanded_fields: bool,
 }
 
 struct AgentPreview {
@@ -42,6 +43,10 @@ impl Overlay {
         self.agent_preview = None;
         self.key = Some(key);
         self.scroll = 0;
+        self.expanded_fields = false;
+    }
+    pub fn expand_fields(&mut self) {
+        self.expanded_fields = true;
     }
     /// Read the selected agent entry once, never substitute a same-named root skill.
     pub fn open_agent(
@@ -72,6 +77,7 @@ impl Overlay {
             ("↑↓/j/k", "scroll"),
             ("PgUp/PgDn", "page"),
             ("Home/End", "top/bottom"),
+            ("e", "expand/collapse fields"),
             ("Esc/Enter", "close"),
         ])
     }
@@ -88,6 +94,10 @@ impl Overlay {
         }
         match k.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.close(),
+            KeyCode::Char('e') => {
+                self.expanded_fields = !self.expanded_fields;
+                self.scroll = 0;
+            }
             KeyCode::Down | KeyCode::Char('j') => self.scroll_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.scroll_by(-1),
             KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_by(self.height as i32 - 2),
@@ -149,7 +159,7 @@ impl Overlay {
                     .to_string(),
                 th.bold(),
             ),
-            Span::styled("  Esc closes ", th.dim()),
+            Span::styled("  e fields · Esc closes ", th.dim()),
         ]);
         let block = th.block(title, true);
         let inner = block.inner(rect);
@@ -169,6 +179,12 @@ impl Overlay {
             match &preview.doc {
                 Ok(doc) => {
                     lines.push(kv("name", &doc.name, th));
+                    if !self.expanded_fields {
+                        lines = lines
+                            .into_iter()
+                            .map(|line| single_line(line, inner.width as usize))
+                            .collect();
+                    }
                     lines.extend(markdown_section(
                         "Description",
                         &doc.description,
@@ -188,7 +204,7 @@ impl Overlay {
             }
             lines
         } else if let Some(r) = ctx.snap.get(key) {
-            preview_lines(r, ctx, &[], inner.width as usize)
+            record_lines(r, ctx, &[], inner.width as usize, self.expanded_fields)
         } else {
             vec![Line::from(Span::styled("not in the skills root", th.err()))]
         };
@@ -229,6 +245,16 @@ pub fn preview_lines<'a>(
     ctx: &'a Ctx,
     terms: &[String],
     available_width: usize,
+) -> Vec<Line<'a>> {
+    record_lines(r, ctx, terms, available_width, false)
+}
+
+fn record_lines<'a>(
+    r: &'a SkillRecord,
+    ctx: &'a Ctx,
+    terms: &[String],
+    available_width: usize,
+    expanded: bool,
 ) -> Vec<Line<'a>> {
     let th = ctx.theme;
     let mut lines = vec![Line::from(vec![
@@ -279,6 +305,12 @@ pub fn preview_lines<'a>(
     if r.external {
         lines.push(kv("path", format!("{} (symlink)", r.path.display()), th));
     }
+    if !expanded {
+        lines = lines
+            .into_iter()
+            .map(|line| single_line(line, available_width))
+            .collect();
+    }
     if let Some(n) = &r.note {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("note", th.bold().fg(th.tag))));
@@ -299,6 +331,56 @@ pub fn preview_lines<'a>(
         lines.extend(markdown_section("SKILL.md", b, available_width, terms, th));
     }
     lines
+}
+
+/// Metadata is one physical row, even when stored values contain line breaks.
+fn single_line(line: Line<'_>, columns: usize) -> Line<'static> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let mut spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            Span::styled(
+                span.content
+                    .chars()
+                    .map(|c| {
+                        if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                            ' '
+                        } else {
+                            c
+                        }
+                    })
+                    .collect::<String>(),
+                span.style,
+            )
+        })
+        .collect();
+    if spans.iter().map(Span::width).sum::<usize>() <= columns {
+        return Line::from(spans).style(line.style);
+    }
+    let mut left = columns.saturating_sub(1);
+    let mut clipped = Vec::new();
+    for span in spans.drain(..) {
+        let mut text = String::new();
+        for glyph in span.content.graphemes(true) {
+            let width = UnicodeWidthStr::width(glyph);
+            if width > left {
+                break;
+            }
+            text.push_str(glyph);
+            left -= width;
+        }
+        let complete = text.len() == span.content.len();
+        clipped.push(Span::styled(text, span.style));
+        if !complete || left == 0 {
+            break;
+        }
+    }
+    if columns > 0 {
+        clipped.push(Span::raw("…"));
+    }
+    Line::from(clipped).style(line.style)
 }
 
 /// Description and SKILL.md share a heading, divider, Markdown and highlighting.
@@ -359,4 +441,34 @@ pub fn highlight_line<'a>(line: Line<'a>, terms: &[String], th: &Theme) -> Line<
     Line::from(spans)
         .style(line.style)
         .alignment(line.alignment.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn metadata_stays_on_one_row_with_wide_text_and_control_characters() {
+        for columns in 0..80 {
+            let row = single_line(
+                Line::from(vec![
+                    Span::raw("source   "),
+                    Span::styled(
+                        "https://example.org/文档\nnext\tfield\u{2028}value".repeat(8),
+                        Style::default(),
+                    ),
+                ]),
+                columns,
+            );
+            assert!(row.width() <= columns);
+            assert!(
+                row.spans
+                    .iter()
+                    .all(|s| !s.content.contains(['\n', '\t', '\u{2028}']))
+            );
+            let paragraph = Paragraph::new(vec![row]).wrap(Wrap { trim: false });
+            if columns > 0 {
+                assert_eq!(paragraph.line_count(columns as u16), 1);
+            }
+        }
+    }
 }
