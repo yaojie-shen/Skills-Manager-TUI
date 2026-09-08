@@ -884,10 +884,12 @@ impl View for AgentsView {
                     .flatten();
                 let mut spans = vec![
                     Span::styled(if on { "▸ " } else { "  " }, th.accent()),
-                    Span::styled(format!("{glyph} "), gs),
+                    managed
+                        .map(|r| cards::health_marker(r, th))
+                        .unwrap_or_else(|| Span::styled(format!("{glyph} "), gs)),
                 ];
                 if let Some(r) = managed {
-                    let available = (cell.width as usize).saturating_sub(4);
+                    let available = (cell.width as usize).saturating_sub(5);
                     let badge = cards::repository_badge(r, ctx.ws.config.ui.icons);
                     let badge_w = badge
                         .as_deref()
@@ -1037,12 +1039,12 @@ fn lit(c: Color) -> Color {
 /// does not have it at all.
 fn glyph_for(state: Option<&EntryState>, th: &crate::tui::theme::Theme) -> (&'static str, Style) {
     match state {
-        Some(EntryState::Deployed) => ("●", th.ok()),
+        Some(EntryState::Deployed) => ("✓", th.ok()),
         Some(EntryState::Broken { .. }) => ("!", th.err()),
         Some(EntryState::Shadow { .. }) => ("▪", th.warn()),
         Some(EntryState::Foreign { .. }) => ("→", th.warn()),
         Some(EntryState::AgentOnly) => ("▪", th.dim()),
-        None => ("○", th.dim()),
+        None => ("—", th.dim()),
     }
 }
 
@@ -1076,7 +1078,7 @@ fn entry_summary(state: Option<&EntryState>) -> String {
 /// Short status word for the right of a card.
 fn state_label(state: Option<&EntryState>) -> &'static str {
     match state {
-        Some(EntryState::Deployed) => "managed",
+        Some(EntryState::Deployed) => "linked",
         Some(EntryState::Broken { .. }) => "broken link",
         Some(EntryState::Shadow { same_content: true }) => "shadow",
         Some(EntryState::Shadow {
@@ -1119,6 +1121,67 @@ mod overflow_tests {
     use crate::tui::theme::Theme;
     use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::AgentConfig};
+
+    #[test]
+    fn linked_unmanaged_skill_keeps_its_health_marker_across_layouts() {
+        let root =
+            std::env::temp_dir().join(format!("skills-agent-markers-{}", std::process::id()));
+        let central = root.join("central");
+        let agent_dir = root.join("agent");
+        std::fs::create_dir_all(central.join("printer")).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            central.join("printer/SKILL.md"),
+            "---\nname: printer\ndescription: Print documents\n---\nPrint documents.\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(central.join("printer"), agent_dir.join("printer")).unwrap();
+        let mut ws = Workspace::open(&central).unwrap();
+        ws.config.agents = vec![AgentConfig {
+            key: "sample".into(),
+            name: "Sample Agent".into(),
+            skills_dir: agent_dir.display().to_string(),
+        }];
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = AgentsView {
+            scope: "sample".into(),
+            ..AgentsView::default()
+        };
+        view.refresh(&ctx);
+        let record = snap.get("printer").unwrap();
+        assert!(matches!(
+            record.status,
+            skills::reconcile::SkillStatus::Unmanaged
+        ));
+        assert!(
+            view.rows(&ctx)
+                .iter()
+                .any(|row| row.name == "printer" && row.managed)
+        );
+        for compact in [false, true] {
+            view.compact = compact;
+            let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+            let buf = terminal.backend().buffer();
+            let text = (0..30)
+                .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let line = text.lines().find(|line| line.contains("printer")).unwrap();
+            assert!(line.contains("○"), "compact={compact}: {line}");
+            assert!(!line.contains("●"), "compact={compact}: {line}");
+        }
+        assert_eq!(glyph_for(Some(&EntryState::Deployed), &theme).0, "✓");
+        assert_eq!(glyph_for(None, &theme).0, "—");
+        assert!(!central.join(".skills-meta").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn agent_preview_reads_the_selected_entry_instead_of_its_root_namesake() {

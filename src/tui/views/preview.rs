@@ -255,7 +255,7 @@ pub fn preview_lines<'a>(
     for a in &ctx.snap.agents {
         let (txt, style) = match r.deploy.get(&a.key) {
             Some(DeployState::Deployed) => ("✓", th.ok()),
-            Some(DeployState::NotDeployed) => ("○", th.dim()),
+            Some(DeployState::NotDeployed) => ("—", th.dim()),
             Some(DeployState::Shadow { same_content: true }) => ("shadow", th.warn()),
             Some(DeployState::Shadow {
                 same_content: false,

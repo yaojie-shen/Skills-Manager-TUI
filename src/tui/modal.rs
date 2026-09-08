@@ -1302,7 +1302,7 @@ impl Modal {
                             Some(DeployState::Deployed) => ("✓", th.ok()),
                             Some(DeployState::NotDeployed)
                             | Some(DeployState::NoAgentDir)
-                            | None => (" ", th.dim()),
+                            | None => ("—", th.dim()),
                             Some(DeployState::Broken) => ("!", th.err()),
                             _ => ("~", th.warn()),
                         };
