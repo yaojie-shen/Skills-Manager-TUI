@@ -6,7 +6,7 @@
 
 use super::app::Level;
 use super::theme::Theme;
-use super::widgets::{fit, width};
+use super::widgets::{SPINNER, fit, width};
 use crate::tui::widgets::OverlayClear as Clear;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -52,7 +52,8 @@ impl Toast {
 
     fn marker(&self) -> &'static str {
         if self.detail.is_some() {
-            return "↻";
+            let frame = (self.at.elapsed().as_millis() / 100) % SPINNER.len() as u128;
+            return SPINNER[frame as usize];
         }
         match self.level {
             Level::Info => "i",
