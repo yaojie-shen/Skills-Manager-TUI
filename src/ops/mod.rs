@@ -1,5 +1,6 @@
 //! Write operations. Every function here is user-initiated; scanning lives in `reconcile`.
 
+pub mod agent_links;
 pub mod deploy;
 pub mod edit;
 pub mod install;

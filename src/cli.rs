@@ -275,6 +275,24 @@ pub enum AgentsCommand {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Remove one foreign symlink while preserving its external target
+    RemoveLink {
+        agent: String,
+        name: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Copy a valid foreign skill into the root and repoint its agent link
+    AdoptLink {
+        agent: String,
+        name: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// Replace the agent's own copies that match the root with links to it
     Relink {
         agent: String,
@@ -1217,6 +1235,32 @@ fn cmd_agents(ctx: &Ctx, c: Option<AgentsCommand>) -> Result<()> {
             gate(&actions, dry_run, yes, "cleaning removes links")?;
             run_actions(ctx, &actions, dry_run)
         }
+        AgentsCommand::RemoveLink {
+            agent,
+            name,
+            dry_run,
+            yes,
+        } => run_foreign_link(
+            ctx,
+            &agent,
+            &name,
+            skills::ops::agent_links::Repair::Remove,
+            dry_run,
+            yes,
+        ),
+        AgentsCommand::AdoptLink {
+            agent,
+            name,
+            dry_run,
+            yes,
+        } => run_foreign_link(
+            ctx,
+            &agent,
+            &name,
+            skills::ops::agent_links::Repair::Adopt,
+            dry_run,
+            yes,
+        ),
         AgentsCommand::Relink {
             agent,
             skills,
@@ -1234,6 +1278,34 @@ fn cmd_agents(ctx: &Ctx, c: Option<AgentsCommand>) -> Result<()> {
             run_actions(ctx, &actions, dry_run)
         }
     }
+}
+
+fn run_foreign_link(
+    ctx: &Ctx,
+    agent: &str,
+    name: &str,
+    operation: skills::ops::agent_links::Repair,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    let plan = skills::ops::agent_links::plan(&ctx.ws, agent, name, operation)?;
+    if dry_run {
+        return ctx.out(&plan, || {
+            println!(
+                "{operation:?} {} -> {}; external target will be preserved",
+                plan.path.display(),
+                plan.target.display()
+            )
+        });
+    }
+    if !yes {
+        bail!("changing an agent link requires --yes (or --dry-run to preview)");
+    }
+    let message = plan.apply(&ctx.ws)?;
+    ctx.out(
+        &serde_json::json!({"message": message, "plan": plan}),
+        || println!("{message}"),
+    )
 }
 
 /// The `--yes` check for a plan that deletes something. A plan with nothing

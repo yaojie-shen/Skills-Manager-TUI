@@ -10,16 +10,16 @@ use super::{View, split_panes, status_glyph, status_text, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
 use crate::tui::event::Task;
 use crate::tui::modal::Modal;
-use crate::tui::widgets::{ListNav, pad, width};
+use crate::tui::widgets::{ListNav, fit, pad, width};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 use skills::meta::{Source, short_rev};
-use skills::ops::edit;
 use skills::ops::update::CheckResult;
-use skills::reconcile::{SkillRecord, SkillStatus};
+use skills::ops::{deploy, edit};
+use skills::reconcile::{AgentDirMode, EntryState, SkillRecord, SkillStatus};
 use std::collections::BTreeMap;
 
 /// Which of the page's actions apply to one row. Decided once per rebuild
@@ -60,6 +60,10 @@ impl Caps {
 struct Row {
     key: String,
     caps: Caps,
+    agent: Option<String>,
+    state: Option<EntryState>,
+    heading: Option<String>,
+    explanation: Option<String>,
 }
 
 #[derive(Default)]
@@ -85,11 +89,20 @@ fn short_hash(h: &str) -> &str {
 
 impl HealthView {
     fn select_skills(&self, checked: Option<String>) -> Vec<Action> {
-        if self.rows.is_empty() {
+        if !self
+            .rows
+            .iter()
+            .any(|row| row.agent.is_none() && row.heading.is_none())
+        {
             return vec![];
         }
         vec![Action::SelectSkills {
-            keys: self.rows.iter().map(|row| row.key.clone()).collect(),
+            keys: self
+                .rows
+                .iter()
+                .filter(|row| row.agent.is_none() && row.heading.is_none())
+                .map(|row| row.key.clone())
+                .collect(),
             title: "Health".into(),
             checked,
         }]
@@ -100,16 +113,28 @@ impl HealthView {
     }
 
     fn selected<'a>(&self, ctx: &'a Ctx) -> Option<&'a SkillRecord> {
-        self.selected_row().and_then(|r| ctx.snap.get(&r.key))
+        self.selected_row()
+            .filter(|r| r.agent.is_none() && r.heading.is_none())
+            .and_then(|r| ctx.snap.get(&r.key))
     }
 
     fn select_by(&mut self, delta: i32) {
         self.list.move_by(delta, self.rows.len());
+        while self.selected_row().is_some_and(|r| r.heading.is_some()) {
+            let previous = self.list.selected();
+            self.list.move_by(delta.signum(), self.rows.len());
+            if self.list.selected() == previous {
+                break;
+            }
+        }
         // The pane describes a different item now, so start it from the top.
         self.detail_scroll = 0;
     }
 
     fn open_selected(&mut self, ctx: &Ctx) -> Vec<Action> {
+        if let Some(actions) = self.agent_action(KeyCode::Enter, ctx) {
+            return actions;
+        }
         if let Some(r) = self.selected(ctx) {
             self.preview.open(r.key.clone());
         }
@@ -137,6 +162,9 @@ impl HealthView {
     }
 
     fn rebuild(&mut self, ctx: &Ctx) {
+        let selected = self
+            .selected_row()
+            .map(|r| (r.agent.clone(), r.key.clone()));
         self.rows = ctx
             .snap
             .skills
@@ -152,9 +180,132 @@ impl HealthView {
             .map(|s| Row {
                 key: s.key.clone(),
                 caps: Caps::of(s, self.checks.get(&s.key)),
+                agent: None,
+                state: None,
+                heading: None,
+                explanation: None,
             })
             .collect();
+        if !self.rows.is_empty() {
+            self.rows.insert(0, Row::heading("skills".into()));
+        }
+        for agent in &ctx.snap.agents {
+            let issues: Vec<_> = agent
+                .entries
+                .iter()
+                .filter(|(_, state)| !matches!(state, EntryState::Deployed))
+                .collect();
+            let mode_issue = match &agent.mode {
+                AgentDirMode::Missing => Some(
+                    "Agent directory does not exist. Deploy or sync from Agents to create it."
+                        .to_string(),
+                ),
+                AgentDirMode::DirForeign { target } => Some(format!(
+                    "Agent directory links outside the root → {}. Review this path before changing it.",
+                    target.display()
+                )),
+                _ => None,
+            };
+            self.rows.push(Row::heading(format!(
+                "{}  {}{}",
+                agent.key,
+                agent.skills_dir.display(),
+                if issues.is_empty() && mode_issue.is_none() {
+                    " · no issues"
+                } else {
+                    ""
+                }
+            )));
+            if let Some(explanation) = mode_issue {
+                self.rows.push(Row {
+                    key: "directory".into(),
+                    caps: Caps::default(),
+                    agent: Some(agent.key.clone()),
+                    state: None,
+                    heading: None,
+                    explanation: Some(explanation),
+                });
+            }
+            for (name, state) in issues {
+                self.rows.push(Row {
+                    key: name.clone(),
+                    caps: Caps::default(),
+                    agent: Some(agent.key.clone()),
+                    state: Some(state.clone()),
+                    heading: None,
+                    explanation: None,
+                });
+            }
+        }
+        let selection = selected
+            .and_then(|(agent, key)| {
+                self.rows
+                    .iter()
+                    .position(|r| r.heading.is_none() && r.agent == agent && r.key == key)
+            })
+            .or_else(|| self.rows.iter().position(|r| r.heading.is_none()));
+        self.list.select(selection);
         self.list.clamp(self.rows.len());
+    }
+
+    fn issue_count(&self) -> usize {
+        self.rows.iter().filter(|r| r.heading.is_none()).count()
+    }
+
+    fn agent_action(&self, code: KeyCode, ctx: &Ctx) -> Option<Vec<Action>> {
+        let row = self.selected_row()?;
+        let agent = row.agent.as_ref()?;
+        let actions = match (&row.state, code) {
+            (Some(EntryState::Foreign { .. }), KeyCode::Char('x') | KeyCode::Char('a')) => {
+                use skills::ops::agent_links::{self, Repair};
+                let operation = if code == KeyCode::Char('a') {
+                    Repair::Adopt
+                } else {
+                    Repair::Remove
+                };
+                let plan = match agent_links::plan(ctx.ws, agent, &row.key, operation) {
+                    Ok(plan) => plan,
+                    Err(error) => return Some(vec![Action::Error(format!("{error:#}"))]),
+                };
+                let lines = vec![
+                    format!("{} → {}", plan.path.display(), plan.target.display()),
+                    match operation {
+                        Repair::Remove => "Remove only this symlink? Its external target will be preserved.".into(),
+                        Repair::Adopt => "Copy this skill into the root and repoint the agent link? Its external target will be preserved.".into(),
+                    },
+                    "Undo does not cover this repair.".into(),
+                ];
+                return Some(vec![Action::OpenModal(Box::new(Modal::confirm_write(
+                    format!("repair {agent}/{}", row.key),
+                    lines,
+                    Box::new(move |ws| plan.apply(ws)),
+                )))]);
+            }
+            (Some(EntryState::Broken { .. }), KeyCode::Char('x') | KeyCode::Enter) => {
+                deploy::plan_clean(ctx.ws, ctx.snap, agent, std::slice::from_ref(&row.key))
+            }
+            (
+                Some(EntryState::Shadow { same_content: true }),
+                KeyCode::Char('r') | KeyCode::Enter,
+            ) => deploy::plan_relink(ctx.ws, ctx.snap, agent, std::slice::from_ref(&row.key)),
+            (Some(EntryState::AgentOnly), KeyCode::Char('a') | KeyCode::Enter) => {
+                let report = ctx.snap.agent(agent)?;
+                return Some(vec![Action::OpenModal(Box::new(Modal::adopt(
+                    agent,
+                    &row.key,
+                    report.skills_dir.join(&row.key),
+                )))]);
+            }
+            (_, KeyCode::Enter) => return Some(vec![Action::SwitchTab(Tab::Agents)]),
+            _ => return None,
+        };
+        Some(match actions {
+            Ok(actions) => vec![Action::ConfirmLinks {
+                title: format!("repair {agent}/{}", row.key),
+                actions,
+            }],
+            Err(e) => vec![Action::Error(format!("{e:#}"))],
+        })
     }
 
     /// The right pane: what the record actually carries for this status and
@@ -417,10 +568,26 @@ impl HealthView {
         let Some(row) = self.selected_row() else {
             return;
         };
-        let Some(r) = ctx.snap.get(&row.key) else {
+        let lines = if let Some(heading) = &row.heading {
+            vec![
+                Line::from(heading.clone()),
+                Line::from("Select an issue to see its details and repair actions."),
+            ]
+        } else if let Some(agent) = &row.agent {
+            let (description, action) = agent_description(row);
+            vec![
+                kv("agent", agent.clone(), th),
+                kv("entry", row.key.clone(), th),
+                Line::from(""),
+                Line::from(description),
+                Line::from(""),
+                Line::from(action),
+            ]
+        } else if let Some(r) = ctx.snap.get(&row.key) {
+            self.detail_lines(r, row.caps, ctx)
+        } else {
             return;
         };
-        let lines = self.detail_lines(r, row.caps, ctx);
         // Count wrapped rows so the wheel cannot scroll past the end.
         let wrap_w = inner.width.max(1) as usize;
         self.detail_rows = lines
@@ -447,6 +614,9 @@ impl View for HealthView {
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         if self.preview.handle_key(k) {
             return vec![];
+        }
+        if let Some(actions) = self.agent_action(k.code, ctx) {
+            return actions;
         }
         let caps = self.selected_row().map(|r| r.caps).unwrap_or_default();
         match k.code {
@@ -563,16 +733,21 @@ impl View for HealthView {
         // With nothing to show there is nothing to explain either, so the
         // message gets the whole width instead of being squeezed beside an
         // empty pane.
-        if self.rows.is_empty() {
+        if self.issue_count() == 0 {
             self.left = area;
             self.right = Rect::default();
             let block = th.block(" health ", true);
             let inner = block.inner(area);
             f.render_widget(block, area);
-            let msg =
-                "everything is managed or unmanaged — press c to check git sources for updates";
+            let msg = format!(
+                "everything is healthy\n{} skills · {} agents checked\nPress c to check git sources for updates.",
+                ctx.snap.skills.len(),
+                ctx.snap.agents.len()
+            );
             f.render_widget(
-                Paragraph::new(Span::styled(msg, th.dim())).wrap(Wrap { trim: false }),
+                Paragraph::new(msg)
+                    .style(th.dim())
+                    .wrap(Wrap { trim: false }),
                 Rect {
                     x: inner.x + 1,
                     width: inner.width.saturating_sub(2),
@@ -590,8 +765,27 @@ impl View for HealthView {
         let items: Vec<ListItem> = self
             .rows
             .iter()
-            .filter_map(|row| ctx.snap.get(&row.key))
-            .map(|r| {
+            .map(|row| {
+                if let Some(heading) = &row.heading {
+                    return ListItem::new(Line::from(Span::styled(
+                        fit(heading, left.width.saturating_sub(4) as usize),
+                        th.bold().fg(th.accent),
+                    )));
+                }
+                if row.agent.is_some() {
+                    let (description, _) = agent_description(row);
+                    return ListItem::new(Line::from(Span::styled(
+                        fit(
+                            &format!("{} {}  {description}", agent_marker(row), row.key),
+                            left.width.saturating_sub(4) as usize,
+                        ),
+                        th.warn(),
+                    )));
+                }
+                let r = ctx
+                    .snap
+                    .get(&row.key)
+                    .expect("skill row comes from snapshot");
                 let mut spans = vec![
                     status_glyph(&r.status, th),
                     Span::raw(format!(" {}", pad(&r.key, 26))),
@@ -616,7 +810,7 @@ impl View for HealthView {
                 ListItem::new(Line::from(spans))
             })
             .collect();
-        let title = format!(" health · {} item(s) ", self.rows.len());
+        let title = format!(" health · {} issues ", self.issue_count());
         self.list.set_area_from_block(left);
         let list = List::new(items)
             .block(th.block(title, true))
@@ -633,6 +827,45 @@ impl View for HealthView {
     fn hints(&self) -> Hints {
         if let Some(hints) = self.preview.hints() {
             return hints;
+        }
+        if let Some(row) = self.selected_row() {
+            if row.heading.is_some() {
+                return &[("c", "check updates"), ("Esc/q", "search")];
+            }
+            if row.agent.is_some() {
+                return match row.state {
+                    Some(EntryState::Foreign { .. }) => &[
+                        ("x", "remove link"),
+                        ("a", "adopt copy"),
+                        ("Enter", "agents"),
+                        ("c", "check updates"),
+                        ("Esc/q", "search"),
+                    ],
+                    Some(EntryState::Broken { .. }) => &[
+                        ("x", "remove link"),
+                        ("Enter", "act"),
+                        ("c", "check updates"),
+                        ("Esc/q", "search"),
+                    ],
+                    Some(EntryState::Shadow { same_content: true }) => &[
+                        ("r", "relink"),
+                        ("Enter", "act"),
+                        ("c", "check updates"),
+                        ("Esc/q", "search"),
+                    ],
+                    Some(EntryState::AgentOnly) => &[
+                        ("a", "adopt"),
+                        ("Enter", "act"),
+                        ("c", "check updates"),
+                        ("Esc/q", "search"),
+                    ],
+                    _ => &[
+                        ("Enter", "agents"),
+                        ("c", "check updates"),
+                        ("Esc/q", "search"),
+                    ],
+                };
+            }
         }
         let Some(caps) = self.selected_row().map(|r| r.caps) else {
             return &[("c", "check updates"), ("Esc", "search"), ("q", "search")];
@@ -705,5 +938,209 @@ impl View for HealthView {
                 ("q", "search"),
             ],
         }
+    }
+}
+
+impl Row {
+    fn heading(text: String) -> Self {
+        Self {
+            key: String::new(),
+            caps: Caps::default(),
+            agent: None,
+            state: None,
+            heading: Some(text),
+            explanation: None,
+        }
+    }
+}
+
+fn agent_marker(row: &Row) -> &'static str {
+    match row.state {
+        Some(EntryState::Broken { .. }) => "✗",
+        Some(EntryState::Foreign { .. }) => "→",
+        Some(EntryState::Shadow { .. } | EntryState::AgentOnly) => "▪",
+        _ => "!",
+    }
+}
+
+fn agent_description(row: &Row) -> (String, &'static str) {
+    match &row.state {
+        Some(EntryState::Broken { target }) => (
+            format!("broken link → {}", target.display()),
+            "x / Enter: remove this broken link (confirmation required).",
+        ),
+        Some(EntryState::Foreign { target }) => (
+            format!("links outside the root → {}", target.display()),
+            "x: remove only the symlink. a: copy a valid skill into the root and repoint this link. Both require confirmation and preserve the external target. Enter opens Agents.",
+        ),
+        Some(EntryState::Shadow { same_content: true }) => (
+            "the agent's own copy, same content as root".into(),
+            "r / Enter: replace the matching copy with a root link (confirmation required).",
+        ),
+        Some(EntryState::Shadow {
+            same_content: false,
+        }) => (
+            "the agent's own copy differs from root".into(),
+            "Review both copies manually; relink is disabled to preserve different content. Enter opens Agents.",
+        ),
+        Some(EntryState::AgentOnly) => (
+            "the agent's own directory, absent from root".into(),
+            "a / Enter: adopt into the root (confirmation required; only valid skills can be adopted).",
+        ),
+        _ => (
+            row.explanation.clone().unwrap_or_default(),
+            "Enter: review agent configuration in Agents.",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::theme::Theme;
+    use ratatui::{Terminal, backend::TestBackend};
+    use skills::{Workspace, config::AgentConfig};
+
+    #[test]
+    fn health_lists_agent_issues_and_only_offers_safe_repairs() {
+        let root =
+            std::env::temp_dir().join(format!("skills-health-parity-{}", std::process::id()));
+        let central = root.join("central");
+        let agent_dir = root.join("agent");
+        std::fs::create_dir_all(central.join("printer")).unwrap();
+        std::fs::create_dir_all(central.join("invalid-item")).unwrap();
+        std::fs::create_dir_all(central.join("repos")).unwrap();
+        std::fs::create_dir_all(agent_dir.join("printer")).unwrap();
+        let skill = "---\nname: printer\ndescription: Print documents\n---\nPrint documents.\n";
+        std::fs::write(central.join("printer/SKILL.md"), skill).unwrap();
+        std::fs::write(agent_dir.join("printer/SKILL.md"), skill).unwrap();
+        std::os::unix::fs::symlink(root.join("gone"), agent_dir.join("broken-item")).unwrap();
+        std::os::unix::fs::symlink(&root, agent_dir.join("foreign-item")).unwrap();
+        let mut ws = Workspace::open(&central).unwrap();
+        ws.config.agents = vec![AgentConfig {
+            key: "sample".into(),
+            name: "Sample".into(),
+            skills_dir: agent_dir.display().to_string(),
+        }];
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = HealthView::default();
+        view.refresh(&ctx);
+        assert!(
+            snap.get("repos").is_none(),
+            "repos is a storage container, not an invalid skill"
+        );
+        assert_eq!(view.issue_count(), 4);
+        assert_eq!(view.rows.iter().filter(|r| r.heading.is_some()).count(), 2);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("health · 4 issues"));
+        for name in ["invalid-item", "broken-item", "foreign-item", "printer"] {
+            assert!(text.contains(name), "missing {name}");
+        }
+        assert!(!text.contains("everything is healthy"));
+        for (name, key) in [("broken-item", 'x'), ("printer", 'r')] {
+            view.list
+                .select(view.rows.iter().position(|r| r.key == name));
+            assert!(matches!(
+                view.agent_action(KeyCode::Char(key), &ctx)
+                    .unwrap()
+                    .as_slice(),
+                [Action::ConfirmLinks { .. }]
+            ));
+        }
+        view.list
+            .select(view.rows.iter().position(|r| r.key == "foreign-item"));
+        assert!(matches!(
+            view.agent_action(KeyCode::Char('x'), &ctx)
+                .unwrap()
+                .as_slice(),
+            [Action::OpenModal(_)]
+        ));
+        assert!(matches!(
+            view.agent_action(KeyCode::Char('a'), &ctx)
+                .unwrap()
+                .as_slice(),
+            [Action::Error(_)]
+        ));
+        let mut confirmation = view.agent_action(KeyCode::Char('x'), &ctx).unwrap();
+        let Action::OpenModal(modal) = &mut confirmation[0] else {
+            panic!("expected confirmation");
+        };
+        let mut small = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        small.draw(|f| modal.draw(f, f.area(), &ctx)).unwrap();
+        let text: String = small
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("Undo does not cover this repair."),
+            "wrapped confirmation must show its final warning"
+        );
+
+        assert!(
+            std::fs::symlink_metadata(agent_dir.join("broken-item"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(agent_dir.join("printer").is_dir());
+        assert!(!central.join(".skills-meta/printer.toml").exists());
+        assert!(matches!(
+            view.handle_key(KeyEvent::from(KeyCode::Char('q')), &ctx)
+                .as_slice(),
+            [Action::SwitchTab(Tab::Search)]
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn healthy_message_reports_the_full_checked_scope() {
+        let root = std::env::temp_dir().join(format!("skills-health-empty-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("agent")).unwrap();
+        std::fs::create_dir_all(root.join("central")).unwrap();
+        let mut ws = Workspace::open(&root.join("central")).unwrap();
+        ws.config.agents = vec![AgentConfig {
+            key: "sample".into(),
+            name: "Sample".into(),
+            skills_dir: root.join("agent").display().to_string(),
+        }];
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = HealthView::default();
+        view.refresh(&ctx);
+        assert_eq!(view.issue_count(), 0);
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("everything is healthy"));
+        assert!(text.contains("0 skills · 1 agents checked"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

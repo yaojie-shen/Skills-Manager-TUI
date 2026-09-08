@@ -174,7 +174,7 @@ impl Modal {
     }
     /// A write with nothing to log: everything it could take back is either
     /// gone for good or already an entry of its own.
-    fn confirm_write(title: String, lines: Vec<String>, write: WriteFn) -> Self {
+    pub(super) fn confirm_write(title: String, lines: Vec<String>, write: WriteFn) -> Self {
         Self::confirm_meta(
             title,
             lines,
@@ -1246,15 +1246,21 @@ impl Modal {
                 rect,
                 ..
             } => {
-                let r = centered(area, 70, lines.len() as u16 + 5);
+                let width = centered(area, 70, 5).width.saturating_sub(2);
+                let ls: Vec<Line> = lines.iter().map(|l| Line::from(l.as_str())).collect();
+                let body = Paragraph::new(ls).wrap(Wrap { trim: false });
+                let height = body
+                    .line_count(width)
+                    .saturating_add(4)
+                    .min(u16::MAX as usize) as u16;
+                let r = centered(area, 70, height);
                 *rect = r;
                 f.render_widget(Clear, r);
                 let block = th.block(format!(" {} ", title.trim()), true);
                 let inner = block.inner(r);
                 f.render_widget(block, r);
-                let ls: Vec<Line> = lines.iter().map(|l| Line::from(l.as_str())).collect();
                 f.render_widget(
-                    Paragraph::new(ls).wrap(Wrap { trim: false }),
+                    body,
                     Rect {
                         height: inner.height.saturating_sub(2),
                         ..inner
