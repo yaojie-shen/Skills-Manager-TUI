@@ -2,10 +2,9 @@
 //!
 //! Turning a preset on or off is the Agents page's job, one agent at a time.
 //! This page is where a preset is defined: which skills belong to it. The
-//! cards on the left say, per agent, how much of the preset is in place, so
-//! the definition and its effect can be read together without switching tabs.
+//! cards summarize each preset's purpose and members; deployment lives on Agents.
 
-use super::cards::{self, CARD_H, cols_for, frame, frame_styled, rule, skill_card};
+use super::cards::{self, CARD_H, cols_for, frame, frame_styled, skill_card};
 use super::matrix::Matrix;
 use super::preview::Overlay;
 use super::{View, split_panes, wheel};
@@ -19,7 +18,6 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use skills::history;
-use skills::ops::deploy::{PresetState, preset_status};
 use skills::preset::Preset;
 
 #[derive(Default)]
@@ -118,61 +116,87 @@ impl PresetsView {
         vec![]
     }
 
-    /// The three lines of a preset card: name and size, what it is for, and
-    /// how much of it each agent has. The last is derived from the links on
-    /// disk exactly as the pills on the Agents page are.
+    /// Match skill cards: identity, two description lines, and member summary.
     fn preset_card(&self, p: &Preset, ctx: &Ctx, inner_w: usize) -> Vec<Line<'static>> {
         let th = ctx.theme;
-        let auto = ctx.ws.config.deploy.presets.contains(&p.name);
         let count = match p.skills.len() {
+            0 => "Empty".to_string(),
             1 => "1 skill".to_string(),
             n => format!("{n} skills"),
         };
-        let right = if auto {
-            format!("{count} · auto")
-        } else {
-            count
-        };
-        let name_w = inner_w.saturating_sub(width(&right) + 1);
+        let count = fit(&count, inner_w);
+        let gap = usize::from(inner_w > width(&count));
         let head = vec![
-            Span::styled(pad(&p.name, name_w), th.bold()),
-            Span::raw(" "),
-            Span::styled(right, th.dim()),
+            Span::styled(
+                pad(&p.name, inner_w.saturating_sub(width(&count) + gap)),
+                th.bold(),
+            ),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(count, th.dim()),
         ];
-        let body = match &p.description {
-            Some(d) => Span::styled(fit(d, inner_w.saturating_sub(2)), th.dim()),
-            None => Span::styled("no description", th.dim()),
-        };
-        // One mark per agent the preset applies to. An agent outside the
-        // preset's own list is left out rather than shown as inactive, which
-        // would read as something to fix.
-        let agents: Vec<String> = if p.agents.is_empty() {
-            ctx.ws.config.agent_keys()
+        let description = cards::summary_lines(
+            p.description
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("No description"),
+            inner_w,
+        );
+        let missing = p
+            .skills
+            .iter()
+            .filter(|key| {
+                ctx.snap.get(key).is_none_or(|r| {
+                    matches!(
+                        r.status,
+                        skills::reconcile::SkillStatus::Missing
+                            | skills::reconcile::SkillStatus::Renamed { .. }
+                    )
+                })
+            })
+            .count();
+        let auto = if ctx.ws.config.deploy.presets.contains(&p.name) {
+            "auto"
         } else {
-            p.agents.clone()
+            ""
         };
-        let mut foot = vec![Span::raw("  ")];
-        for (i, key) in agents.iter().enumerate() {
-            if i > 0 {
-                foot.push(Span::raw("   "));
-            }
-            let st = preset_status(ctx.snap, p, std::slice::from_ref(key));
-            let (mark, style) = match st.state() {
-                PresetState::Active => ("✓", th.ok()),
-                PresetState::Partial => ("◐", th.warn()),
-                PresetState::Inactive => ("◌", th.dim()),
-                PresetState::Empty => ("◦", th.dim()),
-            };
-            foot.push(Span::styled(format!("{key} "), th.dim()));
-            foot.push(Span::styled(mark.to_string(), style));
-            if let Some(progress) = st.progress() {
-                foot.push(Span::styled(format!(" {progress}"), style));
-            }
-        }
+        let auto = fit(auto, inner_w);
+        let available = inner_w.saturating_sub(width(&auto) + usize::from(!auto.is_empty()));
+        let warning = if missing > 0 {
+            fit(&format!("! {missing} missing"), available)
+        } else {
+            String::new()
+        };
+        let separator = if !warning.is_empty() && available > width(&warning) + 3 {
+            " · "
+        } else {
+            ""
+        };
+        let names: Vec<&str> = p
+            .skills
+            .iter()
+            .map(|key| {
+                ctx.snap
+                    .get(key)
+                    .map(cards::display_name)
+                    .unwrap_or_else(|| key.rsplit('/').next().unwrap_or(key))
+            })
+            .collect();
+        let summary = member_summary(
+            &names,
+            available.saturating_sub(width(&warning) + width(separator)),
+        );
+        let used = width(&warning) + width(separator) + width(&summary) + width(&auto);
+        let foot = vec![
+            Span::styled(warning, th.warn()),
+            Span::styled(separator, th.dim()),
+            Span::styled(summary, th.dim()),
+            Span::raw(" ".repeat(inner_w.saturating_sub(used))),
+            Span::styled(auto, th.dim()),
+        ];
         vec![
             Line::from(head),
-            Line::from(vec![Span::raw("  "), body]),
-            rule(inner_w, th),
+            Line::from(Span::styled(description[0].clone(), th.dim())),
+            Line::from(Span::styled(description[1].clone(), th.dim())),
             Line::from(foot),
         ]
     }
@@ -603,12 +627,104 @@ impl View for PresetsView {
 #[allow(unused_imports)]
 use cards::MIN_CARD_W as _;
 
+/// Preserve whole member names where possible and count entries that do not fit.
+fn member_summary(names: &[&str], columns: usize) -> String {
+    if names.is_empty() {
+        return fit("No members", columns);
+    }
+    let mut shown = String::new();
+    for (i, name) in names.iter().enumerate() {
+        let separator = if shown.is_empty() { "" } else { " · " };
+        let remaining = names.len() - i - 1;
+        let suffix = if remaining > 0 {
+            format!(" · +{remaining}")
+        } else {
+            String::new()
+        };
+        if width(&shown) + width(separator) + width(name) + width(&suffix) > columns {
+            if shown.is_empty() {
+                if columns > width(&suffix) + 3 {
+                    return format!("{}{}", fit(name, columns - width(&suffix)), suffix);
+                }
+                return fit(&format!("+{}", names.len()), columns);
+            }
+            return fit(&format!("{shown} · +{}", names.len() - i), columns);
+        }
+        shown.push_str(separator);
+        shown.push_str(name);
+    }
+    shown
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::theme::Theme;
     use crossterm::event::KeyModifiers;
     use skills::{Workspace, config::Config};
+
+    #[test]
+    fn preset_cards_show_members_and_fit_unicode_without_agent_status() {
+        let root = skills::ops::DownloadDir::new("preset-card-test").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        let path = root.path().join("document");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("SKILL.md"),
+            "---\nname: 文档工具\ndescription: Document tools\n---\nBody",
+        )
+        .unwrap();
+        let mut ws = Workspace::open(root.path()).unwrap();
+        ws.config.deploy.presets.push("Office".into());
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let preset = Preset {
+            name: "Office".into(),
+            description: Some("**Document tools** with 中文说明".into()),
+            skills: vec!["document".into(), "missing".into()],
+            agents: vec!["SampleAgent".into()],
+        };
+        let view = PresetsView::default();
+        let lines = view.preset_card(&preset, &ctx, 65);
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].to_string().ends_with("2 skills"));
+        assert!(lines[1].to_string().starts_with("Document tools"));
+        assert!(lines[3].to_string().contains("文档工具"));
+        assert!(lines[3].to_string().contains("! 1 missing"));
+        assert!(lines[3].to_string().ends_with("auto"));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.to_string().contains("SampleAgent"))
+        );
+        for width in 0..80 {
+            assert!(
+                view.preset_card(&preset, &ctx, width)
+                    .iter()
+                    .all(|line| line.width() <= width)
+            );
+            assert!(
+                crate::tui::widgets::width(&member_summary(
+                    &["printer", "calendar", "document"],
+                    width
+                )) <= width
+            );
+        }
+        assert_eq!(
+            member_summary(&["printer", "calendar", "document"], 16),
+            "printer · +2"
+        );
+    }
 
     #[test]
     fn preview_blocks_member_removal_until_closed() {

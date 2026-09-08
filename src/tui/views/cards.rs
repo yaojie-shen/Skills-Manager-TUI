@@ -160,7 +160,7 @@ pub fn health_marker(r: &SkillRecord, th: &Theme) -> Span<'static> {
 
 /// Render Markdown as readable text and wrap at words where possible. CJK and
 /// long unbroken tokens wrap at grapheme boundaries, never splitting an emoji.
-fn summary_lines(markdown: &str, columns: usize) -> [String; 2] {
+pub(super) fn summary_lines(markdown: &str, columns: usize) -> [String; 2] {
     let plain = tui_markdown::from_str(markdown)
         .lines
         .iter()
