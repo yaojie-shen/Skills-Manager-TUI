@@ -825,19 +825,30 @@ fn row_lines<'a>(
 ) -> Vec<Line<'a>> {
     let th = ctx.theme;
     let dep_w = agents.len() * 3;
-    let key_w = 26.min(inner_w.saturating_sub(dep_w + 6));
+    let badge = cards::repository_badge(r);
+    let content_w = inner_w.saturating_sub(dep_w + 5);
+    let badge_w = badge
+        .as_deref()
+        .map(|text| width(text).min(content_w / 2))
+        .unwrap_or(0);
+    let badge_space = badge_w + usize::from(badge_w > 0);
+    let key_w = 26.min(content_w.saturating_sub(badge_space));
     let mut spans = vec![
         Span::styled(if on { "▸ " } else { "  " }, th.accent()),
         status_glyph(&r.status, th),
         Span::raw(" "),
     ];
     spans.extend(highlight_spans(
-        &pad(&r.key, key_w),
+        &pad(cards::display_name(r), key_w),
         &h.terms,
         Style::default(),
         th,
     ));
-    let tags_w = inner_w.saturating_sub(key_w + 4 + dep_w + 2);
+    if let Some(badge) = badge.filter(|_| badge_w > 0) {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(pad(&badge, badge_w), th.dim()));
+    }
+    let tags_w = content_w.saturating_sub(key_w + badge_space);
     if !r.tags.is_empty() && tags_w > 3 {
         spans.push(Span::raw(" "));
         spans.extend(highlight_spans(

@@ -836,19 +836,55 @@ impl View for AgentsView {
                     Style::default()
                 };
                 let (glyph, gs) = glyph_for(row.state, th);
-                let line = Line::from(vec![
+                let managed = row
+                    .managed
+                    .then(|| {
+                        ctx.snap
+                            .skills
+                            .iter()
+                            .find(|r| r.deployment_name() == row.name)
+                    })
+                    .flatten();
+                let mut spans = vec![
                     Span::styled(if on { "▸ " } else { "  " }, th.accent()),
                     Span::styled(format!("{glyph} "), gs),
-                    Span::styled(
+                ];
+                if let Some(r) = managed {
+                    let available = (cell.width as usize).saturating_sub(4);
+                    let badge = cards::repository_badge(r);
+                    let badge_w = badge
+                        .as_deref()
+                        .map(|text| width(text).min(available / 2))
+                        .unwrap_or(0);
+                    let badge_space = badge_w + usize::from(badge_w > 0);
+                    let name_w = 26.min(available.saturating_sub(badge_space));
+                    spans.push(Span::styled(
+                        pad(cards::display_name(r), name_w),
+                        Style::default(),
+                    ));
+                    if let Some(badge) = badge.filter(|_| badge_w > 0) {
+                        spans.push(Span::styled(format!(" {}", pad(&badge, badge_w)), th.dim()));
+                    }
+                    let note_w = available.saturating_sub(name_w + badge_space);
+                    spans.push(Span::styled(
+                        fit(&row.state.map(entry_note).unwrap_or_default(), note_w),
+                        th.dim(),
+                    ));
+                } else {
+                    spans.push(Span::styled(
                         pad(row.name, 26),
                         if row.managed {
                             Style::default()
                         } else {
                             th.dim()
                         },
-                    ),
-                    Span::styled(row.state.map(entry_note).unwrap_or_default(), th.dim()),
-                ]);
+                    ));
+                    spans.push(Span::styled(
+                        row.state.map(entry_note).unwrap_or_default(),
+                        th.dim(),
+                    ));
+                }
+                let line = Line::from(spans);
                 f.render_widget(Paragraph::new(line).style(style), cell);
             }
         }

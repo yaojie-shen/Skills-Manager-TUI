@@ -140,6 +140,30 @@ pub fn tag_pills(tags: &[String], ctx: &Ctx, max_w: usize) -> Vec<Span<'static>>
     out
 }
 
+/// Human-facing identity; filesystem and deployment keys remain unchanged.
+pub fn display_name(r: &SkillRecord) -> &str {
+    r.name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| r.key.rsplit('/').next().unwrap_or(&r.key))
+}
+
+/// A readable Git source badge, separate from the skill's own name.
+pub fn repository_badge(r: &SkillRecord) -> Option<String> {
+    if let Some(skills::meta::Source::Git { url, .. }) = &r.source {
+        let url = url.trim_end_matches('/').trim_end_matches(".git");
+        let parts: Vec<_> = url
+            .rsplit(['/', ':'])
+            .filter(|s| !s.is_empty())
+            .take(2)
+            .collect();
+        if parts.len() == 2 {
+            return Some(format!("⎇ {}/{}", parts[1], parts[0]));
+        }
+    }
+    skills::repository::alias_of(&r.key).map(|alias| format!("⎇ {alias}"))
+}
+
 /// The lines of a skill card. `body` replaces the description when the page
 /// has something better to show there (the search page puts the matching
 /// excerpt); `tail` sits at the right of the last line: the source kind, or
@@ -155,19 +179,14 @@ pub fn skill_card(
     terms: &[String],
 ) -> Vec<Line<'static>> {
     let th = ctx.theme;
-    let repo = skills::repository::alias_of(&r.key);
-    let tail = if tail == "git" {
-        repo.unwrap_or(tail)
-    } else {
-        tail
+    let source = match repository_badge(r) {
+        Some(badge) if tail.is_empty() || tail == "git" => badge,
+        Some(badge) => format!("{badge} · {tail}"),
+        None => tail.to_string(),
     };
-    let tail = fit(tail, inner_w.saturating_sub(4));
+    let tail = fit(&source, inner_w.saturating_sub(4));
     let tail = tail.as_str();
-    let label = if repo.is_some() {
-        r.key.rsplit('/').next().unwrap_or(&r.key)
-    } else {
-        &r.key
-    };
+    let label = display_name(r);
     let deploy: Vec<Span> = agents
         .iter()
         .flat_map(|a| {
@@ -207,4 +226,70 @@ pub fn skill_card(
         rule(inner_w, th),
         Line::from(foot),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cards_use_frontmatter_names_and_keep_repository_identity_separate() {
+        let dir = skills::ops::DownloadDir::new("card-render-test").unwrap();
+        let root = dir.path();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root)
+        .unwrap();
+        let key = "repos/sampleorg--kit/skills--mock-calendar";
+        let path = root.join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("SKILL.md"),
+            "---\nname: mock-calendar\ndescription: 日历管理\n---\nCalendar tools\n",
+        )
+        .unwrap();
+        let ws = skills::Workspace::open(root).unwrap();
+        ws.meta
+            .save(
+                key,
+                &skills::meta::SkillMeta {
+                    source: Some(skills::meta::Source::Git {
+                        url: "https://github.com/sampleorg/kit.git".into(),
+                        branch: Some("main".into()),
+                        subpath: Some("skills/mock-calendar".into()),
+                        revision: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut record = snap.get(key).unwrap().clone();
+        let lines = skill_card(&record, &ctx, &[], 60, None, "name", &[]);
+        assert!(lines[0].to_string().contains("mock-calendar"));
+        assert!(!lines[0].to_string().contains("skills--"));
+        assert!(lines[3].to_string().contains("⎇ sampleorg/kit"));
+        assert!(lines[3].to_string().contains("name"));
+        assert_eq!(record.key, key);
+        assert_eq!(
+            record.deployment_name(),
+            "sampleorg--kit--skills--mock-calendar"
+        );
+        record.name = Some("中文日历".into());
+        for width in [16, 24, 40, 80] {
+            for line in skill_card(&record, &ctx, &[], width, None, "git", &[]) {
+                assert!(line.width() <= width);
+            }
+        }
+        record.name = None;
+        assert_eq!(display_name(&record), "skills--mock-calendar");
+    }
 }
