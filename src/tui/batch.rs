@@ -201,6 +201,20 @@ impl Batch {
             self.error = None;
         }
     }
+    pub fn paste(&mut self, text: &str) -> Vec<Action> {
+        if self.focus != 0 {
+            return vec![];
+        }
+        match self.input.paste(text) {
+            Ok(true) => {
+                self.filter();
+                vec![]
+            }
+            Ok(false) => vec![],
+            Err(error) => vec![Action::Error(error.into())],
+        }
+    }
+
     pub fn key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         if k.code == KeyCode::Esc {
             return vec![Action::CloseModal];

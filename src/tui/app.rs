@@ -281,6 +281,7 @@ impl App {
                 self.tasks_running = self.tasks_running.saturating_sub(1);
                 self.on_task(*out)
             }
+            Msg::Paste(text) => self.on_paste(&text),
             Msg::Key(k) => self.on_key(k),
             Msg::Mouse(m) => self.on_mouse(m),
         };
@@ -444,6 +445,25 @@ impl App {
                     None => vec![Action::Error(format!("install {reference}: {e:#}"))],
                 }
             }
+        }
+    }
+
+    fn on_paste(&mut self, text: &str) -> Vec<Action> {
+        if self.batch_running {
+            return vec![];
+        }
+        let ctx = Ctx {
+            ws: &self.ws,
+            snap: &self.snap,
+            theme: &self.theme,
+        };
+        if let Some(modal) = self.modal.as_mut() {
+            return modal.paste(text, &ctx);
+        }
+        match self.tab {
+            Tab::Search => self.search.paste(text, &ctx),
+            Tab::Tags => self.tags.paste(text),
+            _ => vec![],
         }
     }
 
@@ -959,6 +979,54 @@ pub type Hints = &'static [(&'static str, &'static str)];
 #[cfg(test)]
 mod matrix_key_tests {
     use super::*;
+
+    #[test]
+    fn source_paste_never_submits_or_dispatches_shortcuts() {
+        let root = std::env::temp_dir().join(format!("skills-source-paste-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("sample")).unwrap();
+        std::fs::write(
+            root.join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: Sample\n---\nBody\n",
+        )
+        .unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        app.modal = Some(Modal::set_source("sample", None));
+        app.handle(Msg::Paste(
+            "https://example.com/team/tools\nset -g junk 1\nmore junk".into(),
+        ));
+        let Some(Modal::Input {
+            input,
+            kind: super::super::modal::InputKind::SetSource { skill },
+            ..
+        }) = &app.modal
+        else {
+            panic!("paste changed the dialog");
+        };
+        assert_eq!(skill, "sample");
+        assert!(input.is_empty());
+        assert!(!root.join(".skills-meta/sample.toml").exists());
+        app.handle(Msg::Paste("https://example.com/team/tools".into()));
+        let Some(Modal::Input { input, .. }) = &app.modal else {
+            panic!("paste submitted the dialog");
+        };
+        assert_eq!(input.value(), "https://example.com/team/tools");
+        assert!(!root.join(".skills-meta/sample.toml").exists());
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        app.handle(Msg::Paste("sqx123\n".into()));
+        assert!(app.modal.is_none());
+        assert!(!app.quit);
+        assert_eq!(app.tab, Tab::Search);
+        assert!(!root.join(".skills-meta/sample.toml").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn batch_worker_keeps_ticks_live_and_rejects_duplicate_submission() {

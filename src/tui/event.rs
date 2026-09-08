@@ -12,6 +12,7 @@ use std::time::Duration;
 
 pub enum Msg {
     Key(KeyEvent),
+    Paste(String),
     Mouse(MouseEvent),
     Resize,
     Tick,
@@ -104,6 +105,11 @@ pub fn spawn_input(tx: Sender<Msg>, gate: Arc<InputGate>) {
                         if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat =>
                     {
                         if tx.send(Msg::Key(k)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(Event::Paste(text)) => {
+                        if tx.send(Msg::Paste(text)).is_err() {
                             return;
                         }
                     }

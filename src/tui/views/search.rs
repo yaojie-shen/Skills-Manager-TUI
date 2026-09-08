@@ -264,6 +264,22 @@ impl SearchView {
     pub fn query(&self) -> String {
         self.input.value().to_string()
     }
+    pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
+        if self.focus != Focus::Input || self.overlay.is_open() {
+            return vec![];
+        }
+        match self.input.paste(text) {
+            Ok(true) => {
+                self.esc_armed = false;
+                self.run_search(ctx, false);
+                self.completion.update(&self.input, ctx);
+                vec![]
+            }
+            Ok(false) => vec![],
+            Err(error) => vec![Action::Error(error.into())],
+        }
+    }
+
     pub fn input_focused(&self) -> bool {
         self.focus == Focus::Input
     }

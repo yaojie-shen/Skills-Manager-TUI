@@ -295,6 +295,27 @@ impl RepositoryPicker {
             ],
         }
     }
+    pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
+        if self.preview.is_open() {
+            return vec![];
+        }
+        let input = match self.focus {
+            0 => &mut self.alias,
+            1 => &mut self.search,
+            3 => &mut self.name,
+            _ => return vec![],
+        };
+        match input.paste(text) {
+            Ok(true) if self.focus == 1 => {
+                self.refilter();
+                self.update_completion(ctx);
+                vec![]
+            }
+            Ok(_) => vec![],
+            Err(error) => vec![Action::Error(error.into())],
+        }
+    }
+
     pub fn key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         self.configure(ctx);
         if self.preview.handle_key(k) {

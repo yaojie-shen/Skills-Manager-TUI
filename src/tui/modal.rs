@@ -604,6 +604,35 @@ impl Modal {
 
     // ---- input ------------------------------------------------------------
 
+    pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
+        match self {
+            Modal::PresetSkills(view) => view.paste(text, ctx),
+            Modal::Batch(picker) => picker.paste(text),
+            Modal::Repository(picker) => picker.paste(text, ctx),
+            Modal::Input { input, .. } => match input.paste(text) {
+                Ok(_) => vec![],
+                Err(error) => vec![Action::Error(error.into())],
+            },
+            Modal::Picker {
+                input,
+                input_focus: true,
+                items,
+                shown,
+                list,
+                ..
+            } => match input.paste(text) {
+                Ok(true) => {
+                    refilter(input.value(), items, shown);
+                    list.first(shown.len());
+                    vec![]
+                }
+                Ok(false) => vec![],
+                Err(error) => vec![Action::Error(error.into())],
+            },
+            _ => vec![],
+        }
+    }
+
     pub fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match self {

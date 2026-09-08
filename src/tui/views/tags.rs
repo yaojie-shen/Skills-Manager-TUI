@@ -175,6 +175,20 @@ impl TagsView {
     /// field has focus, so `app.rs` needs to consult this too before a hex
     /// colour with a 1 to 5 in it can be typed here; until it does, nothing
     /// calls it.
+    pub fn paste(&mut self, text: &str) -> Vec<Action> {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return vec![];
+        };
+        match prompt.input.paste(text) {
+            Ok(true) => {
+                prompt.refilter();
+                vec![]
+            }
+            Ok(false) => vec![],
+            Err(error) => vec![Action::Error(error.into())],
+        }
+    }
+
     pub fn input_focused(&self) -> bool {
         self.prompt.is_some()
     }

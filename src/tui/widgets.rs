@@ -137,12 +137,27 @@ impl Input {
             .unwrap_or(self.value.len())
     }
 
+    /// Insert one paste atomically. Single-line fields reject the entire payload
+    /// when it contains controls; pasted newlines must never become Enter keys.
+    pub fn paste(&mut self, text: &str) -> Result<bool, &'static str> {
+        if text
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
+            return Err("Paste rejected: this field accepts one line without control characters.");
+        }
+        let at = self.cursor_byte();
+        self.value.insert_str(at, text);
+        self.cursor += text.chars().count();
+        Ok(!text.is_empty())
+    }
+
     /// Returns true when the value changed.
     pub fn handle_key(&mut self, k: KeyEvent) -> bool {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         match k.code {
-            KeyCode::Char(c) if !ctrl && !alt => {
+            KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
                 let i = self.byte_at(self.cursor);
                 self.value.insert(i, c);
                 self.cursor += 1;
@@ -444,6 +459,34 @@ impl ScrollTrack {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn paste_is_atomic_and_respects_unicode_cursor() {
+        let mut input = super::Input::with_value("a尾");
+        input.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(input.paste("中文🙂"), Ok(true));
+        assert_eq!(input.value(), "a中文🙂尾");
+        let cursor = input.cursor_byte();
+        for rejected in [
+            "first\nsecond",
+            "x\ry",
+            "x\ty",
+            "\u{1b}[31m",
+            "x\u{7f}",
+            "x\u{2028}y",
+            "x\u{2029}y",
+        ] {
+            assert!(input.paste(rejected).is_err());
+            assert_eq!(input.value(), "a中文🙂尾");
+            assert_eq!(input.cursor_byte(), cursor);
+        }
+        assert_eq!(input.paste(""), Ok(false));
+        input.paste("!").unwrap();
+        assert_eq!(input.value(), "a中文🙂!尾");
+    }
+
     #[test]
     fn overlay_edges_are_emitted_when_background_contains_wide_characters() {
         use ratatui::{
