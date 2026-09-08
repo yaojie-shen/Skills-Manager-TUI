@@ -52,6 +52,8 @@ pub struct SearchView {
     searcher: Searcher,
     multi: bool,
     scope_agent: Option<String>,
+    preset: Option<String>,
+    area: Rect,
     scope: Option<(BTreeSet<String>, String)>,
     checked: BTreeSet<String>,
     batch_buttons: Vec<(Rect, char)>,
@@ -80,6 +82,8 @@ impl Default for SearchView {
             searcher: Searcher::new(),
             multi: false,
             scope_agent: None,
+            preset: None,
+            area: Rect::default(),
             scope: None,
             checked: BTreeSet::new(),
             batch_buttons: Vec::new(),
@@ -89,6 +93,44 @@ impl Default for SearchView {
 }
 
 impl SearchView {
+    pub fn preset_members(preset: &str, ctx: &Ctx) -> Self {
+        let mut view = Self::default();
+        view.refresh(ctx);
+        view.preset = Some(preset.into());
+        view.multi = true;
+        view.layout = Some(UiLayout::Grid);
+        if let Ok(Some(p)) = ctx.ws.presets.load(preset) {
+            view.checked = p.skills.iter().cloned().collect();
+        }
+        view
+    }
+
+    fn apply_preset(&self, ctx: &Ctx) -> Vec<Action> {
+        let Some(preset) = self.preset.clone() else {
+            return vec![];
+        };
+        let visible: BTreeSet<String> = self
+            .hits
+            .iter()
+            .map(|hit| ctx.snap.skills[hit.index].key.clone())
+            .collect();
+        let desired = self.visible_checked(ctx);
+        let keys = visible.iter().cloned().collect();
+        vec![Action::BatchMeta(
+            Box::new(move |ws| {
+                skills::history::preset_edit(ws, &preset, |members| {
+                    members.retain(|key| !visible.contains(key));
+                    for key in &desired {
+                        if !members.contains(key) {
+                            members.push(key.clone());
+                        }
+                    }
+                })
+            }),
+            keys,
+        )]
+    }
+
     pub fn clear_selection(&mut self) {
         self.multi = false;
         self.checked.clear();
@@ -772,6 +814,33 @@ impl View for SearchView {
                 _ => {}
             }
         }
+        if self.preset.is_some() {
+            if k.code == KeyCode::Esc {
+                if self.focus == Focus::Preview {
+                    self.focus = Focus::List;
+                    return vec![];
+                }
+                return vec![Action::CloseModal];
+            }
+            if self.focus == Focus::List && k.code == KeyCode::Char('a') && k.modifiers.is_empty() {
+                return self.apply_preset(ctx);
+            }
+            if k.code == KeyCode::Enter && k.modifiers.contains(KeyModifiers::CONTROL) {
+                return self.apply_preset(ctx);
+            }
+            if self.focus != Focus::Input {
+                match k.code {
+                    KeyCode::Char('/') => {
+                        self.focus_input();
+                        return vec![];
+                    }
+                    KeyCode::Char('m' | 't' | 'd' | 'p' | 'q') if k.modifiers.is_empty() => {
+                        return vec![];
+                    }
+                    _ => {}
+                }
+            }
+        }
         if self.multi && k.code == KeyCode::Esc {
             self.clear_selection();
             self.run_search(ctx, true);
@@ -949,6 +1018,12 @@ impl View for SearchView {
         if self.overlay.handle_mouse(m) {
             return vec![];
         }
+        if self.preset.is_some()
+            && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && !self.area.contains((m.column, m.row).into())
+        {
+            return vec![Action::CloseModal];
+        }
         if self.focus == Focus::Input {
             let (consumed, accepted) = self.completion.mouse(m, &mut self.input);
             if consumed {
@@ -973,7 +1048,19 @@ impl View for SearchView {
                     self.focus = Focus::List;
                     return vec![];
                 }
+                'a' => {
+                    self.checked.extend(
+                        self.hits
+                            .iter()
+                            .map(|h| ctx.snap.skills[h.index].key.clone()),
+                    );
+                    return vec![];
+                }
+                'c' => return self.apply_preset(ctx),
                 'e' => {
+                    if self.preset.is_some() {
+                        return vec![Action::CloseModal];
+                    }
                     self.clear_selection();
                     self.run_search(ctx, true);
                     return vec![];
@@ -1041,6 +1128,9 @@ impl View for SearchView {
             && self.grid.click(m.column, m.row).is_some()
         {
             self.focus = Focus::List;
+            if self.preset.is_some() {
+                return vec![];
+            }
             return if self.multi {
                 self.batch_action('d', ctx)
             } else {
@@ -1051,6 +1141,7 @@ impl View for SearchView {
     }
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        self.area = area;
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1105,8 +1196,15 @@ impl View for SearchView {
             Rect::new(x, bar.y, w, 1),
         );
         x += w;
-        let buttons: &[(&str, char)] = if self.multi {
+        let buttons: &[(&str, char)] = if self.preset.is_some() {
             &[
+                ("[Select all]", 'a'),
+                ("[Apply a]", 'c'),
+                ("[Cancel Esc]", 'e'),
+            ]
+        } else if self.multi {
+            &[
+                ("[Select all]", 'a'),
                 ("[Tags t]", 't'),
                 ("[Deploy d]", 'd'),
                 ("[Preset p]", 'p'),
@@ -1121,7 +1219,10 @@ impl View for SearchView {
                 break;
             }
             let rect = Rect::new(x, bar.y, w, 1);
-            let enabled = !self.multi || selected > 0 || *command == 'e';
+            let enabled = self.preset.is_some()
+                || !self.multi
+                || selected > 0
+                || matches!(*command, 'e' | 'a');
             f.render_widget(
                 Paragraph::new(Span::styled(
                     *label,
@@ -1146,6 +1247,17 @@ impl View for SearchView {
     fn hints(&self) -> Hints {
         if let Some(hints) = self.overlay.hints() {
             return hints;
+        }
+        if self.preset.is_some() {
+            return &[
+                ("Space", "select"),
+                ("Ctrl+A", "select all results"),
+                ("/", "search"),
+                ("v/V", "layout"),
+                ("Enter", "preview"),
+                ("a/Ctrl+Enter", "apply"),
+                ("Esc", "cancel"),
+            ];
         }
         if self.multi && self.focus == Focus::List {
             return &[
@@ -1341,6 +1453,37 @@ mod tests {
         assert_eq!(view.visible_checked(&ctx), vec!["printer"]);
         view.batch_finished(&[]);
         assert!(!view.multi);
+        ws.presets
+            .save(&skills::preset::Preset {
+                name: "office".into(),
+                skills: vec!["document".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let mut picker = SearchView::preset_members("office", &ctx);
+        picker.set_query("printer", &ctx);
+        picker.focus_list();
+        picker.handle_key(key(KeyCode::Char(' ')), &ctx);
+        assert_eq!(
+            ws.presets.load("office").unwrap().unwrap().skills,
+            vec!["document"]
+        );
+        let mut actions = picker.handle_key(key(KeyCode::Char('a')), &ctx);
+        let Action::BatchMeta(write, _) = actions.remove(0) else {
+            panic!("not a staged preset apply")
+        };
+        let (_, intent) = write(&ws).unwrap();
+        assert!(intent.is_some());
+        assert_eq!(
+            ws.presets.load("office").unwrap().unwrap().skills,
+            vec!["document", "printer"]
+        );
+        picker.handle_key(key(KeyCode::Char(' ')), &ctx);
+        assert!(matches!(
+            picker.handle_key(key(KeyCode::Esc), &ctx).as_slice(),
+            [Action::CloseModal]
+        ));
+        assert_eq!(ws.presets.load("office").unwrap().unwrap().skills.len(), 2);
         std::fs::remove_dir_all(root).unwrap();
     }
 

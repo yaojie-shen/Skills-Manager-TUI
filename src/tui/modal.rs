@@ -2,6 +2,7 @@
 //! and the update conflict resolver.
 
 use super::app::{Action, Ctx, Hints, MetaFn, Step, WriteFn};
+use super::views::{View, search::SearchView};
 use super::widgets::{Input, ListNav, button, fit, width};
 use crate::tui::widgets::OverlayClear as Clear;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -27,26 +28,6 @@ pub struct PickItem {
     pub sub: String,
 }
 
-pub enum PickAction {
-    BrowseRepositories,
-    /// Toggle skills in and out of a preset. Each toggle writes at once, so the
-    /// list doubles as the preset's membership.
-    PresetMembers {
-        preset: String,
-    },
-    /// Pick one skill inside a fetched reference and install it.
-    InstallFrom {
-        reference: String,
-    },
-}
-
-impl PickAction {
-    /// Several rows can be on at once, versus one choice and done.
-    fn multi(&self) -> bool {
-        matches!(self, PickAction::PresetMembers { .. })
-    }
-}
-
 pub enum InputKind {
     Tags { skill: String },
     PresetName,
@@ -59,6 +40,7 @@ pub enum InputKind {
 }
 
 pub enum Modal {
+    PresetSkills(Box<SearchView>),
     Batch(Box<super::batch::Batch>),
     NameConflict {
         title: String,
@@ -110,8 +92,7 @@ pub enum Modal {
         list: ListNav,
         rect: Rect,
     },
-    /// A searchable list to choose from. Used wherever a name would otherwise
-    /// have to be typed from memory.
+    /// Browse installed repositories; skill pickers use SearchView or RepositoryPicker.
     Picker {
         title: String,
         input: Input,
@@ -119,12 +100,9 @@ pub enum Modal {
         /// Whether typing edits the filter rather than operating on results.
         input_focus: bool,
         input_rect: Rect,
-        /// Indices into `items` currently on.
-        chosen: std::collections::BTreeSet<usize>,
         /// Indices matching the filter, in display order.
         shown: Vec<usize>,
         list: ListNav,
-        action: PickAction,
         rect: Rect,
     },
     Resolve {
@@ -460,59 +438,9 @@ impl Modal {
         )
     }
 
-    /// Every skill in the root, with the ones already in `preset` switched on.
-    pub fn preset_members(
-        preset: &skills::preset::Preset,
-        snap: &skills::reconcile::Snapshot,
-    ) -> Self {
-        let items: Vec<PickItem> = snap
-            .skills
-            .iter()
-            .filter(|s| s.status.is_present())
-            .map(|s| PickItem {
-                id: s.key.clone(),
-                label: s.key.clone(),
-                sub: s
-                    .description
-                    .clone()
-                    .or_else(|| Some(s.tags.join(" · ")))
-                    .unwrap_or_default(),
-            })
-            .collect();
-        let chosen = items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| preset.skills.contains(&it.id))
-            .map(|(i, _)| i)
-            .collect();
-        Self::picker(
-            format!(" skills in {} ", preset.name),
-            items,
-            chosen,
-            PickAction::PresetMembers {
-                preset: preset.name.clone(),
-            },
-        )
-    }
-
-    /// The skills a fetched reference turned out to hold.
-    pub fn install_choice(reference: &str, choices: Vec<String>) -> Self {
-        let items: Vec<PickItem> = choices
-            .into_iter()
-            .map(|path| PickItem {
-                label: path.rsplit('/').next().unwrap_or(&path).to_string(),
-                sub: path.clone(),
-                id: path,
-            })
-            .collect();
-        Self::picker(
-            format!(" {} holds several skills ", short_ref(reference)),
-            items,
-            Default::default(),
-            PickAction::InstallFrom {
-                reference: reference.to_string(),
-            },
-        )
+    /// Search cards with staged checkboxes for editing a preset's membership.
+    pub fn preset_members(preset: &str, ctx: &Ctx) -> Self {
+        Self::PresetSkills(Box::new(SearchView::preset_members(preset, ctx)))
     }
 
     pub fn repositories(ctx: &Ctx) -> Self {
@@ -547,19 +475,12 @@ impl Modal {
                         }
                     })
                     .collect(),
-                Default::default(),
-                PickAction::BrowseRepositories,
             ),
             Err(e) => Self::message("repositories", vec![format!("{e:#}")]),
         }
     }
 
-    fn picker(
-        title: String,
-        items: Vec<PickItem>,
-        chosen: std::collections::BTreeSet<usize>,
-        action: PickAction,
-    ) -> Self {
+    fn picker(title: String, items: Vec<PickItem>) -> Self {
         let shown: Vec<usize> = (0..items.len()).collect();
         let mut list = ListNav::default();
         list.clamp(shown.len());
@@ -569,10 +490,8 @@ impl Modal {
             input_focus: true,
             input_rect: Rect::default(),
             items,
-            chosen,
             shown,
             list,
-            action,
             rect: Rect::default(),
         }
     }
@@ -649,6 +568,7 @@ impl Modal {
     pub fn hints(&self) -> Hints {
         match self {
             Modal::NameConflict { .. } => &[("c", "coexist"), ("r", "replace"), ("Esc", "cancel")],
+            Modal::PresetSkills(view) => view.hints(),
             Modal::Batch(p) => p.hints(),
             Modal::Repository(p) => p.hints(),
             Modal::Help { .. } | Modal::Message { .. } => &[("Esc", "close")],
@@ -657,42 +577,20 @@ impl Modal {
             }
             Modal::Input { .. } => &[("Enter", "save"), ("Esc", "cancel")],
             Modal::Picker {
-                action: PickAction::BrowseRepositories,
-                input_focus: true,
-                ..
+                input_focus: true, ..
             } => &[
                 ("type", "filter"),
                 ("↓/Tab", "list"),
                 ("Enter", "browse"),
                 ("Esc", "close"),
             ],
-            Modal::Picker {
-                action: PickAction::BrowseRepositories,
-                ..
-            } => &[
+            Modal::Picker { .. } => &[
                 ("Enter", "browse"),
                 ("u", "check repo"),
                 ("U", "update repo"),
                 ("↑↓", "move"),
                 ("/Tab", "filter"),
                 ("Esc", "close"),
-            ],
-            Modal::Picker {
-                action,
-                input_focus: true,
-                ..
-            } if action.multi() => &[("type", "filter"), ("↓/Tab", "results"), ("Esc", "done")],
-            Modal::Picker { action, .. } if action.multi() => &[
-                ("/", "filter"),
-                ("Space", "toggle"),
-                ("↑↓", "move"),
-                ("Esc", "done"),
-            ],
-            Modal::Picker { .. } => &[
-                ("type", "filter"),
-                ("Enter", "install"),
-                ("↑↓", "move"),
-                ("Esc", "cancel"),
             ],
             Modal::AgentPick { .. } => &[("Space/Enter", "toggle"), ("Esc", "close")],
             Modal::Resolve { .. } => &[
@@ -724,6 +622,7 @@ impl Modal {
                 },
                 _ => vec![],
             },
+            Modal::PresetSkills(view) => view.handle_key(k, ctx),
             Modal::Batch(p) => p.key(k, ctx),
             Modal::Repository(p) => p.key(k, ctx),
             Modal::Help { scroll } | Modal::Message { scroll, .. } => match k.code {
@@ -844,104 +743,65 @@ impl Modal {
                 input,
                 input_focus,
                 items,
-                chosen,
                 shown,
                 list,
-                action,
                 ..
             } => {
-                let multi = action.multi();
-                let browse = matches!(action, PickAction::BrowseRepositories);
-                if browse {
-                    if k.code == KeyCode::Char('/') && !*input_focus {
-                        *input_focus = true;
-                        return vec![];
+                if k.code == KeyCode::Char('/') && !*input_focus {
+                    *input_focus = true;
+                    return vec![];
+                }
+                if (k.code == KeyCode::Enter
+                    || (!*input_focus && matches!(k.code, KeyCode::Char('u' | 'U'))))
+                    && let Some(i) = list.selected().and_then(|i| shown.get(i)).copied()
+                {
+                    let alias = &items[i].id;
+                    if k.code == KeyCode::Enter {
+                        return vec![
+                            Action::CloseModal,
+                            Action::Search {
+                                query: repository_query(alias, ctx),
+                                focus_list: true,
+                            },
+                        ];
                     }
-                    if (k.code == KeyCode::Enter
-                        || (!*input_focus && matches!(k.code, KeyCode::Char('u' | 'U'))))
-                        && let Some(i) = list.selected().and_then(|i| shown.get(i)).copied()
-                    {
-                        let alias = &items[i].id;
-                        if k.code == KeyCode::Enter {
-                            return vec![
-                                Action::CloseModal,
-                                Action::Search {
-                                    query: repository_query(alias, ctx),
-                                    focus_list: true,
-                                },
-                            ];
-                        }
-                        let keys: Vec<_> = ctx
-                            .snap
-                            .skills
-                            .iter()
-                            .filter(|s| {
-                                skills::repository::alias_of(&s.key) == Some(alias.as_str())
-                            })
-                            .map(|s| s.key.clone())
-                            .collect();
-                        return if k.code == KeyCode::Char('u') {
-                            vec![Action::Spawn(crate::tui::event::Task::Check(keys))]
-                        } else {
-                            keys.into_iter()
-                                .map(|key| Action::Spawn(crate::tui::event::Task::Prepare(key)))
-                                .collect()
-                        };
-                    }
+                    let keys: Vec<_> = ctx
+                        .snap
+                        .skills
+                        .iter()
+                        .filter(|s| skills::repository::alias_of(&s.key) == Some(alias.as_str()))
+                        .map(|s| s.key.clone())
+                        .collect();
+                    return if k.code == KeyCode::Char('u') {
+                        vec![Action::Spawn(crate::tui::event::Task::Check(keys))]
+                    } else {
+                        keys.into_iter()
+                            .map(|key| Action::Spawn(crate::tui::event::Task::Prepare(key)))
+                            .collect()
+                    };
                 }
                 match k.code {
                     KeyCode::Esc => return vec![Action::CloseModal],
-                    KeyCode::Tab if multi || browse => *input_focus = !*input_focus,
-                    KeyCode::Char('/') if multi && !*input_focus => *input_focus = true,
+                    KeyCode::Tab => *input_focus = !*input_focus,
                     KeyCode::Down | KeyCode::Char('n') if k.code == KeyCode::Down || ctrl => {
-                        if (multi || browse) && *input_focus {
+                        if *input_focus {
                             *input_focus = false;
                         } else {
                             list.move_by(1, shown.len());
                         }
                     }
                     KeyCode::Up | KeyCode::Char('p') if k.code == KeyCode::Up || ctrl => {
-                        if (multi || browse) && (*input_focus || list.selected() == Some(0)) {
+                        if *input_focus || list.selected() == Some(0) {
                             *input_focus = true;
                         } else {
                             list.move_by(-1, shown.len());
                         }
                     }
-                    KeyCode::Char(' ') if multi && !*input_focus => {
-                        if let Some(i) = list.selected().and_then(|i| shown.get(i)).copied() {
-                            let on = !chosen.contains(&i);
-                            if on {
-                                chosen.insert(i);
-                            } else {
-                                chosen.remove(&i);
-                            }
-                            return vec![preset_toggle(action, &items[i].id, on)];
-                        }
+                    _ if *input_focus && input.handle_key(k) => {
+                        refilter(input.value(), items, shown);
+                        list.first(shown.len());
                     }
-                    KeyCode::Enter if multi => return vec![Action::CloseModal],
-                    KeyCode::Enter => {
-                        if let Some(i) = list.selected().and_then(|i| shown.get(i)).copied()
-                            && let PickAction::InstallFrom { reference } = action
-                        {
-                            return vec![
-                                Action::CloseModal,
-                                Action::Spawn(crate::tui::event::Task::Install {
-                                    reference: reference.clone(),
-                                    subpath: Some(items[i].id.clone()),
-                                }),
-                            ];
-                        }
-                    }
-                    _ => {
-                        if ((!multi && !browse) || *input_focus) && input.handle_key(k) {
-                            refilter(input.value(), items, shown);
-                            if browse {
-                                list.first(shown.len());
-                            } else {
-                                list.clamp(shown.len());
-                            }
-                        }
-                    }
+                    _ => {}
                 }
                 vec![]
             }
@@ -1058,6 +918,7 @@ impl Modal {
                 }
                 vec![]
             }
+            Modal::PresetSkills(view) => view.handle_mouse(m, ctx),
             Modal::Batch(p) => p.mouse(m, ctx),
             Modal::Repository(p) => p.mouse(m, ctx),
             Modal::Help { scroll } | Modal::Message { scroll, .. } => {
@@ -1138,20 +999,16 @@ impl Modal {
                 input_focus,
                 input_rect,
                 items,
-                chosen,
                 shown,
                 list,
-                action,
                 rect,
                 ..
             } => {
                 if let Some(d) = wheel {
-                    if matches!(action, PickAction::BrowseRepositories) {
-                        if !list.rows.contains(at) {
-                            return vec![];
-                        }
-                        *input_focus = false;
+                    if !list.rows.contains(at) {
+                        return vec![];
                     }
+                    *input_focus = false;
                     list.move_by(d, shown.len());
                 } else if click {
                     if !rect.contains(at) {
@@ -1166,31 +1023,13 @@ impl Modal {
                         && let Some(i) = shown.get(row).copied()
                     {
                         *input_focus = false;
-                        if double && matches!(action, PickAction::BrowseRepositories) {
+                        if double {
                             return vec![
                                 Action::CloseModal,
                                 Action::Search {
                                     query: repository_query(&items[i].id, ctx),
                                     focus_list: true,
                                 },
-                            ];
-                        }
-                        if action.multi() {
-                            let on = !chosen.contains(&i);
-                            if on {
-                                chosen.insert(i);
-                            } else {
-                                chosen.remove(&i);
-                            }
-                            return vec![preset_toggle(action, &items[i].id, on)];
-                        }
-                        if double && let PickAction::InstallFrom { reference } = action {
-                            return vec![
-                                Action::CloseModal,
-                                Action::Spawn(crate::tui::event::Task::Install {
-                                    reference: reference.clone(),
-                                    subpath: Some(items[i].id.clone()),
-                                }),
                             ];
                         }
                     }
@@ -1294,6 +1133,18 @@ impl Modal {
                         1,
                     ),
                 );
+            }
+            Modal::PresetSkills(view) => {
+                let r = centered(
+                    area,
+                    area.width.saturating_sub(4),
+                    area.height.saturating_sub(2),
+                );
+                f.render_widget(Clear, r);
+                let block = th.block(" Preset skills ", true);
+                let inner = block.inner(r);
+                f.render_widget(block, r);
+                view.draw(f, inner, ctx);
             }
             Modal::Batch(p) => p.draw(f, area, ctx),
             Modal::Repository(p) => p.draw(f, area, ctx),
@@ -1459,13 +1310,10 @@ impl Modal {
                 input_focus,
                 input_rect,
                 items,
-                chosen,
                 shown,
                 list,
-                action,
                 rect,
             } => {
-                let multi = action.multi();
                 let r = centered(
                     area,
                     76,
@@ -1483,14 +1331,7 @@ impl Modal {
                     ..inner
                 };
                 *input_rect = field;
-                let separate_focus = multi || matches!(action, PickAction::BrowseRepositories);
-                input.render(
-                    f,
-                    field,
-                    !separate_focus || *input_focus,
-                    "type to filter…",
-                    th,
-                );
+                input.render(f, field, *input_focus, "type to filter…", th);
                 let list_area = Rect {
                     y: inner.y + 2,
                     height: inner.height.saturating_sub(2),
@@ -1501,20 +1342,9 @@ impl Modal {
                     .iter()
                     .map(|i| {
                         let it = &items[*i];
-                        let on = chosen.contains(i);
-                        let mark = if !multi {
-                            Span::raw("  ")
-                        } else if on {
-                            Span::styled("✓ ", th.ok())
-                        } else {
-                            Span::styled("  ", th.dim())
-                        };
                         ListItem::new(Line::from(vec![
-                            mark,
-                            Span::styled(
-                                fit(&it.label, 26),
-                                if on { th.bold() } else { Style::default() },
-                            ),
+                            Span::raw("  "),
+                            Span::styled(fit(&it.label, 26), Style::default()),
                             Span::raw("  "),
                             Span::styled(
                                 fit(&it.sub, list_area.width.saturating_sub(32) as usize),
@@ -1524,7 +1354,7 @@ impl Modal {
                     })
                     .collect();
                 let w = List::new(rows)
-                    .highlight_style(if separate_focus && *input_focus {
+                    .highlight_style(if *input_focus {
                         th.dim()
                     } else {
                         th.selected()
@@ -1655,37 +1485,6 @@ fn refilter(query: &str, items: &[PickItem], shown: &mut Vec<usize>) {
             || items[*i].label.to_lowercase().contains(&q)
             || items[*i].sub.to_lowercase().contains(&q)
     }));
-}
-
-/// Add or drop one skill from a preset, writing the file straight away so the
-/// list the user is looking at is the membership.
-fn preset_toggle(action: &PickAction, skill: &str, on: bool) -> Action {
-    let PickAction::PresetMembers { preset } = action else {
-        return Action::Toast(String::new());
-    };
-    let (preset, skill) = (preset.clone(), skill.to_string());
-    Action::WriteMeta(Box::new(move |ws| {
-        history::preset_edit(ws, &preset, |skills| {
-            skills.retain(|s| s != &skill);
-            if on {
-                skills.push(skill.clone());
-                skills.sort();
-            }
-        })
-    }))
-}
-
-/// The tail of a URL or path, for a dialog title.
-fn short_ref(reference: &str) -> String {
-    reference
-        .trim_end_matches('/')
-        .rsplit('/')
-        .take(2)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 /// A confirmed write, plus the history move it belongs to when it is a step.
@@ -2079,8 +1878,6 @@ mod picker_tests {
                     sub: "sample repo".into(),
                 })
                 .collect(),
-            Default::default(),
-            PickAction::BrowseRepositories,
         );
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let state = |modal: &Modal| {
@@ -2165,16 +1962,15 @@ mod picker_tests {
     }
 
     #[test]
-    fn searching_with_spaces_never_changes_membership() {
-        let root = std::env::temp_dir().join(format!(
-            "skills-picker-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+    fn preset_search_stages_selection_without_writing() {
+        let root =
+            std::env::temp_dir().join(format!("skills-preset-search-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("printer")).unwrap();
+        std::fs::write(
+            root.join("printer/SKILL.md"),
+            "---\nname: printer\ndescription: network tools\n---\nNetwork tools\n",
+        )
+        .unwrap();
         Config {
             agents: vec![],
             ..Config::default()
@@ -2185,7 +1981,7 @@ mod picker_tests {
         ws.presets
             .save(&Preset {
                 name: "reading".into(),
-                ..Preset::default()
+                ..Default::default()
             })
             .unwrap();
         let before = std::fs::read(ws.presets.path("reading")).unwrap();
@@ -2196,88 +1992,30 @@ mod picker_tests {
             snap: &snap,
             theme: &theme,
         };
-        let mut modal = Modal::picker(
-            "members".into(),
-            vec![PickItem {
-                id: "printer".into(),
-                label: "printer".into(),
-                sub: "network tools".into(),
-            }],
-            Default::default(),
-            PickAction::PresetMembers {
-                preset: "reading".into(),
-            },
-        );
+        let mut modal = Modal::preset_members("reading", &ctx);
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let Modal::PresetSkills(view) = &modal else {
+            panic!("expected shared Search view")
+        };
+        assert!(view.input_focused());
         for c in "network tools".chars() {
             assert!(modal.handle_key(key(KeyCode::Char(c)), &ctx).is_empty());
         }
-        let Modal::Picker {
-            input,
-            chosen,
-            shown,
-            ..
-        } = &modal
-        else {
-            unreachable!()
-        };
-        assert_eq!(input.value(), "network tools");
-        assert!(chosen.is_empty());
-        assert_eq!(shown, &[0]);
+        modal.handle_key(key(KeyCode::Down), &ctx);
+        assert!(modal.handle_key(key(KeyCode::Char(' ')), &ctx).is_empty());
         assert_eq!(std::fs::read(ws.presets.path("reading")).unwrap(), before);
-        assert!(modal.handle_key(key(KeyCode::Down), &ctx).is_empty());
-        let mut actions = modal.handle_key(key(KeyCode::Char(' ')), &ctx);
-        assert_eq!(actions.len(), 1);
-        let Action::WriteMeta(write) = actions.remove(0) else {
-            panic!("expected membership write")
-        };
-        write(&ws).unwrap();
-        assert_eq!(
-            ws.presets.load("reading").unwrap().unwrap().skills,
-            ["printer"]
-        );
-        assert!(modal.handle_key(key(KeyCode::Char('/')), &ctx).is_empty());
-        assert!(modal.handle_key(key(KeyCode::Char(' ')), &ctx).is_empty());
-        let Modal::Picker { input, chosen, .. } = &modal else {
-            unreachable!()
-        };
-        assert_eq!(input.value(), "network tools ");
-        assert_eq!(chosen.len(), 1);
-
-        // Clicking the input restores typing focus and places the cursor.
-        modal.handle_key(key(KeyCode::Tab), &ctx);
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| modal.draw(f, f.area(), &ctx)).unwrap();
-        let Modal::Picker { input_rect, .. } = &modal else {
-            unreachable!()
-        };
-        let at = *input_rect;
-        assert!(
-            modal
-                .handle_mouse(
-                    MouseEvent {
-                        kind: MouseEventKind::Down(MouseButton::Left),
-                        column: at.x,
-                        row: at.y,
-                        modifiers: KeyModifiers::NONE,
-                    },
-                    &ctx
-                )
-                .is_empty()
-        );
-        assert!(modal.handle_key(key(KeyCode::Char(' ')), &ctx).is_empty());
-        let Modal::Picker {
-            input, input_focus, ..
-        } = &modal
-        else {
-            unreachable!()
-        };
-        assert!(*input_focus);
-        assert_eq!(input.value(), " network tools ");
-        assert_eq!(
-            ws.presets.load("reading").unwrap().unwrap().skills,
-            ["printer"]
-        );
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("printer"));
+        assert!(screen.contains("[✓]"));
+        assert!(screen.contains("Apply"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

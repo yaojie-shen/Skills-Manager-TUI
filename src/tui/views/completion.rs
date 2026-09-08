@@ -9,7 +9,7 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{Frame, layout::Rect, text::Line, widgets::Paragraph};
 
 #[derive(Default)]
-pub(super) struct Completion {
+pub(crate) struct Completion {
     choices: Vec<String>,
     token: Range<usize>,
     selected: usize,
@@ -69,6 +69,21 @@ impl Completion {
         self.selected = 0;
         self.offset = 0;
         self.rect = Rect::default();
+    }
+
+    /// Installation candidates have repository and health data, but no tags or deployment yet.
+    pub fn update_install(&mut self, input: &Input, ctx: &Ctx) {
+        self.update(input, ctx);
+        self.choices.retain(|choice| {
+            choice.starts_with("repo:")
+                || (choice.starts_with("status:")
+                    && (choice == "status:"
+                        || ctx
+                            .snap
+                            .skills
+                            .iter()
+                            .any(|r| choice == &format!("status:{}", r.status.label()))))
+        });
     }
 
     pub fn move_by(&mut self, delta: i32) {

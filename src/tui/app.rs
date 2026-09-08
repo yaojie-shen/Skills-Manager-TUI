@@ -437,14 +437,10 @@ impl App {
                     focus_list: true,
                 },
             ],
-            // A reference that holds several skills is not a failure; it is a
-            // question, so ask it.
+            // Legacy git installs with several skills enter the shared repository picker.
             TaskOutput::Installed(reference, Err(e)) => {
                 match e.downcast_ref::<skills::ops::install::NotOneSkill>() {
-                    Some(choice) => vec![Action::OpenModal(Box::new(Modal::install_choice(
-                        &reference,
-                        choice.choices.clone(),
-                    )))],
+                    Some(_) => vec![Action::Spawn(Task::DiscoverRepository(reference))],
                     None => vec![Action::Error(format!("install {reference}: {e:#}"))],
                 }
             }
@@ -1027,15 +1023,29 @@ mod matrix_key_tests {
         app.handle(key(KeyCode::Char('/')));
         app.handle(key(KeyCode::Left));
         for reference in ["first", "second"] {
+            let workdir = root.join(".downloads").join(reference);
+            for skill in ["printer", "reader"] {
+                std::fs::create_dir_all(workdir.join(skill)).unwrap();
+                std::fs::write(
+                    workdir.join(skill).join("SKILL.md"),
+                    format!("---\nname: {skill}\ndescription: Sample skill\n---\nBody\n"),
+                )
+                .unwrap();
+            }
+            let fetched = skills::repository::FetchedRepository {
+                repository: skills::repository::Repository {
+                    alias: reference.into(),
+                    url: format!("https://example.com/sample/{reference}"),
+                    branch: "main".into(),
+                },
+                revision: "0000000000000000000000000000000000000001".into(),
+                workdir,
+                choices: vec!["printer".into(), "reader".into()],
+                invalid: Default::default(),
+            };
             app.handle(Msg::Task(
                 0,
-                Box::new(TaskOutput::Installed(
-                    reference.into(),
-                    Err(skills::ops::install::NotOneSkill {
-                        choices: vec!["printer".into(), "reader".into()],
-                    }
-                    .into()),
-                )),
+                Box::new(TaskOutput::RepositoryFetched(reference.into(), Ok(fetched))),
             ));
         }
         assert_eq!(app.pending_task_ui.len(), 2);
@@ -1050,23 +1060,17 @@ mod matrix_key_tests {
         app.handle(key(KeyCode::Delete));
         app.handle(key(KeyCode::Enter)); // Save; only the first task may appear.
         assert!(app.ws.presets.load("ab").unwrap().is_some());
-        let Some(Modal::Picker {
-            action: super::super::modal::PickAction::InstallFrom { reference },
-            ..
-        }) = &app.modal
-        else {
+        let Some(Modal::Repository(picker)) = &app.modal else {
             panic!("expected first result")
         };
-        assert_eq!(reference, "first");
+        assert_eq!(picker.selection.fetched.repository.alias, "first");
         app.handle(key(KeyCode::Esc));
-        let Some(Modal::Picker {
-            action: super::super::modal::PickAction::InstallFrom { reference },
-            ..
-        }) = &app.modal
-        else {
+        let Some(Modal::Repository(picker)) = &app.modal else {
             panic!("expected second result")
         };
-        assert_eq!(reference, "second");
+        assert_eq!(picker.selection.fetched.repository.alias, "second");
+        assert!(!root.join(".downloads/first").exists());
+        assert!(root.join(".downloads/second").exists());
         app.handle(key(KeyCode::Esc));
         assert!(app.modal.is_none());
         assert!(app.pending_task_ui.is_empty());

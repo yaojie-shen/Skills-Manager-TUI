@@ -106,7 +106,7 @@ impl PresetsView {
     fn add_members(&self, ctx: &Ctx) -> Vec<Action> {
         // Membership is edited by picking from the library, never by typing
         // a name from memory.
-        self.with_selected(|p| Modal::preset_members(p, ctx.snap))
+        self.with_selected(|p| Modal::preset_members(&p.name, ctx))
     }
 
     /// Reading a member must not cost the place on this page, so it opens in a

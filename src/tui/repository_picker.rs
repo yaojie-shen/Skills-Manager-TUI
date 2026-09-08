@@ -1,4 +1,5 @@
 //! Always-expanded repository tree with ancestry-aware multi-selection.
+use super::views::{completion::Completion, preview::Overlay};
 use super::{
     app::{Action, Ctx, Hints},
     event::Task,
@@ -11,7 +12,9 @@ use ratatui::{
     text::{Line, Span},
     widgets::{List, ListItem, Paragraph},
 };
+use skills::reconcile::{SkillRecord, SkillStatus, Snapshot};
 use skills::repository::{FetchedRepository, overlaps, related};
+use skills::search::{Query, Searcher};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
@@ -31,6 +34,12 @@ pub struct RepositoryPicker {
     shown: Vec<String>,
     rect: Rect,
     fields: [Rect; 3],
+    candidates: Snapshot,
+    searcher: Searcher,
+    matching: BTreeSet<String>,
+    configured: bool,
+    completion: Completion,
+    preview: Overlay,
 }
 impl RepositoryPicker {
     pub fn new(fetched: FetchedRepository, ctx: &Ctx) -> Self {
@@ -70,7 +79,14 @@ impl RepositoryPicker {
     }
     pub fn restore(selection: InstallSelection) -> Self {
         let alias = Input::with_value(&selection.fetched.repository.alias);
+        let candidates = candidate_snapshot(&selection.fetched);
         let mut this = Self {
+            candidates,
+            searcher: Searcher::new(),
+            matching: BTreeSet::new(),
+            configured: false,
+            completion: Completion::default(),
+            preview: Overlay::default(),
             selection,
             alias,
             search: Input::default(),
@@ -101,31 +117,64 @@ impl RepositoryPicker {
         }
         nodes.into_iter().collect()
     }
-    fn matches_filter(&self, path: &str) -> bool {
-        let query = self.search.value().trim().to_lowercase();
-        let path = path.to_lowercase();
-        if query.contains('/') {
-            let prefix = query
-                .strip_prefix("./")
-                .unwrap_or(&query)
-                .trim_start_matches('/');
-            path.starts_with(prefix)
-        } else {
-            path.contains(&query)
+    fn configure(&mut self, ctx: &Ctx) {
+        if !self.configured {
+            self.searcher = Searcher::for_workspace(ctx.ws);
+            self.configured = true;
+            self.refilter();
         }
     }
+    fn update_completion(&mut self, ctx: &Ctx) {
+        let candidate_ctx = Ctx {
+            ws: ctx.ws,
+            snap: &self.candidates,
+            theme: ctx.theme,
+        };
+        self.completion.update_install(&self.search, &candidate_ctx);
+    }
+    fn matches_filter(&self, path: &str) -> bool {
+        self.matching.contains(path)
+    }
     fn refilter(&mut self) {
-        let matching: Vec<_> = self
-            .selection
-            .fetched
-            .choices
-            .iter()
-            .filter(|p| self.matches_filter(p))
+        let mut query = Query::parse(self.search.value());
+        // Only free path tokens use root-relative prefix semantics; the slash
+        // in repo:owner/repository is part of a normal shared query filter.
+        let mut prefixes = Vec::new();
+        query.text = query
+            .text
+            .split_whitespace()
+            .filter(|token| {
+                if token.contains('/') {
+                    prefixes.push(
+                        token
+                            .strip_prefix("./")
+                            .unwrap_or(token)
+                            .trim_start_matches('/')
+                            .to_lowercase(),
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.matching = self
+            .searcher
+            .search(&self.candidates.skills, &query)
+            .into_iter()
+            .map(|hit| self.candidates.skills[hit.index].key.clone())
+            .filter(|path| {
+                prefixes
+                    .iter()
+                    .all(|prefix| path.to_lowercase().starts_with(prefix))
+            })
             .collect();
+        let matching = &self.matching;
         self.shown = self
             .tree()
             .into_iter()
-            .filter(|p| matching.iter().any(|c| *c == p || overlaps(p, c)))
+            .filter(|p| matching.iter().any(|c| c == p || overlaps(p, c)))
             .collect();
         self.list.clamp(self.shown.len());
     }
@@ -217,9 +266,21 @@ impl RepositoryPicker {
         vec![]
     }
     pub fn hints(&self) -> Hints {
+        if let Some(hints) = self.preview.hints() {
+            return hints;
+        }
+        if self.focus == 1 && self.completion.active() {
+            return &[
+                ("↑↓", "suggestions"),
+                ("Tab", "complete"),
+                ("Enter", "list"),
+                ("Esc", "close suggestions"),
+            ];
+        }
         match self.focus {
             2 => &[
                 ("Space", "select"),
+                ("v", "preview"),
                 ("Enter", "install"),
                 ("a", "repo alias"),
                 ("e", "local name"),
@@ -235,6 +296,33 @@ impl RepositoryPicker {
         }
     }
     pub fn key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        self.configure(ctx);
+        if self.preview.handle_key(k) {
+            return vec![];
+        }
+        if self.focus == 1 && self.completion.active() {
+            match k.code {
+                KeyCode::Up => {
+                    self.completion.move_by(-1);
+                    return vec![];
+                }
+                KeyCode::Down => {
+                    self.completion.move_by(1);
+                    return vec![];
+                }
+                KeyCode::Tab => {
+                    self.completion.accept(&mut self.search);
+                    self.refilter();
+                    self.update_completion(ctx);
+                    return vec![];
+                }
+                KeyCode::Esc => {
+                    self.completion.close();
+                    return vec![];
+                }
+                _ => {}
+            }
+        }
         if k.code == KeyCode::Esc {
             self.selection.fetched.cleanup();
             return vec![Action::CloseModal];
@@ -257,6 +345,7 @@ impl RepositoryPicker {
                     self.selection.names.insert(path, value.into());
                 }
                 self.focus = 2;
+                self.completion.close();
                 return vec![];
             }
             match self.focus {
@@ -266,6 +355,7 @@ impl RepositoryPicker {
                 1 => {
                     if self.search.handle_key(k) {
                         self.refilter();
+                        self.update_completion(ctx);
                     }
                 }
                 3 => {
@@ -276,6 +366,14 @@ impl RepositoryPicker {
             return vec![];
         }
         match k.code {
+            KeyCode::Char('v') => {
+                if let Some(path) = self
+                    .selected()
+                    .filter(|path| self.candidates.get(path).is_some())
+                {
+                    self.preview.open(path);
+                }
+            }
             KeyCode::Down => self.list.move_by(1, self.shown.len()),
             KeyCode::Up => self.list.move_by(-1, self.shown.len()),
             KeyCode::PageDown => self
@@ -329,10 +427,27 @@ impl RepositoryPicker {
         vec![]
     }
     pub fn mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.preview.handle_mouse(m) {
+            return vec![];
+        }
+        if self.focus == 1 {
+            let (consumed, accepted) = self.completion.mouse(m, &mut self.search);
+            if accepted {
+                self.refilter();
+                self.update_completion(ctx);
+            }
+            if consumed {
+                return vec![];
+            }
+        }
         let at = (m.column, m.row).into();
         match m.kind {
-            MouseEventKind::ScrollDown => self.list.move_by(3, self.shown.len()),
-            MouseEventKind::ScrollUp => self.list.move_by(-3, self.shown.len()),
+            MouseEventKind::ScrollDown if self.list.rows.contains(at) => {
+                self.list.move_by(3, self.shown.len())
+            }
+            MouseEventKind::ScrollUp if self.list.rows.contains(at) => {
+                self.list.move_by(-3, self.shown.len())
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if !self.rect.contains(at) {
                     return self.key(KeyEvent::new(KeyCode::Esc, m.modifiers), ctx);
@@ -365,6 +480,7 @@ impl RepositoryPicker {
         vec![]
     }
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        self.configure(ctx);
         let th = ctx.theme;
         let w = area.width.saturating_sub(4).min(110);
         let h = area.height.saturating_sub(4).min(32);
@@ -420,7 +536,7 @@ impl RepositoryPicker {
             f,
             self.fields[1],
             self.focus == 1,
-            "filter by keyword or root path, e.g. skills/",
+            "Filter skills/ · repo:owner/repo · status:invalid · keywords",
             th,
         );
         if self.focus == 3 {
@@ -470,6 +586,11 @@ impl RepositoryPicker {
                 } else {
                     path.rsplit('/').next().unwrap_or(path)
                 };
+                let label = self
+                    .candidates
+                    .get(path)
+                    .and_then(|r| r.name.as_deref())
+                    .unwrap_or(label);
                 let suffix = disabled.map(|s| format!("  ({s})")).unwrap_or_default();
                 let style = if self.selection.fetched.invalid.contains_key(path) {
                     th.err()
@@ -494,6 +615,60 @@ impl RepositoryPicker {
             self.list.rows,
             &mut self.list.state,
         );
+        if self.focus == 1 {
+            self.completion.draw(f, self.list.rows, ctx);
+        }
+        let candidate_ctx = Ctx {
+            ws: ctx.ws,
+            snap: &self.candidates,
+            theme: ctx.theme,
+        };
+        self.preview.draw(f, area, &candidate_ctx);
+    }
+}
+
+/// Candidate records stay in memory; browsing never creates metadata or copies skills.
+fn candidate_snapshot(fetched: &FetchedRepository) -> Snapshot {
+    let skills = fetched
+        .choices
+        .iter()
+        .map(|key| {
+            let path = fetched.workdir.join(key);
+            let doc = skills::skill::SkillDoc::load(&path).ok();
+            SkillRecord {
+                key: key.clone(),
+                path,
+                status: fetched
+                    .invalid
+                    .get(key)
+                    .map(|reason| SkillStatus::Invalid {
+                        reason: reason.clone(),
+                    })
+                    .unwrap_or(SkillStatus::Unmanaged),
+                name: doc.as_ref().map(|doc| doc.name.clone()),
+                description: doc.as_ref().map(|doc| doc.description.clone()),
+                body: doc.map(|doc| doc.body),
+                external: false,
+                name_mismatch: false,
+                tags: vec![],
+                note: None,
+                source: Some(skills::meta::Source::Git {
+                    url: fetched.repository.url.clone(),
+                    branch: Some(fetched.repository.branch.clone()),
+                    subpath: Some(key.clone()),
+                    revision: Some(fetched.revision.clone()),
+                }),
+                current_hash: None,
+                baseline_hash: None,
+                deploy: BTreeMap::new(),
+                meta: None,
+            }
+        })
+        .collect();
+    Snapshot {
+        root: fetched.workdir.clone(),
+        skills,
+        agents: vec![],
     }
 }
 
@@ -504,6 +679,96 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::Config, repository::Repository};
+
+    #[test]
+    fn candidate_search_reuses_names_body_fuzzy_filters_and_preview() {
+        let temp = skills::ops::DownloadDir::new("candidate-search").unwrap();
+        let root = temp.path();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root)
+        .unwrap();
+        for (path, name, body) in [
+            ("skills/print", "printer", "Observability workflows"),
+            ("internal/print", "internal-printer", "Internal helpers"),
+        ] {
+            std::fs::create_dir_all(root.join(path)).unwrap();
+            std::fs::write(
+                root.join(path).join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Document tools\n---\n{body}\n"),
+            )
+            .unwrap();
+        }
+        let ws = Workspace::open(root).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut picker = RepositoryPicker::new(
+            FetchedRepository {
+                repository: Repository {
+                    alias: "sample--tools".into(),
+                    url: "https://github.com/sample/tools".into(),
+                    branch: "main".into(),
+                },
+                invalid: BTreeMap::new(),
+                revision: "test".into(),
+                workdir: root.to_path_buf(),
+                choices: vec!["skills/print".into(), "internal/print".into()],
+            },
+            &ctx,
+        );
+        picker.configure(&ctx);
+        picker.search = Input::with_value("repo:sampl");
+        picker.update_completion(&ctx);
+        assert!(picker.completion.active());
+        picker.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &ctx);
+        assert_eq!(picker.search.value(), "repo:sample/tools ");
+        for token in ["tag:", "agent:", "status:modified"] {
+            picker.search = Input::with_value(token);
+            picker.update_completion(&ctx);
+            assert!(
+                !picker.completion.active(),
+                "installation must not suggest unavailable {token}"
+            );
+        }
+        for query in [
+            "observability",
+            "skills/ prnter",
+            "repo:sample/tools skills/",
+            "status:unmanaged skills/",
+        ] {
+            picker.search = Input::with_value(query);
+            picker.refilter();
+            assert!(picker.matches_filter("skills/print"), "{query}");
+            assert!(!picker.matches_filter("internal/print"), "{query}");
+        }
+        picker.search = Input::with_value("repo:other/tools");
+        picker.refilter();
+        assert!(picker.shown.is_empty());
+        picker.search = Input::with_value("skills/");
+        picker.refilter();
+        picker.focus = 2;
+        picker.list.move_by(1, picker.shown.len());
+        assert!(
+            picker
+                .key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE), &ctx)
+                .is_empty()
+        );
+        assert!(picker.preview.is_open());
+        assert!(
+            picker
+                .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctx)
+                .is_empty()
+        );
+        assert!(!picker.preview.is_open());
+        assert!(root.join("skills/print/SKILL.md").exists());
+    }
 
     #[test]
     fn directory_queries_are_root_relative_and_keep_tree_ancestors() {
