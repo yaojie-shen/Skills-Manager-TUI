@@ -1862,7 +1862,8 @@ Mouse
   wheel             scroll lists and preview
 Global
   Ctrl-Z  Ctrl-Y    undo and redo the last change
-  1-5  Tab          switch tabs (Alt+1..5 while typing in the search box)
+  1-5               switch tabs outside text inputs
+  Tab / Shift-Tab   next / previous tab outside Search
   /                 back to search      Ctrl-R  rescan      Ctrl-C  quit";
 
 fn repository_query(alias: &str, ctx: &Ctx) -> String {

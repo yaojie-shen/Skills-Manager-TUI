@@ -600,9 +600,7 @@ impl App {
             (KeyCode::Char('?'), _) if !in_search_input => {
                 return vec![Action::OpenModal(Box::new(Modal::help()))];
             }
-            (KeyCode::Char(c @ '1'..='5'), m)
-                if !in_search_input || m.contains(KeyModifiers::ALT) =>
-            {
+            (KeyCode::Char(c @ '1'..='5'), KeyModifiers::NONE) if !in_search_input => {
                 return vec![Action::SwitchTab(Tab::ALL[(c as u8 - b'1') as usize])];
             }
             (KeyCode::Tab, _) if self.tab != Tab::Search => {

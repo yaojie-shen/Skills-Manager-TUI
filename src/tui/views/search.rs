@@ -1319,7 +1319,6 @@ impl View for SearchView {
                 ("Tab", "list"),
                 ("Enter", "list"),
                 ("Esc", "clear/quit"),
-                ("Alt-1..5", "tabs"),
                 ("F1", "help"),
             ],
             Focus::List => &[
