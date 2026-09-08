@@ -12,6 +12,7 @@ use super::preview::Overlay;
 use super::{View, split_panes, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
 use crate::tui::modal::Modal;
+use crate::tui::widgets::OverlayClear as Clear;
 use crate::tui::widgets::{CardGrid, Input, ListNav, ScrollTrack, fit, pad, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -19,7 +20,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use skills::Workspace;
 use skills::config::Config;
@@ -174,6 +175,20 @@ impl TagsView {
     /// field has focus, so `app.rs` needs to consult this too before a hex
     /// colour with a 1 to 5 in it can be typed here; until it does, nothing
     /// calls it.
+    pub fn paste(&mut self, text: &str) -> Vec<Action> {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return vec![];
+        };
+        match prompt.input.paste(text) {
+            Ok(true) => {
+                prompt.refilter();
+                vec![]
+            }
+            Ok(false) => vec![],
+            Err(error) => vec![Action::Error(error.into())],
+        }
+    }
+
     pub fn input_focused(&self) -> bool {
         self.prompt.is_some()
     }
@@ -190,6 +205,17 @@ impl TagsView {
         self.selected_tag()
             .filter(|t| *t != UNTAGGED)
             .map(str::to_string)
+    }
+
+    fn select_skills(&self, checked: Option<String>) -> Vec<Action> {
+        if self.members.is_empty() {
+            return vec![];
+        }
+        vec![Action::SelectSkills {
+            keys: self.members.clone(),
+            title: format!("Tag: {}", self.selected_tag().unwrap_or("untagged")),
+            checked,
+        }]
     }
 
     fn selected_member(&self) -> Option<String> {
@@ -478,7 +504,6 @@ impl TagsView {
             return;
         }
         let selected = self.grid.selected();
-        let agents = &ctx.snap.agents;
         for i in self.grid.visible() {
             let (Some(cell), Some(r)) = (self.grid.cell(i), ctx.snap.get(&self.members[i])) else {
                 continue;
@@ -490,7 +515,7 @@ impl TagsView {
                 .as_ref()
                 .map(|s| s.kind().to_string())
                 .unwrap_or_default();
-            let lines = skill_card(r, ctx, agents, ci.width as usize, None, &tail, &[]);
+            let lines = skill_card(r, ctx, ci.width as usize, None, &tail, &[]);
             f.render_widget(Paragraph::new(lines), ci);
         }
         draw_track(f, inner, &self.grid, selected, &mut self.grid_track, th);
@@ -657,6 +682,7 @@ impl View for TagsView {
         let m = self.members.len();
         if self.focus_grid {
             return match k.code {
+                KeyCode::Char('m') => self.select_skills(None),
                 KeyCode::Esc | KeyCode::Char('h') | KeyCode::BackTab => {
                     self.focus_grid = false;
                     vec![]
@@ -707,7 +733,7 @@ impl View for TagsView {
             };
         }
         match k.code {
-            KeyCode::Char('q') => vec![Action::Quit],
+            KeyCode::Char('q') => vec![Action::SwitchTab(Tab::Search)],
             // Esc means "back" everywhere else in the program, so here it goes
             // back to the search page rather than out of the door.
             KeyCode::Esc => vec![Action::SwitchTab(Tab::Search)],
@@ -813,9 +839,15 @@ impl View for TagsView {
                     }
                 }
             } else if self.right.contains(at)
-                && let Some((_, double)) = self.grid.click(m.column, m.row)
+                && let Some((index, double)) = self.grid.click(m.column, m.row)
             {
                 self.focus_grid = true;
+                if self.grid.cell(index).is_some_and(|cell| {
+                    m.row == cell.y + 1
+                        && (cell.x + 2..cell.x + 2 + cards::MARKER_W as u16).contains(&m.column)
+                }) {
+                    return self.select_skills(self.selected_member());
+                }
                 if double {
                     return self.open_member();
                 }
@@ -845,6 +877,9 @@ impl View for TagsView {
     }
 
     fn hints(&self) -> Hints {
+        if let Some(hints) = self.preview.hints() {
+            return hints;
+        }
         match self.prompt.as_ref().map(|p| p.ask) {
             Some(Ask::Merge) => &[("↑/↓", "target"), ("Enter", "merge"), ("Esc", "cancel")],
             Some(Ask::Color) => &[
@@ -852,16 +887,19 @@ impl View for TagsView {
                 ("Enter", "apply"),
                 ("Esc", "cancel"),
             ],
-            None if self.focus_grid => {
-                &[("Enter", "preview"), ("t", "edit tags"), ("←/Esc", "tags")]
-            }
+            None if self.focus_grid => &[
+                ("Enter", "preview"),
+                ("t", "edit tags"),
+                ("m", "multi-select"),
+                ("←/Esc", "tags"),
+            ],
             None => &[
                 ("r", "rename"),
                 ("m", "merge"),
                 ("c", "colour"),
                 ("x", "delete"),
                 ("Enter/→", "skills"),
-                ("q", "quit"),
+                ("q", "search"),
             ],
         }
     }

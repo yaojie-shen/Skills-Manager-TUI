@@ -54,6 +54,7 @@ struct Row<'a> {
 struct Caps {
     /// A link with nothing behind it; removing it loses nothing.
     clean: bool,
+    managed: bool,
     /// The agent's own copy, byte for byte what the root has.
     relink: bool,
 }
@@ -61,6 +62,7 @@ struct Caps {
 impl Caps {
     fn of(state: Option<&EntryState>) -> Caps {
         Caps {
+            managed: matches!(state, Some(EntryState::Deployed)),
             clean: matches!(state, Some(EntryState::Broken { .. })),
             relink: matches!(state, Some(EntryState::Shadow { same_content: true })),
         }
@@ -74,6 +76,7 @@ pub struct AgentsView {
     focus: FocusState,
     presets: Vec<(Preset, PresetStatus)>,
     preset_cursor: usize,
+    preset_offset: usize,
     entries: CardGrid,
     /// One per entry row, in the grid's order.
     caps: Vec<Caps>,
@@ -81,7 +84,7 @@ pub struct AgentsView {
     /// of this page is not something the config decides.
     compact: bool,
     scope_rects: Vec<(Rect, String)>,
-    preset_rects: Vec<Rect>,
+    preset_rects: Vec<(usize, Rect)>,
     /// The one column the entry scrollbar occupies, empty while it all fits.
     entries_track: Rect,
     left: Rect,
@@ -102,6 +105,11 @@ impl Default for FocusState {
 }
 
 impl AgentsView {
+    /// An open matrix owns keyboard input before application shortcuts.
+    pub fn handle_matrix_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Option<Vec<Action>> {
+        self.matrix.handle_key(k, ctx)
+    }
+
     /// The scope as the planners want it: one key, or nothing at all.
     fn scope_agents(&self) -> Vec<String> {
         if self.scope.is_empty() {
@@ -144,6 +152,52 @@ impl AgentsView {
         }
         managed.append(&mut local);
         managed
+    }
+
+    fn select_skills(&self, ctx: &Ctx, checked: Option<String>) -> Vec<Action> {
+        let keys: Vec<_> = self
+            .rows(ctx)
+            .into_iter()
+            .filter(|row| row.managed)
+            .filter_map(|row| {
+                ctx.snap
+                    .skills
+                    .iter()
+                    .find(|skill| skill.deployment_name() == row.name)
+            })
+            .map(|skill| skill.key.clone())
+            .collect();
+        if keys.is_empty() {
+            return vec![];
+        }
+        vec![Action::SelectAgentSkills {
+            keys,
+            title: format!("Agent: {}", self.scope),
+            agent: self.scope.clone(),
+            checked,
+        }]
+    }
+
+    fn preview_entry(&mut self, ctx: &Ctx) {
+        let rows = self.rows(ctx);
+        let Some(row) = self.entries.selected().and_then(|i| rows.get(i)) else {
+            return;
+        };
+        let Some(agent) = ctx.snap.agent(&self.scope) else {
+            return;
+        };
+        self.preview.open_agent(
+            row.name.to_string(),
+            agent.name.clone(),
+            agent.skills_dir.join(row.name),
+            if row.managed {
+                "managed link to central skill".into()
+            } else {
+                row.state
+                    .map(entry_note)
+                    .unwrap_or_else(|| "unknown".into())
+            },
+        );
     }
 
     fn selected_preset(&self) -> Option<&(Preset, PresetStatus)> {
@@ -201,6 +255,13 @@ impl AgentsView {
     }
 
     fn activate(&self, ctx: &Ctx, on: bool) -> Vec<Action> {
+        if !self
+            .preset_rects
+            .iter()
+            .any(|(i, _)| *i == self.preset_cursor)
+        {
+            return vec![];
+        }
         let Some((preset, status)) = self.selected_preset() else {
             return vec![Action::Error("no preset here yet".into())];
         };
@@ -299,7 +360,7 @@ impl View for AgentsView {
         }
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
-            KeyCode::Char('q') => return vec![Action::Quit],
+            KeyCode::Char('q') => return vec![Action::SwitchTab(Tab::Search)],
             KeyCode::Char('M') => {
                 self.matrix.open(ctx);
                 return vec![];
@@ -395,6 +456,7 @@ impl View for AgentsView {
                 let rows = self.rows(ctx);
                 let n = rows.len();
                 match k.code {
+                    KeyCode::Char('m') => return self.select_skills(ctx, None),
                     // Down and up cross a whole row of cards; left and right
                     // walk along one, and only mean anything once there is more
                     // than one column to walk.
@@ -427,13 +489,7 @@ impl View for AgentsView {
                     KeyCode::End | KeyCode::Char('G') => {
                         self.entries.last(n);
                     }
-                    KeyCode::Enter => {
-                        if let Some(Row { name, .. }) =
-                            self.entries.selected().and_then(|i| rows.get(i))
-                        {
-                            self.preview.open(name.to_string());
-                        }
-                    }
+                    KeyCode::Enter => self.preview_entry(ctx),
                     // Only an entry the root knows nothing about can be taken
                     // in; everything else here is either already ours or the
                     // agent's to keep.
@@ -506,8 +562,8 @@ impl View for AgentsView {
                 self.set_focus(Focus::Agents);
                 return vec![Action::Rescan];
             }
-            if let Some(i) = self.preset_rects.iter().position(|r| r.contains(at)) {
-                self.preset_cursor = i;
+            if let Some((i, _)) = self.preset_rects.iter().find(|(_, r)| r.contains(at)) {
+                self.preset_cursor = *i;
                 self.set_focus(Focus::Presets);
                 // A pill is a switch: clicking an installed one takes it off
                 // again rather than re-running an install that has nothing to do.
@@ -521,7 +577,29 @@ impl View for AgentsView {
             }
             if self.left.contains(at) {
                 self.set_focus(Focus::Entries);
-                self.entries.click(m.column, m.row);
+                if let Some((index, double)) = self.entries.click(m.column, m.row) {
+                    if !self.compact
+                        && self.entries.cell(index).is_some_and(|cell| {
+                            m.row == cell.y + 1
+                                && (cell.x + 2..cell.x + 2 + cards::MARKER_W as u16)
+                                    .contains(&m.column)
+                        })
+                    {
+                        let rows = self.rows(ctx);
+                        if let Some(row) = rows.get(index).filter(|row| row.managed)
+                            && let Some(skill) = ctx
+                                .snap
+                                .skills
+                                .iter()
+                                .find(|skill| skill.deployment_name() == row.name)
+                        {
+                            return self.select_skills(ctx, Some(skill.key.clone()));
+                        }
+                    }
+                    if double {
+                        self.preview_entry(ctx);
+                    }
+                }
             }
         }
         vec![]
@@ -616,26 +694,40 @@ impl View for AgentsView {
                 th.dim(),
             ));
         }
-        for (i, (preset, status)) in self.presets.iter().enumerate() {
-            // Part way on is a circle filled from the left, the way a gauge
-            // fills: the top-and-bottom split (U+25D2) reads as a different
-            // shape rather than as a fraction of the same one. It is one of the
-            // two glyphs here whose width is Ambiguous, alongside the caps, so
-            // a terminal that widens those shifts this row either way.
-            let mark = match status.state() {
-                PresetState::Active => "✓ ",
-                PresetState::Partial => "◐ ",
-                PresetState::Inactive => "◌ ",
-                PresetState::Empty => "◦ ",
-            };
-            let body = match status.progress() {
-                Some(count) => format!(" {mark}{} {count} ", preset.name),
-                None => format!(" {mark}{} ", preset.name),
-            };
-            // The caps belong to the pill as far as the mouse is concerned.
-            let (lcap, rcap) = ctx.ws.config.ui.pill_caps.glyphs();
-            let w = width(&body) as u16 + width(lcap) as u16 + width(rcap) as u16;
-            self.preset_rects.push(Rect::new(x, rows[1].y, w, 1));
+        let (lcap, rcap) = ctx.ws.config.ui.pill_caps.glyphs();
+        let caps_w = width(lcap) + width(rcap);
+        // Reserve an indicator on each side; every mouse target is a whole pill.
+        let budget = rows[1].width.saturating_sub(13) as usize;
+        let bodies: Vec<String> = self
+            .presets
+            .iter()
+            .map(|(preset, status)| {
+                let mark = match status.state() {
+                    PresetState::Active => "✓ ",
+                    PresetState::Partial => "◐ ",
+                    PresetState::Inactive => "◌ ",
+                    PresetState::Empty => "◦ ",
+                };
+                let suffix = status
+                    .progress()
+                    .map(|p| format!(" {p} "))
+                    .unwrap_or(" ".into());
+                let name_w = budget.saturating_sub(caps_w + width(mark) + width(&suffix) + 2);
+                format!(" {mark}{}{suffix}", fit(&preset.name, name_w))
+            })
+            .collect();
+        let widths: Vec<usize> = bodies.iter().map(|b| width(b) + caps_w + 1).collect();
+        let visible = pill_window(&widths, self.preset_cursor, &mut self.preset_offset, budget);
+        pills.push(Span::styled(
+            if visible.start > 0 { "‹ " } else { "  " },
+            th.dim(),
+        ));
+        x += 2;
+        for i in visible.clone() {
+            let (_, status) = &self.presets[i];
+            let body = bodies[i].clone();
+            let w = (widths[i] - 1) as u16;
+            self.preset_rects.push((i, Rect::new(x, rows[1].y, w, 1)));
             let base = match status.state() {
                 PresetState::Active => th.ok,
                 PresetState::Partial => th.warn,
@@ -666,6 +758,14 @@ impl View for AgentsView {
             pills.push(Span::raw(" "));
             x += w + 1;
         }
+        pills.push(Span::styled(
+            if visible.end < self.presets.len() {
+                "›"
+            } else {
+                " "
+            },
+            th.dim(),
+        ));
         f.render_widget(Paragraph::new(Line::from(pills)), rows[1]);
 
         // The whole width goes to the entries. A detail pane here only ever had
@@ -717,7 +817,12 @@ impl View for AgentsView {
             let on = selected == Some(i);
             if cards {
                 let ci = frame(f, cell, on, self.focus() == Focus::Entries, th);
-                let lines = match ctx.snap.get(row.name) {
+                let lines = match ctx
+                    .snap
+                    .skills
+                    .iter()
+                    .find(|s| s.deployment_name() == row.name)
+                {
                     // A skill the root knows is drawn the way every page draws
                     // it. Being in this grid already says it is linked, so the
                     // tail says where it came from rather than "managed" again.
@@ -727,25 +832,17 @@ impl View for AgentsView {
                             .as_ref()
                             .map(|s| s.kind().to_string())
                             .unwrap_or_default();
-                        skill_card(
-                            r,
-                            ctx,
-                            &ctx.snap.agents,
-                            ci.width as usize,
-                            None,
-                            &tail,
-                            &[],
-                        )
+                        skill_card(r, ctx, ci.width as usize, None, &tail, &[])
                     }
                     // The agent's own: there may be no record behind it, and
                     // even when there is, what matters is the shape it is in.
                     _ => {
                         let (glyph, gs) = glyph_for(row.state, th);
                         let label = state_label(row.state);
-                        let name_w = (ci.width as usize).saturating_sub(4);
+                        let name_w = (ci.width as usize).saturating_sub(cards::MARKER_W);
                         vec![
                             Line::from(vec![
-                                Span::styled(format!("{glyph} "), gs),
+                                Span::styled(format!("{glyph}   "), gs),
                                 Span::styled(pad(row.name, name_w), th.dim()),
                             ]),
                             Line::from(vec![
@@ -778,19 +875,57 @@ impl View for AgentsView {
                     Style::default()
                 };
                 let (glyph, gs) = glyph_for(row.state, th);
-                let line = Line::from(vec![
+                let managed = row
+                    .managed
+                    .then(|| {
+                        ctx.snap
+                            .skills
+                            .iter()
+                            .find(|r| r.deployment_name() == row.name)
+                    })
+                    .flatten();
+                let mut spans = vec![
                     Span::styled(if on { "▸ " } else { "  " }, th.accent()),
-                    Span::styled(format!("{glyph} "), gs),
-                    Span::styled(
+                    managed
+                        .map(|r| cards::health_marker(r, th))
+                        .unwrap_or_else(|| Span::styled(format!("{glyph}   "), gs)),
+                ];
+                if let Some(r) = managed {
+                    let available = (cell.width as usize).saturating_sub(2 + cards::MARKER_W);
+                    let badge = cards::repository_badge(r, ctx.ws.config.ui.icons);
+                    let badge_w = badge
+                        .as_deref()
+                        .map(|text| width(text).min(available / 2))
+                        .unwrap_or(0);
+                    let badge_space = badge_w + usize::from(badge_w > 0);
+                    let name_w = 26.min(available.saturating_sub(badge_space));
+                    spans.push(Span::styled(
+                        pad(cards::display_name(r), name_w),
+                        Style::default(),
+                    ));
+                    if let Some(badge) = badge.filter(|_| badge_w > 0) {
+                        spans.push(Span::styled(format!(" {}", pad(&badge, badge_w)), th.dim()));
+                    }
+                    let note_w = available.saturating_sub(name_w + badge_space);
+                    spans.push(Span::styled(
+                        fit(&row.state.map(entry_note).unwrap_or_default(), note_w),
+                        th.dim(),
+                    ));
+                } else {
+                    spans.push(Span::styled(
                         pad(row.name, 26),
                         if row.managed {
                             Style::default()
                         } else {
                             th.dim()
                         },
-                    ),
-                    Span::styled(row.state.map(entry_note).unwrap_or_default(), th.dim()),
-                ]);
+                    ));
+                    spans.push(Span::styled(
+                        row.state.map(entry_note).unwrap_or_default(),
+                        th.dim(),
+                    ));
+                }
+                let line = Line::from(spans);
                 f.render_widget(Paragraph::new(line).style(style), cell);
             }
         }
@@ -818,6 +953,12 @@ impl View for AgentsView {
     }
 
     fn hints(&self) -> Hints {
+        if let Some(hints) = self.matrix.hints() {
+            return hints;
+        }
+        if let Some(hints) = self.preview.hints() {
+            return hints;
+        }
         match self.focus() {
             Focus::Presets => &[
                 ("Enter", "deploy / undeploy"),
@@ -825,9 +966,9 @@ impl View for AgentsView {
                 ("M", "matrix"),
                 ("←→", "pick preset"),
                 ("↓", "entries"),
-                ("[ ]", "scope"),
+                ("[ ]", "agent"),
                 ("s", "sync"),
-                ("v", "density"),
+                ("v", "layout"),
             ],
             // A repair key is shown only on a row it applies to, so the footer
             // never offers something the page would refuse.
@@ -840,7 +981,7 @@ impl View for AgentsView {
                     ("a", "adopt"),
                     ("[ ]", "agent"),
                     ("c", "convert dir-link"),
-                    ("v", "density"),
+                    ("v", "layout"),
                 ],
                 Caps { relink: true, .. } => &[
                     ("j/k", "move"),
@@ -850,7 +991,15 @@ impl View for AgentsView {
                     ("a", "adopt"),
                     ("[ ]", "agent"),
                     ("c", "convert dir-link"),
-                    ("v", "density"),
+                    ("v", "layout"),
+                ],
+                Caps { managed: true, .. } => &[
+                    ("j/k", "move"),
+                    ("↑", "back to presets"),
+                    ("Enter", "preview"),
+                    ("m", "multi-select"),
+                    ("[ ]", "agent"),
+                    ("v", "layout"),
                 ],
                 Caps { .. } => &[
                     ("j/k", "move"),
@@ -859,7 +1008,7 @@ impl View for AgentsView {
                     ("a", "adopt"),
                     ("[ ]", "agent"),
                     ("c", "convert dir-link"),
-                    ("v", "density"),
+                    ("v", "layout"),
                 ],
             },
             Focus::Agents => &[
@@ -867,7 +1016,7 @@ impl View for AgentsView {
                 ("↓", "presets"),
                 ("s", "sync"),
                 ("c", "convert dir-link"),
-                ("v", "density"),
+                ("v", "layout"),
             ],
         }
     }
@@ -892,12 +1041,12 @@ fn lit(c: Color) -> Color {
 /// does not have it at all.
 fn glyph_for(state: Option<&EntryState>, th: &crate::tui::theme::Theme) -> (&'static str, Style) {
     match state {
-        Some(EntryState::Deployed) => ("●", th.ok()),
+        Some(EntryState::Deployed) => ("✓", th.ok()),
         Some(EntryState::Broken { .. }) => ("!", th.err()),
         Some(EntryState::Shadow { .. }) => ("▪", th.warn()),
         Some(EntryState::Foreign { .. }) => ("→", th.warn()),
         Some(EntryState::AgentOnly) => ("▪", th.dim()),
-        None => ("·", th.dim()),
+        None => ("—", th.dim()),
     }
 }
 
@@ -931,7 +1080,7 @@ fn entry_summary(state: Option<&EntryState>) -> String {
 /// Short status word for the right of a card.
 fn state_label(state: Option<&EntryState>) -> &'static str {
     match state {
-        Some(EntryState::Deployed) => "managed",
+        Some(EntryState::Deployed) => "linked",
         Some(EntryState::Broken { .. }) => "broken link",
         Some(EntryState::Shadow { same_content: true }) => "shadow",
         Some(EntryState::Shadow {
@@ -940,5 +1089,236 @@ fn state_label(state: Option<&EntryState>) -> &'static str {
         Some(EntryState::Foreign { .. }) => "foreign",
         Some(EntryState::AgentOnly) => "the agent's own",
         None => "",
+    }
+}
+
+/// Fit whole pills, moving the start only when selection leaves the viewport.
+fn pill_window(
+    widths: &[usize],
+    selected: usize,
+    offset: &mut usize,
+    budget: usize,
+) -> std::ops::Range<usize> {
+    if widths.is_empty() {
+        *offset = 0;
+        return 0..0;
+    }
+    let selected = selected.min(widths.len() - 1);
+    *offset = (*offset).min(selected);
+    while *offset < selected && widths[*offset..=selected].iter().sum::<usize>() > budget {
+        *offset += 1;
+    }
+    let mut end = *offset;
+    let mut used = 0;
+    while end < widths.len() && used + widths[end] <= budget {
+        used += widths[end];
+        end += 1;
+    }
+    *offset..end
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+    use crate::tui::theme::Theme;
+    use ratatui::{Terminal, backend::TestBackend};
+    use skills::{Workspace, config::AgentConfig};
+
+    #[test]
+    fn linked_unmanaged_skill_keeps_its_health_marker_across_layouts() {
+        let root =
+            std::env::temp_dir().join(format!("skills-agent-markers-{}", std::process::id()));
+        let central = root.join("central");
+        let agent_dir = root.join("agent");
+        std::fs::create_dir_all(central.join("printer")).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            central.join("printer/SKILL.md"),
+            "---\nname: printer\ndescription: Print documents\n---\nPrint documents.\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(central.join("printer"), agent_dir.join("printer")).unwrap();
+        let mut ws = Workspace::open(&central).unwrap();
+        ws.config.agents = vec![AgentConfig {
+            key: "sample".into(),
+            name: "Sample Agent".into(),
+            skills_dir: agent_dir.display().to_string(),
+        }];
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = AgentsView {
+            scope: "sample".into(),
+            ..AgentsView::default()
+        };
+        view.refresh(&ctx);
+        let record = snap.get("printer").unwrap();
+        assert!(matches!(
+            record.status,
+            skills::reconcile::SkillStatus::Unmanaged
+        ));
+        assert!(
+            view.rows(&ctx)
+                .iter()
+                .any(|row| row.name == "printer" && row.managed)
+        );
+        for compact in [false, true] {
+            view.compact = compact;
+            let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+            let buf = terminal.backend().buffer();
+            let text = (0..30)
+                .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let line = text.lines().find(|line| line.contains("printer")).unwrap();
+            assert!(line.contains("○"), "compact={compact}: {line}");
+            assert!(!line.contains("●"), "compact={compact}: {line}");
+        }
+        assert_eq!(glyph_for(Some(&EntryState::Deployed), &theme).0, "✓");
+        assert_eq!(glyph_for(None, &theme).0, "—");
+        assert!(!central.join(".skills-meta").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_preview_reads_the_selected_entry_instead_of_its_root_namesake() {
+        let root =
+            std::env::temp_dir().join(format!("skills-agent-preview-{}", std::process::id()));
+        let central = root.join("central");
+        let agent_dir = root.join("agent");
+        std::fs::create_dir_all(&central).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let put = |dir: &std::path::Path, body: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: printer\ndescription: Print documents\n---\n{body}\n"),
+            )
+            .unwrap();
+        };
+        put(&central.join("printer"), "CENTRAL CONTENT");
+        put(&agent_dir.join("printer"), "AGENT COPY CONTENT");
+        put(&agent_dir.join("reader"), "AGENT ONLY CONTENT");
+        put(&root.join("external"), "EXTERNAL CONTENT");
+        std::os::unix::fs::symlink(root.join("external"), agent_dir.join("external")).unwrap();
+        std::os::unix::fs::symlink(root.join("absent"), agent_dir.join("broken")).unwrap();
+        std::fs::create_dir_all(agent_dir.join("invalid")).unwrap();
+        std::fs::write(agent_dir.join("invalid/SKILL.md"), "invalid frontmatter").unwrap();
+        let mut ws = Workspace::open(&central).unwrap();
+        ws.config.agents = vec![AgentConfig {
+            key: "sample".into(),
+            name: "Sample Agent".into(),
+            skills_dir: agent_dir.display().to_string(),
+        }];
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = AgentsView {
+            scope: "sample".into(),
+            ..AgentsView::default()
+        };
+        view.refresh(&ctx);
+        view.set_focus(Focus::Entries);
+        assert!(
+            view.select_skills(&ctx, None).is_empty(),
+            "agent-owned entries must not enter central skill selection"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for (name, expected) in [
+            ("printer", "AGENT COPY CONTENT"),
+            ("reader", "AGENT ONLY CONTENT"),
+            ("external", "EXTERNAL CONTENT"),
+            ("broken", "missing SKILL.md"),
+            ("invalid", "no YAML frontmatter"),
+        ] {
+            let rows = view.rows(&ctx);
+            let index = rows.iter().position(|r| r.name == name).unwrap();
+            view.entries.first(rows.len());
+            view.entries.move_by(index as i32, rows.len());
+            assert!(view.handle_key(key(KeyCode::Enter), &ctx).is_empty());
+            terminal
+                .draw(|f| view.preview.draw(f, f.area(), &ctx))
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let text = (0..40)
+                .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(expected), "{name}: {text}");
+            assert!(text.contains("Sample Agent"));
+            assert!(text.contains(&format!("{name}/SKILL.md")));
+            assert!(!text.contains("CENTRAL CONTENT"));
+            assert!(view.handle_key(key(KeyCode::Esc), &ctx).is_empty());
+        }
+        assert!(!central.join(".skills-meta").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn selected_pill_is_visible_and_mouse_targets_are_clipped() {
+        let root = std::env::temp_dir().join(format!("skills-pills-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut ws = Workspace::open(&root).unwrap();
+        ws.config.agents = vec![AgentConfig {
+            key: "sample".into(),
+            name: "Sample".into(),
+            skills_dir: "../sample".into(),
+        }];
+        for i in 0..24 {
+            ws.presets
+                .save(&Preset {
+                    name: format!("group-{i:02}-long-name"),
+                    ..Preset::default()
+                })
+                .unwrap();
+        }
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = AgentsView::default();
+        view.refresh(&ctx);
+        for (w, h) in [(100, 30), (80, 24), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            for i in (0..24).chain((0..24).rev()) {
+                view.preset_cursor = i;
+                terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+                assert!(view.preset_rects.iter().any(|(index, _)| *index == i));
+                for (_, rect) in &view.preset_rects {
+                    assert!(rect.right() <= w);
+                    assert!(rect.bottom() <= h);
+                }
+                let (_, rect) = view
+                    .preset_rects
+                    .iter()
+                    .find(|(index, _)| *index == i)
+                    .unwrap();
+                let actions = view.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: rect.x,
+                        row: rect.y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &ctx,
+                );
+                assert_eq!(view.preset_cursor, i);
+                assert!(!actions.is_empty());
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

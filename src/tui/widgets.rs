@@ -4,11 +4,40 @@
 use super::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
+use ratatui::buffer::CellWidth;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{ListState, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Clear an overlay without leaving half of a wide background character at its edge.
+pub struct OverlayClear;
+
+impl ratatui::widgets::Widget for OverlayClear {
+    fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        let area = area.intersection(*buf.area());
+        if area.is_empty() {
+            return;
+        }
+        for y in area.top()..area.bottom() {
+            // Walk whole symbols: continuation cells of a wide glyph look like spaces.
+            let mut x = buf.area().left();
+            while x < area.right() {
+                let end = x
+                    .saturating_add(buf[(x, y)].cell_width().max(1))
+                    .min(buf.area().right());
+                if (x < area.left() && end > area.left()) || end > area.right() {
+                    for col in x..end {
+                        buf[(col, y)].reset();
+                    }
+                }
+                x = end;
+            }
+        }
+        ratatui::widgets::Clear.render(area, buf);
+    }
+}
 
 // ---- text helpers ---------------------------------------------------------
 
@@ -77,6 +106,18 @@ impl Input {
         self.value = v.to_string();
         self.cursor = self.value.chars().count();
     }
+    /// Cursor position as a byte boundary, for token-aware completion.
+    pub fn cursor_byte(&self) -> usize {
+        self.byte_at(self.cursor)
+    }
+
+    /// Replace a token while retaining the text and cursor after it.
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, replacement: &str) {
+        let cursor_byte = range.start + replacement.len();
+        self.value.replace_range(range, replacement);
+        self.cursor = self.value[..cursor_byte].chars().count();
+    }
+
     pub fn clear(&mut self) {
         self.value.clear();
         self.cursor = 0;
@@ -96,12 +137,27 @@ impl Input {
             .unwrap_or(self.value.len())
     }
 
+    /// Insert one paste atomically. Single-line fields reject the entire payload
+    /// when it contains controls; pasted newlines must never become Enter keys.
+    pub fn paste(&mut self, text: &str) -> Result<bool, &'static str> {
+        if text
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        {
+            return Err("Paste rejected: this field accepts one line without control characters.");
+        }
+        let at = self.cursor_byte();
+        self.value.insert_str(at, text);
+        self.cursor += text.chars().count();
+        Ok(!text.is_empty())
+    }
+
     /// Returns true when the value changed.
     pub fn handle_key(&mut self, k: KeyEvent) -> bool {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         match k.code {
-            KeyCode::Char(c) if !ctrl && !alt => {
+            KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
                 let i = self.byte_at(self.cursor);
                 self.value.insert(i, c);
                 self.cursor += 1;
@@ -403,6 +459,80 @@ impl ScrollTrack {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn paste_is_atomic_and_respects_unicode_cursor() {
+        let mut input = super::Input::with_value("a尾");
+        input.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(input.paste("中文🙂"), Ok(true));
+        assert_eq!(input.value(), "a中文🙂尾");
+        let cursor = input.cursor_byte();
+        for rejected in [
+            "first\nsecond",
+            "x\ry",
+            "x\ty",
+            "\u{1b}[31m",
+            "x\u{7f}",
+            "x\u{2028}y",
+            "x\u{2029}y",
+        ] {
+            assert!(input.paste(rejected).is_err());
+            assert_eq!(input.value(), "a中文🙂尾");
+            assert_eq!(input.cursor_byte(), cursor);
+        }
+        assert_eq!(input.paste(""), Ok(false));
+        input.paste("!").unwrap();
+        assert_eq!(input.value(), "a中文🙂!尾");
+    }
+
+    #[test]
+    fn overlay_edges_are_emitted_when_background_contains_wide_characters() {
+        use ratatui::{
+            buffer::Buffer,
+            widgets::{Block, Borders, Widget},
+        };
+        for text in ["中文中文中文中文中文中文", "🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂"]
+        {
+            let mut background = Buffer::empty(Rect::new(0, 0, 24, 6));
+            for y in 0..6 {
+                background.set_string(0, y, text, Style::default());
+            }
+            let mut overlay = background.clone();
+            let area = Rect::new(3, 1, 14, 4);
+            OverlayClear.render(area, &mut overlay);
+            Block::default()
+                .borders(Borders::ALL)
+                .render(area, &mut overlay);
+            let updates = background.diff(&overlay);
+            for y in 2..4 {
+                assert!(
+                    updates
+                        .iter()
+                        .any(|(x, row, cell)| *x == 3 && *row == y && cell.symbol() == "│"),
+                    "left border missing at row {y}"
+                );
+                assert!(
+                    updates
+                        .iter()
+                        .any(|(x, row, cell)| *x == 16 && *row == y && cell.symbol() == "│")
+                );
+            }
+            assert_eq!(overlay[(2, 2)].symbol(), " ");
+            assert_eq!(overlay[(17, 2)].symbol(), " ");
+            assert_eq!(overlay[(0, 2)].symbol(), background[(0, 2)].symbol());
+            assert_eq!(overlay[(18, 2)].symbol(), background[(18, 2)].symbol());
+            // Closing the overlay restores the full background character.
+            assert!(
+                overlay
+                    .diff(&background)
+                    .iter()
+                    .any(|(x, y, _)| *x == 2 && *y == 2)
+            );
+        }
+    }
+
     use super::*;
 
     fn track() -> ScrollTrack {

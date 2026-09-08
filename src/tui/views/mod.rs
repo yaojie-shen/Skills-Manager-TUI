@@ -3,6 +3,7 @@
 
 pub mod agents;
 pub mod cards;
+pub(crate) mod completion;
 pub mod health;
 pub mod matrix;
 pub mod presets;

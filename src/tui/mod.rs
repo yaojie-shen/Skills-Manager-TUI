@@ -6,15 +6,21 @@
 //! implements overlays. All writes go through `skills::ops`, like the CLI.
 
 mod app;
+mod batch;
 mod event;
+mod icons;
+mod markdown;
 mod modal;
+mod repository_picker;
 mod theme;
 mod toast;
 mod views;
 mod widgets;
 
 use anyhow::Result;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -68,32 +74,51 @@ pub fn run(root: Option<&Path>) -> Result<()> {
 }
 
 fn enter() -> Result<Term> {
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
-    let mut terminal = ratatui::Terminal::new(backend)?;
-    terminal.clear()?;
-    Ok(terminal)
+    let result = (|| -> Result<Term> {
+        enable_raw_mode()?;
+        let mut stdout = std::io::stdout();
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
+        let backend = ratatui::backend::CrosstermBackend::new(stdout);
+        let mut terminal = ratatui::Terminal::new(backend)?;
+        terminal.clear()?;
+        Ok(terminal)
+    })();
+    // An error after enabling a mode must not leave the shell in that mode.
+    if result.is_err() {
+        let _ = restore(&mut std::io::stdout());
+    }
+    result
+}
+
+fn restore(writer: &mut impl std::io::Write) -> Result<()> {
+    // Try both cleanup steps even if either fails.
+    let modes = execute!(
+        writer,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+    let raw = disable_raw_mode();
+    modes?;
+    raw?;
+    Ok(())
 }
 
 fn leave(terminal: &mut Term) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
-    Ok(())
+    restore(terminal.backend_mut())
 }
 
 /// Restore the terminal before printing a panic so the message is readable.
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = restore(&mut std::io::stdout());
         default(info);
     }));
 }

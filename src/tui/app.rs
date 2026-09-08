@@ -21,6 +21,7 @@ use skills::config::Config;
 use skills::history::{self, History, Plan};
 use skills::ops::deploy;
 use skills::reconcile::Snapshot;
+use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +65,18 @@ pub type MetaFn = Box<dyn FnOnce(&Workspace) -> Result<(String, Option<history::
 
 /// Requests a view or modal hands back to the app.
 pub enum Action {
+    SelectAgentSkills {
+        keys: Vec<String>,
+        title: String,
+        checked: Option<String>,
+        agent: String,
+    },
     Quit,
+    SelectSkills {
+        keys: Vec<String>,
+        title: String,
+        checked: Option<String>,
+    },
     Toast(String),
     Error(String),
     /// Re-scan in the background.
@@ -72,6 +84,8 @@ pub enum Action {
     Spawn(Task),
     OpenModal(Box<Modal>),
     CloseModal,
+    /// Keep the input and cursor until validation and synchronous writes succeed.
+    SubmitInput(Vec<Action>),
     SwitchTab(Tab),
     /// Land on a preset by name once the list next reloads: after creating
     /// or renaming one, the card to look at is the one that has just changed.
@@ -97,6 +111,12 @@ pub enum Action {
     Write(WriteFn),
     /// Run a write that can be taken back, and log what it changed.
     WriteMeta(MetaFn),
+    BatchMeta(MetaFn, Vec<String>),
+    BatchLinks {
+        title: String,
+        actions: Vec<deploy::Action>,
+        keys: Vec<String>,
+    },
     /// Log something that has already happened.
     Record(history::Intent),
     /// Move the history after a confirmed undo or redo went through.
@@ -141,15 +161,92 @@ pub struct App {
     pub agents: AgentsView,
     pub health: HealthView,
     pub modal: Option<Modal>,
+    pending_task_ui: VecDeque<Action>,
+    batch_running: bool,
     pub toasts: Toasts,
     pub history: History,
     tasks_running: usize,
+    next_task_id: u64,
     spinner: usize,
     tx: Sender<Msg>,
     external: Option<External>,
     quit: bool,
+    quit_prompt: Option<QuitPrompt>,
     tab_rects: Vec<(Rect, Tab)>,
     body: Rect,
+}
+
+/// Kept separate from the editing modal so cancelling quit preserves its input.
+#[derive(Default)]
+struct QuitPrompt {
+    quit_selected: bool,
+    area: Rect,
+    quit_button: Rect,
+    cancel_button: Rect,
+}
+
+impl QuitPrompt {
+    fn draw(&mut self, f: &mut Frame, outer: Rect, th: &Theme, tasks: Vec<String>) {
+        use super::widgets::{OverlayClear, button, fit};
+        let w = outer.width.saturating_sub(2).min(86);
+        let h = outer
+            .height
+            .saturating_sub(2)
+            .min(tasks.len() as u16 + 6)
+            .max(1);
+        self.area = Rect::new(
+            outer.x + (outer.width - w) / 2,
+            outer.y + (outer.height - h) / 2,
+            w,
+            h,
+        );
+        f.render_widget(OverlayClear, self.area);
+        let block = th.block(" quit ", true);
+        let inner = block.inner(self.area);
+        f.render_widget(block, self.area);
+        let available = inner.height.saturating_sub(3) as usize;
+        let total = tasks.len();
+        let mut lines: Vec<Line> = tasks
+            .into_iter()
+            .take(available)
+            .map(|task| Line::raw(fit(&task, inner.width as usize)))
+            .collect();
+        if total == 0 {
+            lines.push(Line::raw("Background work has finished. Quit now?"));
+        } else {
+            if total > available
+                && let Some(last) = lines.last_mut()
+            {
+                *last = Line::raw(format!("… {} more tasks running", total - available + 1));
+            }
+            lines.push(Line::raw(fit(
+                "Quit now and abandon running work?",
+                inner.width as usize,
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+        let y = inner.bottom().saturating_sub(1);
+        self.cancel_button = Rect::new(
+            inner.right().saturating_sub(10).max(inner.x),
+            y,
+            inner.width.min(10),
+            u16::from(inner.height > 0),
+        );
+        self.quit_button = Rect::new(
+            self.cancel_button.x.saturating_sub(10).max(inner.x),
+            y,
+            self.cancel_button.x.saturating_sub(inner.x).min(8),
+            u16::from(inner.height > 0),
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(button("Quit", self.quit_selected, th))),
+            self.quit_button,
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(button("Cancel", !self.quit_selected, th))),
+            self.cancel_button,
+        );
+    }
 }
 
 impl App {
@@ -166,13 +263,17 @@ impl App {
             agents: AgentsView::default(),
             health: HealthView::default(),
             modal: None,
+            pending_task_ui: VecDeque::new(),
+            batch_running: false,
             toasts: Toasts::default(),
             history: History::default(),
             tasks_running: 0,
+            next_task_id: 0,
             spinner: 0,
             tx,
             external: None,
             quit: false,
+            quit_prompt: None,
             tab_rects: Vec::new(),
             body: Rect::default(),
         };
@@ -210,7 +311,7 @@ impl App {
         self.external.take()
     }
 
-    pub fn run_external(&mut self, req: External) -> Result<(String, String)> {
+    pub fn run_external(&mut self, req: External) -> Result<(String, Option<String>)> {
         match req {
             External::EditNote { skill, initial } => {
                 let text = crate::cli::edit_in_editor(&initial)?;
@@ -219,9 +320,13 @@ impl App {
         }
     }
 
-    pub fn finish_external(&mut self, outcome: Result<(String, String)>) {
+    pub fn finish_external(&mut self, outcome: Result<(String, Option<String>)>) {
         match outcome {
-            Ok((skill, text)) => match history::note_edit(&self.ws, &skill, Some(&text)) {
+            Ok((skill, None)) => {
+                self.toast(format!("note unchanged on {skill}"), Level::Info);
+                return;
+            }
+            Ok((skill, Some(text))) => match history::note_edit(&self.ws, &skill, Some(&text)) {
                 Ok((msg, intent)) => {
                     self.toast(msg, Level::Ok);
                     if let Some(intent) = intent {
@@ -238,6 +343,7 @@ impl App {
     // ---- messages ---------------------------------------------------------
 
     pub fn handle(&mut self, msg: Msg) {
+        let background = matches!(&msg, Msg::Task(..));
         let actions = match msg {
             Msg::Tick => {
                 self.spinner = (self.spinner + 1) % SPINNER.len();
@@ -245,20 +351,127 @@ impl App {
                 Vec::new()
             }
             Msg::Resize => Vec::new(),
-            Msg::Task(out) => {
+            Msg::Progress(id, detail) => {
+                self.toasts.progress(id, detail);
+                Vec::new()
+            }
+            Msg::Task(id, out) => {
+                self.toasts.finish(id);
                 self.tasks_running = self.tasks_running.saturating_sub(1);
                 self.on_task(*out)
             }
+            Msg::Paste(text) => self.on_paste(&text),
             Msg::Key(k) => self.on_key(k),
             Msg::Mouse(m) => self.on_mouse(m),
         };
-        for a in actions {
-            self.apply(a);
+        let mut queued = false;
+        for action in actions {
+            if background
+                && matches!(action, Action::OpenModal(_) | Action::Search { .. })
+                && (self.task_ui_blocked() || !self.pending_task_ui.is_empty())
+            {
+                self.pending_task_ui.push_back(action);
+                queued = true;
+            } else {
+                self.apply(action);
+            }
         }
+        if queued {
+            self.toast("task ready — waiting for the current dialog", Level::Info);
+        }
+        // Drain only after the whole event, so CloseModal + OpenModal transitions
+        // and failed input submissions cannot expose a queued dialog in between.
+        while !self.quit && !self.task_ui_blocked() {
+            let Some(action) = self.pending_task_ui.pop_front() else {
+                break;
+            };
+            self.apply(action);
+        }
+    }
+
+    fn task_ui_blocked(&self) -> bool {
+        self.quit_prompt.is_some()
+            || self.modal.is_some()
+            || (self.tab == Tab::Tags && self.tags.input_focused())
     }
 
     fn on_task(&mut self, out: TaskOutput) -> Vec<Action> {
         match out {
+            TaskOutput::Batch(outcome) => {
+                self.batch_running = false;
+                if let Some(intent) = outcome.intent {
+                    self.history.record(intent);
+                }
+                self.search.batch_finished(&outcome.failed);
+                if outcome.errors.is_empty() {
+                    self.modal = None;
+                    self.toast(outcome.message, Level::Ok);
+                } else {
+                    self.modal = Some(Modal::message(
+                        format!(
+                            "Batch result · {} skills need attention",
+                            outcome.failed.len()
+                        ),
+                        outcome.errors,
+                    ));
+                    self.toast(
+                        format!(
+                            "{}; {} skills need attention",
+                            outcome.message,
+                            outcome.failed.len()
+                        ),
+                        Level::Error,
+                    );
+                }
+                self.rescan();
+                vec![]
+            }
+
+            TaskOutput::RepositoryFetched(_, Ok(fetched)) => {
+                let ctx = Ctx {
+                    ws: &self.ws,
+                    snap: &self.snap,
+                    theme: &self.theme,
+                };
+                vec![Action::OpenModal(Box::new(Modal::Repository(Box::new(
+                    super::repository_picker::RepositoryPicker::new(fetched, &ctx),
+                ))))]
+            }
+            TaskOutput::RepositoryFetched(reference, Err(e)) => {
+                vec![Action::Error(format!("discover {reference}: {e:#}"))]
+            }
+            TaskOutput::RepositoryInstalled(selection, result) => match result {
+                Ok(keys) => {
+                    selection.fetched.cleanup();
+                    let mut actions: Vec<Action> = keys
+                        .iter()
+                        .map(|key| Action::Record(history::Intent::Install { skill: key.clone() }))
+                        .collect();
+                    actions.extend([
+                        Action::Rescan,
+                        Action::Toast(format!(
+                            "installed {} skills — d deploys the selected skill",
+                            keys.len()
+                        )),
+                        Action::Search {
+                            query: format!(
+                                "repo:{}",
+                                skills::repository::source_name(&selection.fetched.repository.url)
+                                    .unwrap_or_else(|| selection.fetched.repository.alias.clone())
+                            ),
+                            focus_list: true,
+                        },
+                    ]);
+                    actions
+                }
+                Err(e) => vec![
+                    Action::Error(format!("install: {e:#}")),
+                    Action::OpenModal(Box::new(Modal::Repository(Box::new(
+                        super::repository_picker::RepositoryPicker::restore(*selection),
+                    )))),
+                ],
+            },
+
             TaskOutput::Scan(Ok(snap)) => {
                 self.snap = snap;
                 self.on_snapshot();
@@ -266,6 +479,7 @@ impl App {
             }
             TaskOutput::Scan(Err(e)) => vec![Action::Error(format!("scan failed: {e:#}"))],
             TaskOutput::Check(results) => {
+                self.search.remember_checks(&results);
                 let ctx = Ctx {
                     ws: &self.ws,
                     snap: &self.snap,
@@ -305,21 +519,56 @@ impl App {
                     focus_list: true,
                 },
             ],
-            // A reference that holds several skills is not a failure; it is a
-            // question, so ask it.
+            // Legacy git installs with several skills enter the shared repository picker.
             TaskOutput::Installed(reference, Err(e)) => {
                 match e.downcast_ref::<skills::ops::install::NotOneSkill>() {
-                    Some(choice) => vec![Action::OpenModal(Box::new(Modal::install_choice(
-                        &reference,
-                        choice.choices.clone(),
-                    )))],
+                    Some(_) => vec![Action::Spawn(Task::DiscoverRepository(reference))],
                     None => vec![Action::Error(format!("install {reference}: {e:#}"))],
                 }
             }
         }
     }
 
+    fn on_paste(&mut self, text: &str) -> Vec<Action> {
+        if self.quit_prompt.is_some() || self.batch_running {
+            return vec![];
+        }
+        let ctx = Ctx {
+            ws: &self.ws,
+            snap: &self.snap,
+            theme: &self.theme,
+        };
+        if let Some(modal) = self.modal.as_mut() {
+            return modal.paste(text, &ctx);
+        }
+        match self.tab {
+            Tab::Search => self.search.paste(text, &ctx),
+            Tab::Tags => self.tags.paste(text),
+            _ => vec![],
+        }
+    }
+
     fn on_key(&mut self, k: KeyEvent) -> Vec<Action> {
+        if let Some(prompt) = self.quit_prompt.as_mut() {
+            match k.code {
+                KeyCode::Esc => self.quit_prompt = None,
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                    prompt.quit_selected = !prompt.quit_selected;
+                }
+                KeyCode::Enter => {
+                    self.quit = prompt.quit_selected;
+                    self.quit_prompt = None;
+                }
+                _ => {}
+            }
+            return vec![];
+        }
+        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+            return vec![Action::Quit];
+        }
+        if self.batch_running {
+            return vec![];
+        }
         let ctx = Ctx {
             ws: &self.ws,
             snap: &self.snap,
@@ -327,6 +576,11 @@ impl App {
         };
         if let Some(m) = self.modal.as_mut() {
             return m.handle_key(k, &ctx);
+        }
+        if self.tab == Tab::Agents
+            && let Some(actions) = self.agents.handle_matrix_key(k, &ctx)
+        {
+            return actions;
         }
         // Any text field that holds the keyboard keeps its digits and slashes;
         // the Tags page has one of its own for colours and merge targets.
@@ -339,13 +593,14 @@ impl App {
             (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
                 return vec![Action::Rescan, Action::Toast("rescanning".into())];
             }
+            (KeyCode::Char('R'), _) if !in_search_input => {
+                return vec![Action::OpenModal(Box::new(Modal::repositories(&ctx)))];
+            }
             (KeyCode::F(1), _) => return vec![Action::OpenModal(Box::new(Modal::help()))],
             (KeyCode::Char('?'), _) if !in_search_input => {
                 return vec![Action::OpenModal(Box::new(Modal::help()))];
             }
-            (KeyCode::Char(c @ '1'..='5'), m)
-                if !in_search_input || m.contains(KeyModifiers::ALT) =>
-            {
+            (KeyCode::Char(c @ '1'..='5'), KeyModifiers::NONE) if !in_search_input => {
                 return vec![Action::SwitchTab(Tab::ALL[(c as u8 - b'1') as usize])];
             }
             (KeyCode::Tab, _) if self.tab != Tab::Search => {
@@ -376,6 +631,21 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) -> Vec<Action> {
+        if let Some(prompt) = self.quit_prompt.as_ref() {
+            if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                let point = (m.column, m.row).into();
+                if prompt.quit_button.contains(point) {
+                    self.quit = true;
+                    self.quit_prompt = None;
+                } else if prompt.cancel_button.contains(point) || !prompt.area.contains(point) {
+                    self.quit_prompt = None;
+                }
+            }
+            return vec![];
+        }
+        if self.batch_running {
+            return vec![];
+        }
         let ctx = Ctx {
             ws: &self.ws,
             snap: &self.snap,
@@ -406,13 +676,77 @@ impl App {
 
     fn apply(&mut self, action: Action) {
         match action {
-            Action::Quit => self.quit = true,
+            Action::SelectAgentSkills {
+                keys,
+                title,
+                checked,
+                agent,
+            } => {
+                self.apply(Action::SelectSkills {
+                    keys,
+                    title,
+                    checked,
+                });
+                self.search.restrict_agent(agent);
+            }
+            Action::Quit => {
+                if self.tasks_running == 0 {
+                    self.quit = true;
+                } else {
+                    self.quit_prompt = Some(QuitPrompt::default());
+                }
+            }
+            Action::SelectSkills {
+                keys,
+                title,
+                checked,
+            } => {
+                self.switch_tab(Tab::Search);
+                let ctx = Ctx {
+                    ws: &self.ws,
+                    snap: &self.snap,
+                    theme: &self.theme,
+                };
+                self.search.select_scope(keys, title, checked, &ctx);
+            }
             Action::Toast(t) => self.toast(t, Level::Ok),
             Action::Error(t) => self.toast(t, Level::Error),
             Action::Rescan => self.rescan(),
             Action::Spawn(task) => self.spawn(task),
             Action::OpenModal(m) => self.modal = Some(*m),
             Action::CloseModal => self.modal = None,
+            Action::SubmitInput(actions) => {
+                let prompt = self.modal.take();
+                for action in actions {
+                    let result = match action {
+                        Action::Error(error) => Err(anyhow::anyhow!(error)),
+                        Action::Write(write) => {
+                            let result = write(&self.ws);
+                            self.rescan();
+                            result.map(|message| self.toast(message, Level::Ok))
+                        }
+                        Action::WriteMeta(write) => {
+                            let result = write(&self.ws);
+                            self.rescan();
+                            result.map(|(message, intent)| {
+                                self.toast(message, Level::Ok);
+                                if let Some(intent) = intent {
+                                    self.history.record(intent);
+                                }
+                            })
+                        }
+                        other => {
+                            self.apply(other);
+                            Ok(())
+                        }
+                    };
+                    if let Err(error) = result {
+                        self.modal = prompt;
+                        self.toast(format!("{error:#}"), Level::Error);
+                        break;
+                    }
+                }
+            }
             Action::SwitchTab(t) => {
                 self.switch_tab(t);
                 if t == Tab::Search {
@@ -443,6 +777,14 @@ impl App {
                 self.external = Some(External::EditNote { skill, initial });
             }
             Action::ApplyLinks { title, actions } => {
+                if !deploy::name_conflicts(&self.snap, &actions).is_empty() {
+                    self.modal = Some(Modal::NameConflict {
+                        title,
+                        actions,
+                        rect: Rect::default(),
+                    });
+                    return;
+                }
                 if !actions.iter().any(|a| a.is_change()) {
                     let reason = actions.iter().find_map(|a| match a {
                         deploy::Action::Skip { reason, .. } => Some(reason.clone()),
@@ -466,7 +808,15 @@ impl App {
                 self.rescan();
             }
             Action::ConfirmLinks { title, actions } => {
-                self.modal = Some(Modal::confirm(title, actions));
+                self.modal = Some(if deploy::name_conflicts(&self.snap, &actions).is_empty() {
+                    Modal::confirm(title, actions)
+                } else {
+                    Modal::NameConflict {
+                        title,
+                        actions,
+                        rect: Rect::default(),
+                    }
+                });
             }
             Action::Record(intent) => self.history.record(intent),
             Action::Step(Step::Undo) => self.history.commit_undo(),
@@ -477,6 +827,19 @@ impl App {
                     Err(e) => self.toast(format!("{e:#}"), Level::Error),
                 }
                 self.rescan();
+            }
+            Action::BatchMeta(write, keys) => {
+                self.spawn_batch(
+                    super::event::BatchWork::Metadata(write, keys.clone()),
+                    format!("Applying metadata to {} skills…", keys.len()),
+                );
+            }
+            Action::BatchLinks {
+                title,
+                actions,
+                keys,
+            } => {
+                self.spawn_batch(super::event::BatchWork::Links(actions, keys), title);
             }
             Action::WriteMeta(f) => {
                 match f(&self.ws) {
@@ -501,6 +864,7 @@ impl App {
         if t == self.tab {
             return;
         }
+        self.search.clear_selection();
         self.tab = t;
         let view: &mut dyn View = match t {
             Tab::Search => &mut self.search,
@@ -569,9 +933,47 @@ impl App {
         }
     }
 
+    fn spawn_batch(&mut self, work: super::event::BatchWork, title: String) {
+        if self.batch_running {
+            return;
+        }
+        self.batch_running = true;
+        self.next_task_id += 1;
+        let id = self.next_task_id;
+        self.tasks_running += 1;
+        self.toasts.start(id, title);
+        if let Some(Modal::Batch(batch)) = self.modal.as_mut() {
+            batch.set_busy(true);
+        }
+        if let Err(e) = super::event::spawn_batch(self.ws.clone(), work, id, self.tx.clone()) {
+            self.batch_running = false;
+            self.tasks_running = self.tasks_running.saturating_sub(1);
+            self.toasts.finish(id);
+            if let Some(Modal::Batch(batch)) = self.modal.as_mut() {
+                batch.set_busy(false);
+            }
+            self.toast(format!("Cannot start batch: {e}"), Level::Error);
+        }
+    }
+
     fn spawn(&mut self, task: Task) {
         self.tasks_running += 1;
-        spawn_task(self.ws.clone(), task, self.tx.clone());
+        self.next_task_id += 1;
+        let id = self.next_task_id;
+        let label = match &task {
+            Task::Scan => None,
+            Task::DiscoverRepository(reference) => Some(format!("Clone {reference}")),
+            Task::InstallRepository(selection) => {
+                Some(format!("Install {}", selection.fetched.repository.alias))
+            }
+            Task::Install { reference, .. } => Some(format!("Install {reference}")),
+            Task::Check(keys) => Some(format!("Check upstream: {} skills", keys.len())),
+            Task::Prepare(key) => Some(format!("Prepare update: {key}")),
+        };
+        if let Some(label) = label {
+            self.toasts.start(id, label);
+        }
+        spawn_task(self.ws.clone(), task, id, self.tx.clone());
     }
 
     pub fn rescan(&mut self) {
@@ -621,6 +1023,14 @@ impl App {
         }
         // Above everything: a notification should be readable over a dialog.
         self.toasts.draw(f, area, &self.theme);
+        if let Some(prompt) = self.quit_prompt.as_mut() {
+            let mut tasks = self.toasts.running_details();
+            let scans = self.tasks_running.saturating_sub(tasks.len());
+            if scans > 0 {
+                tasks.push(format!("Scan skills: {scans} running"));
+            }
+            prompt.draw(f, area, &self.theme, tasks);
+        }
     }
 
     fn draw_header(&mut self, f: &mut Frame, area: Rect) {
@@ -641,12 +1051,19 @@ impl App {
             spans.push(Span::raw(" "));
             x += w + 1;
         }
-        let right = if self.tasks_running > 0 {
-            format!("{} working  ", SPINNER[self.spinner])
-        } else {
-            format!("{}  ", skills::paths::contract_tilde(&self.snap.root))
-        };
         let used = (x - area.x) as usize;
+        let available = (area.width as usize).saturating_sub(used);
+        let right = if self.tasks_running > 0 {
+            super::widgets::fit(&format!("{} working  ", SPINNER[self.spinner]), available)
+        } else {
+            let path = skills::paths::contract_tilde(&self.snap.root);
+            let tail_space = available.min(2);
+            format!(
+                "{}{}",
+                middle_ellipsis(&path, available - tail_space),
+                " ".repeat(tail_space)
+            )
+        };
         let pad = (area.width as usize).saturating_sub(used + width(&right));
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(right, th.dim()));
@@ -687,3 +1104,445 @@ impl App {
 
 /// Key hint pairs shown in the footer.
 pub type Hints = &'static [(&'static str, &'static str)];
+
+/// Fit the root into its header allocation while keeping the directory tail.
+fn middle_ellipsis(text: &str, max: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    if width(text) <= max {
+        return text.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let prefix_budget = (max - 1) / 2;
+    let mut prefix = String::new();
+    for glyph in text.graphemes(true) {
+        if width(&prefix) + width(glyph) > prefix_budget {
+            break;
+        }
+        prefix.push_str(glyph);
+    }
+    let suffix_budget = max - 1 - width(&prefix);
+    let mut suffix = Vec::new();
+    let mut used = 0;
+    for glyph in text.graphemes(true).rev() {
+        if used + width(glyph) > suffix_budget {
+            break;
+        }
+        used += width(glyph);
+        suffix.push(glyph);
+    }
+    format!("{prefix}…{}", suffix.into_iter().rev().collect::<String>())
+}
+
+#[cfg(test)]
+mod matrix_key_tests {
+    use super::*;
+
+    #[test]
+    fn header_paths_keep_the_tail_with_unicode_safe_middle_ellipsis() {
+        let path = "/temporary/long-parent-directory/project/skills";
+        let shortened = middle_ellipsis(path, 16);
+        assert!(shortened.starts_with("/tempor"));
+        assert!(shortened.ends_with("/skills"));
+        assert!(shortened.contains('…'));
+        for max in 0..50 {
+            assert!(width(&middle_ellipsis("/文件系统/打印机/skills", max)) <= max);
+        }
+        assert_eq!(middle_ellipsis("/skills", 30), "/skills");
+    }
+
+    #[test]
+    fn unchanged_editor_buffer_does_not_create_metadata_or_start_a_scan() {
+        let root =
+            std::env::temp_dir().join(format!("skills-editor-unchanged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("printer")).unwrap();
+        std::fs::write(
+            root.join("printer/SKILL.md"),
+            "---\nname: printer\ndescription: Print documents\n---\n",
+        )
+        .unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        let running = app.tasks_running;
+        app.finish_external(Ok(("printer".into(), None)));
+        assert!(app.ws.meta.load("printer").unwrap().is_none());
+        assert_eq!(app.tasks_running, running);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("note unchanged on printer"));
+        assert!(!rendered.contains("note saved"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quitting_running_work_requires_explicit_confirmation_and_preserves_input() {
+        let root = std::env::temp_dir().join(format!("skills-quit-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        app.tasks_running = 1;
+        app.toasts.start(1, "Check upstream: 30 skills".into());
+        app.handle(Msg::Progress(
+            1,
+            "12/30 complete · querying printer…".into(),
+        ));
+        for tab in [Tab::Tags, Tab::Presets, Tab::Agents, Tab::Health] {
+            app.switch_tab(tab);
+            app.handle(Msg::Key(KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+            )));
+            assert_eq!(app.tab, Tab::Search);
+            assert!(!app.quit);
+            assert!(app.quit_prompt.is_none());
+            assert_eq!(app.tasks_running, 1);
+        }
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        if app.quit_prompt.is_none() {
+            app.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        }
+        assert!(
+            app.quit_prompt.is_some(),
+            "empty Search Esc must use the quit guard"
+        );
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!app.quit);
+        app.modal = Some(Modal::set_source("printer", None));
+        app.handle(Msg::Paste("https://example.com/team/tools".into()));
+        app.batch_running = true;
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(app.quit_prompt.is_some());
+        assert!(!app.quit);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("12/30 complete"));
+        assert!(rendered.contains("Quit now and abandon running work?"));
+        app.handle(Msg::Paste("unexpected paste".into()));
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(!app.quit);
+        assert!(app.quit_prompt.is_none());
+        let Some(Modal::Input { input, .. }) = &app.modal else {
+            panic!("lost editing dialog")
+        };
+        assert_eq!(input.value(), "https://example.com/team/tools");
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        app.tasks_running = 0;
+        app.toasts.finish(1);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("Background work has finished"));
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(app.quit);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn source_paste_never_submits_or_dispatches_shortcuts() {
+        let root = std::env::temp_dir().join(format!("skills-source-paste-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("sample")).unwrap();
+        std::fs::write(
+            root.join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: Sample\n---\nBody\n",
+        )
+        .unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        app.modal = Some(Modal::set_source("sample", None));
+        app.handle(Msg::Paste(
+            "https://example.com/team/tools\nset -g junk 1\nmore junk".into(),
+        ));
+        let Some(Modal::Input {
+            input,
+            kind: super::super::modal::InputKind::SetSource { skill },
+            ..
+        }) = &app.modal
+        else {
+            panic!("paste changed the dialog");
+        };
+        assert_eq!(skill, "sample");
+        assert!(input.is_empty());
+        assert!(!root.join(".skills-meta/sample.toml").exists());
+        app.handle(Msg::Paste("https://example.com/team/tools".into()));
+        let Some(Modal::Input { input, .. }) = &app.modal else {
+            panic!("paste submitted the dialog");
+        };
+        assert_eq!(input.value(), "https://example.com/team/tools");
+        assert!(!root.join(".skills-meta/sample.toml").exists());
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        app.handle(Msg::Paste("sqx123\n".into()));
+        assert!(app.modal.is_none());
+        assert!(!app.quit);
+        assert_eq!(app.tab, Tab::Search);
+        assert!(!root.join(".skills-meta/sample.toml").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_worker_keeps_ticks_live_and_rejects_duplicate_submission() {
+        let root = std::env::temp_dir().join(format!("skills-async-batch-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        app.apply(Action::BatchMeta(
+            Box::new(move |_| {
+                wait.recv().unwrap();
+                Ok(("done".into(), None))
+            }),
+            vec![],
+        ));
+        assert!(app.batch_running);
+        let tick = app.spinner;
+        app.handle(Msg::Tick);
+        assert_ne!(tick, app.spinner);
+        let id = app.next_task_id;
+        app.apply(Action::BatchMeta(
+            Box::new(|_| panic!("duplicate work must not execute")),
+            vec![],
+        ));
+        assert_eq!(id, app.next_task_id);
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.quit);
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.batch_running || app.tasks_running > 0 {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            app.handle(rx.recv_timeout(remaining).unwrap());
+        }
+        assert!(app.modal.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn background_dialogs_wait_for_editing_and_keep_arrival_order() {
+        let root = std::env::temp_dir().join(format!("skills-task-dialogs-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        app.modal = Some(Modal::new_preset());
+        let key = |code| Msg::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        app.handle(key(KeyCode::Char('a')));
+        app.handle(key(KeyCode::Char('/')));
+        app.handle(key(KeyCode::Left));
+        for reference in ["first", "second"] {
+            let workdir = root.join(".downloads").join(reference);
+            for skill in ["printer", "reader"] {
+                std::fs::create_dir_all(workdir.join(skill)).unwrap();
+                std::fs::write(
+                    workdir.join(skill).join("SKILL.md"),
+                    format!("---\nname: {skill}\ndescription: Sample skill\n---\nBody\n"),
+                )
+                .unwrap();
+            }
+            let fetched = skills::repository::FetchedRepository {
+                repository: skills::repository::Repository {
+                    alias: reference.into(),
+                    url: format!("https://example.com/sample/{reference}"),
+                    branch: "main".into(),
+                },
+                revision: "0000000000000000000000000000000000000001".into(),
+                workdir,
+                choices: vec!["printer".into(), "reader".into()],
+                invalid: Default::default(),
+            };
+            app.handle(Msg::Task(
+                0,
+                Box::new(TaskOutput::RepositoryFetched(reference.into(), Ok(fetched))),
+            ));
+        }
+        assert_eq!(app.pending_task_ui.len(), 2);
+        app.handle(key(KeyCode::Enter)); // Invalid preset name: keep editing.
+        assert!(matches!(&app.modal, Some(Modal::Input { .. })));
+        assert_eq!(app.pending_task_ui.len(), 2);
+        app.handle(key(KeyCode::Char('b')));
+        let Some(Modal::Input { input, .. }) = &app.modal else {
+            panic!("lost input")
+        };
+        assert_eq!(input.value(), "ab/");
+        app.handle(key(KeyCode::Delete));
+        app.handle(key(KeyCode::Enter)); // Save; only the first task may appear.
+        assert!(app.ws.presets.load("ab").unwrap().is_some());
+        let Some(Modal::Repository(picker)) = &app.modal else {
+            panic!("expected first result")
+        };
+        assert_eq!(picker.selection.fetched.repository.alias, "first");
+        app.handle(key(KeyCode::Esc));
+        let Some(Modal::Repository(picker)) = &app.modal else {
+            panic!("expected second result")
+        };
+        assert_eq!(picker.selection.fetched.repository.alias, "second");
+        assert!(!root.join(".downloads/first").exists());
+        assert!(root.join(".downloads/second").exists());
+        app.handle(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert!(app.pending_task_ui.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_inputs_keep_their_text_and_cursor_until_a_successful_retry() {
+        let root = std::env::temp_dir().join(format!("skills-input-retry-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        ws.presets
+            .save(&skills::preset::Preset {
+                name: "reading".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(ws, tx).unwrap();
+        let press =
+            |app: &mut App, code| app.handle(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        let value = |app: &App| match &app.modal {
+            Some(Modal::Input { input, .. }) => input.value().to_string(),
+            _ => panic!("input must remain open"),
+        };
+        app.modal = Some(Modal::rename_preset("reading"));
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(value(&app), "reading/");
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(value(&app), "readings/"); // Cursor stayed before the slash.
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        assert!(app.ws.presets.load("readings").unwrap().is_some());
+
+        app.modal = Some(Modal::new_preset());
+        for c in "readings".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter); // Write closure rejects the duplicate.
+        assert_eq!(value(&app), "readings");
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        assert!(app.ws.presets.load("readings2").unwrap().is_some());
+
+        // A metadata write can fail after validation, too.
+        app.modal = Some(Modal::rename_preset("readings2"));
+        press(&mut app, KeyCode::Backspace);
+        press(&mut app, KeyCode::Enter); // Existing destination.
+        assert_eq!(value(&app), "readings");
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        assert!(app.ws.presets.load("readings3").unwrap().is_some());
+        app.modal = Some(Modal::new_preset());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn matrix_receives_keys_before_global_shortcuts() {
+        let root =
+            std::env::temp_dir().join(format!("skills-matrix-routing-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(ws, tx).unwrap();
+        app.tab = Tab::Agents;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(app.on_key(key(KeyCode::Char('M'))).is_empty());
+        for code in [
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Char('/'),
+            KeyCode::Char('1'),
+        ] {
+            assert!(app.on_key(key(code)).is_empty());
+            assert_eq!(app.tab, Tab::Agents);
+        }
+        assert!(app.on_key(key(KeyCode::Esc)).is_empty());
+        assert!(matches!(
+            app.on_key(key(KeyCode::Tab)).as_slice(),
+            [Action::SwitchTab(Tab::Health)]
+        ));
+        assert!(matches!(
+            app.on_key(key(KeyCode::BackTab)).as_slice(),
+            [Action::SwitchTab(Tab::Presets)]
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

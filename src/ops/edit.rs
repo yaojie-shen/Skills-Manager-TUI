@@ -169,18 +169,25 @@ pub fn rename(ws: &Workspace, snap: &Snapshot, old: &str, new: &str) -> Result<V
         .agents
         .iter()
         .filter(|a| {
-            a.mode == AgentDirMode::Real && matches!(a.entries.get(old), Some(EntryState::Deployed))
+            a.mode == AgentDirMode::Real
+                && matches!(
+                    a.entries.get(&crate::repository::default_deploy_name(old)),
+                    Some(EntryState::Deployed)
+                )
         })
         .map(|a| a.key.clone())
         .collect();
     let unlink = deploy::plan_undeploy(ws, snap, &[old.to_string()], &agents)?;
     deploy::apply(&unlink)?;
+    std::fs::create_dir_all(to.parent().context("missing parent")?)?;
     std::fs::rename(&from, &to).with_context(|| format!("renaming {old} -> {new}"))?;
     log.push(format!("renamed directory {old} -> {new}"));
     ws.meta.rename(old, new)?;
     for a in &agents {
         let cfg = ws.config.agent(a).context("agent vanished")?;
-        let link = cfg.skills_path().join(new);
+        let link = cfg
+            .skills_path()
+            .join(crate::repository::default_deploy_name(new));
         std::os::unix::fs::symlink(&to, &link)?;
         log.push(format!("relinked {a}/{new}"));
     }

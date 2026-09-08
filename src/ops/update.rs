@@ -3,7 +3,7 @@
 use crate::Workspace;
 use crate::hash::{HASH_ALGO, hash_directory};
 use crate::meta::{Baseline, Source};
-use crate::ops::{fresh_staging, git, swap_dir};
+use crate::ops::{DownloadDir, fresh_staging, git, swap_dir};
 use crate::reconcile::{SkillStatus, Snapshot};
 use crate::util::{copy_dir, is_ignored_name};
 use anyhow::{Context, Result, bail};
@@ -122,7 +122,7 @@ impl Prepared {
 
 /// Fetch the upstream (and, when the skill is modified, the baseline revision)
 /// into staging and classify differences. Nothing in the root is touched.
-pub fn prepare(ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> {
+pub fn prepare(_ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> {
     let rec = snap
         .get(key)
         .with_context(|| format!("no such skill: {key}"))?;
@@ -143,7 +143,8 @@ pub fn prepare(ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> {
         SkillStatus::Managed { .. } | SkillStatus::Modified => {}
         ref s => bail!("cannot update a skill in state {}", s.label()),
     }
-    let work = fresh_staging(&ws.root, "update")?;
+    let download = DownloadDir::new("update")?;
+    let work = download.path().to_path_buf();
     let clone = work.join("clone");
     let mut args = vec!["clone", "--quiet", "--depth", "1"];
     if let Some(b) = &branch {
@@ -164,7 +165,6 @@ pub fn prepare(ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> {
         clone.join(&sub)
     };
     if !upstream_src.join(crate::skill::SKILL_FILE).is_file() {
-        let _ = std::fs::remove_dir_all(&work);
         bail!("upstream no longer has a skill at {sub:?}; keeping local copy");
     }
     let upstream_dir = work.join("upstream");
@@ -210,6 +210,7 @@ pub fn prepare(ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> {
             prepared.baseline_dir.as_deref(),
         )?;
     }
+    prepared.workdir = download.keep();
     Ok(prepared)
 }
 
@@ -280,42 +281,46 @@ pub fn apply(
 ) -> Result<()> {
     let key = &prepared.skill;
     let dest = ws.skill_path(key);
-    let result_dir = prepared.workdir.join("result");
-    if prepared.needs_resolution() {
-        // Start from the chosen default side, then overlay per-file picks.
-        let (base_side, other_side) = match take {
-            Take::Upstream => (&prepared.upstream_dir, dest.clone()),
-            Take::Local => (&dest, prepared.upstream_dir.clone()),
-        };
-        copy_dir(base_side, &result_dir)?;
-        for (rel, side) in per_file {
-            if *side == take {
-                continue;
-            }
-            let src = other_side.join(rel);
-            let dst = result_dir.join(rel);
-            if src.is_file() {
-                if let Some(p) = dst.parent() {
-                    std::fs::create_dir_all(p)?;
+    let result_dir = fresh_staging(&ws.root, "update-result")?;
+    let result = (|| -> Result<()> {
+        if prepared.needs_resolution() {
+            // Start from the chosen default side, then overlay per-file picks.
+            let (base_side, other_side) = match take {
+                Take::Upstream => (&prepared.upstream_dir, dest.clone()),
+                Take::Local => (&dest, prepared.upstream_dir.clone()),
+            };
+            copy_dir(base_side, &result_dir)?;
+            for (rel, side) in per_file {
+                if *side == take {
+                    continue;
                 }
-                std::fs::copy(&src, &dst)?;
-            } else {
-                let _ = std::fs::remove_file(&dst);
+                let src = other_side.join(rel);
+                let dst = result_dir.join(rel);
+                if src.is_file() {
+                    if let Some(p) = dst.parent() {
+                        std::fs::create_dir_all(p)?;
+                    }
+                    std::fs::copy(&src, &dst)?;
+                } else {
+                    let _ = std::fs::remove_file(&dst);
+                }
             }
+        } else {
+            copy_dir(&prepared.upstream_dir, &result_dir)?;
         }
-    } else {
-        copy_dir(&prepared.upstream_dir, &result_dir)?;
-    }
-    swap_dir(&ws.root, &dest, &result_dir)?;
-    let mut meta = ws.meta.load(key)?.context("metadata vanished")?;
-    if let Some(Source::Git { revision, .. }) = meta.source.as_mut() {
-        *revision = Some(prepared.to_revision.clone());
-    }
-    meta.baseline = Some(Baseline {
-        hash: hash_directory(&dest)?,
-        hash_algo: HASH_ALGO,
-    });
-    ws.meta.save(key, &meta)?;
-    prepared.cleanup();
-    Ok(())
+        swap_dir(&ws.root, &dest, &result_dir)?;
+        let mut meta = ws.meta.load(key)?.context("metadata vanished")?;
+        if let Some(Source::Git { revision, .. }) = meta.source.as_mut() {
+            *revision = Some(prepared.to_revision.clone());
+        }
+        meta.baseline = Some(Baseline {
+            hash: hash_directory(&dest)?,
+            hash_algo: HASH_ALGO,
+        });
+        ws.meta.save(key, &meta)?;
+        prepared.cleanup();
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&result_dir);
+    result
 }

@@ -2,13 +2,15 @@
 //! and the update conflict resolver.
 
 use super::app::{Action, Ctx, Hints, MetaFn, Step, WriteFn};
+use super::views::{View, search::SearchView};
 use super::widgets::{Input, ListNav, button, fit, width};
+use crate::tui::widgets::OverlayClear as Clear;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 use skills::history;
 use skills::ops::deploy;
 use skills::ops::edit;
@@ -26,21 +28,6 @@ pub struct PickItem {
     pub sub: String,
 }
 
-pub enum PickAction {
-    /// Toggle skills in and out of a preset. Each toggle writes at once, so the
-    /// list doubles as the preset's membership.
-    PresetMembers { preset: String },
-    /// Pick one skill inside a fetched reference and install it.
-    InstallFrom { reference: String },
-}
-
-impl PickAction {
-    /// Several rows can be on at once, versus one choice and done.
-    fn multi(&self) -> bool {
-        matches!(self, PickAction::PresetMembers { .. })
-    }
-}
-
 pub enum InputKind {
     Tags { skill: String },
     PresetName,
@@ -53,6 +40,14 @@ pub enum InputKind {
 }
 
 pub enum Modal {
+    PresetSkills(Box<SearchView>),
+    Batch(Box<super::batch::Batch>),
+    NameConflict {
+        title: String,
+        actions: Vec<deploy::Action>,
+        rect: Rect,
+    },
+    Repository(Box<super::repository_picker::RepositoryPicker>),
     Help {
         scroll: u16,
     },
@@ -97,18 +92,17 @@ pub enum Modal {
         list: ListNav,
         rect: Rect,
     },
-    /// A searchable list to choose from. Used wherever a name would otherwise
-    /// have to be typed from memory.
+    /// Browse installed repositories; skill pickers use SearchView or RepositoryPicker.
     Picker {
         title: String,
         input: Input,
         items: Vec<PickItem>,
-        /// Indices into `items` currently on.
-        chosen: std::collections::BTreeSet<usize>,
+        /// Whether typing edits the filter rather than operating on results.
+        input_focus: bool,
+        input_rect: Rect,
         /// Indices matching the filter, in display order.
         shown: Vec<usize>,
         list: ListNav,
-        action: PickAction,
         rect: Rect,
     },
     Resolve {
@@ -124,6 +118,21 @@ pub enum Modal {
 
 impl Modal {
     // ---- constructors -----------------------------------------------------
+
+    pub fn batch_tags(keys: Vec<String>, ctx: &Ctx) -> Self {
+        Self::Batch(Box::new(super::batch::Batch::tags(keys, ctx)))
+    }
+    pub fn batch_deploy(keys: Vec<String>, ctx: &Ctx) -> Self {
+        Self::Batch(Box::new(super::batch::Batch::deploy(keys, ctx)))
+    }
+    pub fn batch_deploy_agent(keys: Vec<String>, agent: &str, ctx: &Ctx) -> Self {
+        Self::Batch(Box::new(super::batch::Batch::deploy_agent(
+            keys, agent, ctx,
+        )))
+    }
+    pub fn batch_presets(keys: Vec<String>, ctx: &Ctx) -> Self {
+        Self::Batch(Box::new(super::batch::Batch::presets(keys, ctx)))
+    }
 
     pub fn help() -> Self {
         Modal::Help { scroll: 0 }
@@ -165,7 +174,7 @@ impl Modal {
     }
     /// A write with nothing to log: everything it could take back is either
     /// gone for good or already an entry of its own.
-    fn confirm_write(title: String, lines: Vec<String>, write: WriteFn) -> Self {
+    pub(super) fn confirm_write(title: String, lines: Vec<String>, write: WriteFn) -> Self {
         Self::confirm_meta(
             title,
             lines,
@@ -240,8 +249,7 @@ impl Modal {
             title: " install a skill ".into(),
             input: Input::default(),
             kind: InputKind::Install,
-            hint: "owner/repo[/path] · a git URL · a local path — Enter installs, Esc cancels"
-                .into(),
+            hint: "owner/repo[/path] · git URL · local path\nEnter install · Esc cancel".into(),
             rect: Rect::default(),
         }
     }
@@ -261,7 +269,7 @@ impl Modal {
     pub fn rename(skill: &str) -> Self {
         Modal::Input {
             title: format!(" rename {skill} "),
-            input: Input::with_value(skill),
+            input: Input::with_value(skill.rsplit('/').next().unwrap_or(skill)),
             kind: InputKind::Rename {
                 skill: skill.into(),
             },
@@ -429,78 +437,60 @@ impl Modal {
         )
     }
 
-    /// Every skill in the root, with the ones already in `preset` switched on.
-    pub fn preset_members(
-        preset: &skills::preset::Preset,
-        snap: &skills::reconcile::Snapshot,
-    ) -> Self {
-        let items: Vec<PickItem> = snap
-            .skills
-            .iter()
-            .filter(|s| s.status.is_present())
-            .map(|s| PickItem {
-                id: s.key.clone(),
-                label: s.key.clone(),
-                sub: s
-                    .description
-                    .clone()
-                    .or_else(|| Some(s.tags.join(" · ")))
-                    .unwrap_or_default(),
-            })
-            .collect();
-        let chosen = items
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| preset.skills.contains(&it.id))
-            .map(|(i, _)| i)
-            .collect();
-        Self::picker(
-            format!(" skills in {} ", preset.name),
-            items,
-            chosen,
-            PickAction::PresetMembers {
-                preset: preset.name.clone(),
-            },
-        )
+    /// Search cards with staged checkboxes for editing a preset's membership.
+    pub fn preset_members(preset: &str, ctx: &Ctx) -> Self {
+        Self::PresetSkills(Box::new(SearchView::preset_members(preset, ctx)))
     }
 
-    /// The skills a fetched reference turned out to hold.
-    pub fn install_choice(reference: &str, choices: Vec<String>) -> Self {
-        let items: Vec<PickItem> = choices
-            .into_iter()
-            .map(|path| PickItem {
-                label: path.rsplit('/').next().unwrap_or(&path).to_string(),
-                sub: path.clone(),
-                id: path,
-            })
-            .collect();
-        Self::picker(
-            format!(" {} holds several skills ", short_ref(reference)),
-            items,
-            Default::default(),
-            PickAction::InstallFrom {
-                reference: reference.to_string(),
-            },
-        )
+    pub fn repositories(ctx: &Ctx) -> Self {
+        match skills::repository::Repository::list(&ctx.ws.root) {
+            Ok(repositories) => Self::picker(
+                " repositories ".into(),
+                repositories
+                    .into_iter()
+                    .map(|r| {
+                        let count = ctx
+                            .snap
+                            .skills
+                            .iter()
+                            .filter(|s| {
+                                skills::repository::alias_of(&s.key) == Some(r.alias.as_str())
+                            })
+                            .count();
+                        PickItem {
+                            id: r.alias.clone(),
+                            label: format!(
+                                "{} {}",
+                                crate::tui::icons::git(ctx.ws.config.ui.icons, &r.url),
+                                skills::repository::source_name(&r.url).unwrap_or(r.alias)
+                            ),
+                            sub: format!(
+                                "{} {count} skills · {} {} · {}",
+                                crate::tui::icons::package(ctx.ws.config.ui.icons),
+                                crate::tui::icons::branch(ctx.ws.config.ui.icons),
+                                r.branch,
+                                r.url
+                            ),
+                        }
+                    })
+                    .collect(),
+            ),
+            Err(e) => Self::message("repositories", vec![format!("{e:#}")]),
+        }
     }
 
-    fn picker(
-        title: String,
-        items: Vec<PickItem>,
-        chosen: std::collections::BTreeSet<usize>,
-        action: PickAction,
-    ) -> Self {
+    fn picker(title: String, items: Vec<PickItem>) -> Self {
         let shown: Vec<usize> = (0..items.len()).collect();
         let mut list = ListNav::default();
         list.clamp(shown.len());
         Modal::Picker {
             title,
             input: Input::default(),
+            input_focus: true,
+            input_rect: Rect::default(),
             items,
-            chosen,
             shown,
             list,
-            action,
             rect: Rect::default(),
         }
     }
@@ -576,22 +566,34 @@ impl Modal {
 
     pub fn hints(&self) -> Hints {
         match self {
+            Modal::NameConflict { .. } => &[("c", "coexist"), ("r", "replace"), ("Esc", "cancel")],
+            Modal::PresetSkills(view) => view.hints(),
+            Modal::Batch(p) => p.hints(),
+            Modal::Repository(p) => p.hints(),
             Modal::Help { .. } | Modal::Message { .. } => &[("Esc", "close")],
             Modal::Confirm { .. } | Modal::ConfirmWrite { .. } => {
                 &[("Enter/y", "apply"), ("Esc/n", "cancel"), ("←→", "buttons")]
             }
+            Modal::Input {
+                kind: InputKind::Install,
+                ..
+            } => &[("Enter", "install"), ("Esc", "cancel")],
             Modal::Input { .. } => &[("Enter", "save"), ("Esc", "cancel")],
-            Modal::Picker { action, .. } if action.multi() => &[
+            Modal::Picker {
+                input_focus: true, ..
+            } => &[
                 ("type", "filter"),
-                ("Space", "toggle"),
-                ("↑↓", "move"),
-                ("Esc", "done"),
+                ("↓/Tab", "list"),
+                ("Enter", "browse"),
+                ("Esc", "close"),
             ],
             Modal::Picker { .. } => &[
-                ("type", "filter"),
-                ("Enter", "install"),
+                ("Enter", "browse"),
+                ("u", "check repo"),
+                ("U", "update repo"),
                 ("↑↓", "move"),
-                ("Esc", "cancel"),
+                ("/Tab", "filter"),
+                ("Esc", "close"),
             ],
             Modal::AgentPick { .. } => &[("Space/Enter", "toggle"), ("Esc", "close")],
             Modal::Resolve { .. } => &[
@@ -605,9 +607,56 @@ impl Modal {
 
     // ---- input ------------------------------------------------------------
 
+    pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
+        match self {
+            Modal::PresetSkills(view) => view.paste(text, ctx),
+            Modal::Batch(picker) => picker.paste(text),
+            Modal::Repository(picker) => picker.paste(text, ctx),
+            Modal::Input { input, .. } => match input.paste(text) {
+                Ok(_) => vec![],
+                Err(error) => vec![Action::Error(error.into())],
+            },
+            Modal::Picker {
+                input,
+                input_focus: true,
+                items,
+                shown,
+                list,
+                ..
+            } => match input.paste(text) {
+                Ok(true) => {
+                    refilter(input.value(), items, shown);
+                    list.first(shown.len());
+                    vec![]
+                }
+                Ok(false) => vec![],
+                Err(error) => vec![Action::Error(error.into())],
+            },
+            _ => vec![],
+        }
+    }
+
     pub fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match self {
+            Modal::NameConflict { title, actions, .. } => match k.code {
+                KeyCode::Esc => vec![Action::CloseModal],
+                KeyCode::Char(c @ ('c' | 'r')) => match deploy::resolve_names(
+                    ctx.snap,
+                    actions,
+                    Some(if c == 'c' { "coexist" } else { "replace" }),
+                ) {
+                    Ok(plan) => vec![Action::OpenModal(Box::new(Modal::confirm(
+                        title.clone(),
+                        plan,
+                    )))],
+                    Err(e) => vec![Action::Error(format!("{e:#}"))],
+                },
+                _ => vec![],
+            },
+            Modal::PresetSkills(view) => view.handle_key(k, ctx),
+            Modal::Batch(p) => p.key(k, ctx),
+            Modal::Repository(p) => p.key(k, ctx),
             Modal::Help { scroll } | Modal::Message { scroll, .. } => match k.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     *scroll = scroll.saturating_add(1);
@@ -691,9 +740,7 @@ impl Modal {
                 KeyCode::Esc => vec![Action::CloseModal],
                 KeyCode::Enter => {
                     let value = input.value().to_string();
-                    let mut acts = vec![Action::CloseModal];
-                    acts.extend(submit(kind, value, ctx));
-                    acts
+                    vec![Action::SubmitInput(submit(kind, value, ctx))]
                 }
                 _ => {
                     input.handle_key(k);
@@ -726,54 +773,67 @@ impl Modal {
             }
             Modal::Picker {
                 input,
+                input_focus,
                 items,
-                chosen,
                 shown,
                 list,
-                action,
                 ..
             } => {
-                let multi = action.multi();
+                if k.code == KeyCode::Char('/') && !*input_focus {
+                    *input_focus = true;
+                    return vec![];
+                }
+                if (k.code == KeyCode::Enter
+                    || (!*input_focus && matches!(k.code, KeyCode::Char('u' | 'U'))))
+                    && let Some(i) = list.selected().and_then(|i| shown.get(i)).copied()
+                {
+                    let alias = &items[i].id;
+                    if k.code == KeyCode::Enter {
+                        return vec![
+                            Action::CloseModal,
+                            Action::Search {
+                                query: repository_query(alias, ctx),
+                                focus_list: true,
+                            },
+                        ];
+                    }
+                    let keys: Vec<_> = ctx
+                        .snap
+                        .skills
+                        .iter()
+                        .filter(|s| skills::repository::alias_of(&s.key) == Some(alias.as_str()))
+                        .map(|s| s.key.clone())
+                        .collect();
+                    return if k.code == KeyCode::Char('u') {
+                        vec![Action::Spawn(crate::tui::event::Task::Check(keys))]
+                    } else {
+                        keys.into_iter()
+                            .map(|key| Action::Spawn(crate::tui::event::Task::Prepare(key)))
+                            .collect()
+                    };
+                }
                 match k.code {
                     KeyCode::Esc => return vec![Action::CloseModal],
+                    KeyCode::Tab => *input_focus = !*input_focus,
                     KeyCode::Down | KeyCode::Char('n') if k.code == KeyCode::Down || ctrl => {
-                        list.move_by(1, shown.len())
+                        if *input_focus {
+                            *input_focus = false;
+                        } else {
+                            list.move_by(1, shown.len());
+                        }
                     }
                     KeyCode::Up | KeyCode::Char('p') if k.code == KeyCode::Up || ctrl => {
-                        list.move_by(-1, shown.len())
-                    }
-                    KeyCode::Char(' ') if multi => {
-                        if let Some(i) = list.selected().and_then(|i| shown.get(i)).copied() {
-                            let on = !chosen.contains(&i);
-                            if on {
-                                chosen.insert(i);
-                            } else {
-                                chosen.remove(&i);
-                            }
-                            return vec![preset_toggle(action, &items[i].id, on)];
+                        if *input_focus || list.selected() == Some(0) {
+                            *input_focus = true;
+                        } else {
+                            list.move_by(-1, shown.len());
                         }
                     }
-                    KeyCode::Enter if multi => return vec![Action::CloseModal],
-                    KeyCode::Enter => {
-                        if let Some(i) = list.selected().and_then(|i| shown.get(i)).copied()
-                            && let PickAction::InstallFrom { reference } = action
-                        {
-                            return vec![
-                                Action::CloseModal,
-                                Action::Toast(format!("fetching {}…", items[i].label)),
-                                Action::Spawn(crate::tui::event::Task::Install {
-                                    reference: reference.clone(),
-                                    subpath: Some(items[i].id.clone()),
-                                }),
-                            ];
-                        }
+                    _ if *input_focus && input.handle_key(k) => {
+                        refilter(input.value(), items, shown);
+                        list.first(shown.len());
                     }
-                    _ => {
-                        if input.handle_key(k) {
-                            refilter(input.value(), items, shown);
-                            list.clamp(shown.len());
-                        }
-                    }
+                    _ => {}
                 }
                 vec![]
             }
@@ -871,6 +931,28 @@ impl Modal {
         };
         let click = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
         match self {
+            Modal::NameConflict { rect, .. } => {
+                if click {
+                    if !rect.contains(at) {
+                        return vec![Action::CloseModal];
+                    }
+                    if m.row == rect.bottom().saturating_sub(2) {
+                        let code = if m.column < rect.x + rect.width / 2 {
+                            'c'
+                        } else {
+                            'r'
+                        };
+                        return self.handle_key(
+                            KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE),
+                            ctx,
+                        );
+                    }
+                }
+                vec![]
+            }
+            Modal::PresetSkills(view) => view.handle_mouse(m, ctx),
+            Modal::Batch(p) => p.mouse(m, ctx),
+            Modal::Repository(p) => p.mouse(m, ctx),
             Modal::Help { scroll } | Modal::Message { scroll, .. } => {
                 if let Some(d) = wheel {
                     *scroll = (*scroll as i32 + d).max(0) as u16;
@@ -945,40 +1027,41 @@ impl Modal {
                 vec![]
             }
             Modal::Picker {
+                input,
+                input_focus,
+                input_rect,
                 items,
-                chosen,
                 shown,
                 list,
-                action,
                 rect,
                 ..
             } => {
                 if let Some(d) = wheel {
+                    if !list.rows.contains(at) {
+                        return vec![];
+                    }
+                    *input_focus = false;
                     list.move_by(d, shown.len());
                 } else if click {
                     if !rect.contains(at) {
                         return vec![Action::CloseModal];
                     }
+                    if input_rect.contains(at) {
+                        *input_focus = true;
+                        input.click(m.column);
+                        return vec![];
+                    }
                     if let Some((row, double)) = list.click(m.row, shown.len())
                         && let Some(i) = shown.get(row).copied()
                     {
-                        if action.multi() {
-                            let on = !chosen.contains(&i);
-                            if on {
-                                chosen.insert(i);
-                            } else {
-                                chosen.remove(&i);
-                            }
-                            return vec![preset_toggle(action, &items[i].id, on)];
-                        }
-                        if double && let PickAction::InstallFrom { reference } = action {
+                        *input_focus = false;
+                        if double {
                             return vec![
                                 Action::CloseModal,
-                                Action::Toast(format!("fetching {}…", items[i].label)),
-                                Action::Spawn(crate::tui::event::Task::Install {
-                                    reference: reference.clone(),
-                                    subpath: Some(items[i].id.clone()),
-                                }),
+                                Action::Search {
+                                    query: repository_query(&items[i].id, ctx),
+                                    focus_list: true,
+                                },
                             ];
                         }
                     }
@@ -1027,6 +1110,76 @@ impl Modal {
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let th = ctx.theme;
         match self {
+            Modal::NameConflict {
+                title,
+                actions,
+                rect,
+            } => {
+                let conflicts = deploy::name_conflicts(ctx.snap, actions);
+                let mut lines = vec![
+                    Line::from("Different folders contain skills with the same frontmatter name."),
+                    Line::from("SKILL.md stays unchanged. Agent selection may be ambiguous."),
+                    Line::from(""),
+                ];
+                lines.extend(conflicts.iter().map(|c| {
+                    Line::from(format!(
+                        "{}: {} ↔ {} ({})",
+                        c.agent,
+                        c.skill,
+                        c.other_path.display(),
+                        c.name
+                    ))
+                }));
+                let r = centered(
+                    area,
+                    100,
+                    (lines.len() as u16 + 5).min(area.height.saturating_sub(2)),
+                );
+                *rect = r;
+                f.render_widget(Clear, r);
+                let block = th.block(format!(" name conflict · {title} "), true);
+                let inner = block.inner(r);
+                f.render_widget(block, r);
+                f.render_widget(
+                    Paragraph::new(lines).wrap(Wrap { trim: false }),
+                    Rect {
+                        height: inner.height.saturating_sub(2),
+                        ..inner
+                    },
+                );
+                f.render_widget(
+                    Paragraph::new("[c] Coexist"),
+                    Rect::new(
+                        inner.x,
+                        inner.bottom().saturating_sub(1),
+                        inner.width / 2,
+                        1,
+                    ),
+                );
+                f.render_widget(
+                    Paragraph::new("[r] Replace managed links"),
+                    Rect::new(
+                        inner.x + inner.width / 2,
+                        inner.bottom().saturating_sub(1),
+                        inner.width - inner.width / 2,
+                        1,
+                    ),
+                );
+            }
+            Modal::PresetSkills(view) => {
+                let r = centered(
+                    area,
+                    area.width.saturating_sub(4),
+                    area.height.saturating_sub(2),
+                );
+                f.render_widget(Clear, r);
+                let block = th.block(" Preset skills ", true);
+                let inner = block.inner(r);
+                f.render_widget(block, r);
+                view.draw(f, inner, ctx);
+            }
+            Modal::Batch(p) => p.draw(f, area, ctx),
+            Modal::Repository(p) => p.draw(f, area, ctx),
             Modal::Help { scroll } => {
                 let lines: Vec<Line> = HELP.lines().map(|l| help_line(l, th)).collect();
                 let r = centered(area, 78, lines.len() as u16 + 2);
@@ -1093,15 +1246,21 @@ impl Modal {
                 rect,
                 ..
             } => {
-                let r = centered(area, 70, lines.len() as u16 + 5);
+                let width = centered(area, 70, 5).width.saturating_sub(2);
+                let ls: Vec<Line> = lines.iter().map(|l| Line::from(l.as_str())).collect();
+                let body = Paragraph::new(ls).wrap(Wrap { trim: false });
+                let height = body
+                    .line_count(width)
+                    .saturating_add(4)
+                    .min(u16::MAX as usize) as u16;
+                let r = centered(area, 70, height);
                 *rect = r;
                 f.render_widget(Clear, r);
                 let block = th.block(format!(" {} ", title.trim()), true);
                 let inner = block.inner(r);
                 f.render_widget(block, r);
-                let ls: Vec<Line> = lines.iter().map(|l| Line::from(l.as_str())).collect();
                 f.render_widget(
-                    Paragraph::new(ls).wrap(Wrap { trim: false }),
+                    body,
                     Rect {
                         height: inner.height.saturating_sub(2),
                         ..inner
@@ -1116,7 +1275,12 @@ impl Modal {
                 rect,
                 ..
             } => {
-                let r = centered(area, 72, 4);
+                let width = centered(area, 72, 4).width.saturating_sub(4);
+                let hint_text = Paragraph::new(hint.as_str())
+                    .style(th.dim())
+                    .wrap(Wrap { trim: false });
+                let hint_height = hint_text.line_count(width).min(6) as u16;
+                let r = centered(area, 72, 3 + hint_height);
                 *rect = r;
                 f.render_widget(Clear, r);
                 let block = th.block(title.as_str(), true);
@@ -1130,12 +1294,12 @@ impl Modal {
                 };
                 input.render(f, field, true, "", th);
                 f.render_widget(
-                    Paragraph::new(Span::styled(fit(hint, inner.width as usize), th.dim())),
+                    hint_text,
                     Rect {
                         x: inner.x + 1,
                         y: inner.y + 1,
                         width: inner.width.saturating_sub(2),
-                        height: 1,
+                        height: inner.height.saturating_sub(1),
                     },
                 );
             }
@@ -1152,7 +1316,7 @@ impl Modal {
                             Some(DeployState::Deployed) => ("✓", th.ok()),
                             Some(DeployState::NotDeployed)
                             | Some(DeployState::NoAgentDir)
-                            | None => (" ", th.dim()),
+                            | None => ("—", th.dim()),
                             Some(DeployState::Broken) => ("!", th.err()),
                             _ => ("~", th.warn()),
                         };
@@ -1186,14 +1350,13 @@ impl Modal {
             Modal::Picker {
                 title,
                 input,
+                input_focus,
+                input_rect,
                 items,
-                chosen,
                 shown,
                 list,
-                action,
                 rect,
             } => {
-                let multi = action.multi();
                 let r = centered(
                     area,
                     76,
@@ -1210,7 +1373,8 @@ impl Modal {
                     height: 1,
                     ..inner
                 };
-                input.render(f, field, true, "type to filter…", th);
+                *input_rect = field;
+                input.render(f, field, *input_focus, "type to filter…", th);
                 let list_area = Rect {
                     y: inner.y + 2,
                     height: inner.height.saturating_sub(2),
@@ -1221,20 +1385,9 @@ impl Modal {
                     .iter()
                     .map(|i| {
                         let it = &items[*i];
-                        let on = chosen.contains(i);
-                        let mark = if !multi {
-                            Span::raw("  ")
-                        } else if on {
-                            Span::styled("✓ ", th.ok())
-                        } else {
-                            Span::styled("  ", th.dim())
-                        };
                         ListItem::new(Line::from(vec![
-                            mark,
-                            Span::styled(
-                                fit(&it.label, 26),
-                                if on { th.bold() } else { Style::default() },
-                            ),
+                            Span::raw("  "),
+                            Span::styled(fit(&it.label, 26), Style::default()),
                             Span::raw("  "),
                             Span::styled(
                                 fit(&it.sub, list_area.width.saturating_sub(32) as usize),
@@ -1244,7 +1397,11 @@ impl Modal {
                     })
                     .collect();
                 let w = List::new(rows)
-                    .highlight_style(th.selected())
+                    .highlight_style(if *input_focus {
+                        th.dim()
+                    } else {
+                        th.selected()
+                    })
                     .highlight_symbol("▸ ");
                 f.render_stateful_widget(w, list_area, &mut list.state);
                 if shown.is_empty() {
@@ -1373,37 +1530,6 @@ fn refilter(query: &str, items: &[PickItem], shown: &mut Vec<usize>) {
     }));
 }
 
-/// Add or drop one skill from a preset, writing the file straight away so the
-/// list the user is looking at is the membership.
-fn preset_toggle(action: &PickAction, skill: &str, on: bool) -> Action {
-    let PickAction::PresetMembers { preset } = action else {
-        return Action::Toast(String::new());
-    };
-    let (preset, skill) = (preset.clone(), skill.to_string());
-    Action::WriteMeta(Box::new(move |ws| {
-        history::preset_edit(ws, &preset, |skills| {
-            skills.retain(|s| s != &skill);
-            if on {
-                skills.push(skill.clone());
-                skills.sort();
-            }
-        })
-    }))
-}
-
-/// The tail of a URL or path, for a dialog title.
-fn short_ref(reference: &str) -> String {
-    reference
-        .trim_end_matches('/')
-        .rsplit('/')
-        .take(2)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 /// A confirmed write, plus the history move it belongs to when it is a step.
 fn write_actions(w: MetaFn, then: Option<Step>) -> Vec<Action> {
     let mut out = vec![Action::CloseModal, Action::WriteMeta(w)];
@@ -1495,13 +1621,24 @@ fn toggle_agent(ctx: &Ctx, skill: &str, idx: usize) -> Vec<Action> {
 fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
     match kind {
         InputKind::Rename { skill } => {
-            let new = value.trim().to_string();
+            let name = value.trim();
+            if name.is_empty() {
+                return vec![];
+            }
+            if !skills::util::valid_skill_key(name) {
+                return vec![Action::Error(format!("invalid local name: {name:?}"))];
+            }
+            let new = if skill.starts_with("repos/") {
+                format!("{}/{}", skill.rsplit_once('/').unwrap().0, name)
+            } else {
+                name.to_string()
+            };
             if new.is_empty() || new == *skill {
                 return vec![];
             }
             // Refused here rather than after the confirmation, which would
             // otherwise list moves that are never going to happen.
-            if !skills::util::valid_skill_key(&new) {
+            if !skills::repository::valid_id(&new) {
                 return vec![Action::Error(format!("invalid skill name: {new:?}"))];
             }
             vec![Action::OpenModal(Box::new(Modal::confirm_rename(
@@ -1598,13 +1735,18 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
             if reference.is_empty() {
                 return vec![];
             }
-            vec![
-                Action::Toast(format!("fetching {reference}…")),
-                Action::Spawn(crate::tui::event::Task::Install {
+            match install::parse_ref(&reference, None, None) {
+                Ok(install::InstallRef::Local(_)) => {
+                    vec![Action::Spawn(crate::tui::event::Task::Install {
+                        reference,
+                        subpath: None,
+                    })]
+                }
+                Ok(_) => vec![Action::Spawn(crate::tui::event::Task::DiscoverRepository(
                     reference,
-                    subpath: None,
-                }),
-            ]
+                ))],
+                Err(e) => vec![Action::Error(format!("{e:#}"))],
+            }
         }
         InputKind::RenameTag { old } => {
             let old = old.clone();
@@ -1705,7 +1847,11 @@ const HELP: &str = "Search
   i                 install a skill from a repo or a local path
   t  n  d           tags / note in $EDITOR / deploy picker
   r  s              rename the skill / set where it came from
-  a  m  x           accept local changes / migrate renamed metadata / remove
+  a  x              accept local changes / remove
+  m                 enter multi-select (status marker also starts selection)
+  Space  Ctrl-A     toggle skill / select current results in multi-select
+  t  d  p           selected skills: tags / deploy / add to preset
+  Esc               cancel multi-select; hidden selections never participate
   u  U              check upstream / update from upstream (git sources)
 Agents
   a                 adopt an entry the agent has but the root does not
@@ -1716,5 +1862,238 @@ Mouse
   wheel             scroll lists and preview
 Global
   Ctrl-Z  Ctrl-Y    undo and redo the last change
-  1-5  Tab          switch tabs (Alt+1..5 while typing in the search box)
+  1-5               switch tabs outside text inputs
+  Tab / Shift-Tab   next / previous tab outside Search
   /                 back to search      Ctrl-R  rescan      Ctrl-C  quit";
+
+fn repository_query(alias: &str, ctx: &Ctx) -> String {
+    let name = ctx
+        .snap
+        .skills
+        .iter()
+        .filter(|r| skills::repository::alias_of(&r.key) == Some(alias))
+        .find_map(|r| match &r.source {
+            Some(skills::meta::Source::Git { url, .. }) => skills::repository::source_name(url),
+            _ => None,
+        })
+        .unwrap_or_else(|| alias.to_string());
+    format!("repo:{name}")
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::*;
+    use crate::tui::theme::Theme;
+    use ratatui::{Terminal, backend::TestBackend};
+    use skills::{Workspace, config::Config, preset::Preset};
+
+    #[test]
+    fn install_hint_wraps_without_losing_cancel_instruction() {
+        let root = std::env::temp_dir().join(format!("skills-install-hint-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        for width in [40, 60, 80] {
+            let mut modal = Modal::install();
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|f| modal.draw(f, f.area(), &ctx)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
+            assert!(
+                text.contains("Enter install · Esc cancel"),
+                "{width}: {text}"
+            );
+            assert!(text.contains("owner/repo[/path]"));
+            assert!(!text.contains("Esc c…"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repository_browser_moves_focus_without_skipping_and_mouse_focus_matches_keys() {
+        let root = std::env::temp_dir().join(format!(
+            "skills-repo-focus-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut modal = Modal::picker(
+            "repositories".into(),
+            ["alpha", "beta", "gamma"]
+                .into_iter()
+                .map(|name| PickItem {
+                    id: name.into(),
+                    label: name.into(),
+                    sub: "sample repo".into(),
+                })
+                .collect(),
+        );
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let state = |modal: &Modal| {
+            let Modal::Picker {
+                input_focus, list, ..
+            } = modal
+            else {
+                panic!("picker")
+            };
+            (*input_focus, list.selected())
+        };
+        modal.handle_key(key(KeyCode::Down), &ctx);
+        assert_eq!(
+            state(&modal),
+            (false, Some(0)),
+            "first down only enters results"
+        );
+        modal.handle_key(key(KeyCode::Down), &ctx);
+        assert_eq!(state(&modal), (false, Some(1)));
+        modal.handle_key(key(KeyCode::Up), &ctx);
+        modal.handle_key(key(KeyCode::Up), &ctx);
+        assert_eq!(
+            state(&modal),
+            (true, Some(0)),
+            "up from first row restores filter"
+        );
+        modal.handle_key(key(KeyCode::Tab), &ctx);
+        assert_eq!(state(&modal), (false, Some(0)));
+        let actions = modal.handle_key(key(KeyCode::Enter), &ctx);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Search { query, .. } if query == "repo:alpha"))
+        );
+        modal.handle_key(key(KeyCode::Char('/')), &ctx);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| modal.draw(f, f.area(), &ctx)).unwrap();
+        let Modal::Picker {
+            input_rect, list, ..
+        } = &modal
+        else {
+            panic!("picker")
+        };
+        let input_at = *input_rect;
+        let rows_at = list.rows;
+        let mouse = |kind, x, y| MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        modal.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0), &ctx);
+        assert_eq!(
+            state(&modal),
+            (true, Some(0)),
+            "wheel outside the list does not move results"
+        );
+        modal.handle_mouse(
+            mouse(MouseEventKind::ScrollDown, rows_at.x, rows_at.y),
+            &ctx,
+        );
+        assert!(
+            !state(&modal).0,
+            "wheel over results transfers keyboard focus"
+        );
+        modal.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                input_at.x,
+                input_at.y,
+            ),
+            &ctx,
+        );
+        assert!(state(&modal).0);
+        modal.handle_key(key(KeyCode::Char('a')), &ctx);
+        assert_eq!(
+            state(&modal),
+            (true, Some(0)),
+            "editing filter selects its first result"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preset_search_stages_selection_without_writing() {
+        let root =
+            std::env::temp_dir().join(format!("skills-preset-search-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("printer")).unwrap();
+        std::fs::write(
+            root.join("printer/SKILL.md"),
+            "---\nname: printer\ndescription: network tools\n---\nNetwork tools\n",
+        )
+        .unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        ws.presets
+            .save(&Preset {
+                name: "reading".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let before = std::fs::read(ws.presets.path("reading")).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut modal = Modal::preset_members("reading", &ctx);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let Modal::PresetSkills(view) = &modal else {
+            panic!("expected shared Search view")
+        };
+        assert!(view.input_focused());
+        for c in "network tools".chars() {
+            assert!(modal.handle_key(key(KeyCode::Char(c)), &ctx).is_empty());
+        }
+        modal.handle_key(key(KeyCode::Down), &ctx);
+        assert!(modal.handle_key(key(KeyCode::Char(' ')), &ctx).is_empty());
+        assert_eq!(std::fs::read(ws.presets.path("reading")).unwrap(), before);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| modal.draw(f, f.area(), &ctx)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("printer"));
+        assert!(screen.contains("[✓]"));
+        assert!(screen.contains("Apply"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

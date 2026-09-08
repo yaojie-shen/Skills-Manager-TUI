@@ -891,3 +891,53 @@ fn aliased_roots_use_the_same_identity_for_adopt_and_deployment() {
     assert!(matches!(entries["foreign"], EntryState::Foreign { .. }));
     assert!(matches!(entries["missing"], EntryState::Broken { .. }));
 }
+
+#[test]
+fn note_editor_only_saves_successful_content_changes() {
+    let f = Fixture::new("note-editor");
+    f.add_skill("printer", "Print documents");
+    let ws = f.ws();
+    let run = |editor: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_skills"))
+            .args([
+                "--root",
+                f.root.to_str().unwrap(),
+                "note",
+                "edit",
+                "printer",
+            ])
+            .env("VISUAL", editor)
+            .env("EDITOR", "false")
+            .output()
+            .unwrap()
+    };
+
+    // Quitting an untouched buffer must not turn an unmanaged skill into a
+    // managed one merely by creating an empty note and baseline.
+    let output = run("true");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("note unchanged"));
+    assert!(ws.meta.load("printer").unwrap().is_none());
+
+    edit::note_set(&ws, "printer", Some("Original note\n")).unwrap();
+    let meta_path = ws.meta.path("printer");
+    let before = std::fs::read(&meta_path).unwrap();
+    let output = run("true");
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("note saved"));
+    assert_eq!(std::fs::read(&meta_path).unwrap(), before);
+
+    // Even a modified temporary file is discarded when the editor fails.
+    let output = run("sh -c 'printf changed > \"$1\"; exit 1' sh");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("note edit abandoned"));
+    assert_eq!(std::fs::read(&meta_path).unwrap(), before);
+
+    let output = run("sh -c 'printf updated > \"$1\"' sh");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("note saved"));
+    assert_eq!(
+        ws.meta.load("printer").unwrap().unwrap().note.as_deref(),
+        Some("updated")
+    );
+}

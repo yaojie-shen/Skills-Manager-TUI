@@ -93,6 +93,10 @@ pub struct SkillRecord {
 }
 
 impl SkillRecord {
+    pub fn deployment_name(&self) -> String {
+        crate::repository::default_deploy_name(&self.key)
+    }
+
     pub fn deployed_to(&self) -> Vec<&str> {
         self.deploy
             .iter()
@@ -188,17 +192,44 @@ pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
     let store = MetaStore::new(root);
     let mut records: BTreeMap<String, SkillRecord> = BTreeMap::new();
 
-    // 1. Skill directories.
+    // Preserve flat local skills; repository skill identities are relative paths.
+    let mut discovered = Vec::new();
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !valid_skill_key(&name) {
+        if !valid_skill_key(&name) || !entry.path().is_dir() {
             continue;
         }
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
+        if name == "repos" && !entry.path().join("SKILL.md").exists() && !is_symlink(&entry.path())
+        {
+            for repo in std::fs::read_dir(entry.path())? {
+                let repo = repo?;
+                if !repo.file_type()?.is_dir()
+                    || !valid_skill_key(&repo.file_name().to_string_lossy())
+                {
+                    continue;
+                }
+                for skill in std::fs::read_dir(repo.path())? {
+                    let skill = skill?;
+                    if skill.path().is_dir()
+                        && valid_skill_key(&skill.file_name().to_string_lossy())
+                    {
+                        discovered.push((
+                            skill
+                                .path()
+                                .strip_prefix(root)?
+                                .to_string_lossy()
+                                .to_string(),
+                            skill.path(),
+                        ));
+                    }
+                }
+            }
+        } else {
+            discovered.push((name, entry.path()));
         }
+    }
+    for (name, path) in discovered {
         let external = is_symlink(&path);
         let (status, doc, current_hash) = match SkillDoc::load(&path) {
             Ok(doc) => {
@@ -341,7 +372,7 @@ pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
     // 4. Agents.
     let mut agents = Vec::new();
     for a in &config.agents {
-        agents.push(scan_agent(root, a)?);
+        agents.push(scan_agent(root, a, &records)?);
     }
     for rec in records.values_mut() {
         for a in &agents {
@@ -357,7 +388,11 @@ pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
     })
 }
 
-fn scan_agent(root: &Path, a: &AgentConfig) -> Result<AgentReport> {
+fn scan_agent(
+    root: &Path,
+    a: &AgentConfig,
+    records: &BTreeMap<String, SkillRecord>,
+) -> Result<AgentReport> {
     let dir = a.skills_path();
     let mut report = AgentReport {
         key: a.key.clone(),
@@ -398,11 +433,15 @@ fn scan_agent(root: &Path, a: &AgentConfig) -> Result<AgentReport> {
             match resolved {
                 None => EntryState::Broken { target },
                 Some(res) => {
-                    if res.parent() == Some(root)
+                    if records.values().any(|r| {
+                        r.key.starts_with("repos/")
+                            && r.deployment_name() == name
+                            && std::fs::canonicalize(&r.path).ok().as_ref() == Some(&res)
+                    }) || (res.parent() == Some(root)
                         && res
                             .file_name()
                             .map(|n| n.to_string_lossy() == name)
-                            .unwrap_or(false)
+                            .unwrap_or(false))
                     {
                         EntryState::Deployed
                     } else if res.starts_with(root) {
@@ -414,7 +453,11 @@ fn scan_agent(root: &Path, a: &AgentConfig) -> Result<AgentReport> {
                 }
             }
         } else if ft.is_dir() {
-            let central = root.join(&name);
+            let central = records
+                .values()
+                .find(|r| r.deployment_name() == name)
+                .map(|r| r.path.clone())
+                .unwrap_or_else(|| root.join(&name));
             if central.is_dir() {
                 let same = match (hash_directory(&central), hash_directory(&p)) {
                     (Ok(a), Ok(b)) => a == b,
@@ -435,9 +478,10 @@ fn scan_agent(root: &Path, a: &AgentConfig) -> Result<AgentReport> {
 fn deploy_state(a: &AgentReport, key: &str, _hash: Option<&str>, _root: &Path) -> DeployState {
     match &a.mode {
         AgentDirMode::Missing => DeployState::NoAgentDir,
+        AgentDirMode::DirLinked if key.starts_with("repos/") => DeployState::NotDeployed,
         AgentDirMode::DirLinked => DeployState::Deployed,
         AgentDirMode::DirForeign { .. } => DeployState::NotDeployed,
-        AgentDirMode::Real => match a.entries.get(key) {
+        AgentDirMode::Real => match a.entries.get(&crate::repository::default_deploy_name(key)) {
             None => DeployState::NotDeployed,
             Some(EntryState::Deployed) => DeployState::Deployed,
             Some(EntryState::Broken { .. }) => DeployState::Broken,

@@ -8,13 +8,13 @@
 use super::{status_glyph, status_text};
 use crate::tui::app::Ctx;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::width;
+use crate::tui::widgets::OverlayClear as Clear;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Margin, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use skills::reconcile::{DeployState, SkillRecord};
 use skills::search::highlight_ranges;
 
@@ -23,43 +23,88 @@ use skills::search::highlight_ranges;
 #[derive(Default)]
 pub struct Overlay {
     key: Option<String>,
+    agent_preview: Option<AgentPreview>,
     scroll: u16,
     rect: Rect,
     lines: usize,
     height: u16,
+    expanded_fields: bool,
+}
+
+struct AgentPreview {
+    agent: String,
+    path: std::path::PathBuf,
+    ownership: String,
+    doc: Result<skills::skill::SkillDoc, String>,
 }
 
 impl Overlay {
     pub fn open(&mut self, key: String) {
+        self.agent_preview = None;
         self.key = Some(key);
         self.scroll = 0;
+        self.expanded_fields = false;
+    }
+    pub fn expand_fields(&mut self) {
+        self.expanded_fields = true;
+    }
+    /// Read the selected agent entry once, never substitute a same-named root skill.
+    pub fn open_agent(
+        &mut self,
+        key: String,
+        agent: String,
+        path: std::path::PathBuf,
+        ownership: String,
+    ) {
+        self.open(key);
+        let doc = skills::skill::SkillDoc::load(&path).map_err(|e| format!("{e:#}"));
+        self.agent_preview = Some(AgentPreview {
+            agent,
+            path,
+            ownership,
+            doc,
+        });
     }
     pub fn close(&mut self) {
+        self.agent_preview = None;
         self.key = None;
     }
     pub fn is_open(&self) -> bool {
         self.key.is_some()
+    }
+    pub fn hints(&self) -> Option<crate::tui::app::Hints> {
+        self.is_open().then_some(&[
+            ("↑↓/j/k", "scroll"),
+            ("PgUp/PgDn", "page"),
+            ("Home/End", "top/bottom"),
+            ("e", "expand/collapse fields"),
+            ("Esc/Enter", "close"),
+        ])
     }
     fn scroll_by(&mut self, delta: i32) {
         let max = (self.lines as i32 - self.height as i32).max(0);
         self.scroll = (self.scroll as i32 + delta).clamp(0, max) as u16;
     }
 
-    /// Keys while the overlay is up. Returns whether the key was taken, so a
-    /// page can fall through to its own bindings for anything else.
+    /// Consume every page key while the overlay is open, including unbound
+    /// keys, so hidden page actions cannot run underneath the preview.
     pub fn handle_key(&mut self, k: KeyEvent) -> bool {
         if !self.is_open() {
             return false;
         }
         match k.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.close(),
+            KeyCode::Char('e') => {
+                self.expanded_fields = !self.expanded_fields;
+                self.scroll = 0;
+            }
             KeyCode::Down | KeyCode::Char('j') => self.scroll_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.scroll_by(-1),
             KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_by(self.height as i32 - 2),
             KeyCode::PageUp => self.scroll_by(-(self.height as i32 - 2)),
             KeyCode::Home | KeyCode::Char('g') => self.scroll = 0,
             KeyCode::End | KeyCode::Char('G') => self.scroll_by(i32::MAX / 2),
-            _ => return false,
+            _ => {}
         }
         true
     }
@@ -104,34 +149,73 @@ impl Overlay {
         f.render_widget(Clear, rect);
         let title = Line::from(vec![
             Span::raw(" "),
-            Span::styled(key.clone(), th.bold()),
-            Span::styled("  Esc closes ", th.dim()),
+            Span::styled(
+                self.agent_preview
+                    .as_ref()
+                    .and_then(|p| p.doc.as_ref().ok())
+                    .map(|d| d.name.as_str())
+                    .or_else(|| ctx.snap.get(key).map(super::cards::display_name))
+                    .unwrap_or(key)
+                    .to_string(),
+                th.bold(),
+            ),
+            Span::styled("  e fields · Esc closes ", th.dim()),
         ]);
         let block = th.block(title, true);
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         self.height = inner.height;
-        let Some(r) = ctx.snap.get(key) else {
-            f.render_widget(
-                Paragraph::new(Span::styled("not in the skills root", th.err())),
-                inner,
-            );
-            return;
+        let lines = if let Some(preview) = &self.agent_preview {
+            let mut lines = vec![
+                kv("agent", &preview.agent, th),
+                kv(
+                    "path",
+                    preview.path.join("SKILL.md").display().to_string(),
+                    th,
+                ),
+                kv("entry", &preview.ownership, th),
+                Line::from(""),
+            ];
+            match &preview.doc {
+                Ok(doc) => {
+                    lines.push(kv("name", &doc.name, th));
+                    if !self.expanded_fields {
+                        lines = lines
+                            .into_iter()
+                            .map(|line| single_line(line, inner.width as usize))
+                            .collect();
+                    }
+                    lines.extend(markdown_section(
+                        "Description",
+                        &doc.description,
+                        inner.width as usize,
+                        &[],
+                        th,
+                    ));
+                    lines.extend(markdown_section(
+                        "SKILL.md",
+                        &doc.body,
+                        inner.width as usize,
+                        &[],
+                        th,
+                    ));
+                }
+                Err(error) => lines.push(Line::from(Span::styled(error.clone(), th.err()))),
+            }
+            lines
+        } else if let Some(r) = ctx.snap.get(key) {
+            record_lines(r, ctx, &[], inner.width as usize, self.expanded_fields)
+        } else {
+            vec![Line::from(Span::styled("not in the skills root", th.err()))]
         };
-        let lines = preview_lines(r, ctx, &[]);
-        let wrap_w = inner.width.max(1) as usize;
-        self.lines = lines
-            .iter()
-            .map(|l| width(&l.to_string()).max(1).div_ceil(wrap_w))
-            .sum();
-        let max = self.lines.saturating_sub(inner.height as usize) as u16;
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        self.lines = paragraph.line_count(inner.width);
+        let max = self
+            .lines
+            .saturating_sub(inner.height as usize)
+            .min(u16::MAX as usize) as u16;
         self.scroll = self.scroll.min(max);
-        f.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((self.scroll, 0)),
-            inner,
-        );
+        f.render_widget(paragraph.scroll((self.scroll, 0)), inner);
         if self.lines > inner.height as usize {
             let mut sb = ScrollbarState::new(self.lines.saturating_sub(inner.height as usize))
                 .position(self.scroll as usize);
@@ -156,22 +240,30 @@ pub fn kv<'a>(k: &'a str, v: impl Into<String>, th: &Theme) -> Line<'a> {
     ])
 }
 
-pub fn preview_lines<'a>(r: &'a SkillRecord, ctx: &'a Ctx, terms: &[String]) -> Vec<Line<'a>> {
+pub fn preview_lines<'a>(
+    r: &'a SkillRecord,
+    ctx: &'a Ctx,
+    terms: &[String],
+    available_width: usize,
+) -> Vec<Line<'a>> {
+    record_lines(r, ctx, terms, available_width, false)
+}
+
+fn record_lines<'a>(
+    r: &'a SkillRecord,
+    ctx: &'a Ctx,
+    terms: &[String],
+    available_width: usize,
+    expanded: bool,
+) -> Vec<Line<'a>> {
     let th = ctx.theme;
     let mut lines = vec![Line::from(vec![
-        Span::styled(r.key.as_str(), th.bold().fg(th.accent)),
+        Span::styled(super::cards::display_name(r), th.bold().fg(th.accent)),
         Span::raw("  "),
         status_glyph(&r.status, th),
         Span::raw(" "),
         Span::styled(status_text(&r.status), th.dim()),
     ])];
-    if r.name_mismatch {
-        lines.push(kv(
-            "name",
-            format!("{}  ≠ directory name", r.name.as_deref().unwrap_or("")),
-            th,
-        ));
-    }
     let mut tag_line = vec![Span::styled(format!("{:<9}", "tags"), th.dim())];
     if r.tags.is_empty() {
         tag_line.push(Span::styled("none", th.dim()));
@@ -189,7 +281,7 @@ pub fn preview_lines<'a>(r: &'a SkillRecord, ctx: &'a Ctx, terms: &[String]) -> 
     for a in &ctx.snap.agents {
         let (txt, style) = match r.deploy.get(&a.key) {
             Some(DeployState::Deployed) => ("✓", th.ok()),
-            Some(DeployState::NotDeployed) => ("·", th.dim()),
+            Some(DeployState::NotDeployed) => ("—", th.dim()),
             Some(DeployState::Shadow { same_content: true }) => ("shadow", th.warn()),
             Some(DeployState::Shadow {
                 same_content: false,
@@ -206,12 +298,18 @@ pub fn preview_lines<'a>(r: &'a SkillRecord, ctx: &'a Ctx, terms: &[String]) -> 
         "source",
         r.source
             .as_ref()
-            .map(|s| s.summary())
+            .map(|s| crate::tui::icons::source(ctx.ws.config.ui.icons, s))
             .unwrap_or_else(|| "none".into()),
         th,
     ));
     if r.external {
         lines.push(kv("path", format!("{} (symlink)", r.path.display()), th));
+    }
+    if !expanded {
+        lines = lines
+            .into_iter()
+            .map(|line| single_line(line, available_width))
+            .collect();
     }
     if let Some(n) = &r.note {
         lines.push(Line::from(""));
@@ -221,24 +319,88 @@ pub fn preview_lines<'a>(r: &'a SkillRecord, ctx: &'a Ctx, terms: &[String]) -> 
         }
     }
     if let Some(d) = &r.description {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "description",
-            th.bold().fg(th.accent),
-        )));
-        lines.push(Line::from(highlight_spans(d, terms, Style::default(), th)));
+        lines.extend(markdown_section(
+            "Description",
+            d,
+            available_width,
+            terms,
+            th,
+        ));
     }
     if let Some(b) = &r.body {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "SKILL.md",
-            th.bold().fg(th.accent),
-        )));
-        lines.push(Line::from(Span::styled("─".repeat(24), th.dim())));
-        for line in tui_markdown::from_str(b).lines {
-            lines.push(highlight_line(line, terms, th));
+        lines.extend(markdown_section("SKILL.md", b, available_width, terms, th));
+    }
+    lines
+}
+
+/// Metadata is one physical row, even when stored values contain line breaks.
+fn single_line(line: Line<'_>, columns: usize) -> Line<'static> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let mut spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            Span::styled(
+                span.content
+                    .chars()
+                    .map(|c| {
+                        if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                            ' '
+                        } else {
+                            c
+                        }
+                    })
+                    .collect::<String>(),
+                span.style,
+            )
+        })
+        .collect();
+    if spans.iter().map(Span::width).sum::<usize>() <= columns {
+        return Line::from(spans).style(line.style);
+    }
+    let mut left = columns.saturating_sub(1);
+    let mut clipped = Vec::new();
+    for span in spans.drain(..) {
+        let mut text = String::new();
+        for glyph in span.content.graphemes(true) {
+            let width = UnicodeWidthStr::width(glyph);
+            if width > left {
+                break;
+            }
+            text.push_str(glyph);
+            left -= width;
+        }
+        let complete = text.len() == span.content.len();
+        clipped.push(Span::styled(text, span.style));
+        if !complete || left == 0 {
+            break;
         }
     }
+    if columns > 0 {
+        clipped.push(Span::raw("…"));
+    }
+    Line::from(clipped).style(line.style)
+}
+
+/// Description and SKILL.md share a heading, divider, Markdown and highlighting.
+fn markdown_section(
+    title: &str,
+    body: &str,
+    width: usize,
+    terms: &[String],
+    th: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::default(),
+        Line::from(Span::styled(title.to_string(), th.bold().fg(th.accent))),
+        Line::from(Span::styled("─".repeat(width.min(24)), th.dim())),
+    ];
+    lines.extend(
+        crate::tui::markdown::render(body, width)
+            .into_iter()
+            .map(|line| highlight_line(line, terms, th)),
+    );
     lines
 }
 
@@ -279,4 +441,34 @@ pub fn highlight_line<'a>(line: Line<'a>, terms: &[String], th: &Theme) -> Line<
     Line::from(spans)
         .style(line.style)
         .alignment(line.alignment.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn metadata_stays_on_one_row_with_wide_text_and_control_characters() {
+        for columns in 0..80 {
+            let row = single_line(
+                Line::from(vec![
+                    Span::raw("source   "),
+                    Span::styled(
+                        "https://example.org/文档\nnext\tfield\u{2028}value".repeat(8),
+                        Style::default(),
+                    ),
+                ]),
+                columns,
+            );
+            assert!(row.width() <= columns);
+            assert!(
+                row.spans
+                    .iter()
+                    .all(|s| !s.content.contains(['\n', '\t', '\u{2028}']))
+            );
+            let paragraph = Paragraph::new(vec![row]).wrap(Wrap { trim: false });
+            if columns > 0 {
+                assert_eq!(paragraph.line_count(columns as u16), 1);
+            }
+        }
+    }
 }
