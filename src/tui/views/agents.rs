@@ -785,15 +785,7 @@ impl View for AgentsView {
                             .as_ref()
                             .map(|s| s.kind().to_string())
                             .unwrap_or_default();
-                        skill_card(
-                            r,
-                            ctx,
-                            &ctx.snap.agents,
-                            ci.width as usize,
-                            None,
-                            &tail,
-                            &[],
-                        )
+                        skill_card(r, ctx, ci.width as usize, None, &tail, &[])
                     }
                     // The agent's own: there may be no record behind it, and
                     // even when there is, what matters is the shape it is in.
@@ -851,7 +843,7 @@ impl View for AgentsView {
                 ];
                 if let Some(r) = managed {
                     let available = (cell.width as usize).saturating_sub(4);
-                    let badge = cards::repository_badge(r);
+                    let badge = cards::repository_badge(r, ctx.ws.config.ui.icons);
                     let badge_w = badge
                         .as_deref()
                         .map(|text| width(text).min(available / 2))
@@ -912,6 +904,12 @@ impl View for AgentsView {
     }
 
     fn hints(&self) -> Hints {
+        if let Some(hints) = self.matrix.hints() {
+            return hints;
+        }
+        if let Some(hints) = self.preview.hints() {
+            return hints;
+        }
         match self.focus() {
             Focus::Presets => &[
                 ("Enter", "deploy / undeploy"),
@@ -919,9 +917,9 @@ impl View for AgentsView {
                 ("M", "matrix"),
                 ("←→", "pick preset"),
                 ("↓", "entries"),
-                ("[ ]", "scope"),
+                ("[ ]", "agent"),
                 ("s", "sync"),
-                ("v", "density"),
+                ("v", "layout"),
             ],
             // A repair key is shown only on a row it applies to, so the footer
             // never offers something the page would refuse.
@@ -934,7 +932,7 @@ impl View for AgentsView {
                     ("a", "adopt"),
                     ("[ ]", "agent"),
                     ("c", "convert dir-link"),
-                    ("v", "density"),
+                    ("v", "layout"),
                 ],
                 Caps { relink: true, .. } => &[
                     ("j/k", "move"),
@@ -944,7 +942,7 @@ impl View for AgentsView {
                     ("a", "adopt"),
                     ("[ ]", "agent"),
                     ("c", "convert dir-link"),
-                    ("v", "density"),
+                    ("v", "layout"),
                 ],
                 Caps { .. } => &[
                     ("j/k", "move"),
@@ -953,7 +951,7 @@ impl View for AgentsView {
                     ("a", "adopt"),
                     ("[ ]", "agent"),
                     ("c", "convert dir-link"),
-                    ("v", "density"),
+                    ("v", "layout"),
                 ],
             },
             Focus::Agents => &[
@@ -961,7 +959,7 @@ impl View for AgentsView {
                 ("↓", "presets"),
                 ("s", "sync"),
                 ("c", "convert dir-link"),
-                ("v", "density"),
+                ("v", "layout"),
             ],
         }
     }
@@ -991,7 +989,7 @@ fn glyph_for(state: Option<&EntryState>, th: &crate::tui::theme::Theme) -> (&'st
         Some(EntryState::Shadow { .. }) => ("▪", th.warn()),
         Some(EntryState::Foreign { .. }) => ("→", th.warn()),
         Some(EntryState::AgentOnly) => ("▪", th.dim()),
-        None => ("·", th.dim()),
+        None => ("○", th.dim()),
     }
 }
 

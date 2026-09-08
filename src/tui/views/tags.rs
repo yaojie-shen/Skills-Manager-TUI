@@ -479,7 +479,6 @@ impl TagsView {
             return;
         }
         let selected = self.grid.selected();
-        let agents = &ctx.snap.agents;
         for i in self.grid.visible() {
             let (Some(cell), Some(r)) = (self.grid.cell(i), ctx.snap.get(&self.members[i])) else {
                 continue;
@@ -491,7 +490,7 @@ impl TagsView {
                 .as_ref()
                 .map(|s| s.kind().to_string())
                 .unwrap_or_default();
-            let lines = skill_card(r, ctx, agents, ci.width as usize, None, &tail, &[]);
+            let lines = skill_card(r, ctx, ci.width as usize, None, &tail, &[]);
             f.render_widget(Paragraph::new(lines), ci);
         }
         draw_track(f, inner, &self.grid, selected, &mut self.grid_track, th);
@@ -846,6 +845,9 @@ impl View for TagsView {
     }
 
     fn hints(&self) -> Hints {
+        if let Some(hints) = self.preview.hints() {
+            return hints;
+        }
         match self.prompt.as_ref().map(|p| p.ask) {
             Some(Ask::Merge) => &[("↑/↓", "target"), ("Enter", "merge"), ("Esc", "cancel")],
             Some(Ask::Color) => &[

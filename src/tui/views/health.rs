@@ -619,6 +619,9 @@ impl View for HealthView {
     /// are mutually exclusive, so at most one of `a`, `m`, `x` applies, with
     /// or without `U`.
     fn hints(&self) -> Hints {
+        if let Some(hints) = self.preview.hints() {
+            return hints;
+        }
         let Some(caps) = self.selected_row().map(|r| r.caps) else {
             return &[("c", "check updates"), ("Esc", "search"), ("q", "quit")];
         };

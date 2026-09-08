@@ -243,7 +243,6 @@ impl PresetsView {
             return;
         }
         let selected = self.members.selected();
-        let agents = &ctx.snap.agents;
         for i in self.members.visible() {
             let Some(cell) = self.members.cell(i) else {
                 continue;
@@ -258,7 +257,7 @@ impl PresetsView {
                         .as_ref()
                         .map(|s| s.kind().to_string())
                         .unwrap_or_default();
-                    skill_card(r, ctx, agents, ci.width as usize, None, &tail, &[])
+                    skill_card(r, ctx, ci.width as usize, None, &tail, &[])
                         .into_iter()
                         .map(|l| (ci, l))
                         .collect::<Vec<_>>()
@@ -553,6 +552,12 @@ impl View for PresetsView {
     }
 
     fn hints(&self) -> Hints {
+        if let Some(hints) = self.matrix.hints() {
+            return hints;
+        }
+        if let Some(hints) = self.preview.hints() {
+            return hints;
+        }
         if self.focus_members {
             &[
                 ("a", "add skills"),

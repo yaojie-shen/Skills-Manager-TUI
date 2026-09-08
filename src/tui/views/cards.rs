@@ -1,7 +1,6 @@
 //! The framed skill card, shared by every page that lays skills out in a grid.
 //!
-//! A card is three lines inside a rounded frame: what it is and where it is
-//! deployed, what it does, how it is filed. The frame carries the selection,
+//! A card shows its name, description, tags and source inside a rounded frame. The frame carries the selection,
 //! so a match highlighted inside keeps its own background instead of being
 //! painted over.
 
@@ -15,10 +14,10 @@ use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders};
-use skills::reconcile::{AgentReport, DeployState, SkillRecord};
+use skills::reconcile::{DeployState, SkillRecord};
 
 /// Narrowest a card may get before the grid gives up a column. Below this the
-/// name and the deployment marks stop fitting on one line together.
+/// name and description become too cramped to read.
 pub const MIN_CARD_W: u16 = 40;
 /// Most columns worth having: past this a card holds less than it costs to scan.
 pub const MAX_COLS: usize = 4;
@@ -77,7 +76,7 @@ pub fn deploy_glyph(state: Option<&DeployState>, th: &Theme) -> (&'static str, S
         Some(DeployState::Deployed) => ("✓", th.ok()),
         Some(DeployState::Broken) => ("!", th.err()),
         Some(DeployState::Shadow { .. }) | Some(DeployState::Foreign) => ("~", th.warn()),
-        _ => ("·", th.dim()),
+        _ => ("○", th.dim()),
     }
 }
 
@@ -149,13 +148,17 @@ pub fn display_name(r: &SkillRecord) -> &str {
 }
 
 /// A readable Git source badge, separate from the skill's own name.
-pub fn repository_badge(r: &SkillRecord) -> Option<String> {
-    if let Some(skills::meta::Source::Git { url, .. }) = &r.source
-        && let Some(name) = skills::repository::source_name(url)
-    {
-        return Some(format!("⎇ {name}"));
+pub fn repository_badge(r: &SkillRecord, icons: skills::config::Icons) -> Option<String> {
+    use skills::meta::Source;
+    match &r.source {
+        Some(Source::Git { url, .. }) => {
+            let name = skills::repository::source_name(url).unwrap_or_else(|| url.clone());
+            Some(format!("{} {name}", crate::tui::icons::git(icons, url)))
+        }
+        Some(Source::Local { .. }) => Some(crate::tui::icons::local(icons).into()),
+        None => skills::repository::alias_of(&r.key)
+            .map(|alias| format!("{} {alias}", crate::tui::icons::package(icons))),
     }
-    skills::repository::alias_of(&r.key).map(|alias| format!("⎇ {alias}"))
 }
 
 /// The lines of a skill card. `body` replaces the description when the page
@@ -166,36 +169,23 @@ pub fn repository_badge(r: &SkillRecord) -> Option<String> {
 pub fn skill_card(
     r: &SkillRecord,
     ctx: &Ctx,
-    agents: &[AgentReport],
     inner_w: usize,
     body: Option<&str>,
     tail: &str,
     terms: &[String],
 ) -> Vec<Line<'static>> {
     let th = ctx.theme;
-    let source = match repository_badge(r) {
-        Some(badge) if tail.is_empty() || tail == "git" => badge,
+    let source = match repository_badge(r, ctx.ws.config.ui.icons) {
+        Some(badge) if tail.is_empty() || tail == "git" || tail == "local" => badge,
         Some(badge) => format!("{badge} · {tail}"),
         None => tail.to_string(),
     };
     let tail = fit(&source, inner_w.saturating_sub(4));
     let tail = tail.as_str();
     let label = display_name(r);
-    let deploy: Vec<Span> = agents
-        .iter()
-        .flat_map(|a| {
-            let (g, style) = deploy_glyph(r.deploy.get(&a.key), th);
-            [
-                Span::styled(format!("{g} "), style),
-                Span::styled(format!("{}  ", abbrev(&a.key)), th.dim()),
-            ]
-        })
-        .collect();
-    let deploy_w: usize = deploy.iter().map(|s| width(&s.content)).sum();
-    let name_w = inner_w.saturating_sub(deploy_w + 3);
+    let name_w = inner_w.saturating_sub(3);
     let mut head = vec![status_glyph(&r.status, th), Span::raw(" ")];
     head.extend(highlight_spans(&pad(label, name_w), terms, th.bold(), th));
-    head.extend(deploy);
 
     let body: Vec<Span> = match body.or(r.description.as_deref()) {
         Some(d) => highlight_spans(&fit(d, inner_w.saturating_sub(2)), terms, th.dim(), th),
@@ -267,12 +257,30 @@ mod tests {
             theme: &theme,
         };
         let mut record = snap.get(key).unwrap().clone();
-        let lines = skill_card(&record, &ctx, &[], 60, None, "name", &[]);
+        let lines = skill_card(&record, &ctx, 60, None, "name", &[]);
         assert!(lines[0].to_string().contains("mock-calendar"));
         assert!(!lines[0].to_string().contains("skills--"));
-        assert!(lines[3].to_string().contains("⎇ sampleorg/kit"));
+        assert!(lines[3].to_string().contains("󰊤 sampleorg/kit"));
         assert!(lines[3].to_string().contains("name"));
+        record.description = Some("**Description emphasis** with `code`".into());
         let preview = super::super::preview::preview_lines(&record, &ctx, &[], 60);
+        let description_start = preview
+            .iter()
+            .position(|line| line.to_string() == "Description")
+            .unwrap();
+        let body_start = preview
+            .iter()
+            .position(|line| line.to_string() == "SKILL.md")
+            .unwrap();
+        assert_eq!(preview[description_start + 1], preview[body_start + 1]);
+        assert!(
+            preview[description_start + 2..body_start]
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.content.contains("Description emphasis")
+                    && span.style.add_modifier.contains(Modifier::BOLD))
+        );
+
         assert!(preview[0].to_string().starts_with("mock-calendar"));
         assert!(
             !preview
@@ -286,7 +294,7 @@ mod tests {
         );
         record.name = Some("中文日历".into());
         for width in [16, 24, 40, 80] {
-            for line in skill_card(&record, &ctx, &[], width, None, "git", &[]) {
+            for line in skill_card(&record, &ctx, width, None, "git", &[]) {
                 assert!(line.width() <= width);
             }
         }

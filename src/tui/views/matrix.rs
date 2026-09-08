@@ -44,6 +44,15 @@ impl Matrix {
         self.open = false;
     }
 
+    pub fn hints(&self) -> Option<crate::tui::app::Hints> {
+        self.open.then_some(&[
+            ("↑↓←→", "cell"),
+            ("Enter/Space", "toggle"),
+            ("A", "toggle row"),
+            ("Esc", "close"),
+        ])
+    }
+
     /// Throw the switch in one cell: on unless the preset is already fully on
     /// there. Runs straight away and records itself, exactly like a pill.
     fn toggle(&self, ctx: &Ctx, row: usize, col: usize) -> Vec<Action> {

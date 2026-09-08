@@ -516,8 +516,18 @@ impl Modal {
                             .count();
                         PickItem {
                             id: r.alias.clone(),
-                            label: skills::repository::source_name(&r.url).unwrap_or(r.alias),
-                            sub: format!("{count} skills · {} · {}", r.branch, r.url),
+                            label: format!(
+                                "{} {}",
+                                crate::tui::icons::git(ctx.ws.config.ui.icons, &r.url),
+                                skills::repository::source_name(&r.url).unwrap_or(r.alias)
+                            ),
+                            sub: format!(
+                                "{} {count} skills · {} {} · {}",
+                                crate::tui::icons::package(ctx.ws.config.ui.icons),
+                                crate::tui::icons::branch(ctx.ws.config.ui.icons),
+                                r.branch,
+                                r.url
+                            ),
                         }
                     })
                     .collect(),
@@ -635,7 +645,7 @@ impl Modal {
                 ..
             } => &[
                 ("type", "filter"),
-                ("↓", "list"),
+                ("↓/Tab", "list"),
                 ("Enter", "browse"),
                 ("Esc", "close"),
             ],
@@ -646,7 +656,8 @@ impl Modal {
                 ("Enter", "browse"),
                 ("u", "check repo"),
                 ("U", "update repo"),
-                ("/", "filter"),
+                ("↑↓", "move"),
+                ("/Tab", "filter"),
                 ("Esc", "close"),
             ],
             Modal::Picker {
@@ -824,9 +835,6 @@ impl Modal {
                 let multi = action.multi();
                 let browse = matches!(action, PickAction::BrowseRepositories);
                 if browse {
-                    if k.code == KeyCode::Down {
-                        *input_focus = false;
-                    }
                     if k.code == KeyCode::Char('/') && !*input_focus {
                         *input_focus = true;
                         return vec![];
@@ -865,17 +873,17 @@ impl Modal {
                 }
                 match k.code {
                     KeyCode::Esc => return vec![Action::CloseModal],
-                    KeyCode::Tab if multi => *input_focus = !*input_focus,
+                    KeyCode::Tab if multi || browse => *input_focus = !*input_focus,
                     KeyCode::Char('/') if multi && !*input_focus => *input_focus = true,
                     KeyCode::Down | KeyCode::Char('n') if k.code == KeyCode::Down || ctrl => {
-                        if multi && *input_focus {
+                        if (multi || browse) && *input_focus {
                             *input_focus = false;
                         } else {
                             list.move_by(1, shown.len());
                         }
                     }
                     KeyCode::Up | KeyCode::Char('p') if k.code == KeyCode::Up || ctrl => {
-                        if multi && (*input_focus || list.selected() == Some(0)) {
+                        if (multi || browse) && (*input_focus || list.selected() == Some(0)) {
                             *input_focus = true;
                         } else {
                             list.move_by(-1, shown.len());
@@ -909,7 +917,11 @@ impl Modal {
                     _ => {
                         if ((!multi && !browse) || *input_focus) && input.handle_key(k) {
                             refilter(input.value(), items, shown);
-                            list.clamp(shown.len());
+                            if browse {
+                                list.first(shown.len());
+                            } else {
+                                list.clamp(shown.len());
+                            }
                         }
                     }
                 }
@@ -1115,6 +1127,12 @@ impl Modal {
                 ..
             } => {
                 if let Some(d) = wheel {
+                    if matches!(action, PickAction::BrowseRepositories) {
+                        if !list.rows.contains(at) {
+                            return vec![];
+                        }
+                        *input_focus = false;
+                    }
                     list.move_by(d, shown.len());
                 } else if click {
                     if !rect.contains(at) {
@@ -1445,7 +1463,14 @@ impl Modal {
                     ..inner
                 };
                 *input_rect = field;
-                input.render(f, field, !multi || *input_focus, "type to filter…", th);
+                let separate_focus = multi || matches!(action, PickAction::BrowseRepositories);
+                input.render(
+                    f,
+                    field,
+                    !separate_focus || *input_focus,
+                    "type to filter…",
+                    th,
+                );
                 let list_area = Rect {
                     y: inner.y + 2,
                     height: inner.height.saturating_sub(2),
@@ -1479,7 +1504,7 @@ impl Modal {
                     })
                     .collect();
                 let w = List::new(rows)
-                    .highlight_style(if multi && *input_focus {
+                    .highlight_style(if separate_focus && *input_focus {
                         th.dim()
                     } else {
                         th.selected()
@@ -1994,6 +2019,126 @@ mod picker_tests {
     use crate::tui::theme::Theme;
     use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::Config, preset::Preset};
+
+    #[test]
+    fn repository_browser_moves_focus_without_skipping_and_mouse_focus_matches_keys() {
+        let root = std::env::temp_dir().join(format!(
+            "skills-repo-focus-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Config::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut modal = Modal::picker(
+            "repositories".into(),
+            ["alpha", "beta", "gamma"]
+                .into_iter()
+                .map(|name| PickItem {
+                    id: name.into(),
+                    label: name.into(),
+                    sub: "sample repo".into(),
+                })
+                .collect(),
+            Default::default(),
+            PickAction::BrowseRepositories,
+        );
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let state = |modal: &Modal| {
+            let Modal::Picker {
+                input_focus, list, ..
+            } = modal
+            else {
+                panic!("picker")
+            };
+            (*input_focus, list.selected())
+        };
+        modal.handle_key(key(KeyCode::Down), &ctx);
+        assert_eq!(
+            state(&modal),
+            (false, Some(0)),
+            "first down only enters results"
+        );
+        modal.handle_key(key(KeyCode::Down), &ctx);
+        assert_eq!(state(&modal), (false, Some(1)));
+        modal.handle_key(key(KeyCode::Up), &ctx);
+        modal.handle_key(key(KeyCode::Up), &ctx);
+        assert_eq!(
+            state(&modal),
+            (true, Some(0)),
+            "up from first row restores filter"
+        );
+        modal.handle_key(key(KeyCode::Tab), &ctx);
+        assert_eq!(state(&modal), (false, Some(0)));
+        let actions = modal.handle_key(key(KeyCode::Enter), &ctx);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Search { query, .. } if query == "repo:alpha"))
+        );
+        modal.handle_key(key(KeyCode::Char('/')), &ctx);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| modal.draw(f, f.area(), &ctx)).unwrap();
+        let Modal::Picker {
+            input_rect, list, ..
+        } = &modal
+        else {
+            panic!("picker")
+        };
+        let input_at = *input_rect;
+        let rows_at = list.rows;
+        let mouse = |kind, x, y| MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        modal.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0), &ctx);
+        assert_eq!(
+            state(&modal),
+            (true, Some(0)),
+            "wheel outside the list does not move results"
+        );
+        modal.handle_mouse(
+            mouse(MouseEventKind::ScrollDown, rows_at.x, rows_at.y),
+            &ctx,
+        );
+        assert!(
+            !state(&modal).0,
+            "wheel over results transfers keyboard focus"
+        );
+        modal.handle_mouse(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                input_at.x,
+                input_at.y,
+            ),
+            &ctx,
+        );
+        assert!(state(&modal).0);
+        modal.handle_key(key(KeyCode::Char('a')), &ctx);
+        assert_eq!(
+            state(&modal),
+            (true, Some(0)),
+            "editing filter selects its first result"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn searching_with_spaces_never_changes_membership() {

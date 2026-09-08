@@ -432,15 +432,7 @@ impl SearchView {
                         .unwrap_or_default()
                 };
                 f.render_widget(
-                    Paragraph::new(skill_card(
-                        r,
-                        ctx,
-                        agents,
-                        ci.width as usize,
-                        body,
-                        &tail,
-                        &h.terms,
-                    )),
+                    Paragraph::new(skill_card(r, ctx, ci.width as usize, body, &tail, &h.terms)),
                     ci,
                 );
             } else if layout == UiLayout::List {
@@ -468,7 +460,6 @@ impl SearchView {
                 let mut lines = skill_card(
                     r,
                     ctx,
-                    agents,
                     cell.width.saturating_sub(3) as usize,
                     body,
                     &tail,
@@ -552,20 +543,14 @@ impl SearchView {
         };
         let terms: Vec<String> = self.selected_terms().to_vec();
         let lines = preview_lines(r, ctx, &terms, inner.width as usize);
-        // Count wrapped lines for scroll clamping (approximate: by display width).
-        let w = inner.width.max(1) as usize;
-        self.preview_lines = lines
-            .iter()
-            .map(|l| width(&l.to_string()).max(1).div_ceil(w))
-            .sum();
-        let max = self.preview_lines.saturating_sub(inner.height as usize) as u16;
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        self.preview_lines = paragraph.line_count(inner.width);
+        let max = self
+            .preview_lines
+            .saturating_sub(inner.height as usize)
+            .min(u16::MAX as usize) as u16;
         self.preview_scroll = self.preview_scroll.min(max);
-        f.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((self.preview_scroll, 0)),
-            inner,
-        );
+        f.render_widget(paragraph.scroll((self.preview_scroll, 0)), inner);
         if self.preview_lines > inner.height as usize {
             let mut sb =
                 ScrollbarState::new(self.preview_lines.saturating_sub(inner.height as usize))
@@ -825,10 +810,19 @@ impl View for SearchView {
     }
 
     fn hints(&self) -> Hints {
+        if let Some(hints) = self.overlay.hints() {
+            return hints;
+        }
         match self.focus {
+            Focus::Input if self.completion.active() => &[
+                ("↑↓", "suggestions"),
+                ("Tab", "complete"),
+                ("Enter", "list"),
+                ("Esc", "close suggestions"),
+            ],
             Focus::Input => &[
                 ("↑↓", "select"),
-                ("Tab", "complete/list"),
+                ("Tab", "list"),
                 ("Enter", "list"),
                 ("Esc", "clear/quit"),
                 ("Alt-1..5", "tabs"),
@@ -874,7 +868,7 @@ fn row_lines<'a>(
 ) -> Vec<Line<'a>> {
     let th = ctx.theme;
     let dep_w = agents.len() * 3;
-    let badge = cards::repository_badge(r);
+    let badge = cards::repository_badge(r, ctx.ws.config.ui.icons);
     let content_w = inner_w.saturating_sub(dep_w + 5);
     let badge_w = badge
         .as_deref()

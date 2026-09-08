@@ -9,7 +9,6 @@ use super::{status_glyph, status_text};
 use crate::tui::app::Ctx;
 use crate::tui::theme::Theme;
 use crate::tui::widgets::OverlayClear as Clear;
-use crate::tui::widgets::width;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Margin, Rect};
@@ -67,6 +66,14 @@ impl Overlay {
     }
     pub fn is_open(&self) -> bool {
         self.key.is_some()
+    }
+    pub fn hints(&self) -> Option<crate::tui::app::Hints> {
+        self.is_open().then_some(&[
+            ("↑↓/j/k", "scroll"),
+            ("PgUp/PgDn", "page"),
+            ("Home/End", "top/bottom"),
+            ("Esc/Enter", "close"),
+        ])
     }
     fn scroll_by(&mut self, delta: i32) {
         let max = (self.lines as i32 - self.height as i32).max(0);
@@ -162,11 +169,19 @@ impl Overlay {
             match &preview.doc {
                 Ok(doc) => {
                     lines.push(kv("name", &doc.name, th));
-                    lines.push(kv("summary", &doc.description, th));
-                    lines.push(Line::from(""));
-                    lines.extend(crate::tui::markdown::render(
+                    lines.extend(markdown_section(
+                        "Description",
+                        &doc.description,
+                        inner.width as usize,
+                        &[],
+                        th,
+                    ));
+                    lines.extend(markdown_section(
+                        "SKILL.md",
                         &doc.body,
                         inner.width as usize,
+                        &[],
+                        th,
                     ));
                 }
                 Err(error) => lines.push(Line::from(Span::styled(error.clone(), th.err()))),
@@ -177,19 +192,14 @@ impl Overlay {
         } else {
             vec![Line::from(Span::styled("not in the skills root", th.err()))]
         };
-        let wrap_w = inner.width.max(1) as usize;
-        self.lines = lines
-            .iter()
-            .map(|l| width(&l.to_string()).max(1).div_ceil(wrap_w))
-            .sum();
-        let max = self.lines.saturating_sub(inner.height as usize) as u16;
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+        self.lines = paragraph.line_count(inner.width);
+        let max = self
+            .lines
+            .saturating_sub(inner.height as usize)
+            .min(u16::MAX as usize) as u16;
         self.scroll = self.scroll.min(max);
-        f.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((self.scroll, 0)),
-            inner,
-        );
+        f.render_widget(paragraph.scroll((self.scroll, 0)), inner);
         if self.lines > inner.height as usize {
             let mut sb = ScrollbarState::new(self.lines.saturating_sub(inner.height as usize))
                 .position(self.scroll as usize);
@@ -245,7 +255,7 @@ pub fn preview_lines<'a>(
     for a in &ctx.snap.agents {
         let (txt, style) = match r.deploy.get(&a.key) {
             Some(DeployState::Deployed) => ("✓", th.ok()),
-            Some(DeployState::NotDeployed) => ("·", th.dim()),
+            Some(DeployState::NotDeployed) => ("○", th.dim()),
             Some(DeployState::Shadow { same_content: true }) => ("shadow", th.warn()),
             Some(DeployState::Shadow {
                 same_content: false,
@@ -262,7 +272,7 @@ pub fn preview_lines<'a>(
         "source",
         r.source
             .as_ref()
-            .map(|s| s.summary())
+            .map(|s| crate::tui::icons::source(ctx.ws.config.ui.icons, s))
             .unwrap_or_else(|| "none".into()),
         th,
     ));
@@ -277,24 +287,38 @@ pub fn preview_lines<'a>(
         }
     }
     if let Some(d) = &r.description {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "description",
-            th.bold().fg(th.accent),
-        )));
-        lines.push(Line::from(highlight_spans(d, terms, Style::default(), th)));
+        lines.extend(markdown_section(
+            "Description",
+            d,
+            available_width,
+            terms,
+            th,
+        ));
     }
     if let Some(b) = &r.body {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "SKILL.md",
-            th.bold().fg(th.accent),
-        )));
-        lines.push(Line::from(Span::styled("─".repeat(24), th.dim())));
-        for line in crate::tui::markdown::render(b, available_width) {
-            lines.push(highlight_line(line, terms, th));
-        }
+        lines.extend(markdown_section("SKILL.md", b, available_width, terms, th));
     }
+    lines
+}
+
+/// Description and SKILL.md share a heading, divider, Markdown and highlighting.
+fn markdown_section(
+    title: &str,
+    body: &str,
+    width: usize,
+    terms: &[String],
+    th: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::default(),
+        Line::from(Span::styled(title.to_string(), th.bold().fg(th.accent))),
+        Line::from(Span::styled("─".repeat(width.min(24)), th.dim())),
+    ];
+    lines.extend(
+        crate::tui::markdown::render(body, width)
+            .into_iter()
+            .map(|line| highlight_line(line, terms, th)),
+    );
     lines
 }
 

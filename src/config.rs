@@ -77,6 +77,15 @@ impl PillCaps {
     }
 }
 
+/// Source decorations; text mode supports terminals without Nerd Fonts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Icons {
+    Text,
+    #[default]
+    Nerd,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct UiConfig {
@@ -84,6 +93,8 @@ pub struct UiConfig {
     pub layout: UiLayout,
     #[serde(default)]
     pub pill_caps: PillCaps,
+    #[serde(default)]
+    pub icons: Icons,
 }
 
 /// Search tuning. Defaults follow Omnisearch-style field boosting; every value
