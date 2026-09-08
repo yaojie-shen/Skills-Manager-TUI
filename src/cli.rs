@@ -828,32 +828,41 @@ fn cmd_note(ctx: &Ctx, c: NoteCommand) -> Result<()> {
         }
         NoteCommand::Edit { skill } => {
             let m = ctx.ws.meta.load(&skill)?.unwrap_or_default();
-            let text = edit_in_editor(m.note.as_deref().unwrap_or(""))?;
-            let m = edit::note_set(&ctx.ws, &skill, Some(&text))?;
-            ctx.out(&m, || println!("note saved on {skill}"))
+            match edit_in_editor(m.note.as_deref().unwrap_or(""))? {
+                Some(text) => {
+                    let m = edit::note_set(&ctx.ws, &skill, Some(&text))?;
+                    ctx.out(&m, || println!("note saved on {skill}"))
+                }
+                None => ctx.out(&m, || println!("note unchanged on {skill}")),
+            }
         }
     }
 }
 
-pub fn edit_in_editor(initial: &str) -> Result<String> {
+/// An unchanged temporary file is a no-op, including an editor's successful
+/// discard command (such as `:q!`). Failed editors never supply text to save.
+pub fn edit_in_editor(initial: &str) -> Result<Option<String>> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".into());
     let path = std::env::temp_dir().join(format!("skills-note-{}.md", std::process::id()));
     std::fs::write(&path, initial)?;
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"$1\""))
-        .arg("sh")
-        .arg(&path)
-        .status()
-        .with_context(|| format!("launching editor {editor}"))?;
-    if !status.success() {
-        bail!("editor exited with {status}");
-    }
-    let text = std::fs::read_to_string(&path)?;
+    let outcome = (|| {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{editor} \"$1\""))
+            .arg("sh")
+            .arg(&path)
+            .status()
+            .with_context(|| format!("launching editor {editor}"))?;
+        if !status.success() {
+            bail!("editor exited with {status}; note edit abandoned");
+        }
+        let text = std::fs::read_to_string(&path)?;
+        Ok((text != initial).then_some(text))
+    })();
     let _ = std::fs::remove_file(&path);
-    Ok(text)
+    outcome
 }
 
 fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {

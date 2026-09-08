@@ -236,7 +236,7 @@ impl App {
         self.external.take()
     }
 
-    pub fn run_external(&mut self, req: External) -> Result<(String, String)> {
+    pub fn run_external(&mut self, req: External) -> Result<(String, Option<String>)> {
         match req {
             External::EditNote { skill, initial } => {
                 let text = crate::cli::edit_in_editor(&initial)?;
@@ -245,9 +245,13 @@ impl App {
         }
     }
 
-    pub fn finish_external(&mut self, outcome: Result<(String, String)>) {
+    pub fn finish_external(&mut self, outcome: Result<(String, Option<String>)>) {
         match outcome {
-            Ok((skill, text)) => match history::note_edit(&self.ws, &skill, Some(&text)) {
+            Ok((skill, None)) => {
+                self.toast(format!("note unchanged on {skill}"), Level::Info);
+                return;
+            }
+            Ok((skill, Some(text))) => match history::note_edit(&self.ws, &skill, Some(&text)) {
                 Ok((msg, intent)) => {
                     self.toast(msg, Level::Ok);
                     if let Some(intent) = intent {
@@ -979,6 +983,43 @@ pub type Hints = &'static [(&'static str, &'static str)];
 #[cfg(test)]
 mod matrix_key_tests {
     use super::*;
+    #[test]
+    fn unchanged_editor_buffer_does_not_create_metadata_or_start_a_scan() {
+        let root =
+            std::env::temp_dir().join(format!("skills-editor-unchanged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("printer")).unwrap();
+        std::fs::write(
+            root.join("printer/SKILL.md"),
+            "---\nname: printer\ndescription: Print documents\n---\n",
+        )
+        .unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        let running = app.tasks_running;
+        app.finish_external(Ok(("printer".into(), None)));
+        assert!(app.ws.meta.load("printer").unwrap().is_none());
+        assert_eq!(app.tasks_running, running);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("note unchanged on printer"));
+        assert!(!rendered.contains("note saved"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn source_paste_never_submits_or_dispatches_shortcuts() {
