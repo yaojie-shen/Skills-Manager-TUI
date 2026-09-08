@@ -176,15 +176,17 @@ impl Overlay {
                 kv("entry", &preview.ownership, th),
                 Line::from(""),
             ];
+            if let Ok(doc) = &preview.doc {
+                lines.push(kv("name", &doc.name, th));
+            }
+            if !self.expanded_fields {
+                lines = lines
+                    .into_iter()
+                    .map(|line| single_line(line, inner.width as usize))
+                    .collect();
+            }
             match &preview.doc {
                 Ok(doc) => {
-                    lines.push(kv("name", &doc.name, th));
-                    if !self.expanded_fields {
-                        lines = lines
-                            .into_iter()
-                            .map(|line| single_line(line, inner.width as usize))
-                            .collect();
-                    }
                     lines.extend(markdown_section(
                         "Description",
                         &doc.description,
