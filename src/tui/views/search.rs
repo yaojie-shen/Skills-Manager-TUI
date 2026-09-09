@@ -1,4 +1,4 @@
-//! Search tab: input, result list, preview.
+//! Library tab: input, result list, preview.
 
 use super::cards::{self, CARD_H, cols_for, frame, skill_card};
 use super::completion::Completion;
@@ -105,6 +105,10 @@ impl SearchView {
         self.preset.is_some() || self.target.is_some()
     }
 
+    fn includes_record(&self, record: &skills::reconcile::SkillRecord) -> bool {
+        self.is_picker() || self.scope.is_some() || record.status.is_healthy()
+    }
+
     pub fn picker_title(&self) -> String {
         match &self.target {
             Some((agent, _, on)) => format!(
@@ -130,6 +134,7 @@ impl SearchView {
             view.select_scope(keys, "Deployed skills".into(), None, ctx);
         }
         view.target = Some((agent, project, on));
+        view.run_search(ctx, false);
         view.multi = true;
         view.layout = Some(UiLayout::Grid);
         view
@@ -139,6 +144,7 @@ impl SearchView {
         let mut view = Self::default();
         view.refresh(ctx);
         view.preset = Some(preset.into());
+        view.run_search(ctx, false);
         view.multi = true;
         view.layout = Some(UiLayout::Grid);
         if let Ok(Some(p)) = ctx.ws.presets.load(preset) {
@@ -373,7 +379,12 @@ impl SearchView {
             None
         };
         let q = Query::parse(self.input.value());
-        self.hits = self.searcher.search(&ctx.snap.skills, &q);
+        self.hits = self
+            .searcher
+            .search(&ctx.snap.skills, &q)
+            .into_iter()
+            .filter(|hit| self.includes_record(&ctx.snap.skills[hit.index]))
+            .collect();
         // Keep relevance within each group; repository installs follow local skills.
         self.hits.sort_by_key(|hit| {
             skills::repository::alias_of(&ctx.snap.skills[hit.index].key).is_some()
@@ -580,11 +591,20 @@ impl SearchView {
             Span::raw(" "),
             Span::styled(
                 {
+                    let total = ctx
+                        .snap
+                        .skills
+                        .iter()
+                        .filter(|r| self.includes_record(r))
+                        .count();
                     let local_total = ctx
                         .snap
                         .skills
                         .iter()
-                        .filter(|r| skills::repository::alias_of(&r.key).is_none())
+                        .filter(|r| {
+                            self.includes_record(r)
+                                && skills::repository::alias_of(&r.key).is_none()
+                        })
                         .count();
                     let local_matches = self
                         .hits
@@ -596,7 +616,7 @@ impl SearchView {
                     format!(
                         "{local_matches}/{local_total} local · {}/{} repository installs",
                         self.hits.len() - local_matches,
-                        ctx.snap.skills.len() - local_total
+                        total - local_total
                     )
                 },
                 th.dim(),
@@ -622,7 +642,7 @@ impl SearchView {
             f,
             field,
             self.focus == Focus::Input,
-            "search skills…   repo:owner/repo  tag:x  agent:y  status:modified  untagged",
+            "search skills…   repo:owner/repo  tag:x  agent:y  status:managed  untagged",
             th,
         );
     }
@@ -1488,6 +1508,57 @@ fn row_lines<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_hides_problem_records_without_removing_them_from_repair_views() {
+        let root =
+            std::env::temp_dir().join(format!("skills-library-health-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("valid")).unwrap();
+        std::fs::create_dir_all(root.join("invalid")).unwrap();
+        std::fs::write(
+            root.join("valid/SKILL.md"),
+            "---\nname: valid\ndescription: valid skill\n---\nBody",
+        )
+        .unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = skills::Workspace::open(&root).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = crate::tui::theme::Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = SearchView::default();
+        view.refresh(&ctx);
+        assert_eq!(snap.skills.len(), 2);
+        assert_eq!(view.hits.len(), 1);
+        assert_eq!(view.selected(&ctx).unwrap().key, "valid");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 34)).unwrap();
+        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("1/1 local"));
+        view.set_query("invalid", &ctx);
+        assert!(view.hits.is_empty());
+        view.set_query("", &ctx);
+        view.select_scope(vec!["invalid".into()], "Repair".into(), None, &ctx);
+        assert_eq!(view.selected(&ctx).unwrap().key, "invalid");
+        let picker = SearchView::preset_members("example", &ctx);
+        assert_eq!(picker.hits.len(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn short_result_panes_use_one_line_and_restore_the_chosen_layout() {

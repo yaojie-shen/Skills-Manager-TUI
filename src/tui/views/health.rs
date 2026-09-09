@@ -431,12 +431,12 @@ impl HealthView {
                 match &r.source {
                     Some(Source::Git { .. }) => actions.push(action(
                         "",
-                        "or reinstall it from the Search tab with i, from the git source above"
+                        "or reinstall it from the Library tab with i, from the git source above"
                             .into(),
                     )),
                     Some(Source::Local { path: Some(p) }) => actions.push(action(
                         "",
-                        format!("or reinstall it from the Search tab with i, from {p}"),
+                        format!("or reinstall it from the Library tab with i, from {p}"),
                     )),
                     Some(Source::Local { path: None }) => actions.push(action(
                         "",
@@ -830,7 +830,7 @@ impl View for HealthView {
         }
         if let Some(row) = self.selected_row() {
             if row.heading.is_some() {
-                return &[("c", "check updates"), ("Esc/q", "search")];
+                return &[("c", "check updates"), ("Esc/q", "library")];
             }
             if row.agent.is_some() {
                 return match row.state {
@@ -839,36 +839,36 @@ impl View for HealthView {
                         ("a", "adopt copy"),
                         ("Enter", "agents"),
                         ("c", "check updates"),
-                        ("Esc/q", "search"),
+                        ("Esc/q", "library"),
                     ],
                     Some(EntryState::Broken { .. }) => &[
                         ("x", "remove link"),
                         ("Enter", "act"),
                         ("c", "check updates"),
-                        ("Esc/q", "search"),
+                        ("Esc/q", "library"),
                     ],
                     Some(EntryState::Shadow { same_content: true }) => &[
                         ("r", "relink"),
                         ("Enter", "act"),
                         ("c", "check updates"),
-                        ("Esc/q", "search"),
+                        ("Esc/q", "library"),
                     ],
                     Some(EntryState::AgentOnly) => &[
                         ("a", "adopt"),
                         ("Enter", "act"),
                         ("c", "check updates"),
-                        ("Esc/q", "search"),
+                        ("Esc/q", "library"),
                     ],
                     _ => &[
                         ("Enter", "agents"),
                         ("c", "check updates"),
-                        ("Esc/q", "search"),
+                        ("Esc/q", "library"),
                     ],
                 };
             }
         }
         let Some(caps) = self.selected_row().map(|r| r.caps) else {
-            return &[("c", "check updates"), ("Esc", "search"), ("q", "search")];
+            return &[("c", "check updates"), ("Esc", "library"), ("q", "library")];
         };
         match (caps.update, caps.accept, caps.migrate, caps.clean) {
             (true, true, _, _) => &[
@@ -877,8 +877,8 @@ impl View for HealthView {
                 ("a", "accept"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "search"),
-                ("q", "search"),
+                ("Esc", "library"),
+                ("q", "library"),
             ],
             (true, false, true, _) => &[
                 ("c", "check updates"),
@@ -886,8 +886,8 @@ impl View for HealthView {
                 ("m", "migrate"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "search"),
-                ("q", "search"),
+                ("Esc", "library"),
+                ("q", "library"),
             ],
             (true, false, false, true) => &[
                 ("c", "check updates"),
@@ -895,47 +895,47 @@ impl View for HealthView {
                 ("x", "clean up"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "search"),
-                ("q", "search"),
+                ("Esc", "library"),
+                ("q", "library"),
             ],
             (true, false, false, false) => &[
                 ("c", "check updates"),
                 ("U", "update"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "search"),
-                ("q", "search"),
+                ("Esc", "library"),
+                ("q", "library"),
             ],
             (false, true, _, _) => &[
                 ("c", "check updates"),
                 ("a", "accept"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "search"),
-                ("q", "search"),
+                ("Esc", "library"),
+                ("q", "library"),
             ],
             (false, false, true, _) => &[
                 ("c", "check updates"),
                 ("m", "migrate"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "search"),
-                ("q", "search"),
+                ("Esc", "library"),
+                ("q", "library"),
             ],
             (false, false, false, true) => &[
                 ("c", "check updates"),
                 ("x", "clean up"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "search"),
-                ("q", "search"),
+                ("Esc", "library"),
+                ("q", "library"),
             ],
             (false, false, false, false) => &[
                 ("c", "check updates"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
-                ("Esc", "search"),
-                ("q", "search"),
+                ("Esc", "library"),
+                ("q", "library"),
             ],
         }
     }

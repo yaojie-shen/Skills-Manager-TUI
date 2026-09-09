@@ -899,7 +899,7 @@ impl View for TagsView {
                 ("c", "colour"),
                 ("x", "delete"),
                 ("Enter/→", "skills"),
-                ("q", "search"),
+                ("q", "library"),
             ],
         }
     }

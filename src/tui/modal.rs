@@ -1708,9 +1708,9 @@ fn help_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
     }
 }
 
-const HELP: &str = "Search
+const HELP: &str = "Library
   type              fuzzy search over name, tags, description, note
-  tag:x agent:y     filters; also status:modified  source:git  untagged
+  tag:x agent:y     filters; also status:managed  source:git  untagged
   Enter / Tab       move focus: input → list → preview   (Esc goes back)
   i                 install a skill from a repo or a local path
   t  n  d           tags / note in $EDITOR / deploy picker
@@ -1731,8 +1731,8 @@ Mouse
 Global
   Ctrl-Z  Ctrl-Y    undo and redo the last change
   1-6               switch tabs outside text inputs
-  Tab / Shift-Tab   next / previous tab outside Search
-  /                 back to search      Ctrl-R  rescan      Ctrl-C  quit";
+  Tab / Shift-Tab   next / previous tab outside Library
+  /                 back to Library      Ctrl-R  rescan      Ctrl-C  quit";
 
 fn repository_query(alias: &str, ctx: &Ctx) -> String {
     let name = ctx

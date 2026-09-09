@@ -279,7 +279,7 @@ impl View for ReposView {
             }
             if self.projects.is_empty() {
                 lines.push(Line::raw(
-                    "No skills or repositories found. Install from Search first.",
+                    "No skills or repositories found. Install from Library first.",
                 ));
             }
         }
@@ -299,7 +299,7 @@ impl View for ReposView {
             ("Enter/→", "open"),
             ("Esc/←", "back"),
             ("Ctrl+r", "refresh"),
-            ("q", "search"),
+            ("q", "library"),
         ]
     }
 }

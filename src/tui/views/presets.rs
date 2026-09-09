@@ -617,7 +617,7 @@ impl View for PresetsView {
                 ("r", "rename"),
                 ("Enter/→", "members"),
                 ("D", "delete preset"),
-                ("q", "search"),
+                ("q", "library"),
             ]
         }
     }

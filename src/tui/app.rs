@@ -46,7 +46,7 @@ impl Tab {
     ];
     pub fn title(self) -> &'static str {
         match self {
-            Tab::Search => "Search",
+            Tab::Search => "Library",
             Tab::Tags => "Tags",
             Tab::Presets => "Presets",
             Tab::Agents => "Agents",

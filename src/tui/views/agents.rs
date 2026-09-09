@@ -1485,7 +1485,7 @@ impl AgentsView {
                 ("↑", "presets"),
                 ("[ ]", "agent"),
                 ("v", "layout"),
-                ("Esc", "search"),
+                ("Esc", "library"),
             ];
         }
         match self.focus() {
@@ -1493,7 +1493,7 @@ impl AgentsView {
                 ("←→", "scope"),
                 ("↑", "agents"),
                 ("↓", "presets"),
-                ("Esc", "search"),
+                ("Esc", "library"),
             ],
             Focus::Presets => &[
                 ("Enter", "deploy / undeploy"),
