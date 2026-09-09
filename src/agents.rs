@@ -87,6 +87,7 @@ impl AgentDefinition {
         let extra: &[&str] = match (self.key, local) {
             // https://learn.chatgpt.com/docs/build-skills (legacy user root retained)
             ("codex", false) => &["~/.agents/skills"],
+            ("codex", true) => &[".codex/skills"],
             // https://cursor.com/docs/skills
             ("cursor", false) => &["~/.agents/skills", "~/.claude/skills", "~/.codex/skills"],
             ("cursor", true) => &[".agents/skills", ".claude/skills", ".codex/skills"],
@@ -142,4 +143,48 @@ impl AgentDefinition {
 
 pub fn defaults(local: bool) -> Vec<AgentConfig> {
     BUILTINS[..2].iter().map(|a| a.config(local)).collect()
+}
+
+/// Discover product evidence without running commands or creating directories.
+/// A shared skill directory and a saved deployment preference are not evidence.
+pub fn detect_in(
+    home: &std::path::Path,
+    project: &std::path::Path,
+    executable_dirs: &[std::path::PathBuf],
+) -> std::collections::BTreeSet<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |command: &str| {
+        executable_dirs.iter().any(|dir| {
+            std::fs::metadata(dir.join(command))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    };
+    BUILTINS
+        .iter()
+        .filter(|definition| {
+            let command = match definition.key {
+                "github-copilot" => "copilot",
+                "gemini-cli" => "gemini",
+                "qwen-code" => "qwen",
+                "kimi-code-cli" => "kimi",
+                "kiro-cli" => "kiro-cli",
+                key => key,
+            };
+            let global = std::path::Path::new(definition.global_dir.trim_start_matches("~/"))
+                .parent()
+                .unwrap();
+            let local = std::path::Path::new(definition.local_dir).parent().unwrap();
+            let exclusive = |path: &std::path::Path| {
+                !matches!(
+                    path.to_str(),
+                    Some(".agents" | ".config/agents" | ".github")
+                )
+            };
+            executable(command)
+                || (exclusive(global) && home.join(global).is_dir())
+                || (exclusive(local) && definition.key != "trae-cn" && project.join(local).is_dir())
+                || (definition.key == "codex" && project.join(".codex").is_dir())
+        })
+        .map(|definition| definition.key.to_string())
+        .collect()
 }

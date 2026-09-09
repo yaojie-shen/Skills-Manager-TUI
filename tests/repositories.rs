@@ -95,6 +95,95 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn repository_root_skill_uses_declared_name_instead_of_project_name() {
+    let f = Fixture::new();
+    f.put("", "review-article-architecture", "review");
+    f.commit();
+    let fetched = f.fetch("Boom5426--Nature-Paper-Skills");
+    assert_eq!(fetched.local_name(""), "review-article-architecture");
+    let keys = fetched
+        .install(&f.ws, &[String::new()], &BTreeMap::new())
+        .unwrap();
+    fetched.cleanup();
+    assert_eq!(
+        keys,
+        ["repos/Boom5426--Nature-Paper-Skills/review-article-architecture"]
+    );
+}
+
+#[test]
+fn repository_deployment_preserves_skill_name_without_source_prefix() {
+    let f = Fixture::new();
+    let name = "review-article-architecture";
+    f.put(&format!("skills/{name}"), name, "review");
+    f.commit();
+    let fetched = f.fetch("Boom5426--Nature-Paper-Skills");
+    let keys = fetched
+        .install(&f.ws, &[format!("skills/{name}")], &BTreeMap::new())
+        .unwrap();
+    fetched.cleanup();
+    let snap = f.ws.scan().unwrap();
+    assert_eq!(snap.get(&keys[0]).unwrap().deployment_name(), name);
+    let plan = deploy::plan_deploy(&f.ws, &snap, &keys, &["sample".into()]).unwrap();
+    deploy::apply(&plan).unwrap();
+    assert_eq!(
+        std::fs::read_link(f.dir.join("agent").join(name)).unwrap(),
+        f.ws.skill_path(&keys[0])
+    );
+    assert!(
+        !f.dir
+            .join("agent/Boom5426--Nature-Paper-Skills--review-article-architecture")
+            .exists()
+    );
+    let snap = f.ws.scan().unwrap();
+    assert_eq!(
+        snap.get(&keys[0]).unwrap().deploy["sample"],
+        DeployState::Deployed
+    );
+    edit::remove(&f.ws, &snap, &keys[0], false).unwrap();
+    assert!(!f.dir.join("agent").join(name).is_symlink());
+}
+
+#[test]
+fn repository_name_collision_requires_explicit_local_name_before_publishing() {
+    let f = Fixture::new();
+    f.put("skills/review", "review", "review");
+    f.commit();
+    let first = f.fetch("first");
+    first
+        .install(&f.ws, &["skills/review".into()], &BTreeMap::new())
+        .unwrap();
+    first.cleanup();
+    let second = f.fetch("second");
+    let error = second
+        .install(&f.ws, &["skills/review".into()], &BTreeMap::new())
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("choose a different local skill name")
+    );
+    assert!(!f.ws.root.join("repos/second").exists());
+    assert_eq!(f.ws.meta.list_keys().unwrap(), ["repos/first/review"]);
+    let keys = second
+        .install(
+            &f.ws,
+            &["skills/review".into()],
+            &BTreeMap::from([("skills/review".into(), "alternate-review".into())]),
+        )
+        .unwrap();
+    second.cleanup();
+    assert_eq!(
+        f.ws.scan()
+            .unwrap()
+            .get(&keys[0])
+            .unwrap()
+            .deployment_name(),
+        "alternate-review"
+    );
+}
+
+#[test]
 fn repositories_preserve_sources_and_aliases_through_update_deployment_and_undo() {
     let f = Fixture::new();
     f.put("frontend/review", "review", "first");
@@ -412,7 +501,11 @@ fn invalid_skill_fixtures_are_reported_with_paths_before_installation() {
     );
 
     fetched
-        .install(&f.ws, &["skills/good".into()], &BTreeMap::new())
+        .install(
+            &f.ws,
+            &["skills/good".into()],
+            &BTreeMap::from([("skills/good".into(), "validation-good".into())]),
+        )
         .unwrap();
     fetched.cleanup();
 }

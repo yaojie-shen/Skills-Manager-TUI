@@ -25,6 +25,11 @@ use std::path::{Path, PathBuf};
 pub struct Workspace {
     pub root: PathBuf,
     pub project: Option<PathBuf>,
+    /// TUI-discovered directories retain manual state and never opt into automatic sync.
+    pub discovered_agents: std::collections::BTreeSet<String>,
+    /// Project associated with the transient directory inventory.
+    pub inventory_project: Option<PathBuf>,
+    pub inventory_products: Option<std::collections::BTreeSet<String>>,
     pub config: config::Config,
     pub meta: meta::MetaStore,
     pub presets: preset::PresetStore,
@@ -42,6 +47,9 @@ impl Workspace {
             presets: preset::PresetStore::new(&root),
             root,
             project: None,
+            discovered_agents: Default::default(),
+            inventory_project: None,
+            inventory_products: None,
             config,
         })
     }
@@ -63,6 +71,9 @@ impl Workspace {
             presets: preset::PresetStore::new(&root),
             root,
             project: Some(project),
+            discovered_agents: Default::default(),
+            inventory_project: None,
+            inventory_products: None,
             config: config::Config::local_default(),
         };
         ws.config = ws.load_config()?;

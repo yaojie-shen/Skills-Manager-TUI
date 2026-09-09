@@ -380,10 +380,7 @@ mod tests {
                 .any(|line| line.to_string().contains("≠ directory name"))
         );
         assert_eq!(record.key, key);
-        assert_eq!(
-            record.deployment_name(),
-            "sampleorg--kit--skills--mock-calendar"
-        );
+        assert_eq!(record.deployment_name(), "skills--mock-calendar");
         record.name = Some("中文日历".into());
         record.tags = vec!["A very long tag".into(), "中文标签".into(), "third".into()];
         for width in [0, 1, 2, 3, 8, 16, 24, 40, 80] {

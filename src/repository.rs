@@ -182,10 +182,12 @@ pub fn alias_of(key: &str) -> Option<&str> {
     key.strip_prefix("repos/")?.split('/').next()
 }
 pub fn default_deploy_name(key: &str) -> String {
-    key.strip_prefix("repos/")
-        .or_else(|| key.strip_prefix("local/"))
-        .unwrap_or(key)
-        .replace('/', "--")
+    // Repository aliases identify sources in storage, not the skill's name
+    // in an agent directory. Preserve explicit local names verbatim.
+    if let Some(path) = key.strip_prefix("repos/") {
+        return path.rsplit('/').next().unwrap_or(path).to_string();
+    }
+    key.strip_prefix("local/").unwrap_or(key).replace('/', "--")
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +313,11 @@ impl FetchedRepository {
     }
     pub fn local_name(&self, path: &str) -> String {
         if path.is_empty() {
+            if let Ok(doc) = crate::skill::SkillDoc::load(&self.workdir)
+                && valid_skill_key(&doc.name)
+            {
+                return doc.name;
+            }
             self.repository
                 .url
                 .trim_end_matches('/')
@@ -431,7 +438,7 @@ impl FetchedRepository {
             .collect();
         for key in &keys {
             if !names.insert(default_deploy_name(key)) {
-                bail!("deployment alias collision for {key}; choose a different repository alias")
+                bail!("deployment name collision for {key}; choose a different local skill name")
             }
         }
         // Prepare every copy before publishing any skill directory.

@@ -409,7 +409,8 @@ pub fn plan_relink(
 /// Desired (skill, agent) pairs from config: all-to-all and/or auto-deployed presets.
 pub fn desired_pairs(ws: &Workspace, snap: &Snapshot) -> Result<BTreeSet<(String, String)>> {
     let mut pairs = BTreeSet::new();
-    let explicit = super::targets::registered_keys(&ws.root)?;
+    let mut explicit = super::targets::registered_keys(&ws.root)?;
+    explicit.extend(ws.discovered_agents.iter().cloned());
     let desired = super::targets::desired(&ws.root)?;
     for record in snap.skills.iter().filter(|s| s.status.is_present()) {
         for agent in snap.agents.iter().filter(|a| explicit.contains(&a.key)) {

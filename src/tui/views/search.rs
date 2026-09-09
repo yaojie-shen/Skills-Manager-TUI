@@ -484,10 +484,12 @@ impl SearchView {
             .into_iter()
             .filter(|hit| self.includes_record(&ctx.snap.skills[hit.index]))
             .collect();
-        // Keep relevance within each group; repository installs follow local skills.
-        self.hits.sort_by_key(|hit| {
-            skills::repository::alias_of(&ctx.snap.skills[hit.index].key).is_some()
-        });
+        // Browsing groups sources; text searches preserve relevance across panels.
+        if q.text.trim().is_empty() {
+            self.hits.sort_by_key(|hit| {
+                skills::repository::alias_of(&ctx.snap.skills[hit.index].key).is_some()
+            });
+        }
         if let Some((keys, _)) = self.panel.as_ref().or(self.scope.as_ref()) {
             self.hits
                 .retain(|hit| keys.contains(&ctx.snap.skills[hit.index].key));
@@ -1739,7 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_installs_follow_local_results_without_changing_filtering() {
+    fn text_search_preserves_relevance_across_local_and_repository_results() {
         let root =
             std::env::temp_dir().join(format!("skills-search-groups-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -1755,7 +1757,7 @@ mod tests {
             std::fs::write(
                 path.join("SKILL.md"),
                 format!(
-                    "---\nname: {}\ndescription: shared tools\n---\nBody",
+                    "---\nname: {}\ndescription: shared tools\n---\nBody mentions calendar",
                     name.rsplit('/').next().unwrap()
                 ),
             )
@@ -1781,7 +1783,7 @@ mod tests {
             assert_eq!(keys, ["printer", "repos/sampleorg--kit/calendar"]);
         }
         view.set_query("calendar", &ctx);
-        assert_eq!(view.hits.len(), 1);
+        assert_eq!(view.hits.len(), 2);
         assert_eq!(
             view.selected(&ctx).unwrap().key,
             "repos/sampleorg--kit/calendar"

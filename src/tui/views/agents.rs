@@ -1937,13 +1937,23 @@ impl AgentsView {
                 .agents
                 .iter()
                 .filter(|a| {
+                    ctx.ws.inventory_products.as_ref().is_none_or(|products| {
+                        products.contains(skills::ops::targets::product_key(a))
+                    })
+                })
+                .filter(|a| {
                     !registered.contains(&a.key)
                         || (!a.key.contains("-local-") && !a.key.contains("-global-"))
                 })
                 .cloned()
                 .collect();
             for definition in skills::agents::BUILTINS {
-                if !configured.iter().any(|a| a.key == definition.key)
+                if ctx
+                    .ws
+                    .inventory_products
+                    .as_ref()
+                    .is_none_or(|products| products.contains(definition.key))
+                    && !configured.iter().any(|a| a.key == definition.key)
                     && registered.iter().any(|key| {
                         key.starts_with(&format!("{}-local-", definition.key))
                             || key.starts_with(&format!("{}-global-", definition.key))
@@ -2134,6 +2144,20 @@ impl View for AgentsView {
         self.scoped_actions(actions, scoped.as_ref().unwrap_or(ctx))
     }
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        if ctx
+            .ws
+            .inventory_products
+            .as_ref()
+            .is_some_and(|products| products.is_empty())
+        {
+            self.scope_rects.clear();
+            self.destination_rects.clear();
+            f.render_widget(
+                Paragraph::new("No installed agents detected.").style(ctx.theme.dim()),
+                area,
+            );
+            return;
+        }
         let data = self.scoped.clone();
         let scoped = data.as_ref().map(|d| Ctx {
             ws: &d.0,
@@ -2534,6 +2558,77 @@ mod deployment_scope_tests {
         std::fs::remove_file(directory.join("deployed")).unwrap();
         assert_eq!(count_scope_skills(&directory).label, "1 skill");
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn installed_product_filter_survives_scope_switches() {
+        let tmp = skills::ops::DownloadDir::new("installed-scope-filter").unwrap();
+        let root = tmp.path().join("root");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        Config {
+            agents: vec![
+                AgentConfig {
+                    key: "installed".into(),
+                    name: "Installed Agent".into(),
+                    skills_dir: tmp.path().join("installed").display().to_string(),
+                },
+                AgentConfig {
+                    key: "absent".into(),
+                    name: "Absent Agent".into(),
+                    skills_dir: tmp.path().join("absent").display().to_string(),
+                },
+            ],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let mut ws = Workspace::open(&root).unwrap();
+        ws.inventory_products = Some(std::collections::BTreeSet::from(["installed".into()]));
+        let snap = ws.scan().unwrap();
+        let theme = crate::tui::theme::Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = AgentsView::default();
+        view.discover(&project).unwrap();
+        view.refresh(&ctx);
+        assert_eq!(view.scoped.as_ref().unwrap().0.config.agents.len(), 1);
+        view.move_destination(1, &ctx);
+        assert_eq!(
+            view.scoped.as_ref().unwrap().0.config.agents[0].name,
+            "Installed Agent"
+        );
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Installed Agent"));
+        assert!(!text.contains("Absent Agent"));
+        ws.inventory_products = Some(Default::default());
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        view.refresh(&ctx);
+        term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("No installed agents detected."));
     }
 
     #[test]

@@ -256,6 +256,7 @@ impl QuitPrompt {
 
 impl App {
     pub fn set_launch_directory(&mut self, start: &std::path::Path) -> Result<()> {
+        skills::ops::targets::discover(&mut self.ws, start)?;
         self.agents.discover(start)?;
         self.on_snapshot();
         Ok(())
@@ -298,16 +299,12 @@ impl App {
     }
 
     fn discover_local_agents(ws: &mut Workspace) -> Result<()> {
-        if let Some(project) = &ws.project {
-            for agent in skills::ops::targets::candidates(ws, Some(project))? {
-                if agent.skills_path().is_dir()
-                    && !ws.config.agents.iter().any(|a| a.key == agent.key)
-                {
-                    ws.config.agents.push(agent);
-                }
-            }
-        }
-        Ok(())
+        let project = ws
+            .inventory_project
+            .clone()
+            .or_else(|| ws.project.clone())
+            .unwrap_or(std::env::current_dir()?);
+        skills::ops::targets::discover(ws, &project)
     }
 
     pub fn should_quit(&self) -> bool {
