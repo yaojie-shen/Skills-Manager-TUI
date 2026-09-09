@@ -86,6 +86,7 @@ pub struct AgentsView {
     scoped: Option<std::sync::Arc<(skills::Workspace, skills::reconcile::Snapshot)>>,
     scope_error: Option<String>,
     focus: FocusState,
+    group_rects: [Rect; 3],
     presets: Vec<(Preset, PresetStatus)>,
     all_presets: Vec<(Preset, PresetStatus)>,
     preset_filter: super::filter::Filter,
@@ -1158,6 +1159,7 @@ impl AgentsView {
                 Constraint::Min(3),
             ])
             .split(area);
+        self.group_rects = [groups[0], groups[1], groups[2]];
         let mut interiors = [Rect::default(); 3];
         for (i, (title, focused)) in [
             (" Agents ", self.focus() == Focus::Agents),
@@ -2083,6 +2085,26 @@ impl View for AgentsView {
         self.scoped_actions(actions, scoped.as_ref().unwrap_or(ctx))
     }
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        // The whole group is a focus target. Its controls still handle the
+        // click below; focusing blank space never changes a selection or writes.
+        if !self.preview.is_open()
+            && self.matrix.hints().is_none()
+            && m.kind == MouseEventKind::Down(MouseButton::Left)
+        {
+            if self.filter_editing && self.completion.mouse(m, &mut self.content_filter).0 {
+                return vec![];
+            }
+            if let Some(index) = self
+                .group_rects
+                .iter()
+                .position(|rect| rect.contains((m.column, m.row).into()))
+            {
+                self.set_focus([Focus::Agents, Focus::Scopes, Focus::Presets][index]);
+                self.filter_editing = false;
+                self.preset_filter.editing = false;
+                self.completion.close();
+            }
+        }
         if !self.preview.is_open()
             && self.matrix.hints().is_none()
             && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
@@ -2556,6 +2578,57 @@ mod deployment_scope_tests {
         assert_eq!(view.project(), Some(project.canonicalize().unwrap()));
         assert_eq!(view.scoped.as_ref().unwrap().0.root, ws.root);
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let selection = (view.scope.clone(), view.destination, view.preset_cursor);
+        for (index, expected) in [Focus::Agents, Focus::Scopes, Focus::Presets]
+            .into_iter()
+            .enumerate()
+        {
+            term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+            let rect = view.group_rects[index];
+            for (column, row) in [(rect.right() - 2, rect.bottom() - 2), (rect.x, rect.y)] {
+                view.filter_editing = true;
+                let actions = view.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &ctx,
+                );
+                assert!(
+                    actions.is_empty(),
+                    "blank group clicks must not deploy or rescan"
+                );
+                assert_eq!(view.focus(), expected);
+                assert!(!view.filter_editing);
+                assert_eq!(
+                    (view.scope.clone(), view.destination, view.preset_cursor),
+                    selection
+                );
+            }
+        }
+        view.set_focus(Focus::Agents);
+        let input = view.preset_filter.rect;
+        assert!(
+            view.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: input.x,
+                    row: input.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &ctx
+            )
+            .is_empty()
+        );
+        assert_eq!(view.focus(), Focus::Presets);
+        assert!(
+            view.preset_filter.editing,
+            "one click focuses the group and starts editing"
+        );
+        view.preset_filter.editing = false;
         term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
         let text: String = term
             .backend()
