@@ -157,13 +157,15 @@ fn escaping_local_paths_and_foreign_content_are_preserved() {
     };
     std::fs::create_dir_all(target.skills_path().join("sample")).unwrap();
     std::fs::write(target.skills_path().join("sample/keep"), "owned").unwrap();
-    targets::apply(
-        &ws,
-        &["sample".into()],
-        &[(target.clone(), true)],
-        Some(&project),
-    )
-    .unwrap();
+    assert!(
+        targets::apply(
+            &ws,
+            &["sample".into()],
+            &[(target.clone(), true)],
+            Some(&project),
+        )
+        .is_err()
+    );
     assert_eq!(
         std::fs::read_to_string(target.skills_path().join("sample/keep")).unwrap(),
         "owned"
@@ -197,4 +199,237 @@ fn sync_does_not_expand_a_picker_selection_to_every_skill() {
     let plan = skills::ops::deploy::plan_sync(&ws, &ws.scan().unwrap()).unwrap();
     assert!(plan.iter().all(|a| !a.is_change()));
     assert!(!agent.skills_path().join("other").exists());
+}
+
+#[test]
+fn discovered_scopes_include_nested_roots_and_worktrees_without_duplicates_or_writes() {
+    let f = Fixture::new("discovery");
+    let outer = f.0.join("project");
+    let inner = outer.join("apps/web");
+    let cwd = inner.join("src");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir(outer.join(".git")).unwrap();
+    std::fs::write(inner.join(".git"), "gitdir: /unused/worktree\n").unwrap();
+    let scopes = targets::discover_scopes(&cwd).unwrap();
+    assert!(scopes[0].project.is_none());
+    assert_eq!(scopes[1].project.as_ref(), Some(&cwd));
+    assert!(!scopes[1].repository);
+    assert_eq!(scopes[2].project.as_ref(), Some(&inner));
+    assert_eq!(scopes[3].project.as_ref(), Some(&outer));
+    assert!(scopes[2].repository && scopes[3].repository);
+    let root_scopes = targets::discover_scopes(&inner).unwrap();
+    assert_eq!(
+        root_scopes
+            .iter()
+            .filter(|s| s.project.as_ref() == Some(&inner))
+            .count(),
+        1
+    );
+    assert!(!cwd.join(".agents").exists());
+    assert!(!outer.join(".skills-meta").exists());
+}
+
+#[test]
+fn target_presets_preserve_other_reasons_and_undo_restores_the_selection() {
+    let f = Fixture::new("reasons");
+    let ws = f.ws();
+    let project = f.0.join("project");
+    let agent = targets::candidates(&ws, Some(&project)).unwrap().remove(0);
+    let keys = vec!["sample".into()];
+    targets::set_installed(&ws, &agent, Some(&project), &keys, Some("first"), true).unwrap();
+    targets::set_installed(&ws, &agent, Some(&project), &keys, Some("second"), true).unwrap();
+    targets::set_installed(&ws, &agent, Some(&project), &keys, Some("first"), false).unwrap();
+    assert!(agent.skills_path().join("sample").is_symlink());
+    assert!(targets::set_installed(&ws, &agent, Some(&project), &keys, None, false).is_err());
+    let (_, intent) =
+        targets::set_installed(&ws, &agent, Some(&project), &keys, Some("second"), false).unwrap();
+    assert!(!agent.skills_path().join("sample").exists());
+    let ws = f.ws();
+    let plan = skills::history::undo_plan(&ws, &ws.scan().unwrap(), &intent.unwrap()).unwrap();
+    let skills::history::Plan::Write { apply, .. } = plan else {
+        panic!("selection undo must restore metadata and links")
+    };
+    apply.apply(&ws).unwrap();
+    assert!(agent.skills_path().join("sample").is_symlink());
+    assert!(
+        targets::selection(&ws, &agent)
+            .unwrap()
+            .presets
+            .contains_key("second")
+    );
+    targets::set_installed(&ws, &agent, Some(&project), &keys, None, true).unwrap();
+    targets::set_installed(&ws, &agent, Some(&project), &keys, Some("second"), false).unwrap();
+    assert!(
+        agent.skills_path().join("sample").exists(),
+        "manual install survives preset removal"
+    );
+    assert!(ws.root.join("sample/SKILL.md").is_file());
+}
+
+#[test]
+fn lost_links_are_restored_without_expanding_or_crossing_scopes() {
+    let f = Fixture::new("desired-selection");
+    let ws = f.ws();
+    let project = f.0.join("project");
+    let agent = targets::candidates(&ws, Some(&project)).unwrap().remove(0);
+    targets::set_installed(&ws, &agent, Some(&project), &["sample".into()], None, true).unwrap();
+    std::fs::remove_file(agent.skills_path().join("sample")).unwrap();
+    let ws = f.ws();
+    let actions = skills::ops::deploy::plan_sync(&ws, &ws.scan().unwrap()).unwrap();
+    assert!(actions.iter().any(|a| matches!(a, skills::ops::deploy::Action::Link { agent: key, skill, .. } if key == &agent.key && skill == "sample")));
+    skills::ops::deploy::apply(&actions).unwrap();
+    assert!(agent.skills_path().join("sample").is_symlink());
+    targets::set_installed(&ws, &agent, Some(&project), &["sample".into()], None, false).unwrap();
+    let ws = f.ws();
+    assert!(
+        !skills::ops::deploy::plan_sync(&ws, &ws.scan().unwrap())
+            .unwrap()
+            .iter()
+            .any(skills::ops::deploy::Action::is_change)
+    );
+    assert!(!project.join(".codex").exists());
+}
+
+#[test]
+fn foreign_target_is_rejected_without_recording_a_successful_install() {
+    let f = Fixture::new("foreign-selection");
+    let ws = f.ws();
+    let project = f.0.join("project");
+    let agent = targets::candidates(&ws, Some(&project)).unwrap().remove(0);
+    std::fs::create_dir_all(agent.skills_path().join("sample")).unwrap();
+    std::fs::write(agent.skills_path().join("sample/keep"), "own content").unwrap();
+    assert!(
+        targets::set_installed(&ws, &agent, Some(&project), &["sample".into()], None, true)
+            .is_err()
+    );
+    assert!(targets::selection(&ws, &agent).unwrap().skills().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(agent.skills_path().join("sample/keep")).unwrap(),
+        "own content"
+    );
+    assert!(
+        !ws.root
+            .join(".skills-meta/deployment-targets.toml")
+            .exists()
+    );
+}
+
+#[test]
+fn central_renames_and_removals_update_target_installation_references() {
+    let f = Fixture::new("rename-references");
+    let project = f.0.join("project");
+    let agent = targets::candidates(&f.ws(), Some(&project))
+        .unwrap()
+        .remove(0);
+    targets::set_installed(
+        &f.ws(),
+        &agent,
+        Some(&project),
+        &["sample".into()],
+        None,
+        true,
+    )
+    .unwrap();
+    let ws = f.ws();
+    skills::ops::edit::rename(&ws, &ws.scan().unwrap(), "sample", "renamed").unwrap();
+    let selection = targets::selection(&ws, &agent).unwrap();
+    assert!(selection.manual.contains("renamed"));
+    assert!(!selection.manual.contains("sample"));
+    skills::ops::edit::remove(&ws, &ws.scan().unwrap(), "renamed", false).unwrap();
+    assert!(targets::selection(&ws, &agent).unwrap().skills().is_empty());
+}
+
+#[test]
+fn moving_a_library_and_its_project_keeps_relative_target_identity() {
+    let f = Fixture::new("portable");
+    let project = f.0.join("project");
+    let agent = targets::candidates(&f.ws(), Some(&project))
+        .unwrap()
+        .remove(0);
+    targets::set_installed(
+        &f.ws(),
+        &agent,
+        Some(&project),
+        &["sample".into()],
+        None,
+        true,
+    )
+    .unwrap();
+    let registry =
+        std::fs::read_to_string(f.ws().root.join(".skills-meta/deployment-targets.toml")).unwrap();
+    assert!(!registry.contains(&f.0.display().to_string()));
+    let moved = f.0.join("moved");
+    std::fs::create_dir(&moved).unwrap();
+    std::fs::rename(f.0.join("source"), moved.join("source")).unwrap();
+    std::fs::rename(&project, moved.join("project")).unwrap();
+    let ws = Workspace::open(&moved.join("source")).unwrap();
+    let candidate = targets::candidates(&ws, Some(&moved.join("project")))
+        .unwrap()
+        .into_iter()
+        .find(|a| a.key == agent.key)
+        .unwrap();
+    assert_eq!(
+        candidate.skills_path(),
+        moved
+            .join("project")
+            .join(agent.skills_path().strip_prefix(project).unwrap())
+    );
+    assert!(
+        targets::selection(&ws, &candidate)
+            .unwrap()
+            .manual
+            .contains("sample")
+    );
+    let actions = skills::ops::deploy::plan_sync(&ws, &ws.scan().unwrap()).unwrap();
+    skills::ops::deploy::apply(&actions).unwrap();
+    assert!(candidate.skills_path().join("sample/SKILL.md").is_file());
+}
+
+#[test]
+fn shared_directory_readers_share_installation_reasons() {
+    let f = Fixture::new("shared-reasons");
+    let project = f.0.join("project");
+    let candidates = targets::candidates(&f.ws(), Some(&project)).unwrap();
+    let readers: Vec<_> = candidates
+        .into_iter()
+        .filter(|a| a.skills_path() == project.join(".agents/skills"))
+        .collect();
+    assert!(readers.len() > 1);
+    let keys = ["sample".into()];
+    targets::set_installed(
+        &f.ws(),
+        &readers[0],
+        Some(&project),
+        &keys,
+        Some("shared"),
+        true,
+    )
+    .unwrap();
+    assert!(
+        targets::selection(&f.ws(), &readers[1])
+            .unwrap()
+            .presets
+            .contains_key("shared")
+    );
+    targets::set_installed(
+        &f.ws(),
+        &readers[1],
+        Some(&project),
+        &keys,
+        Some("shared"),
+        false,
+    )
+    .unwrap();
+    assert!(
+        targets::selection(&f.ws(), &readers[0])
+            .unwrap()
+            .skills()
+            .is_empty()
+    );
+    assert!(
+        !skills::ops::deploy::plan_sync(&f.ws(), &f.ws().scan().unwrap())
+            .unwrap()
+            .iter()
+            .any(skills::ops::deploy::Action::is_change)
+    );
 }

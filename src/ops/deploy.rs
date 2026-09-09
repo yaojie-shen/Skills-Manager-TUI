@@ -410,11 +410,17 @@ pub fn plan_relink(
 pub fn desired_pairs(ws: &Workspace, snap: &Snapshot) -> Result<BTreeSet<(String, String)>> {
     let mut pairs = BTreeSet::new();
     let explicit = super::targets::registered_keys(&ws.root)?;
+    let desired = super::targets::desired(&ws.root)?;
     for record in snap.skills.iter().filter(|s| s.status.is_present()) {
         for agent in snap.agents.iter().filter(|a| explicit.contains(&a.key)) {
-            if matches!(
-                agent.entries.get(&record.deployment_name()),
-                Some(EntryState::Deployed | EntryState::Broken { .. })
+            if desired.get(&agent.key).map_or_else(
+                || {
+                    matches!(
+                        agent.entries.get(&record.deployment_name()),
+                        Some(EntryState::Deployed | EntryState::Broken { .. })
+                    )
+                },
+                |keys| keys.contains(&record.key),
             ) {
                 pairs.insert((record.key.clone(), agent.key.clone()));
             }
@@ -450,6 +456,9 @@ pub fn desired_pairs(ws: &Workspace, snap: &Snapshot) -> Result<BTreeSet<(String
         for s in &preset.skills {
             if present.contains(&s.as_str()) {
                 for a in &targets {
+                    if explicit.contains(a) {
+                        continue;
+                    }
                     pairs.insert((s.clone(), a.clone()));
                 }
             }

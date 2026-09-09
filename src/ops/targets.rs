@@ -5,11 +5,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Registry {
     #[serde(default)]
     agents: Vec<AgentConfig>,
+    #[serde(default)]
+    selections: std::collections::BTreeMap<String, Selection>,
     #[serde(default)]
     projects: std::collections::BTreeMap<String, PathBuf>,
 }
@@ -23,18 +25,178 @@ fn load(root: &Path) -> Result<Registry> {
         Err(e) => Err(e.into()),
     }
 }
+/// A deployment location discovered from the launch directory, never a source store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope {
+    pub project: Option<PathBuf>,
+    pub repository: bool,
+}
+
+impl Scope {
+    pub fn name(&self) -> String {
+        self.project
+            .as_ref()
+            .map(|p| {
+                p.file_name()
+                    .unwrap_or(p.as_os_str())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_else(|| "Global".into())
+    }
+
+    pub fn path_label(&self) -> String {
+        self.project
+            .as_ref()
+            .map(|p| paths::contract_tilde(p))
+            .unwrap_or_else(|| "~".into())
+    }
+}
+
+/// Include the working directory and every enclosing Git root, nearest first.
+/// Both ordinary repositories and worktrees have a `.git` entry. No checkout
+/// is traversed and discovering a scope never creates agent directories.
+pub fn discover_scopes(start: &Path) -> Result<Vec<Scope>> {
+    let start = std::fs::canonicalize(start).context("resolving launch directory")?;
+    ensure!(start.is_dir(), "launch directory must be a directory");
+    let mut scopes = vec![Scope {
+        project: None,
+        repository: false,
+    }];
+    for path in start.ancestors() {
+        let repository = path.join(".git").is_dir() || path.join(".git").is_file();
+        if path == start || repository {
+            scopes.push(Scope {
+                project: Some(path.into()),
+                repository,
+            });
+        }
+    }
+    Ok(scopes)
+}
+
+/// Register a target only when an operation actually writes to it.
+pub fn register(ws: &Workspace, agent: &AgentConfig, project: Option<&Path>) -> Result<()> {
+    let mut registry = decoded(&ws.root)?;
+    if let Some(project) = project {
+        paths::ensure_local_path(project, &agent.skills_path())?;
+    }
+    if !registry.agents.iter().any(|a| a.key == agent.key) {
+        registry.agents.push(agent.clone());
+        if let Some(project) = project {
+            registry.projects.insert(agent.key.clone(), project.into());
+        }
+        save(ws, &registry)?;
+    }
+    Ok(())
+}
+
 /// Explicit picker destinations retain their manual deployment state during sync.
 pub fn registered_keys(root: &Path) -> Result<std::collections::BTreeSet<String>> {
     Ok(load(root)?.agents.into_iter().map(|a| a.key).collect())
 }
 
-/// Only explicitly registered destinations are added; catalog entries are never auto-enabled.
+/// Normalize relative locators without requiring the destination to exist yet.
+fn resolve(root: &Path, value: &Path) -> PathBuf {
+    let expanded = paths::expand_tilde(&value.to_string_lossy());
+    let mut out = PathBuf::new();
+    for part in root.join(expanded).components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn relative(root: &Path, path: &Path) -> PathBuf {
+    let left: Vec<_> = root.components().collect();
+    let right: Vec<_> = path.components().collect();
+    let common = left.iter().zip(&right).take_while(|(a, b)| a == b).count();
+    let mut out = PathBuf::new();
+    for _ in common..left.len() {
+        out.push("..");
+    }
+    for part in &right[common..] {
+        out.push(part.as_os_str());
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
+fn portable(root: &Path, path: &Path, home: bool) -> PathBuf {
+    if home {
+        let contracted = paths::contract_tilde(path);
+        if contracted == "~" || contracted.starts_with("~/") {
+            return contracted.into();
+        }
+    }
+    relative(root, path)
+}
+
+fn decoded(root: &Path) -> Result<Registry> {
+    let mut registry = load(root)?;
+    for project in registry.projects.values_mut() {
+        *project = resolve(root, project);
+    }
+    for agent in &mut registry.agents {
+        let stored = Path::new(&agent.skills_dir);
+        let path = if let Some(project) = registry.projects.get(&agent.key) {
+            // Legacy records used absolute targets. New records are project-relative.
+            ensure!(
+                !stored
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir)),
+                "deployment target must stay inside its project"
+            );
+            let path = resolve(project, stored);
+            ensure!(
+                path.starts_with(project),
+                "deployment target must stay inside its project"
+            );
+            if project.exists() {
+                paths::ensure_local_path(project, &path)?;
+            }
+            path
+        } else {
+            resolve(root, stored)
+        };
+        agent.skills_dir = path.to_string_lossy().into_owned();
+    }
+    Ok(registry)
+}
+
+fn save(ws: &Workspace, registry: &Registry) -> Result<()> {
+    let mut stored = registry.clone();
+    for agent in &mut stored.agents {
+        let path = agent.skills_path();
+        agent.skills_dir = match registry.projects.get(&agent.key) {
+            Some(project) => {
+                paths::ensure_local_path(project, &path)?;
+                path.strip_prefix(project)?.to_string_lossy().into_owned()
+            }
+            None => portable(&ws.root, &path, true)
+                .to_string_lossy()
+                .into_owned(),
+        };
+    }
+    for project in stored.projects.values_mut() {
+        *project = portable(&ws.root, project, ws.project.is_none());
+    }
+    crate::util::write_atomic(
+        &registry_path(&ws.root),
+        toml::to_string_pretty(&stored)?.as_bytes(),
+    )
+}
+
+/// Resolve portable target paths at runtime. Reading never migrates files.
 pub fn extend(root: &Path, agents: &mut Vec<AgentConfig>) -> Result<()> {
-    for agent in load(root)?.agents {
-        ensure!(
-            Path::new(&agent.skills_dir).is_absolute(),
-            "deployment target must be absolute"
-        );
+    for agent in decoded(root)?.agents {
         if let Some(existing) = agents.iter().find(|a| a.key == agent.key) {
             ensure!(
                 existing.skills_path() == agent.skills_path(),
@@ -50,7 +212,7 @@ pub fn extend(root: &Path, agents: &mut Vec<AgentConfig>) -> Result<()> {
 
 /// Candidate agents in one scope; opening a picker performs no writes.
 pub fn candidates(ws: &Workspace, project: Option<&Path>) -> Result<Vec<AgentConfig>> {
-    let registry = load(&ws.root)?;
+    let registry = decoded(&ws.root)?;
     let local = project.is_some();
     let mut out = Vec::new();
     for definition in crate::agents::BUILTINS {
@@ -68,7 +230,16 @@ pub fn candidates(ws: &Workspace, project: Option<&Path>) -> Result<Vec<AgentCon
         } else {
             agent.skills_path()
         };
-        let digest: String = Sha256::digest(path.as_os_str().as_encoded_bytes())
+        let identity = if let Some(project) = project {
+            format!(
+                "{}:{}",
+                portable(&ws.root, project, ws.project.is_none()).display(),
+                path.strip_prefix(project)?.display()
+            )
+        } else {
+            portable(&ws.root, &path, true).display().to_string()
+        };
+        let digest: String = Sha256::digest(identity.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
@@ -78,12 +249,19 @@ pub fn candidates(ws: &Workspace, project: Option<&Path>) -> Result<Vec<AgentCon
             if local { "local" } else { "global" },
             &digest[..10]
         );
-        if let Some(existing) = ws
-            .config
-            .agents
-            .iter()
-            .find(|a| a.skills_path() == path && (a.key == agent.key || a.key == id))
-        {
+        if let Some(existing) = ws.config.agents.iter().find(|a| {
+            a.skills_path() == path
+                && (a.key == agent.key
+                    || a.key == id
+                    || registry.agents.iter().any(|r| {
+                        r.key == a.key
+                            && r.key.starts_with(&format!(
+                                "{}-{}-",
+                                definition.key,
+                                if local { "local" } else { "global" }
+                            ))
+                    }))
+        }) {
             agent = existing.clone();
         } else {
             agent.key = id;
@@ -141,29 +319,251 @@ pub fn apply(
         });
     }
     let actions = super::deploy::resolve_names(&snap, &actions, None)?;
-    if actions.iter().any(super::deploy::Action::is_change) {
-        let mut registry = load(&ws.root)?;
-        for (agent, _) in changes {
-            if !ws.config.agents.iter().any(|a| a.key == agent.key)
-                && !registry.agents.iter().any(|a| a.key == agent.key)
-            {
-                registry.agents.push(agent.clone());
-                if let Some(project) = project {
-                    registry
-                        .projects
-                        .insert(agent.key.clone(), project.to_path_buf());
+    // Validate the full batch before changing any destination.
+    for action in &actions {
+        if let super::deploy::Action::Skip { reason, skill, .. } = action {
+            ensure!(
+                reason == "already deployed"
+                    || reason == "not deployed"
+                    || reason == "agent dir missing or foreign",
+                "{skill}: {reason}"
+            );
+        }
+    }
+    for (agent, on) in changes {
+        if !on {
+            let selection = selection(ws, agent)?;
+            for key in keys {
+                ensure!(
+                    !selection
+                        .presets
+                        .values()
+                        .any(|members| members.contains(key)),
+                    "{key} is required by an installed preset"
+                );
+            }
+        }
+    }
+    let mut messages = Vec::new();
+    let mut intents = Vec::new();
+    let mut applied = std::collections::BTreeSet::new();
+    for (agent, on) in changes {
+        if !applied.insert(agent.skills_path()) {
+            continue;
+        }
+        let (message, intent) = set_installed(ws, agent, project, keys, None, *on)?;
+        messages.push(message);
+        if let Some(intent) = intent {
+            intents.push(intent);
+        }
+    }
+    let intent = match intents.len() {
+        0 => None,
+        1 => intents.pop(),
+        _ => Some(crate::history::Intent::Group(intents)),
+    };
+    Ok((messages.join("; "), intent))
+}
+
+/// Installation reasons belong to a destination, independently of its links.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Selection {
+    #[serde(default)]
+    pub manual: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub presets: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+impl Selection {
+    pub fn skills(&self) -> std::collections::BTreeSet<String> {
+        self.manual
+            .iter()
+            .chain(self.presets.values().flatten())
+            .cloned()
+            .collect()
+    }
+}
+
+pub fn selection(ws: &Workspace, agent: &AgentConfig) -> Result<Selection> {
+    let registry = decoded(&ws.root)?;
+    if let Some(selection) = registry.selections.get(&agent.key) {
+        return Ok(selection.clone());
+    }
+    for other in &registry.agents {
+        if other.skills_path() == agent.skills_path()
+            && let Some(selection) = registry.selections.get(&other.key)
+        {
+            return Ok(selection.clone());
+        }
+    }
+    let mut scoped = ws.clone();
+    scoped.config.agents = vec![agent.clone()];
+    let snap = scoped.scan()?;
+    Ok(Selection {
+        manual: snap
+            .skills
+            .iter()
+            .filter(|s| s.deploy.get(&agent.key) == Some(&crate::reconcile::DeployState::Deployed))
+            .map(|s| s.key.clone())
+            .collect(),
+        presets: Default::default(),
+    })
+}
+
+pub fn desired(
+    root: &Path,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>> {
+    Ok(decoded(root)?
+        .selections
+        .into_iter()
+        .map(|(key, s)| (key, s.skills()))
+        .collect())
+}
+
+/// Write only this destination. Other scopes, manual installs, and overlapping
+/// presets keep their independent installation reasons.
+pub fn set_installed(
+    ws: &Workspace,
+    agent: &AgentConfig,
+    project: Option<&Path>,
+    keys: &[String],
+    preset: Option<&str>,
+    on: bool,
+) -> Result<(String, Option<crate::history::Intent>)> {
+    let before = selection(ws, agent)?;
+    let mut after = before.clone();
+    if let Some(preset) = preset {
+        if on {
+            after
+                .presets
+                .insert(preset.into(), keys.iter().cloned().collect());
+        } else {
+            after.presets.remove(preset);
+        }
+    } else if on {
+        after.manual.extend(keys.iter().cloned());
+    } else {
+        for key in keys {
+            ensure!(
+                !after.presets.values().any(|members| members.contains(key)),
+                "{key} is required by an installed preset; uninstall that preset first"
+            );
+            after.manual.remove(key);
+        }
+    }
+    let message = restore_selection(ws, agent, project, &before, &after)?;
+    let intent = (before != after).then(|| crate::history::Intent::TargetSelection {
+        agent: agent.clone(),
+        project: project.map(Path::to_path_buf),
+        before,
+        after,
+    });
+    Ok((message, intent))
+}
+
+pub fn restore_selection(
+    ws: &Workspace,
+    agent: &AgentConfig,
+    project: Option<&Path>,
+    expected: &Selection,
+    desired: &Selection,
+) -> Result<String> {
+    ensure!(
+        &selection(ws, agent)? == expected,
+        "deployment selection changed since this operation; refresh and retry"
+    );
+    let mut scoped = ws.clone();
+    scoped.config.agents = vec![agent.clone()];
+    let snap = scoped.scan()?;
+    let desired_keys = desired.skills();
+    let before_keys = expected.skills();
+    let removed = before_keys
+        .difference(&desired_keys)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut actions = super::deploy::plan_deploy(
+        &scoped,
+        &snap,
+        &desired_keys.iter().cloned().collect::<Vec<_>>(),
+        std::slice::from_ref(&agent.key),
+    )?;
+    actions.extend(super::deploy::plan_undeploy(
+        &scoped,
+        &snap,
+        &removed,
+        std::slice::from_ref(&agent.key),
+    )?);
+    let actions = super::deploy::resolve_names(&snap, &actions, None)?;
+    for action in &actions {
+        if let super::deploy::Action::Skip { reason, skill, .. } = action {
+            let missing_removal = removed.contains(skill)
+                && snap
+                    .agent(&agent.key)
+                    .is_some_and(|a| a.mode == crate::reconcile::AgentDirMode::Missing);
+            ensure!(
+                reason == "already deployed" || reason == "not deployed" || missing_removal,
+                "{skill}: {reason}"
+            );
+        }
+    }
+    register(ws, agent, project)?;
+    // Persist the prior selection before touching links, so a failed or partial
+    // operation can be retried without turning its new links into manual installs.
+    let mut registry = decoded(&ws.root)?;
+    save_shared_selection(&mut registry, agent, expected);
+    save(ws, &registry)?;
+    super::deploy::apply(&actions)?;
+    let mut registry = decoded(&ws.root)?;
+    save_shared_selection(&mut registry, agent, desired);
+    save(ws, &registry)?;
+    Ok(format!(
+        "{} · {}",
+        agent.display_name(),
+        super::deploy::summarize(&actions)
+    ))
+}
+
+/// Keep persisted installation references aligned with central library edits.
+pub fn rename_skill_reference(ws: &Workspace, old: &str, new: Option<&str>) -> Result<()> {
+    let mut registry = decoded(&ws.root)?;
+    let mut changed = false;
+    for selection in registry.selections.values_mut() {
+        for members in std::iter::once(&mut selection.manual).chain(selection.presets.values_mut())
+        {
+            if members.remove(old) {
+                changed = true;
+                if let Some(new) = new {
+                    members.insert(new.into());
                 }
             }
         }
-        // Record first so even a partially failed filesystem operation remains discoverable.
-        crate::util::write_atomic(
-            &registry_path(&ws.root),
-            toml::to_string_pretty(&registry)?.as_bytes(),
-        )?;
     }
-    super::deploy::apply(&actions)?;
-    Ok((
-        super::deploy::summarize(&actions),
-        crate::history::Intent::from_actions(&actions),
-    ))
+    if changed {
+        save(ws, &registry)?;
+    }
+    Ok(())
+}
+
+pub fn rename_preset_reference(ws: &Workspace, old: &str, new: &str) -> Result<()> {
+    let mut registry = decoded(&ws.root)?;
+    let mut changed = false;
+    for selection in registry.selections.values_mut() {
+        if let Some(members) = selection.presets.remove(old) {
+            selection.presets.insert(new.into(), members);
+            changed = true;
+        }
+    }
+    if changed {
+        save(ws, &registry)?;
+    }
+    Ok(())
+}
+
+fn save_shared_selection(registry: &mut Registry, agent: &AgentConfig, selection: &Selection) {
+    for reader in &registry.agents {
+        if reader.skills_path() == agent.skills_path() {
+            registry
+                .selections
+                .insert(reader.key.clone(), selection.clone());
+        }
+    }
 }

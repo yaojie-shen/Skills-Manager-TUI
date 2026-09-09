@@ -208,6 +208,7 @@ pub fn rename(ws: &Workspace, snap: &Snapshot, old: &str, new: &str) -> Result<V
             log.push(format!("updated preset {}", p.name));
         }
     }
+    super::targets::rename_skill_reference(ws, old, Some(new))?;
     Ok(log)
 }
 
@@ -249,5 +250,6 @@ pub fn remove(ws: &Workspace, snap: &Snapshot, key: &str, keep_meta: bool) -> Re
         ws.meta.remove(key)?;
         log.push("removed metadata".into());
     }
+    super::targets::rename_skill_reference(ws, key, None)?;
     Ok(log)
 }
