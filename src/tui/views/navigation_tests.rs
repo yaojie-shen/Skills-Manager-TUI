@@ -192,7 +192,7 @@ fn agent_preset_filter_keeps_its_scope_after_refresh() {
         .iter()
         .map(|c| c.symbol())
         .collect();
-    assert!(text.contains("presets [bndl]"));
+    assert!(text.contains("Presets") && text.contains("[bndl]"));
     assert!(text.contains("bundle"));
     assert!(!text.contains("unrelated"));
     assert_eq!(ws.presets.list().unwrap().len(), 2);

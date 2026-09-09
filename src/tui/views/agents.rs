@@ -1139,23 +1139,58 @@ impl AgentsView {
     fn draw_current(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         self.update_scope_counts();
         let th = ctx.theme;
-        let rows = Layout::default()
+        let preset_input = self.focus() == Focus::Presets || self.preset_filter.editing;
+        let scoped = !self.destinations.is_empty();
+        let groups = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(4),
-                Constraint::Length(if self.destinations.is_empty() {
-                    0
-                } else {
-                    4 + self
+                Constraint::Length(6),
+                Constraint::Length(if scoped {
+                    6 + self
                         .destinations
                         .get(self.destination)
                         .map_or(0, |s| s.links.len() as u16)
+                } else {
+                    0
                 }),
-                Constraint::Length(if self.destinations.is_empty() { 2 } else { 1 }),
-                Constraint::Length(if self.destinations.is_empty() { 0 } else { 3 }),
-                Constraint::Min(1),
+                Constraint::Length(if preset_input { 4 } else { 3 }),
+                Constraint::Length(if !preset_input && scoped { 3 } else { 0 }),
+                Constraint::Min(3),
             ])
             .split(area);
+        let mut interiors = [Rect::default(); 3];
+        for (i, (title, focused)) in [
+            (" Agents ", self.focus() == Focus::Agents),
+            (" Scope ", self.focus() == Focus::Scopes),
+            (" Presets ", self.focus() == Focus::Presets),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if groups[i].height == 0 {
+                continue;
+            }
+            let block = th.block(title, focused);
+            interiors[i] = block.inner(groups[i]);
+            f.render_widget(block, groups[i]);
+        }
+        let pills = Rect::new(
+            interiors[2].x,
+            interiors[2].y,
+            interiors[2].width,
+            interiors[2].height.min(1),
+        );
+        let filter = if preset_input {
+            Rect::new(
+                interiors[2].x,
+                interiors[2].y + pills.height,
+                interiors[2].width,
+                interiors[2].height.saturating_sub(pills.height),
+            )
+        } else {
+            groups[3]
+        };
+        let rows = [interiors[0], interiors[1], pills, filter, groups[4]];
 
         // Agent picker. Big enough to aim at, and it takes the keyboard like
         // anything else on the page rather than hiding behind a bracket key.
@@ -1236,7 +1271,7 @@ impl AgentsView {
             if x + w > rows[0].right() {
                 break;
             }
-            let rect = Rect::new(x, rows[0].y, w, 4);
+            let rect = Rect::new(x, rows[0].y, w, 4.min(rows[0].height));
             let on = a.key == self.scope;
             let holding = on && self.focus() == Focus::Agents;
             let border = if on { th.accent() } else { th.dim() };
@@ -1247,7 +1282,12 @@ impl AgentsView {
                 } else {
                     ratatui::widgets::BorderType::Rounded
                 })
-                .border_style(border);
+                .border_style(border)
+                .style(if on {
+                    th.selected_unfocused()
+                } else {
+                    Style::default()
+                });
             let inner = block.inner(rect).inner(ratatui::layout::Margin {
                 horizontal: 1,
                 vertical: 0,
@@ -1350,6 +1390,11 @@ impl AgentsView {
                         ratatui::widgets::BorderType::Rounded
                     })
                     .border_style(if on { th.accent() } else { th.dim() })
+                    .style(if on {
+                        th.selected_unfocused()
+                    } else {
+                        Style::default()
+                    })
                     .title(Line::from(title));
                 let inner = block.inner(rect).inner(ratatui::layout::Margin {
                     horizontal: 1,
@@ -1438,7 +1483,14 @@ impl AgentsView {
 
         if self.focus() == Focus::Presets || self.preset_filter.editing {
             self.content_filter_rect = Rect::default();
-            self.preset_filter.draw(f, rows[3], "Filter presets", ctx);
+            self.preset_filter.rect = rows[3];
+            self.preset_filter.input.render(
+                f,
+                rows[3],
+                self.preset_filter.editing,
+                " / filter presets · Enter results",
+                th,
+            );
         } else if !self.destinations.is_empty() {
             self.preset_filter.rect = Rect::default();
             self.content_filter_rect = rows[3];
@@ -1457,9 +1509,9 @@ impl AgentsView {
             // Preset pills.
             self.preset_rects.clear();
             let label = if self.preset_filter.input.is_empty() {
-                " presets ".to_string()
+                " ".to_string()
             } else {
-                format!(" presets [{}] ", fit(self.preset_filter.input.value(), 16))
+                format!(" [{}] ", fit(self.preset_filter.input.value(), 16))
             };
             let mut pills = vec![Span::styled(
                 label.clone(),
