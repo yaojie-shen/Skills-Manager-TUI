@@ -926,3 +926,70 @@ fn detection_requires_valid_app_bundle_or_registered_extension_payload() {
     std::fs::remove_file(extension.join("extension.js")).unwrap();
     assert!(!skills::agents::detect_in(&home, &project, &[]).contains("claude"));
 }
+
+#[test]
+fn detection_combines_cli_aliases_system_apps_and_browser_extensions() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("combined-installations");
+    let home = f.0.join("home");
+    let project = f.0.join("project");
+    let bin = f.0.join("bin");
+    let apps = f.0.join("Applications");
+    for directory in [&bin, &home.join(".local/bin")] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    for path in [bin.join("copilot"), home.join(".local/bin/opencode")] {
+        std::fs::write(&path, "fixture, never executed").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let bundle = apps.join("Cursor.app/Contents");
+    std::fs::create_dir_all(bundle.join("MacOS")).unwrap();
+    std::fs::write(bundle.join("Info.plist"), "fixture").unwrap();
+    let binary = bundle.join("MacOS/Cursor");
+    std::fs::write(&binary, "fixture, never executed").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let extensions = home.join(".vscode/extensions");
+    let extension = extensions.join("codex-fixture");
+    std::fs::create_dir_all(&extension).unwrap();
+    std::fs::write(
+        extension.join("package.json"),
+        r#"{"publisher":"OpenAI","name":"ChatGPT","browser":"browser.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(extension.join("browser.js"), "fixture").unwrap();
+    std::fs::write(
+        extensions.join("extensions.json"),
+        serde_json::json!([
+            {"identifier": {"id": "OPENAI.CHATGPT"}, "location": {"path": extension}}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let expected = std::collections::BTreeSet::from([
+        "github-copilot".into(),
+        "opencode".into(),
+        "cursor".into(),
+        "codex".into(),
+    ]);
+    assert_eq!(
+        skills::agents::detect_with_applications(
+            &home,
+            &project,
+            std::slice::from_ref(&bin),
+            std::slice::from_ref(&apps)
+        ),
+        expected
+    );
+    // A registered extension with a different package identity is not evidence.
+    std::fs::write(
+        extension.join("package.json"),
+        r#"{"publisher":"different","name":"ChatGPT","browser":"browser.js"}"#,
+    )
+    .unwrap();
+    assert!(
+        !skills::agents::detect_with_applications(&home, &project, &[bin], &[apps])
+            .contains("codex")
+    );
+}
