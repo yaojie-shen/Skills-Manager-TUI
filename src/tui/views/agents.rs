@@ -161,7 +161,7 @@ impl AgentsView {
         self.content_filter.clear();
         self.preview.close();
         self.matrix.close();
-        self.refresh(ctx);
+        self.refresh_scope(ctx);
     }
 
     fn scoped_actions(&self, actions: Vec<Action>, ctx: &Ctx) -> Vec<Action> {
@@ -482,8 +482,6 @@ impl AgentsView {
     }
 
     fn refresh_current(&mut self, ctx: &Ctx) {
-        *self.content_searcher.borrow_mut() = skills::search::Searcher::for_workspace(ctx.ws);
-        self.content_searcher.borrow_mut().index(&ctx.snap.skills);
         // A scope pinned to an agent that is gone from the config, or never set,
         // falls back to the first one there is.
         if ctx.ws.config.agent(&self.scope).is_none() {
@@ -507,10 +505,13 @@ impl AgentsView {
                 (p, st)
             })
             .collect();
+        self.installed_presets.clear();
         if !self.destinations.is_empty()
             && let Some(agent) = ctx.ws.config.agent(&self.scope)
-            && let Ok(selection) = skills::ops::targets::selection(ctx.ws, agent)
+            && let Ok(selection) =
+                skills::ops::targets::selection_from_snapshot(ctx.ws, agent, ctx.snap)
         {
+            self.installed_presets = selection.presets.keys().cloned().collect();
             for (name, members) in selection.presets {
                 let mut preset = self
                     .presets
@@ -1558,11 +1559,8 @@ impl AgentsView {
 
 /// The bright twin of a pill colour, used for the pill holding the keyboard.
 /// Anything outside the basic palette is left alone; the bold text still marks it.
-impl View for AgentsView {
-    fn enter(&mut self) {
-        self.enter_current();
-    }
-    fn refresh(&mut self, ctx: &Ctx) {
+impl AgentsView {
+    fn refresh_scope(&mut self, ctx: &Ctx) {
         if self.destinations.is_empty() {
             self.refresh_current(ctx);
             return;
@@ -1602,7 +1600,7 @@ impl View for AgentsView {
                     a
                 })
                 .collect();
-            let snap = ws.scan()?;
+            let snap = skills::reconcile::rescope(ctx.snap, &ws.config.agents)?;
             Ok(std::sync::Arc::new((ws, snap)))
         })();
         match result {
@@ -1624,22 +1622,23 @@ impl View for AgentsView {
                     snap: &data.1,
                     theme: ctx.theme,
                 });
-                self.installed_presets = data
-                    .0
-                    .config
-                    .agent(&self.scope)
-                    .map(|a| skills::ops::targets::selection(&data.0, a))
-                    .transpose()
-                    .ok()
-                    .flatten()
-                    .map(|s| s.presets.into_keys().collect())
-                    .unwrap_or_default();
             }
             Err(e) => {
                 self.scope_error = Some(format!("{e:#}"));
                 self.scoped = None;
             }
         }
+    }
+}
+
+impl View for AgentsView {
+    fn enter(&mut self) {
+        self.enter_current();
+    }
+    fn refresh(&mut self, ctx: &Ctx) {
+        *self.content_searcher.borrow_mut() = skills::search::Searcher::for_workspace(ctx.ws);
+        self.content_searcher.borrow_mut().index(&ctx.snap.skills);
+        self.refresh_scope(ctx);
     }
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         if self.focus() == Focus::Scopes && !self.destinations.is_empty() {

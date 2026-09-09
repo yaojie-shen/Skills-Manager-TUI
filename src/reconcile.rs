@@ -191,6 +191,47 @@ pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
     scan_with_hash(root, config, &mut hash_directory)
 }
 
+/// Refresh deployment reports against an existing library snapshot. Scope browsing
+/// does not need to reread every SKILL.md or hash every managed source. Shadow
+/// copies still get fresh comparisons; hashes are shared only within this call.
+pub fn rescope(snapshot: &Snapshot, destinations: &[AgentConfig]) -> Result<Snapshot> {
+    let mut records: BTreeMap<_, _> = snapshot
+        .skills
+        .iter()
+        .map(|r| (r.key.clone(), r.clone()))
+        .collect();
+    let mut hashes = HashMap::new();
+    let mut agents = Vec::with_capacity(destinations.len());
+    for agent in destinations {
+        agents.push(scan_agent(
+            &snapshot.root,
+            agent,
+            &records,
+            &mut hashes,
+            &mut hash_directory,
+        )?);
+    }
+    for record in records.values_mut() {
+        record.deploy.clear();
+        for agent in &agents {
+            record.deploy.insert(
+                agent.key.clone(),
+                deploy_state(
+                    agent,
+                    &record.key,
+                    record.current_hash.as_deref(),
+                    &snapshot.root,
+                ),
+            );
+        }
+    }
+    Ok(Snapshot {
+        root: snapshot.root.clone(),
+        skills: records.into_values().collect(),
+        agents,
+    })
+}
+
 // Cache only within this scan: a later scan must observe every content change.
 fn cached_hash(
     path: &Path,

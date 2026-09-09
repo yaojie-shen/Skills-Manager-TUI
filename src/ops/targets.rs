@@ -383,22 +383,42 @@ impl Selection {
     }
 }
 
-pub fn selection(ws: &Workspace, agent: &AgentConfig) -> Result<Selection> {
+fn recorded_selection(ws: &Workspace, agent: &AgentConfig) -> Result<Option<Selection>> {
     let registry = decoded(&ws.root)?;
     if let Some(selection) = registry.selections.get(&agent.key) {
-        return Ok(selection.clone());
+        return Ok(Some(selection.clone()));
     }
     for other in &registry.agents {
         if other.skills_path() == agent.skills_path()
             && let Some(selection) = registry.selections.get(&other.key)
         {
-            return Ok(selection.clone());
+            return Ok(Some(selection.clone()));
         }
+    }
+    Ok(None)
+}
+
+pub fn selection(ws: &Workspace, agent: &AgentConfig) -> Result<Selection> {
+    if let Some(selection) = recorded_selection(ws, agent)? {
+        return Ok(selection);
     }
     let mut scoped = ws.clone();
     scoped.config.agents = vec![agent.clone()];
-    let snap = scoped.scan()?;
-    Ok(Selection {
+    Ok(inferred_selection(&scoped.scan()?, agent))
+}
+
+/// UI callers already have a matching snapshot; never scan again just to infer
+/// installation reasons. Mutation callers continue to obtain a fresh snapshot.
+pub fn selection_from_snapshot(
+    ws: &Workspace,
+    agent: &AgentConfig,
+    snap: &crate::reconcile::Snapshot,
+) -> Result<Selection> {
+    Ok(recorded_selection(ws, agent)?.unwrap_or_else(|| inferred_selection(snap, agent)))
+}
+
+fn inferred_selection(snap: &crate::reconcile::Snapshot, agent: &AgentConfig) -> Selection {
+    Selection {
         manual: snap
             .skills
             .iter()
@@ -406,7 +426,7 @@ pub fn selection(ws: &Workspace, agent: &AgentConfig) -> Result<Selection> {
             .map(|s| s.key.clone())
             .collect(),
         presets: Default::default(),
-    })
+    }
 }
 
 pub fn desired(

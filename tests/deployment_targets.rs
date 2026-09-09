@@ -433,3 +433,76 @@ fn shared_directory_readers_share_installation_reasons() {
             .any(skills::ops::deploy::Action::is_change)
     );
 }
+
+#[test]
+fn scope_refresh_reuses_library_content_and_reads_current_links() {
+    let f = Fixture::new("scope-snapshot");
+    let ws = f.ws();
+    let snapshot = ws.scan().unwrap();
+    let project = f.0.join("project");
+    let agent = targets::candidates(&ws, Some(&project)).unwrap().remove(0);
+    std::fs::create_dir_all(agent.skills_path()).unwrap();
+    std::os::unix::fs::symlink(ws.root.join("sample"), agent.skills_path().join("sample")).unwrap();
+    std::fs::write(
+        ws.root.join("sample/SKILL.md"),
+        "---\nname: changed\ndescription: changed\n---\nnew body\n",
+    )
+    .unwrap();
+    let scoped = skills::reconcile::rescope(&snapshot, std::slice::from_ref(&agent)).unwrap();
+    assert_eq!(
+        scoped.get("sample").unwrap().name.as_deref(),
+        Some("sample"),
+        "scope changes retain the existing library snapshot"
+    );
+    assert_eq!(
+        scoped.get("sample").unwrap().deploy[&agent.key],
+        skills::reconcile::DeployState::Deployed
+    );
+    assert!(
+        targets::selection_from_snapshot(&ws, &agent, &scoped)
+            .unwrap()
+            .manual
+            .contains("sample")
+    );
+    assert!(
+        !ws.root
+            .join(".skills-meta/deployment-targets.toml")
+            .exists()
+    );
+    std::fs::remove_file(agent.skills_path().join("sample")).unwrap();
+    let next = skills::reconcile::rescope(&snapshot, std::slice::from_ref(&agent)).unwrap();
+    assert_eq!(
+        next.get("sample").unwrap().deploy[&agent.key],
+        skills::reconcile::DeployState::NotDeployed
+    );
+    assert_eq!(
+        ws.scan().unwrap().get("sample").unwrap().name.as_deref(),
+        Some("changed"),
+        "a full scan still reloads source content"
+    );
+}
+
+#[test]
+fn scope_refresh_compares_shadow_contents_fresh_each_time() {
+    let f = Fixture::new("scope-shadow");
+    let ws = f.ws();
+    let snapshot = ws.scan().unwrap();
+    let project = f.0.join("project");
+    let agent = targets::candidates(&ws, Some(&project)).unwrap().remove(0);
+    let copy = agent.skills_path().join("sample");
+    std::fs::create_dir_all(&copy).unwrap();
+    std::fs::copy(ws.root.join("sample/SKILL.md"), copy.join("SKILL.md")).unwrap();
+    let scoped = skills::reconcile::rescope(&snapshot, std::slice::from_ref(&agent)).unwrap();
+    assert_eq!(
+        scoped.agent(&agent.key).unwrap().entries["sample"],
+        skills::reconcile::EntryState::Shadow { same_content: true }
+    );
+    std::fs::write(copy.join("SKILL.md"), "different content").unwrap();
+    let scoped = skills::reconcile::rescope(&snapshot, std::slice::from_ref(&agent)).unwrap();
+    assert_eq!(
+        scoped.agent(&agent.key).unwrap().entries["sample"],
+        skills::reconcile::EntryState::Shadow {
+            same_content: false
+        }
+    );
+}
