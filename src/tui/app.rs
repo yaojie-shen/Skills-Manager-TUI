@@ -10,7 +10,7 @@ use super::views::{
     search::SearchView, tags::TagsView,
 };
 use super::widgets::{SPINNER, width};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -91,7 +91,6 @@ pub enum Action {
     /// Keep the input and cursor until validation and synchronous writes succeed.
     SubmitInput(Vec<Action>),
     SwitchTab(Tab),
-    SwitchScope(bool),
     /// Land on a preset by name once the list next reloads: after creating
     /// or renaming one, the card to look at is the one that has just changed.
     SelectPreset(String),
@@ -179,10 +178,6 @@ pub struct App {
     quit: bool,
     quit_prompt: Option<QuitPrompt>,
     tab_rects: Vec<(Rect, Tab)>,
-    scope_rects: Vec<(Rect, bool)>,
-    global_root: Option<std::path::PathBuf>,
-    local_project: std::path::PathBuf,
-    scope_histories: std::collections::BTreeMap<std::path::PathBuf, History>,
     body: Rect,
 }
 
@@ -260,14 +255,17 @@ impl QuitPrompt {
 }
 
 impl App {
+    pub fn set_launch_directory(&mut self, start: &std::path::Path) -> Result<()> {
+        self.agents.discover(start)?;
+        self.on_snapshot();
+        Ok(())
+    }
+
     pub fn new(mut ws: Workspace, tx: Sender<Msg>) -> Result<Self> {
         Self::discover_local_agents(&mut ws)?;
-        let global_root = if ws.project.is_none() {
-            Some(ws.root.clone())
-        } else {
-            skills::paths::resolve_root(None).ok()
-        };
         let local_project = ws.project.clone().unwrap_or(std::env::current_dir()?);
+        let mut agents = AgentsView::default();
+        agents.discover(&local_project)?;
         let snap = ws.scan()?;
         let mut app = Self {
             ws,
@@ -277,7 +275,7 @@ impl App {
             search: SearchView::default(),
             tags: TagsView::default(),
             presets: PresetsView::default(),
-            agents: AgentsView::default(),
+            agents,
             health: HealthView::default(),
             repos: ReposView::default(),
             modal: None,
@@ -293,10 +291,6 @@ impl App {
             quit: false,
             quit_prompt: None,
             tab_rects: Vec::new(),
-            scope_rects: Vec::new(),
-            global_root,
-            local_project,
-            scope_histories: Default::default(),
             body: Rect::default(),
         };
         app.on_snapshot();
@@ -313,39 +307,6 @@ impl App {
                 }
             }
         }
-        Ok(())
-    }
-
-    fn switch_scope(&mut self, local: bool) -> Result<()> {
-        if local == self.ws.project.is_some() {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            self.tasks_running == 0 && !self.batch_running && self.pending_task_ui.is_empty(),
-            "Wait for background work before switching scope"
-        );
-        let ws = if local {
-            Workspace::open_local(&self.local_project, true)?
-        } else {
-            Workspace::open(
-                self.global_root
-                    .as_deref()
-                    .context("No global root configured; set SKILLS_HOME or the root pointer")?,
-            )?
-        };
-        let mut next = Self::new(ws, self.tx.clone())?;
-        next.global_root = self.global_root.clone();
-        next.local_project = self.local_project.clone();
-        next.next_task_id = self.next_task_id;
-        next.tab = self.tab;
-        self.scope_histories
-            .insert(self.ws.root.clone(), std::mem::take(&mut self.history));
-        next.history = self
-            .scope_histories
-            .remove(&next.ws.root)
-            .unwrap_or_default();
-        next.scope_histories = std::mem::take(&mut self.scope_histories);
-        *self = next;
         Ok(())
     }
 
@@ -629,6 +590,7 @@ impl App {
         match self.tab {
             Tab::Search => self.search.paste(text, &ctx),
             Tab::Tags => self.tags.paste(text),
+            Tab::Agents => self.agents.paste(text),
             _ => vec![],
         }
     }
@@ -669,8 +631,18 @@ impl App {
         }
         // Any text field that holds the keyboard keeps its digits and slashes;
         // the Tags page has one of its own for colours and merge targets.
-        if k.code == KeyCode::F(6) {
-            return vec![Action::SwitchScope(self.ws.project.is_none())];
+        if self.modal.is_none()
+            && self.tab == Tab::Agents
+            && (self.agents.editing() || k.code == KeyCode::Char('/'))
+        {
+            return self.agents.handle_key(
+                k,
+                &Ctx {
+                    ws: &self.ws,
+                    snap: &self.snap,
+                    theme: &self.theme,
+                },
+            );
         }
         let in_search_input = (self.tab == Tab::Search && self.search.input_focused())
             || (self.tab == Tab::Tags && self.tags.input_focused());
@@ -742,14 +714,6 @@ impl App {
         };
         if let Some(modal) = self.modal.as_mut() {
             return modal.handle_mouse(m, &ctx);
-        }
-        if let MouseEventKind::Down(MouseButton::Left) = m.kind
-            && let Some((_, local)) = self
-                .scope_rects
-                .iter()
-                .find(|(r, _)| r.contains((m.column, m.row).into()))
-        {
-            return vec![Action::SwitchScope(*local)];
         }
         if let MouseEventKind::Down(MouseButton::Left) = m.kind
             && let Some((_, tab)) = self
@@ -843,11 +807,6 @@ impl App {
                         self.toast(format!("{error:#}"), Level::Error);
                         break;
                     }
-                }
-            }
-            Action::SwitchScope(local) => {
-                if let Err(e) = self.switch_scope(local) {
-                    self.toast(format!("{e:#}"), Level::Error);
                 }
             }
             Action::SwitchTab(t) => {
@@ -1165,28 +1124,11 @@ impl App {
             Paragraph::new(Line::from(spans)),
             Rect::new(area.x, area.y, area.width, 1),
         );
-        self.scope_rects.clear();
         if area.height < 2 {
             return;
         }
-        let mut spans = Vec::new();
-        x = area.x;
-        for (label, local) in [(" Global ", false), (" Local ", true)] {
-            let w = width(label) as u16;
-            if x + w <= area.right() {
-                self.scope_rects
-                    .push((Rect::new(x, area.y + 1, w, 1), local));
-                spans.push(Span::styled(
-                    label,
-                    if local == self.ws.project.is_some() {
-                        th.selected()
-                    } else {
-                        th.dim()
-                    },
-                ));
-                x += w;
-            }
-        }
+        let mut spans = vec![Span::styled(" Library ", th.dim())];
+        x = area.x + width(" Library ") as u16;
         let used = (x - area.x) as usize;
         let available = (area.width as usize).saturating_sub(used);
         let right = if self.tasks_running > 0 {
@@ -1254,7 +1196,7 @@ impl App {
 pub type Hints = &'static [(&'static str, &'static str)];
 
 /// Fit the root into its header allocation while keeping the directory tail.
-fn middle_ellipsis(text: &str, max: usize) -> String {
+pub(crate) fn middle_ellipsis(text: &str, max: usize) -> String {
     use unicode_segmentation::UnicodeSegmentation;
     if width(text) <= max {
         return text.to_owned();
@@ -1705,54 +1647,32 @@ mod matrix_key_tests {
 mod scope_tests {
     use super::*;
     #[test]
-    fn local_agents_show_existing_project_skills_and_scope_switch_preserves_history() {
+    fn deployment_scopes_do_not_switch_the_central_library() {
         let base = std::env::temp_dir().join(format!("skills-tui-scope-{}", std::process::id()));
-        let global = base.join("global");
-        let project = base.join("project");
-        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(base.join("root")).unwrap();
+        std::fs::create_dir_all(base.join("project/.git")).unwrap();
         skills::config::Config {
             agents: vec![],
             ..Default::default()
         }
-        .save(&global)
+        .save(&base.join("root"))
         .unwrap();
-        for path in [".agents/skills/local-skill", ".cursor/skills/cursor-only"] {
-            let dir = project.join(path);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("SKILL.md"),
-                "---\nname: example\ndescription: example\n---\n",
-            )
-            .unwrap();
-        }
         let (tx, _) = std::sync::mpsc::channel();
-        let mut app = App::new(Workspace::open(&global).unwrap(), tx).unwrap();
-        app.local_project = project.canonicalize().unwrap();
+        let mut app = App::new(Workspace::open(&base.join("root")).unwrap(), tx).unwrap();
+        app.agents.discover(&base.join("project")).unwrap();
+        app.on_snapshot();
         app.tab = Tab::Agents;
         app.history.record(history::Intent::Install {
-            skill: "global-step".into(),
+            skill: "session-step".into(),
         });
-        app.switch_scope(true).unwrap();
-        assert!(app.ws.project.is_some());
-        assert!(app.snap.get("local-skill").is_some());
-        assert!(
-            app.snap
-                .agents
-                .iter()
-                .any(|a| a.entries.contains_key("cursor-only"))
-        );
-        assert!(app.history.is_empty());
+        let root = app.ws.root.clone();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
-        assert_eq!(app.scope_rects.len(), 2);
-        app.tasks_running = 1;
-        assert!(app.switch_scope(false).is_err());
-        app.tasks_running = 0;
-        app.switch_scope(false).unwrap();
-        assert_eq!(app.ws.root, global.canonicalize().unwrap());
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert_eq!(app.ws.root, root);
         assert!(!app.history.is_empty());
-        assert!(app.snap.get("local-skill").is_none());
+        assert!(!base.join("project/.agents").exists());
         std::fs::remove_dir_all(base).unwrap();
     }
 }

@@ -54,6 +54,11 @@ pub struct SearchView {
     multi: bool,
     scope_agent: Option<String>,
     preset: Option<String>,
+    target: Option<(
+        skills::config::AgentConfig,
+        Option<std::path::PathBuf>,
+        bool,
+    )>,
     area: Rect,
     scope: Option<(BTreeSet<String>, String)>,
     checked: BTreeSet<String>,
@@ -85,6 +90,7 @@ impl Default for SearchView {
             multi: false,
             scope_agent: None,
             preset: None,
+            target: None,
             area: Rect::default(),
             scope: None,
             checked: BTreeSet::new(),
@@ -95,6 +101,40 @@ impl Default for SearchView {
 }
 
 impl SearchView {
+    fn is_picker(&self) -> bool {
+        self.preset.is_some() || self.target.is_some()
+    }
+
+    pub fn picker_title(&self) -> String {
+        match &self.target {
+            Some((agent, _, on)) => format!(
+                " {} skills · {} · {} ",
+                if *on { "Install" } else { "Uninstall" },
+                agent.display_name(),
+                skills::paths::contract_tilde(&agent.skills_path())
+            ),
+            None => " Preset skills ".into(),
+        }
+    }
+
+    pub fn target_skills(
+        agent: skills::config::AgentConfig,
+        project: Option<std::path::PathBuf>,
+        on: bool,
+        keys: Option<Vec<String>>,
+        ctx: &Ctx,
+    ) -> Self {
+        let mut view = Self::default();
+        view.refresh(ctx);
+        if let Some(keys) = keys {
+            view.select_scope(keys, "Deployed skills".into(), None, ctx);
+        }
+        view.target = Some((agent, project, on));
+        view.multi = true;
+        view.layout = Some(UiLayout::Grid);
+        view
+    }
+
     pub fn preset_members(preset: &str, ctx: &Ctx) -> Self {
         let mut view = Self::default();
         view.refresh(ctx);
@@ -108,6 +148,33 @@ impl SearchView {
     }
 
     fn apply_preset(&self, ctx: &Ctx) -> Vec<Action> {
+        if let Some((agent, project, on)) = self.target.clone() {
+            let keys = self.visible_checked(ctx);
+            if keys.is_empty() {
+                return vec![Action::Error(
+                    "Select skills in the current filter first".into(),
+                )];
+            }
+            return vec![
+                Action::CloseModal,
+                Action::BatchMeta(
+                    Box::new({
+                        let keys = keys.clone();
+                        move |ws| {
+                            skills::ops::targets::set_installed(
+                                ws,
+                                &agent,
+                                project.as_deref(),
+                                &keys,
+                                None,
+                                on,
+                            )
+                        }
+                    }),
+                    keys,
+                ),
+            ];
+        }
         let Some(preset) = self.preset.clone() else {
             return vec![];
         };
@@ -847,7 +914,7 @@ impl View for SearchView {
                 _ => {}
             }
         }
-        if self.preset.is_some() {
+        if self.is_picker() {
             if k.code == KeyCode::Esc {
                 if self.focus == Focus::Preview {
                     self.focus = Focus::List;
@@ -1057,7 +1124,7 @@ impl View for SearchView {
         if self.overlay.handle_mouse(m) {
             return vec![];
         }
-        if self.preset.is_some()
+        if self.is_picker()
             && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
             && !self.area.contains((m.column, m.row).into())
         {
@@ -1097,7 +1164,7 @@ impl View for SearchView {
                 }
                 'c' => return self.apply_preset(ctx),
                 'e' => {
-                    if self.preset.is_some() {
+                    if self.is_picker() {
                         return vec![Action::CloseModal];
                     }
                     self.clear_selection();
@@ -1167,7 +1234,7 @@ impl View for SearchView {
             && self.grid.click(m.column, m.row).is_some()
         {
             self.focus = Focus::List;
-            if self.preset.is_some() {
+            if self.is_picker() {
                 return vec![];
             }
             return if self.multi {
@@ -1235,7 +1302,7 @@ impl View for SearchView {
             Rect::new(x, bar.y, w, 1),
         );
         x += w;
-        let buttons: &[(&str, char)] = if self.preset.is_some() {
+        let buttons: &[(&str, char)] = if self.is_picker() {
             &[
                 ("[Select all]", 'a'),
                 ("[Apply a]", 'c'),
@@ -1258,10 +1325,8 @@ impl View for SearchView {
                 break;
             }
             let rect = Rect::new(x, bar.y, w, 1);
-            let enabled = self.preset.is_some()
-                || !self.multi
-                || selected > 0
-                || matches!(*command, 'e' | 'a');
+            let enabled =
+                self.is_picker() || !self.multi || selected > 0 || matches!(*command, 'e' | 'a');
             f.render_widget(
                 Paragraph::new(Span::styled(
                     *label,
@@ -1287,7 +1352,7 @@ impl View for SearchView {
         if let Some(hints) = self.overlay.hints() {
             return hints;
         }
-        if self.preset.is_some() {
+        if self.is_picker() {
             return &[
                 ("Space", "select"),
                 ("Ctrl+A", "select all results"),

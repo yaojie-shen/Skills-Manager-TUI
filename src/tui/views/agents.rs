@@ -33,6 +33,7 @@ use skills::reconcile::{AgentDirMode, EntryState};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Agents,
+    Scopes,
     Presets,
     Entries,
 }
@@ -73,6 +74,13 @@ impl Caps {
 pub struct AgentsView {
     /// Key of the agent on show. Empty only while none is configured.
     scope: String,
+    destinations: Vec<skills::ops::targets::Scope>,
+    destination: usize,
+    destination_offset: usize,
+    destination_rects: Vec<(Rect, usize)>,
+    agent_offset: usize,
+    scoped: Option<std::sync::Arc<(skills::Workspace, skills::reconcile::Snapshot)>>,
+    scope_error: Option<String>,
     focus: FocusState,
     presets: Vec<(Preset, PresetStatus)>,
     preset_cursor: usize,
@@ -85,6 +93,12 @@ pub struct AgentsView {
     compact: bool,
     scope_rects: Vec<(Rect, String)>,
     preset_rects: Vec<(usize, Rect)>,
+    content_filter: crate::tui::widgets::Input,
+    content_filter_rect: Rect,
+    content_searcher: std::cell::RefCell<skills::search::Searcher>,
+    completion: super::completion::Completion,
+    filter_editing: bool,
+    installed_presets: std::collections::BTreeSet<String>,
     /// The one column the entry scrollbar occupies, empty while it all fits.
     entries_track: Rect,
     left: Rect,
@@ -105,6 +119,105 @@ impl Default for FocusState {
 }
 
 impl AgentsView {
+    pub fn discover(&mut self, start: &std::path::Path) -> anyhow::Result<()> {
+        self.destinations = skills::ops::targets::discover_scopes(start)?;
+        self.destination = self
+            .destinations
+            .iter()
+            .position(|s| s.repository)
+            .unwrap_or(1);
+        Ok(())
+    }
+
+    pub fn editing(&self) -> bool {
+        self.filter_editing
+    }
+
+    pub fn paste(&mut self, text: &str) -> Vec<Action> {
+        if self.filter_editing
+            && let Err(error) = self.content_filter.paste(text)
+        {
+            return vec![Action::Error(error.into())];
+        }
+        vec![]
+    }
+
+    fn project(&self) -> Option<std::path::PathBuf> {
+        self.destinations
+            .get(self.destination)
+            .and_then(|s| s.project.clone())
+    }
+
+    fn move_destination(&mut self, delta: i32, ctx: &Ctx) {
+        if self.destinations.is_empty() {
+            return;
+        }
+        self.destination =
+            (self.destination as i32 + delta).rem_euclid(self.destinations.len() as i32) as usize;
+        self.entries = CardGrid::default();
+        self.preset_cursor = 0;
+        self.preset_offset = 0;
+        self.filter_editing = false;
+        self.content_filter.clear();
+        self.preview.close();
+        self.matrix.close();
+        self.refresh(ctx);
+    }
+
+    fn scoped_actions(&self, actions: Vec<Action>, ctx: &Ctx) -> Vec<Action> {
+        let Some(data) = &self.scoped else {
+            return actions;
+        };
+        let Some(agent) = data.0.config.agent(&self.scope).cloned() else {
+            return actions;
+        };
+        let project = self.project();
+        actions
+            .into_iter()
+            .map(|action| match action {
+                Action::SelectAgentSkills { keys, .. } => Action::OpenModal(Box::new(
+                    Modal::PresetSkills(Box::new(super::search::SearchView::target_skills(
+                        agent.clone(),
+                        project.clone(),
+                        false,
+                        Some(keys),
+                        ctx,
+                    ))),
+                )),
+
+                Action::ApplyLinks { title: _, actions } => {
+                    let agent = agent.clone();
+                    let project = project.clone();
+                    Action::WriteMeta(Box::new(move |ws| {
+                        skills::ops::targets::register(ws, &agent, project.as_deref())?;
+                        deploy::apply(&actions)?;
+                        Ok((
+                            deploy::summarize(&actions),
+                            skills::history::Intent::from_actions(&actions),
+                        ))
+                    }))
+                }
+                Action::ConfirmLinks { title, actions } => {
+                    let agent = agent.clone();
+                    let project = project.clone();
+                    Action::OpenModal(Box::new(Modal::confirm_meta(
+                        title,
+                        actions.iter().map(|a| a.describe()).collect(),
+                        Box::new(move |ws| {
+                            skills::ops::targets::register(ws, &agent, project.as_deref())?;
+                            deploy::apply(&actions)?;
+                            Ok((
+                                deploy::summarize(&actions),
+                                skills::history::Intent::from_actions(&actions),
+                            ))
+                        }),
+                    )))
+                }
+                other => other,
+            })
+            .collect()
+    }
+
     /// An open matrix owns keyboard input before application shortcuts.
     pub fn handle_matrix_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Option<Vec<Action>> {
         self.matrix.handle_key(k, ctx)
@@ -151,6 +264,28 @@ impl AgentsView {
             }
         }
         managed.append(&mut local);
+        if !self.destinations.is_empty() {
+            let hits = self.content_searcher.borrow_mut().search(
+                &ctx.snap.skills,
+                &skills::search::Query::parse(self.content_filter.value()),
+            );
+            let order: std::collections::BTreeMap<_, _> = hits
+                .iter()
+                .enumerate()
+                .map(|(i, h)| (ctx.snap.skills[h.index].deployment_name(), i))
+                .collect();
+            let query = self.content_filter.value().to_lowercase();
+            managed.retain(|row| {
+                order.contains_key(row.name)
+                    || (!row.managed && row.name.to_lowercase().contains(&query))
+            });
+            managed.sort_by_key(|row| {
+                (
+                    !row.managed,
+                    order.get(row.name).copied().unwrap_or(usize::MAX),
+                )
+            });
+        }
         managed
     }
 
@@ -265,6 +400,30 @@ impl AgentsView {
         let Some((preset, status)) = self.selected_preset() else {
             return vec![Action::Error("no preset here yet".into())];
         };
+        if !self.destinations.is_empty() {
+            let Some(agent) = ctx.ws.config.agent(&self.scope).cloned() else {
+                return vec![];
+            };
+            let project = self.project();
+            let name = preset.name.clone();
+            let keys = preset.skills.clone();
+            return vec![Action::BatchMeta(
+                Box::new({
+                    let keys = keys.clone();
+                    move |ws| {
+                        skills::ops::targets::set_installed(
+                            ws,
+                            &agent,
+                            project.as_deref(),
+                            &keys,
+                            Some(&name),
+                            on,
+                        )
+                    }
+                }),
+                keys,
+            )];
+        }
         let scope = self.scope_agents();
         let plan = if on {
             plan_preset_activate(ctx.ws, ctx.snap, preset, &scope)
@@ -308,20 +467,23 @@ impl AgentsView {
         let cur = keys.iter().position(|x| *x == self.scope).unwrap_or(0) as i32;
         let next = (cur + delta).rem_euclid(keys.len() as i32);
         self.scope = keys[next as usize].clone();
+        self.entries = CardGrid::default();
     }
 }
 
-impl View for AgentsView {
+impl AgentsView {
     /// Coming back to this page puts the keyboard on the pills, whatever it
     /// was doing when the user left: that band is what the page is for, and a
     /// focus left in the grid is invisible until Enter does the wrong thing.
-    fn enter(&mut self) {
+    fn enter_current(&mut self) {
         self.set_focus(Focus::Presets);
         self.preview.close();
         self.matrix.close();
     }
 
-    fn refresh(&mut self, ctx: &Ctx) {
+    fn refresh_current(&mut self, ctx: &Ctx) {
+        *self.content_searcher.borrow_mut() = skills::search::Searcher::for_workspace(ctx.ws);
+        self.content_searcher.borrow_mut().index(&ctx.snap.skills);
         // A scope pinned to an agent that is gone from the config, or never set,
         // falls back to the first one there is.
         if ctx.ws.config.agent(&self.scope).is_none() {
@@ -345,18 +507,148 @@ impl View for AgentsView {
                 (p, st)
             })
             .collect();
+        if !self.destinations.is_empty()
+            && let Some(agent) = ctx.ws.config.agent(&self.scope)
+            && let Ok(selection) = skills::ops::targets::selection(ctx.ws, agent)
+        {
+            for (name, members) in selection.presets {
+                let mut preset = self
+                    .presets
+                    .iter()
+                    .find(|(p, _)| p.name == name)
+                    .map(|(p, _)| p.clone())
+                    .unwrap_or(Preset {
+                        name: name.clone(),
+                        description: Some("Definition removed from library".into()),
+                        ..Default::default()
+                    });
+                preset.skills = members.into_iter().collect();
+                let status = preset_status(ctx.snap, &preset, &scope);
+                if let Some(existing) = self.presets.iter_mut().find(|(p, _)| p.name == name) {
+                    *existing = (preset, status);
+                } else {
+                    self.presets.push((preset, status));
+                }
+            }
+        }
         self.preset_cursor = self.preset_cursor.min(self.presets.len().saturating_sub(1));
         let rows = self.rows(ctx);
         self.caps = rows.iter().map(|r| Caps::of(r.state)).collect();
         self.entries.clamp(rows.len());
     }
 
-    fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+    fn handle_key_current(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         if self.preview.handle_key(k) {
             return vec![];
         }
         if let Some(acts) = self.matrix.handle_key(k, ctx) {
             return acts;
+        }
+        if !self.destinations.is_empty() {
+            if self.filter_editing {
+                if self.completion.active() {
+                    match k.code {
+                        KeyCode::Up => {
+                            self.completion.move_by(-1);
+                            return vec![];
+                        }
+                        KeyCode::Down => {
+                            self.completion.move_by(1);
+                            return vec![];
+                        }
+                        KeyCode::Tab | KeyCode::Enter => {
+                            self.completion.accept(&mut self.content_filter);
+                            return vec![];
+                        }
+                        KeyCode::Esc => {
+                            self.completion.close();
+                            return vec![];
+                        }
+                        _ => {}
+                    }
+                }
+                match k.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Down => {
+                        self.filter_editing = false;
+                        self.set_focus(Focus::Entries);
+                    }
+                    _ => {
+                        self.content_filter.handle_key(k);
+                        self.completion.update(&self.content_filter, ctx);
+                        self.entries.first(0);
+                    }
+                }
+                return vec![];
+            }
+            if k.code == KeyCode::Char('/') {
+                self.filter_editing = true;
+                return vec![];
+            }
+        }
+        if !self.destinations.is_empty() {
+            if k.code == KeyCode::Char('i')
+                || (k.code == KeyCode::Char('m') && self.focus() == Focus::Entries)
+            {
+                let Some(agent) = ctx.ws.config.agent(&self.scope).cloned() else {
+                    return vec![];
+                };
+                let on = k.code == KeyCode::Char('i');
+                let keys = (!on).then(|| {
+                    self.rows(ctx)
+                        .into_iter()
+                        .filter(|r| r.managed)
+                        .filter_map(|r| {
+                            ctx.snap
+                                .skills
+                                .iter()
+                                .find(|s| s.deployment_name() == r.name)
+                                .map(|s| s.key.clone())
+                        })
+                        .collect()
+                });
+                return vec![Action::OpenModal(Box::new(Modal::PresetSkills(Box::new(
+                    super::search::SearchView::target_skills(agent, self.project(), on, keys, ctx),
+                ))))];
+            }
+            if k.code == KeyCode::Char('x')
+                && self.focus() == Focus::Entries
+                && self.selected_caps().managed
+            {
+                let rows = self.rows(ctx);
+                let Some(row) = self.entries.selected().and_then(|i| rows.get(i)) else {
+                    return vec![];
+                };
+                let Some(record) = ctx
+                    .snap
+                    .skills
+                    .iter()
+                    .find(|s| s.deployment_name() == row.name)
+                else {
+                    return vec![];
+                };
+                let Some(agent) = ctx.ws.config.agent(&self.scope).cloned() else {
+                    return vec![];
+                };
+                let project = self.project();
+                let key = record.key.clone();
+                return vec![Action::OpenModal(Box::new(Modal::confirm_meta(
+                    format!("Uninstall {} from {}", record.key, agent.display_name()),
+                    vec![
+                        format!("Remove link from {}", agent.skills_dir),
+                        "The central skill is kept.".into(),
+                    ],
+                    Box::new(move |ws| {
+                        skills::ops::targets::set_installed(
+                            ws,
+                            &agent,
+                            project.as_deref(),
+                            &[key],
+                            None,
+                            false,
+                        )
+                    }),
+                )))];
+            }
         }
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
@@ -380,7 +672,11 @@ impl View for AgentsView {
                 return vec![];
             }
             KeyCode::Char('s') => {
-                return match deploy::plan_sync(ctx.ws, ctx.snap) {
+                let mut ws = ctx.ws.clone();
+                ws.config.agents.retain(|a| a.key == self.scope);
+                let mut snap = ctx.snap.clone();
+                snap.agents.retain(|a| a.key == self.scope);
+                return match deploy::plan_sync(&ws, &snap) {
                     Ok(actions) => vec![Action::ConfirmLinks {
                         title: "sync agents to the desired state".into(),
                         actions,
@@ -414,14 +710,23 @@ impl View for AgentsView {
                     vec![Action::Rescan]
                 }
                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter | KeyCode::Tab => {
-                    self.set_focus(Focus::Presets);
+                    self.set_focus(if self.destinations.is_empty() {
+                        Focus::Presets
+                    } else {
+                        Focus::Scopes
+                    });
                     vec![]
                 }
                 _ => vec![],
             },
+            Focus::Scopes => vec![],
             Focus::Presets => match k.code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.set_focus(Focus::Agents);
+                    self.set_focus(if self.destinations.is_empty() {
+                        Focus::Agents
+                    } else {
+                        Focus::Scopes
+                    });
                     vec![]
                 }
                 KeyCode::Left | KeyCode::Char('h') => {
@@ -435,10 +740,15 @@ impl View for AgentsView {
                 }
                 KeyCode::Enter if shift => self.activate(ctx, false),
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    let on = !matches!(
-                        self.selected_preset().map(|(_, st)| st.state()),
-                        Some(PresetState::Active)
-                    );
+                    let on = if self.destinations.is_empty() {
+                        !matches!(
+                            self.selected_preset().map(|(_, st)| st.state()),
+                            Some(PresetState::Active)
+                        )
+                    } else {
+                        self.selected_preset()
+                            .is_some_and(|(p, _)| !self.installed_presets.contains(&p.name))
+                    };
                     self.activate(ctx, on)
                 }
                 KeyCode::Char('x') | KeyCode::Backspace => self.activate(ctx, false),
@@ -519,12 +829,24 @@ impl View for AgentsView {
         }
     }
 
-    fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+    fn handle_mouse_current(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
         if self.preview.handle_mouse(m) {
             return vec![];
         }
         if let Some(acts) = self.matrix.handle_mouse(m, ctx) {
             return acts;
+        }
+        if self.filter_editing {
+            let (consumed, _) = self.completion.mouse(m, &mut self.content_filter);
+            if consumed {
+                return vec![];
+            }
+        }
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.content_filter_rect.contains((m.column, m.row).into())
+        {
+            self.filter_editing = true;
+            return vec![];
         }
         let at = (m.column, m.row).into();
         if let Some(d) = wheel(&m) {
@@ -569,10 +891,15 @@ impl View for AgentsView {
                 // again rather than re-running an install that has nothing to do.
                 // Shift forces removal whatever the state.
                 let on = !m.modifiers.contains(KeyModifiers::SHIFT)
-                    && !matches!(
-                        self.selected_preset().map(|(_, st)| st.state()),
-                        Some(PresetState::Active)
-                    );
+                    && if self.destinations.is_empty() {
+                        !matches!(
+                            self.selected_preset().map(|(_, st)| st.state()),
+                            Some(PresetState::Active)
+                        )
+                    } else {
+                        self.selected_preset()
+                            .is_some_and(|(p, _)| !self.installed_presets.contains(&p.name))
+                    };
                 return self.activate(ctx, on);
             }
             if self.left.contains(at) {
@@ -605,13 +932,15 @@ impl View for AgentsView {
         vec![]
     }
 
-    fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+    fn draw_current(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let th = ctx.theme;
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(4),
-                Constraint::Length(2),
+                Constraint::Length(if self.destinations.is_empty() { 0 } else { 4 }),
+                Constraint::Length(if self.destinations.is_empty() { 2 } else { 1 }),
+                Constraint::Length(if self.destinations.is_empty() { 0 } else { 3 }),
                 Constraint::Min(1),
             ])
             .split(area);
@@ -626,7 +955,53 @@ impl View for AgentsView {
                 rows[0],
             );
         }
-        for a in &ctx.ws.config.agents {
+        let selected_agent = ctx
+            .ws
+            .config
+            .agents
+            .iter()
+            .position(|a| a.key == self.scope)
+            .unwrap_or(0);
+        let widths: Vec<_> = ctx
+            .ws
+            .config
+            .agents
+            .iter()
+            .map(|a| {
+                let report = ctx.snap.agent(&a.key);
+                let sub = match report.map(|r| {
+                    (
+                        &r.mode,
+                        r.count(|s| matches!(s, EntryState::Deployed)),
+                        r.entries.len(),
+                    )
+                }) {
+                    None | Some((AgentDirMode::Missing, ..)) => "no directory".to_string(),
+                    Some((AgentDirMode::SharedRoot, ..)) => "shared skills root".into(),
+                    Some((AgentDirMode::DirLinked, ..)) => "whole dir linked".into(),
+                    Some((AgentDirMode::DirForeign { .. }, ..)) => "dir links elsewhere".into(),
+                    Some((AgentDirMode::Real, linked, total)) if total > linked => {
+                        format!("{linked} linked · {} own", total - linked)
+                    }
+                    Some((AgentDirMode::Real, linked, _)) => format!("{linked} linked"),
+                };
+                (width(a.display_name()).max(width(&sub)) + 4).max(14) + 1
+            })
+            .collect();
+        let visible = pill_window(
+            &widths,
+            selected_agent,
+            &mut self.agent_offset,
+            rows[0].width.saturating_sub(2) as usize,
+        );
+        for a in ctx
+            .ws
+            .config
+            .agents
+            .iter()
+            .skip(visible.start)
+            .take(visible.len())
+        {
             let report = ctx.snap.agent(&a.key);
             let sub = match report.map(|r| {
                 (
@@ -682,100 +1057,218 @@ impl View for AgentsView {
             x += w + 1;
         }
 
-        // Preset pills.
-        self.preset_rects.clear();
-        let mut pills = vec![Span::styled(
-            " presets ",
-            self.label_style(Focus::Presets, th),
-        )];
-        let mut x = rows[1].x + width(" presets ") as u16;
-        if self.presets.is_empty() {
+        self.destination_rects.clear();
+        if !self.destinations.is_empty() {
+            let band = rows[1];
+            let widths: Vec<usize> = self
+                .destinations
+                .iter()
+                .map(|scope| {
+                    (width(&scope.path_label()).max(width(&scope.name()) + 3) + 4).clamp(18, 32) + 1
+                })
+                .collect();
+            let visible = pill_window(
+                &widths,
+                self.destination,
+                &mut self.destination_offset,
+                band.width.saturating_sub(2) as usize,
+            );
+            let mut x = band.x + 1;
+            for i in visible.clone() {
+                let scope = &self.destinations[i];
+                let w = (widths[i] as u16 - 1).min(band.right().saturating_sub(x));
+                if w < 4 {
+                    break;
+                }
+                let rect = Rect::new(x, band.y, w, 3.min(band.height));
+                let on = i == self.destination;
+                let block = ratatui::widgets::Block::bordered()
+                    .border_type(if on && self.focus() == Focus::Scopes {
+                        ratatui::widgets::BorderType::Thick
+                    } else {
+                        ratatui::widgets::BorderType::Rounded
+                    })
+                    .border_style(if on { th.accent() } else { th.dim() })
+                    .title(format!(
+                        " {}{} ",
+                        crate::tui::icons::scope(
+                            ctx.ws.config.ui.icons,
+                            scope.project.is_none(),
+                            scope.repository
+                        ),
+                        fit(&scope.name(), w.saturating_sub(7) as usize)
+                    ));
+                let inner = block.inner(rect).inner(ratatui::layout::Margin {
+                    horizontal: 1,
+                    vertical: 0,
+                });
+                f.render_widget(block, rect);
+                f.render_widget(
+                    Paragraph::new(crate::tui::app::middle_ellipsis(
+                        &scope.path_label(),
+                        inner.width as usize,
+                    ))
+                    .style(th.dim()),
+                    inner,
+                );
+                self.destination_rects.push((rect, i));
+                x += w + 1;
+            }
+            if band.height > 1 && band.width > 1 {
+                if visible.start > 0 {
+                    f.render_widget(
+                        Paragraph::new("‹").style(th.accent()),
+                        Rect::new(band.x, band.y + 1, 1, 1),
+                    );
+                }
+                if visible.end < self.destinations.len() {
+                    f.render_widget(
+                        Paragraph::new("›").style(th.accent()),
+                        Rect::new(band.right() - 1, band.y + 1, 1, 1),
+                    );
+                }
+            }
+            let target = ctx
+                .ws
+                .config
+                .agent(&self.scope)
+                .map(|a| skills::paths::contract_tilde(&a.skills_path()))
+                .unwrap_or_default();
+            if band.height > 3 {
+                f.render_widget(
+                    Paragraph::new(crate::tui::app::middle_ellipsis(
+                        &format!(" Target  {target}"),
+                        band.width as usize,
+                    ))
+                    .style(th.dim()),
+                    Rect::new(band.x, band.y + 3, band.width, 1),
+                );
+            }
+        }
+
+        if !self.destinations.is_empty() {
+            self.content_filter_rect = rows[3];
+            let block = th.block(" filter ", self.filter_editing);
+            let inner = block.inner(rows[3]);
+            f.render_widget(block, rows[3]);
+            self.content_filter.render(
+                f,
+                inner,
+                self.filter_editing,
+                "Filter skills…   tag:x  agent:y  repo:owner/repo",
+                th,
+            );
+        }
+        {
+            // Preset pills.
+            self.preset_rects.clear();
+            let mut pills = vec![Span::styled(
+                " presets ",
+                self.label_style(Focus::Presets, th),
+            )];
+            let mut x = rows[2].x + width(" presets ") as u16;
+            if self.presets.is_empty() {
+                pills.push(Span::styled(
+                    "none yet — create one on the Presets tab",
+                    th.dim(),
+                ));
+            }
+            let (lcap, rcap) = ctx.ws.config.ui.pill_caps.glyphs();
+            let caps_w = width(lcap) + width(rcap);
+            // Reserve an indicator on each side; every mouse target is a whole pill.
+            let budget = rows[2].width.saturating_sub(13) as usize;
+            let bodies: Vec<String> = self
+                .presets
+                .iter()
+                .map(|(preset, status)| {
+                    let state = if self.destinations.is_empty()
+                        || self.installed_presets.contains(&preset.name)
+                    {
+                        status.state()
+                    } else {
+                        PresetState::Inactive
+                    };
+                    let mark = match state {
+                        PresetState::Active => "✓ ",
+                        PresetState::Partial => "◐ ",
+                        PresetState::Inactive => "◌ ",
+                        PresetState::Empty => "◦ ",
+                    };
+                    let suffix = status
+                        .progress()
+                        .map(|p| format!(" {p} "))
+                        .unwrap_or(" ".into());
+                    let name_w = budget.saturating_sub(caps_w + width(mark) + width(&suffix) + 2);
+                    format!(" {mark}{}{suffix}", fit(&preset.name, name_w))
+                })
+                .collect();
+            let widths: Vec<usize> = bodies.iter().map(|b| width(b) + caps_w + 1).collect();
+            let visible = pill_window(&widths, self.preset_cursor, &mut self.preset_offset, budget);
             pills.push(Span::styled(
-                "none yet — create one on the Presets tab",
+                if visible.start > 0 { "‹ " } else { "  " },
                 th.dim(),
             ));
-        }
-        let (lcap, rcap) = ctx.ws.config.ui.pill_caps.glyphs();
-        let caps_w = width(lcap) + width(rcap);
-        // Reserve an indicator on each side; every mouse target is a whole pill.
-        let budget = rows[1].width.saturating_sub(13) as usize;
-        let bodies: Vec<String> = self
-            .presets
-            .iter()
-            .map(|(preset, status)| {
-                let mark = match status.state() {
-                    PresetState::Active => "✓ ",
-                    PresetState::Partial => "◐ ",
-                    PresetState::Inactive => "◌ ",
-                    PresetState::Empty => "◦ ",
-                };
-                let suffix = status
-                    .progress()
-                    .map(|p| format!(" {p} "))
-                    .unwrap_or(" ".into());
-                let name_w = budget.saturating_sub(caps_w + width(mark) + width(&suffix) + 2);
-                format!(" {mark}{}{suffix}", fit(&preset.name, name_w))
-            })
-            .collect();
-        let widths: Vec<usize> = bodies.iter().map(|b| width(b) + caps_w + 1).collect();
-        let visible = pill_window(&widths, self.preset_cursor, &mut self.preset_offset, budget);
-        pills.push(Span::styled(
-            if visible.start > 0 { "‹ " } else { "  " },
-            th.dim(),
-        ));
-        x += 2;
-        for i in visible.clone() {
-            let (_, status) = &self.presets[i];
-            let body = bodies[i].clone();
-            let w = (widths[i] - 1) as u16;
-            self.preset_rects.push((i, Rect::new(x, rows[1].y, w, 1)));
-            let base = match status.state() {
-                PresetState::Active => th.ok,
-                PresetState::Partial => th.warn,
-                _ => th.dim,
-            };
-            let selected = i == self.preset_cursor;
-            let focused = self.focus() == Focus::Presets;
-            // With the keyboard on this row the pill is lit and underlined, so
-            // the cursor is visible without reading the colours against each
-            // other. Once the focus moves on, the underline goes and bold alone
-            // remembers the place, which marks it without competing with the
-            // list for attention.
-            let fill = if selected && focused { lit(base) } else { base };
-            let mut body_style = Style::default().bg(fill).fg(cards::ink(fill));
-            if selected {
-                body_style = body_style.add_modifier(if focused {
-                    Modifier::BOLD | Modifier::UNDERLINED
+            x += 2;
+            for i in visible.clone() {
+                let (preset, status) = &self.presets[i];
+                let body = bodies[i].clone();
+                let w = (widths[i] - 1) as u16;
+                self.preset_rects.push((i, Rect::new(x, rows[2].y, w, 1)));
+                let state = if self.destinations.is_empty()
+                    || self.installed_presets.contains(&preset.name)
+                {
+                    status.state()
                 } else {
-                    Modifier::BOLD
-                });
+                    PresetState::Inactive
+                };
+                let base = match state {
+                    PresetState::Active => th.ok,
+                    PresetState::Partial => th.warn,
+                    _ => th.dim,
+                };
+                let selected = i == self.preset_cursor;
+                let focused = self.focus() == Focus::Presets;
+                // With the keyboard on this row the pill is lit and underlined, so
+                // the cursor is visible without reading the colours against each
+                // other. Once the focus moves on, the underline goes and bold alone
+                // remembers the place, which marks it without competing with the
+                // list for attention.
+                let fill = if selected && focused { lit(base) } else { base };
+                let mut body_style = Style::default().bg(fill).fg(cards::ink(fill));
+                if selected {
+                    body_style = body_style.add_modifier(if focused {
+                        Modifier::BOLD | Modifier::UNDERLINED
+                    } else {
+                        Modifier::BOLD
+                    });
+                }
+                // The caps carry the fill as foreground against the page, which is
+                // what rounds the ends off; reversing them would square the pill.
+                let cap = Style::default().fg(fill);
+                pills.push(Span::styled(lcap, cap));
+                pills.push(Span::styled(body, body_style));
+                pills.push(Span::styled(rcap, cap));
+                pills.push(Span::raw(" "));
+                x += w + 1;
             }
-            // The caps carry the fill as foreground against the page, which is
-            // what rounds the ends off; reversing them would square the pill.
-            let cap = Style::default().fg(fill);
-            pills.push(Span::styled(lcap, cap));
-            pills.push(Span::styled(body, body_style));
-            pills.push(Span::styled(rcap, cap));
-            pills.push(Span::raw(" "));
-            x += w + 1;
+            pills.push(Span::styled(
+                if visible.end < self.presets.len() {
+                    "›"
+                } else {
+                    " "
+                },
+                th.dim(),
+            ));
+            f.render_widget(Paragraph::new(Line::from(pills)), rows[2]);
         }
-        pills.push(Span::styled(
-            if visible.end < self.presets.len() {
-                "›"
-            } else {
-                " "
-            },
-            th.dim(),
-        ));
-        f.render_widget(Paragraph::new(Line::from(pills)), rows[1]);
 
         // The whole width goes to the entries. A detail pane here only ever had
         // the selected preset's members to show, which the pills already count
         // and the list below already spells out one skill at a time.
-        let left = rows[2];
+        let left = rows[4];
         self.left = left;
         let rows_data = self.rows(ctx);
-        let cards = !self.compact;
+        let cards = !self.compact && left.height >= 12;
         let counts = match (
             rows_data.iter().filter(|r| r.managed).count(),
             rows_data.iter().filter(|r| !r.managed).count(),
@@ -792,6 +1285,13 @@ impl View for AgentsView {
         let inner = block.inner(left);
         f.render_widget(block, left);
 
+        if rows_data.is_empty() && !self.destinations.is_empty() {
+            f.render_widget(
+                Paragraph::new("No matching skills deployed here · press i to install")
+                    .style(th.dim()),
+                inner,
+            );
+        }
         let cell_h = if cards { CARD_H } else { 1 };
         // One column is held back for the scrollbar so the column count does not
         // shift the moment the list outgrows a screen.
@@ -949,18 +1449,51 @@ impl View for AgentsView {
                 &mut sb,
             );
         }
+        if self.filter_editing {
+            self.completion.draw(f, self.left, ctx);
+        }
         self.preview.draw(f, area, ctx);
         self.matrix.draw(f, area, ctx);
     }
 
-    fn hints(&self) -> Hints {
+    fn hints_current(&self) -> Hints {
         if let Some(hints) = self.matrix.hints() {
             return hints;
         }
         if let Some(hints) = self.preview.hints() {
             return hints;
         }
+        if !self.destinations.is_empty() && self.filter_editing {
+            return &[("Enter", "results"), ("Esc", "results")];
+        }
+        if !self.destinations.is_empty() && self.focus() == Focus::Presets {
+            return &[
+                ("Enter / Space", "install / uninstall preset"),
+                ("x", "uninstall preset"),
+                ("←→", "preset"),
+                ("↑", "scopes"),
+                ("↓", "skills"),
+            ];
+        }
+        if !self.destinations.is_empty() && self.focus() == Focus::Entries {
+            return &[
+                ("i", "install skills"),
+                ("x", "uninstall / repair"),
+                ("m", "multi-uninstall"),
+                ("Enter", "preview"),
+                ("↑", "presets"),
+                ("[ ]", "agent"),
+                ("v", "layout"),
+                ("Esc", "search"),
+            ];
+        }
         match self.focus() {
+            Focus::Scopes => &[
+                ("←→", "scope"),
+                ("↑", "agents"),
+                ("↓", "presets"),
+                ("Esc", "search"),
+            ],
             Focus::Presets => &[
                 ("Enter", "deploy / undeploy"),
                 ("x", "undeploy"),
@@ -1025,6 +1558,173 @@ impl View for AgentsView {
 
 /// The bright twin of a pill colour, used for the pill holding the keyboard.
 /// Anything outside the basic palette is left alone; the bold text still marks it.
+impl View for AgentsView {
+    fn enter(&mut self) {
+        self.enter_current();
+    }
+    fn refresh(&mut self, ctx: &Ctx) {
+        if self.destinations.is_empty() {
+            self.refresh_current(ctx);
+            return;
+        }
+        let old_name = self
+            .scoped
+            .as_ref()
+            .and_then(|d| d.0.config.agent(&self.scope))
+            .map(|a| a.display_name().to_string());
+        let result = (|| -> anyhow::Result<_> {
+            let mut ws = ctx.ws.clone();
+            let candidates = skills::ops::targets::candidates(ctx.ws, self.project().as_deref())?;
+            // Keep the configured agent cards, using each agent's local destination.
+            let registered = skills::ops::targets::registered_keys(&ctx.ws.root)?;
+            let configured: Vec<_> = ctx
+                .ws
+                .config
+                .agents
+                .iter()
+                .filter(|a| !registered.contains(&a.key) || !a.key.contains("-local-"))
+                .collect();
+            ws.config.agents = candidates
+                .into_iter()
+                .filter(|a| {
+                    configured.iter().any(|c| {
+                        a.key == c.key
+                            || a.key.starts_with(&format!("{}-local-", c.key))
+                            || a.name.starts_with(&format!("{} (", c.display_name()))
+                    })
+                })
+                .map(|mut a| {
+                    a.name = a
+                        .name
+                        .trim_end_matches(" (local)")
+                        .trim_end_matches(" (global)")
+                        .to_string();
+                    a
+                })
+                .collect();
+            let snap = ws.scan()?;
+            Ok(std::sync::Arc::new((ws, snap)))
+        })();
+        match result {
+            Ok(data) => {
+                if let Some(name) = old_name
+                    && let Some(agent) = data
+                        .0
+                        .config
+                        .agents
+                        .iter()
+                        .find(|a| a.display_name() == name)
+                {
+                    self.scope = agent.key.clone();
+                }
+                self.scope_error = None;
+                self.scoped = Some(data.clone());
+                self.refresh_current(&Ctx {
+                    ws: &data.0,
+                    snap: &data.1,
+                    theme: ctx.theme,
+                });
+                self.installed_presets = data
+                    .0
+                    .config
+                    .agent(&self.scope)
+                    .map(|a| skills::ops::targets::selection(&data.0, a))
+                    .transpose()
+                    .ok()
+                    .flatten()
+                    .map(|s| s.presets.into_keys().collect())
+                    .unwrap_or_default();
+            }
+            Err(e) => {
+                self.scope_error = Some(format!("{e:#}"));
+                self.scoped = None;
+            }
+        }
+    }
+    fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.focus() == Focus::Scopes && !self.destinations.is_empty() {
+            match k.code {
+                KeyCode::Left | KeyCode::Char('h') => {
+                    self.move_destination(-1, ctx);
+                    return vec![];
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    self.move_destination(1, ctx);
+                    return vec![];
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.set_focus(Focus::Agents);
+                    return vec![];
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter | KeyCode::Tab => {
+                    self.set_focus(Focus::Presets);
+                    return vec![];
+                }
+                _ => {}
+            }
+        }
+        if let Some(error) = &self.scope_error {
+            return if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
+                vec![Action::SwitchTab(Tab::Search)]
+            } else {
+                vec![Action::Error(error.clone())]
+            };
+        }
+        let data = self.scoped.clone();
+        let scoped = data.as_ref().map(|d| Ctx {
+            ws: &d.0,
+            snap: &d.1,
+            theme: ctx.theme,
+        });
+        let actions = self.handle_key_current(k, scoped.as_ref().unwrap_or(ctx));
+        self.scoped_actions(actions, scoped.as_ref().unwrap_or(ctx))
+    }
+    fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        if !self.preview.is_open()
+            && self.matrix.hints().is_none()
+            && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some((_, index)) = self
+                .destination_rects
+                .iter()
+                .find(|(r, _)| r.contains((m.column, m.row).into()))
+        {
+            let delta = *index as i32 - self.destination as i32;
+            self.set_focus(Focus::Scopes);
+            self.move_destination(delta, ctx);
+            return vec![];
+        }
+        if self.scope_error.is_some() {
+            return vec![];
+        }
+        let data = self.scoped.clone();
+        let scoped = data.as_ref().map(|d| Ctx {
+            ws: &d.0,
+            snap: &d.1,
+            theme: ctx.theme,
+        });
+        let actions = self.handle_mouse_current(m, scoped.as_ref().unwrap_or(ctx));
+        self.scoped_actions(actions, scoped.as_ref().unwrap_or(ctx))
+    }
+    fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        let data = self.scoped.clone();
+        let scoped = data.as_ref().map(|d| Ctx {
+            ws: &d.0,
+            snap: &d.1,
+            theme: ctx.theme,
+        });
+        self.draw_current(f, area, scoped.as_ref().unwrap_or(ctx));
+        if let Some(error) = &self.scope_error {
+            f.render_widget(
+                Paragraph::new(error.clone()).style(ctx.theme.err()),
+                self.left,
+            );
+        }
+    }
+    fn hints(&self) -> Hints {
+        self.hints_current()
+    }
+}
+
 fn lit(c: Color) -> Color {
     match c {
         Color::Green => Color::LightGreen,
@@ -1347,5 +2047,131 @@ mod overflow_tests {
             }
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod deployment_scope_tests {
+    use super::*;
+    use skills::{
+        Workspace,
+        config::{AgentConfig, Config},
+    };
+    #[test]
+    fn cards_bind_operations_to_the_selected_scope_without_changing_the_library() {
+        let base =
+            std::env::temp_dir().join(format!("skills-agent-scope-cards-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("library");
+        let project = base.join("project");
+        std::fs::create_dir_all(root.join("sample")).unwrap();
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::write(
+            root.join("sample/SKILL.md"),
+            "---\nname: Sample Skill\ndescription: a useful skill\n---\nbody\n",
+        )
+        .unwrap();
+        Config {
+            agents: vec![AgentConfig {
+                key: "claude".into(),
+                name: "Claude Code".into(),
+                skills_dir: base.join("global/claude").display().to_string(),
+            }],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        ws.presets
+            .save(&Preset {
+                name: "quality".into(),
+                skills: vec!["sample".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = crate::tui::theme::Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = AgentsView::default();
+        view.discover(&project).unwrap();
+        view.refresh(&ctx);
+        assert_eq!(view.project(), Some(project.canonicalize().unwrap()));
+        assert_eq!(view.scoped.as_ref().unwrap().0.root, ws.root);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Global") && text.contains("project"));
+        assert!(text.contains("󰋜") && text.contains("󰊢"));
+        assert!(text.contains("Target"));
+        assert!(view.destination_rects.iter().all(|(r, _)| r.right() <= 80));
+        assert_eq!(
+            view.preset_rects.len(),
+            1,
+            "presets remain clickable pills beside the skill list"
+        );
+        assert!(!project.join(".claude").exists(), "browsing must not write");
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let actions = view.handle_key(key(KeyCode::Char('i')), &ctx);
+        let Action::OpenModal(mut modal) = actions.into_iter().next().unwrap() else {
+            panic!("install picker")
+        };
+        let Modal::PresetSkills(picker) = modal.as_mut() else {
+            panic!("shared search picker")
+        };
+        picker.focus_list();
+        picker.handle_key(key(KeyCode::Char(' ')), &ctx);
+        let actions = picker.handle_key(key(KeyCode::Char('a')), &ctx);
+        // The pending install keeps its original target even if the view changes.
+        view.move_destination(-1, &ctx);
+        assert!(view.project().is_none());
+        let write = actions
+            .into_iter()
+            .find_map(|action| {
+                if let Action::BatchMeta(write, _) = action {
+                    Some(write)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        write(&ws).unwrap();
+        assert!(project.join(".claude/skills/sample").is_symlink());
+        assert!(!base.join("global/claude/sample").exists());
+        assert!(root.join("sample/SKILL.md").exists());
+        view.move_destination(1, &ctx);
+        view.refresh(&ctx);
+        term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let actions = view.handle_key(key(KeyCode::Enter), &ctx);
+        let write = actions.into_iter().find_map(|a| if let Action::BatchMeta(write, _) = a { Some(write) } else { None }).expect("Enter on a pill installs a preset even when its skill is already manually installed");
+        write(&ws).unwrap();
+        view.refresh(&ctx);
+        term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let actions = view.handle_key(key(KeyCode::Enter), &ctx);
+        let write = actions
+            .into_iter()
+            .find_map(|a| {
+                if let Action::BatchMeta(write, _) = a {
+                    Some(write)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        write(&ws).unwrap();
+        assert!(
+            project.join(".claude/skills/sample").is_symlink(),
+            "toggling the preset off preserves the manual install"
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

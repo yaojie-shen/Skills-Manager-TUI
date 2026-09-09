@@ -177,7 +177,7 @@ impl Modal {
             Box::new(move |ws| write(ws).map(|m| (m, None))),
         )
     }
-    fn confirm_meta(title: String, lines: Vec<String>, write: MetaFn) -> Self {
+    pub(crate) fn confirm_meta(title: String, lines: Vec<String>, write: MetaFn) -> Self {
         Modal::ConfirmWrite {
             title,
             lines,
@@ -1121,7 +1121,7 @@ impl Modal {
                     area.height.saturating_sub(2),
                 );
                 f.render_widget(Clear, r);
-                let block = th.block(" Preset skills ", true);
+                let block = th.block(view.picker_title(), true);
                 let inner = block.inner(r);
                 f.render_widget(block, r);
                 view.draw(f, inner, ctx);
@@ -1729,7 +1729,6 @@ Mouse
   right-click       deploy picker for that skill
   wheel             scroll lists and preview
 Global
-  F6                switch Global / Local workspace
   Ctrl-Z  Ctrl-Y    undo and redo the last change
   1-6               switch tabs outside text inputs
   Tab / Shift-Tab   next / previous tab outside Search

@@ -50,6 +50,15 @@ pub fn local(mode: Icons) -> &'static str {
     }
 }
 
+pub fn scope(mode: Icons, global: bool, repository: bool) -> &'static str {
+    match (mode, global, repository) {
+        (Icons::Text, _, _) => "",
+        (Icons::Nerd, true, _) => "󰋜 ",
+        (Icons::Nerd, false, true) => "󰊢 ",
+        (Icons::Nerd, false, false) => "󰉋 ",
+    }
+}
+
 pub fn source(mode: Icons, source: &Source) -> String {
     match source {
         Source::Git {

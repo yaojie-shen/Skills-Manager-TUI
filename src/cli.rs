@@ -24,10 +24,10 @@ pub struct Cli {
     /// Skills root (overrides $SKILLS_HOME)
     #[arg(long, global = true, value_name = "DIR")]
     pub root: Option<PathBuf>,
-    /// Use <current directory>/.agents/skills, isolated from the global store
+    /// CLI: use the project store; TUI: use the current directory for deployment scopes
     #[arg(long, global = true, conflicts_with = "root")]
     pub local: bool,
-    /// Use <DIR>/.agents/skills (implies local scope)
+    /// CLI: use <DIR>/.agents/skills; TUI: discover deployment scopes from <DIR>
     #[arg(long, global = true, value_name = "DIR", conflicts_with = "root")]
     pub project: Option<PathBuf>,
     /// Machine-readable JSON output
@@ -398,6 +398,10 @@ impl Ctx {
 }
 
 impl Cli {
+    pub fn tui_workspace(&self) -> Result<Workspace> {
+        Workspace::open(&paths::resolve_root(self.root.as_deref())?)
+    }
+
     pub fn workspace(&self, create: bool) -> Result<Workspace> {
         if self.local || self.project.is_some() {
             let project = self.project.clone().unwrap_or(std::env::current_dir()?);
@@ -1558,4 +1562,35 @@ fn preset_links(ctx: &Ctx, name: &str, agents: &[String], dry_run: bool, on: boo
         });
     }
     run_actions(ctx, &actions, dry_run)
+}
+
+#[cfg(test)]
+mod tui_library_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn project_launch_selects_deployment_context_without_opening_a_second_library() {
+        let base = std::env::temp_dir().join(format!("skills-tui-library-{}", std::process::id()));
+        let root = base.join("library");
+        let project = base.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let mut cli = Cli::parse_from(["skills", "--root", root.to_str().unwrap()]);
+        // These fields are deliberately set directly to keep the test independent
+        // of process-wide SKILLS_HOME while checking project launch semantics.
+        cli.project = Some(project.clone());
+        cli.local = true;
+        let ws = cli.tui_workspace().unwrap();
+        assert_eq!(ws.root, root.canonicalize().unwrap());
+        assert!(ws.project.is_none());
+        assert!(!project.join(".agents").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }

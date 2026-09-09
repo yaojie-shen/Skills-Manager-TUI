@@ -12,7 +12,8 @@ fn main() {
     let args = cli::Cli::parse();
     let json = args.json;
     let result = if args.command.is_none() {
-        args.workspace(false).and_then(tui::run)
+        args.tui_workspace()
+            .and_then(|ws| tui::run(ws, args.project.as_deref()))
     } else {
         cli::run(args)
     };
