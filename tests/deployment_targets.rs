@@ -1047,3 +1047,102 @@ fn shared_directory_links_have_identical_base_scan_and_scope_reports() {
         assert_eq!(scoped.agents[0].entries, snap.agents[0].entries);
     }
 }
+
+#[test]
+fn name_choices_keep_one_or_none_without_deleting_library_sources() {
+    for keep in [Some("first"), Some("second"), None] {
+        let f = Fixture::new(&format!("choices-{}", keep.unwrap_or("none")));
+        for key in ["first", "second"] {
+            std::fs::create_dir_all(f.0.join("source").join(key)).unwrap();
+            std::fs::write(
+                f.0.join("source").join(key).join("SKILL.md"),
+                "---\nname: duplicate\ndescription: example\n---\nbody",
+            )
+            .unwrap();
+        }
+        let ws = f.ws();
+        let agent = AgentConfig {
+            key: "test".into(),
+            name: "Test".into(),
+            skills_dir: f.0.join("project/.agents/skills").display().to_string(),
+        };
+        let error = targets::set_installed(
+            &ws,
+            &agent,
+            None,
+            &["first".into(), "second".into(), "sample".into()],
+            None,
+            true,
+        )
+        .unwrap_err();
+        let pending = error
+            .downcast_ref::<skills::ops::name_choices::Pending>()
+            .unwrap();
+        assert!(!agent.skills_path().exists(), "review never writes");
+        assert_eq!(pending.groups.len(), 1);
+        let choice = keep.map(|key| {
+            pending.groups[0]
+                .candidates
+                .iter()
+                .position(|c| c.key.as_deref() == Some(key))
+                .unwrap()
+        });
+        pending.apply(&ws, &[choice]).unwrap();
+        for key in ["first", "second"] {
+            assert_eq!(agent.skills_path().join(key).exists(), keep == Some(key));
+            assert!(ws.root.join(key).join("SKILL.md").exists());
+        }
+        assert!(
+            agent.skills_path().join("sample").exists(),
+            "unrelated selection survives"
+        );
+        let selection = targets::selection(&ws, &agent).unwrap();
+        assert_eq!(selection.skills().len(), 1 + usize::from(keep.is_some()));
+    }
+}
+
+#[test]
+fn name_choices_archive_only_excluded_owned_entries_and_reject_stale_content() {
+    for keep_owned in [true, false] {
+        let f = Fixture::new(&format!("owned-choice-{keep_owned}"));
+        let ws = f.ws();
+        let agent = AgentConfig {
+            key: "test".into(),
+            name: "Test".into(),
+            skills_dir: f.0.join("project/.agents/skills").display().to_string(),
+        };
+        let owned = agent.skills_path().join("own-folder");
+        std::fs::create_dir_all(&owned).unwrap();
+        let content = "---\nname: sample\ndescription: owned\n---\nprecious content";
+        std::fs::write(owned.join("SKILL.md"), content).unwrap();
+        let get_pending = || {
+            targets::set_installed(&ws, &agent, None, &["sample".into()], None, true)
+                .unwrap_err()
+                .downcast::<skills::ops::name_choices::Pending>()
+                .unwrap()
+        };
+        let stale = get_pending();
+        std::fs::write(owned.join("extra"), "changed").unwrap();
+        assert!(stale.apply(&ws, &[None]).is_err());
+        assert!(owned.join("SKILL.md").exists());
+        let pending = get_pending();
+        let choice = pending.groups[0]
+            .candidates
+            .iter()
+            .position(|c| c.key.is_none() == keep_owned)
+            .unwrap();
+        let (message, _) = pending.apply(&ws, &[Some(choice)]).unwrap();
+        assert_eq!(owned.exists(), keep_owned);
+        assert_eq!(agent.skills_path().join("sample").exists(), !keep_owned);
+        if !keep_owned {
+            let backup = message
+                .split("Archived agent-owned entry to ")
+                .last()
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(PathBuf::from(backup).join("SKILL.md")).unwrap(),
+                content
+            );
+        }
+    }
+}

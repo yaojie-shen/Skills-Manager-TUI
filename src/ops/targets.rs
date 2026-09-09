@@ -567,6 +567,27 @@ pub fn apply_scoped(
             super::deploy::plan_undeploy(&scoped, &snap, keys, &agents)?
         });
     }
+    let mut selections = Vec::new();
+    for (agent, on, project) in changes {
+        let before = selection_from_snapshot(ws, agent, &snap)?;
+        let mut after = before.clone();
+        if *on {
+            after.manual.extend(keys.iter().cloned());
+        } else {
+            for key in keys {
+                after.manual.remove(key);
+            }
+        }
+        selections.push(super::name_choices::Change {
+            agent: agent.clone(),
+            project: project.clone(),
+            before,
+            after,
+        });
+    }
+    if let Some(pending) = super::name_choices::Pending::from_plan(selections, &snap, &actions)? {
+        return Err(pending.into());
+    }
     let actions = super::deploy::resolve_names(&snap, &actions, None)?;
     // Validate the full batch before changing any destination.
     for action in &actions {
@@ -800,6 +821,18 @@ fn restore_scanned_selection(
         &removed,
         std::slice::from_ref(&agent.key),
     )?);
+    if let Some(pending) = super::name_choices::Pending::from_plan(
+        vec![super::name_choices::Change {
+            agent: agent.clone(),
+            project: project.map(Path::to_path_buf),
+            before: expected.clone(),
+            after: desired.clone(),
+        }],
+        snap,
+        &actions,
+    )? {
+        return Err(pending.into());
+    }
     let actions = super::deploy::resolve_names(snap, &actions, None)?;
     for action in &actions {
         if let super::deploy::Action::Skip { reason, skill, .. } = action {

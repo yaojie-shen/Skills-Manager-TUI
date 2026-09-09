@@ -4,6 +4,7 @@ pub mod agent_links;
 pub mod deploy;
 pub mod edit;
 pub mod install;
+pub mod name_choices;
 pub mod targets;
 pub mod update;
 
