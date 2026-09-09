@@ -2,7 +2,7 @@
 //! hood): tokenized inverted index, BM25F ranking with per-field weights,
 //! prefix and typo-tolerant term expansion, CJK-aware tokenization, and
 //! highlighted excerpts. The index is tiny (one document per skill) and is
-//! rebuilt from a `Snapshot` after every scan.
+//! refreshed after every scan, retaining the index when searchable text is unchanged.
 //!
 //! Query syntax: free words plus `tag:x`, `agent:y`, `status:z`, `source:w`
 //! and `untagged` filters.
@@ -682,9 +682,42 @@ pub struct Excerpt {
 }
 
 /// Owns an index over the last set of records and answers queries against it.
+/// Exact copies of indexed fields let deployment-only refreshes retain the
+/// inverted index. Filters still read live records, including agent status.
+#[derive(Debug, Clone)]
+struct IndexedText {
+    key: String,
+    name: Option<String>,
+    tags: Vec<String>,
+    description: Option<String>,
+    note: Option<String>,
+    body: Option<String>,
+}
+impl IndexedText {
+    fn from_record(r: &SkillRecord) -> Self {
+        Self {
+            key: r.key.clone(),
+            name: r.name.clone(),
+            tags: r.tags.clone(),
+            description: r.description.clone(),
+            note: r.note.clone(),
+            body: r.body.clone(),
+        }
+    }
+    fn matches(&self, r: &SkillRecord) -> bool {
+        self.key == r.key
+            && self.name == r.name
+            && self.tags == r.tags
+            && self.description == r.description
+            && self.note == r.note
+            && self.body == r.body
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Searcher {
     index: Index,
+    indexed_text: Vec<IndexedText>,
     len: usize,
     cfg: SearchConfig,
     dict: Dictionaries,
@@ -712,9 +745,21 @@ impl Searcher {
         }
     }
 
-    /// Rebuild the index. Call after every scan.
+    /// Refresh after a scan. Rebuild only when indexed text, ordering, or weights
+    /// changed; deployment and health filters do not require tokenizing again.
     pub fn index(&mut self, records: &[SkillRecord]) {
+        if self.len == records.len()
+            && self.indexed_text.len() == records.len()
+            && self
+                .indexed_text
+                .iter()
+                .zip(records)
+                .all(|(text, record)| text.matches(record))
+        {
+            return;
+        }
         self.index = Index::build(records, &self.cfg.weights);
+        self.indexed_text = records.iter().map(IndexedText::from_record).collect();
         self.len = records.len();
     }
 
@@ -933,6 +978,58 @@ mod tests {
             deploy: BTreeMap::new(),
             meta: None,
         }
+    }
+
+    #[test]
+    fn refreshing_an_index_keeps_deployment_filters_live_and_observes_text_edits() {
+        let mut records = vec![
+            rec("alpha", "needle", "", &[]),
+            rec("beta", "needle", "", &[]),
+        ];
+        records[0]
+            .deploy
+            .insert("test-agent".into(), DeployState::Deployed);
+        let mut searcher = Searcher::new();
+        searcher.index(&records);
+        let query = Query::parse("needle agent:test-agent");
+        assert_eq!(
+            keys(&records, &searcher.search(&records, &query)),
+            ["alpha"]
+        );
+        records[0]
+            .deploy
+            .insert("test-agent".into(), DeployState::NotDeployed);
+        records[1]
+            .deploy
+            .insert("test-agent".into(), DeployState::Deployed);
+        searcher.index(&records);
+        assert_eq!(keys(&records, &searcher.search(&records, &query)), ["beta"]);
+        records[0].body = Some("uniqueupdatedbody".into());
+        records[1].tags = vec!["uniquenewtag".into()];
+        searcher.index(&records);
+        assert_eq!(
+            keys(
+                &records,
+                &searcher.search(&records, &Query::parse("uniqueupdatedbody"))
+            ),
+            ["alpha"]
+        );
+        assert_eq!(
+            keys(
+                &records,
+                &searcher.search(&records, &Query::parse("uniquenewtag"))
+            ),
+            ["beta"]
+        );
+        records.reverse();
+        searcher.index(&records);
+        assert_eq!(
+            keys(
+                &records,
+                &searcher.search(&records, &Query::parse("uniqueupdatedbody"))
+            ),
+            ["alpha"]
+        );
     }
 
     #[test]
@@ -1159,6 +1256,7 @@ mod tests {
             rec("b", "x", "msgpack", &[]),
         ];
         let mut s = Searcher::new();
+        s.index(&records);
         let mut cfg = SearchConfig::default();
         cfg.weights.body = 50.0;
         s.configure(cfg, Dictionaries::default());

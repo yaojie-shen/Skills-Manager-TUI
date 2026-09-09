@@ -506,3 +506,36 @@ fn scope_refresh_compares_shadow_contents_fresh_each_time() {
         }
     );
 }
+
+#[test]
+fn repeating_an_install_does_not_rewrite_unchanged_selection_metadata() {
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new("unchanged-selection");
+    let ws = f.ws();
+    let project = f.0.join("project");
+    let agent = targets::candidates(&ws, Some(&project)).unwrap().remove(0);
+    let keys = ["sample".into()];
+    targets::set_installed(
+        &ws,
+        &agent,
+        Some(&project),
+        &keys,
+        Some("sample-preset"),
+        true,
+    )
+    .unwrap();
+    let path = ws.root.join(".skills-meta/deployment-targets.toml");
+    let before = std::fs::metadata(&path).unwrap().ino();
+    let (_, intent) = targets::set_installed(
+        &ws,
+        &agent,
+        Some(&project),
+        &keys,
+        Some("sample-preset"),
+        true,
+    )
+    .unwrap();
+    assert!(intent.is_none());
+    assert_eq!(std::fs::metadata(path).unwrap().ino(), before);
+    assert!(agent.skills_path().join("sample").is_symlink());
+}

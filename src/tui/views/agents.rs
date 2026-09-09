@@ -1636,7 +1636,10 @@ impl View for AgentsView {
         self.enter_current();
     }
     fn refresh(&mut self, ctx: &Ctx) {
-        *self.content_searcher.borrow_mut() = skills::search::Searcher::for_workspace(ctx.ws);
+        self.content_searcher.borrow_mut().configure(
+            ctx.ws.config.search.clone(),
+            skills::dict::Dictionaries::load(&ctx.ws.root, &ctx.ws.config.search.dictionaries),
+        );
         self.content_searcher.borrow_mut().index(&ctx.snap.skills);
         self.refresh_scope(ctx);
     }

@@ -449,7 +449,8 @@ pub fn set_installed(
     preset: Option<&str>,
     on: bool,
 ) -> Result<(String, Option<crate::history::Intent>)> {
-    let before = selection(ws, agent)?;
+    let snap = scan_target(ws, agent)?;
+    let before = selection_from_snapshot(ws, agent, &snap)?;
     let mut after = before.clone();
     if let Some(preset) = preset {
         if on {
@@ -470,7 +471,7 @@ pub fn set_installed(
             after.manual.remove(key);
         }
     }
-    let message = restore_selection(ws, agent, project, &before, &after)?;
+    let message = restore_scanned_selection(ws, agent, project, &before, &after, &snap)?;
     let intent = (before != after).then(|| crate::history::Intent::TargetSelection {
         agent: agent.clone(),
         project: project.map(Path::to_path_buf),
@@ -487,13 +488,32 @@ pub fn restore_selection(
     expected: &Selection,
     desired: &Selection,
 ) -> Result<String> {
+    let snap = scan_target(ws, agent)?;
+    restore_scanned_selection(ws, agent, project, expected, desired, &snap)
+}
+
+fn scan_target(ws: &Workspace, agent: &AgentConfig) -> Result<crate::reconcile::Snapshot> {
+    let mut scoped = ws.clone();
+    scoped.config.agents = vec![agent.clone()];
+    scoped.scan()
+}
+
+/// Share one fresh scan across inference, validation, and planning. Filesystem
+/// writes still validate their destination immediately before changing it.
+fn restore_scanned_selection(
+    ws: &Workspace,
+    agent: &AgentConfig,
+    project: Option<&Path>,
+    expected: &Selection,
+    desired: &Selection,
+    snap: &crate::reconcile::Snapshot,
+) -> Result<String> {
     ensure!(
-        &selection(ws, agent)? == expected,
+        &selection_from_snapshot(ws, agent, snap)? == expected,
         "deployment selection changed since this operation; refresh and retry"
     );
     let mut scoped = ws.clone();
     scoped.config.agents = vec![agent.clone()];
-    let snap = scoped.scan()?;
     let desired_keys = desired.skills();
     let before_keys = expected.skills();
     let removed = before_keys
@@ -502,17 +522,17 @@ pub fn restore_selection(
         .collect::<Vec<_>>();
     let mut actions = super::deploy::plan_deploy(
         &scoped,
-        &snap,
+        snap,
         &desired_keys.iter().cloned().collect::<Vec<_>>(),
         std::slice::from_ref(&agent.key),
     )?;
     actions.extend(super::deploy::plan_undeploy(
         &scoped,
-        &snap,
+        snap,
         &removed,
         std::slice::from_ref(&agent.key),
     )?);
-    let actions = super::deploy::resolve_names(&snap, &actions, None)?;
+    let actions = super::deploy::resolve_names(snap, &actions, None)?;
     for action in &actions {
         if let super::deploy::Action::Skip { reason, skill, .. } = action {
             let missing_removal = removed.contains(skill)
@@ -529,12 +549,14 @@ pub fn restore_selection(
     // Persist the prior selection before touching links, so a failed or partial
     // operation can be retried without turning its new links into manual installs.
     let mut registry = decoded(&ws.root)?;
-    save_shared_selection(&mut registry, agent, expected);
-    save(ws, &registry)?;
+    if save_shared_selection(&mut registry, agent, expected) {
+        save(ws, &registry)?;
+    }
     super::deploy::apply(&actions)?;
     let mut registry = decoded(&ws.root)?;
-    save_shared_selection(&mut registry, agent, desired);
-    save(ws, &registry)?;
+    if save_shared_selection(&mut registry, agent, desired) {
+        save(ws, &registry)?;
+    }
     Ok(format!(
         "{} · {}",
         agent.display_name(),
@@ -578,12 +600,21 @@ pub fn rename_preset_reference(ws: &Workspace, old: &str, new: &str) -> Result<(
     Ok(())
 }
 
-fn save_shared_selection(registry: &mut Registry, agent: &AgentConfig, selection: &Selection) {
+fn save_shared_selection(
+    registry: &mut Registry,
+    agent: &AgentConfig,
+    selection: &Selection,
+) -> bool {
+    let mut changed = false;
     for reader in &registry.agents {
-        if reader.skills_path() == agent.skills_path() {
+        if reader.skills_path() == agent.skills_path()
+            && registry.selections.get(&reader.key) != Some(selection)
+        {
+            changed = true;
             registry
                 .selections
                 .insert(reader.key.clone(), selection.clone());
         }
     }
+    changed
 }
