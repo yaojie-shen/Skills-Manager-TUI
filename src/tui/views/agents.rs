@@ -112,6 +112,51 @@ pub struct AgentsView {
     matrix: Matrix,
 }
 
+/// Compact card labels; the full destination remains in the Target row.
+fn scope_card_labels(scope: &skills::ops::targets::Scope) -> (String, String, String) {
+    let tier = if scope.project.is_some() {
+        "Local"
+    } else {
+        "Global"
+    };
+    let folder = scope
+        .directory
+        .as_ref()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("custom");
+    let kind = match folder {
+        ".agents" => "Shared".to_string(),
+        ".claude" => "Claude".to_string(),
+        ".codex" => "Codex".to_string(),
+        _ => skills::agents::BUILTINS
+            .iter()
+            .find(|a| {
+                [a.global_dir, a.local_dir].iter().any(|p| {
+                    std::path::Path::new(p)
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .is_some_and(|name| name == folder)
+                })
+            })
+            .map(|a| a.name.to_string())
+            .unwrap_or_else(|| folder.trim_start_matches('.').to_string()),
+    };
+    let path = scope
+        .directory
+        .as_ref()
+        .and_then(|p| {
+            scope
+                .project
+                .as_ref()
+                .and_then(|root| p.strip_prefix(root).ok())
+        })
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| scope.path_label());
+    (tier.into(), kind, path)
+}
+
 /// `Focus` needs a default for `#[derive(Default)]` on the view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FocusState(Focus);
@@ -1112,7 +1157,14 @@ impl AgentsView {
                 .destinations
                 .iter()
                 .map(|scope| {
-                    (width(&scope.path_label()).max(width(&scope.name()) + 3) + 4).clamp(18, 32) + 1
+                    let (tier, kind, path) = scope_card_labels(scope);
+                    let icon = crate::tui::icons::scope(
+                        ctx.ws.config.ui.icons,
+                        scope.project.is_none(),
+                        false,
+                    );
+                    (width(&path).max(width(&format!("{icon}{tier} · {kind}"))) + 4).clamp(18, 36)
+                        + 1
                 })
                 .collect();
             let visible = pill_window(
@@ -1130,6 +1182,19 @@ impl AgentsView {
                 }
                 let rect = Rect::new(x, band.y, w, 3.min(band.height));
                 let on = i == self.destination;
+                let (tier, kind, path) = scope_card_labels(scope);
+                let icon = crate::tui::icons::scope(
+                    ctx.ws.config.ui.icons,
+                    scope.project.is_none(),
+                    false,
+                );
+                let range_style = if scope.project.is_none() {
+                    th.accent()
+                } else {
+                    th.ok()
+                };
+                let prefix = format!(" {icon}{tier}");
+                let kind = fit(&kind, (w as usize).saturating_sub(width(&prefix) + 6));
                 let block = ratatui::widgets::Block::bordered()
                     .border_type(if on && self.focus() == Focus::Scopes {
                         ratatui::widgets::BorderType::Thick
@@ -1137,15 +1202,12 @@ impl AgentsView {
                         ratatui::widgets::BorderType::Rounded
                     })
                     .border_style(if on { th.accent() } else { th.dim() })
-                    .title(format!(
-                        " {}{} ",
-                        crate::tui::icons::scope(
-                            ctx.ws.config.ui.icons,
-                            scope.project.is_none(),
-                            scope.repository
-                        ),
-                        fit(&scope.name(), w.saturating_sub(7) as usize)
-                    ));
+                    .title(Line::from(vec![
+                        Span::styled(prefix, range_style.add_modifier(Modifier::BOLD)),
+                        Span::styled(" · ", th.dim()),
+                        Span::styled(kind, th.tag()),
+                        Span::raw(" "),
+                    ]));
                 let inner = block.inner(rect).inner(ratatui::layout::Margin {
                     horizontal: 1,
                     vertical: 0,
@@ -1153,7 +1215,7 @@ impl AgentsView {
                 f.render_widget(block, rect);
                 f.render_widget(
                     Paragraph::new(crate::tui::app::middle_ellipsis(
-                        &scope.path_label(),
+                        &path,
                         inner.width as usize,
                     ))
                     .style(th.dim()),
