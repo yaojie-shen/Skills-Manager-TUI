@@ -696,11 +696,31 @@ fn inventory_hides_config_only_products_and_ignores_shared_directories() {
     targets::discover_in(&mut ws, &project, &home).unwrap();
     assert_eq!(targets::visible_agents(&ws).count(), 0);
     assert_eq!(ws.config.agents.len(), 2, "saved destinations are retained");
-    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    for dir in [
+        ".codex",
+        ".cursor",
+        ".claude",
+        ".gemini",
+        ".config/opencode",
+    ] {
+        std::fs::create_dir_all(home.join(dir).join("skills")).unwrap();
+        std::fs::create_dir_all(project.join(dir).join("skills")).unwrap();
+    }
+    targets::discover_in(&mut ws, &project, &home).unwrap();
+    assert_eq!(
+        targets::visible_agents(&ws).count(),
+        0,
+        "leftover product directories are not installs"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    let binary = home.join(".local/bin/codex");
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::write(&binary, "not executed").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
     targets::discover_in(&mut ws, &project, &home).unwrap();
     assert!(targets::visible_agents(&ws).count() > 0);
     assert!(targets::visible_agents(&ws).all(|a| targets::product_key(a) == "codex"));
-    std::fs::remove_dir(home.join(".codex")).unwrap();
+    std::fs::remove_file(binary).unwrap();
     targets::discover_in(&mut ws, &project, &home).unwrap();
     assert_eq!(
         targets::visible_agents(&ws).count(),
@@ -845,4 +865,39 @@ fn mixed_scope_changes_preserve_preset_ownership_and_undo_both_destinations() {
     let selection = targets::selection(&reopened, &local).unwrap();
     assert!(selection.manual.is_empty());
     assert!(selection.presets.contains_key("keep"));
+}
+
+#[test]
+fn detection_requires_valid_app_bundle_or_registered_extension_payload() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("installed-evidence");
+    let home = f.0.join("home");
+    let project = f.0.join("project");
+    let bundle = home.join("Applications/Trae.app/Contents");
+    std::fs::create_dir_all(bundle.join("MacOS")).unwrap();
+    std::fs::write(bundle.join("Info.plist"), "fixture").unwrap();
+    assert!(skills::agents::detect_in(&home, &project, &[]).is_empty());
+    let binary = bundle.join("MacOS/Trae");
+    std::fs::write(&binary, "not executed").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let extensions = home.join(".vscode/extensions");
+    let extension = extensions.join("anthropic.claude-code-1.0.0");
+    std::fs::create_dir_all(&extension).unwrap();
+    std::fs::write(
+        extension.join("package.json"),
+        r#"{"publisher":"anthropic","name":"claude-code","main":"extension.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(extension.join("extension.js"), "fixture").unwrap();
+    assert_eq!(
+        skills::agents::detect_in(&home, &project, &[]),
+        std::collections::BTreeSet::from(["trae".into()])
+    );
+    std::fs::write(extensions.join("extensions.json"), r#"[{"identifier":{"id":"anthropic.claude-code"},"relativeLocation":"anthropic.claude-code-1.0.0"}]"#).unwrap();
+    assert_eq!(
+        skills::agents::detect_in(&home, &project, &[]),
+        std::collections::BTreeSet::from(["claude".into(), "trae".into()])
+    );
+    std::fs::remove_file(extension.join("extension.js")).unwrap();
+    assert!(!skills::agents::detect_in(&home, &project, &[]).contains("claude"));
 }

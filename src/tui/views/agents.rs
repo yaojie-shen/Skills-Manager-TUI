@@ -71,6 +71,9 @@ impl Caps {
     }
 }
 
+type ScopeData = std::sync::Arc<(skills::Workspace, skills::reconcile::Snapshot)>;
+type ScopeKey = Vec<(String, std::path::PathBuf)>;
+
 #[derive(Default)]
 pub struct AgentsView {
     /// Key of the agent on show. Empty only while none is configured.
@@ -83,7 +86,9 @@ pub struct AgentsView {
     scope_count_rx: Option<std::sync::mpsc::Receiver<(std::path::PathBuf, ScopeInventory)>>,
     destination_rects: Vec<(Rect, usize)>,
     agent_offset: usize,
-    scoped: Option<std::sync::Arc<(skills::Workspace, skills::reconcile::Snapshot)>>,
+    scoped: Option<ScopeData>,
+    // Valid only for this library snapshot; refresh after writes or explicit rescan.
+    scope_cache: std::collections::HashMap<ScopeKey, ScopeData>,
     scope_error: Option<String>,
     focus: FocusState,
     group_rects: [Rect; 3],
@@ -859,11 +864,11 @@ impl AgentsView {
             // Scope is switchable from anywhere: it frames everything else.
             KeyCode::Char('[') => {
                 self.move_scope(-1, ctx);
-                return vec![Action::Rescan];
+                return vec![];
             }
             KeyCode::Char(']') => {
                 self.move_scope(1, ctx);
-                return vec![Action::Rescan];
+                return vec![];
             }
             KeyCode::Char('v') => {
                 self.compact = !self.compact;
@@ -901,11 +906,11 @@ impl AgentsView {
             Focus::Agents => match k.code {
                 KeyCode::Left | KeyCode::Char('h') => {
                     self.move_scope(-1, ctx);
-                    vec![Action::Rescan]
+                    vec![]
                 }
                 KeyCode::Right | KeyCode::Char('l') => {
                     self.move_scope(1, ctx);
-                    vec![Action::Rescan]
+                    vec![]
                 }
                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => {
                     self.set_focus(if self.destinations.is_empty() {
@@ -1090,7 +1095,7 @@ impl AgentsView {
             {
                 self.scope = scope;
                 self.set_focus(Focus::Agents);
-                return vec![Action::Rescan];
+                return vec![];
             }
             if let Some((i, _)) = self.preset_rects.iter().find(|(_, r)| r.contains(at)) {
                 self.preset_cursor = *i;
@@ -2014,8 +2019,19 @@ impl AgentsView {
             }
             self.destinations = locations;
             self.destination = index;
+            let key: ScopeKey = ws
+                .config
+                .agents
+                .iter()
+                .map(|a| (a.key.clone(), a.skills_path()))
+                .collect();
+            if let Some(cached) = self.scope_cache.get(&key) {
+                return Ok(cached.clone());
+            }
             let snap = skills::reconcile::rescope(ctx.snap, &ws.config.agents)?;
-            Ok(std::sync::Arc::new((ws, snap)))
+            let data = std::sync::Arc::new((ws, snap));
+            self.scope_cache.insert(key, data.clone());
+            Ok(data)
         })();
         match result {
             Ok(data) => {
@@ -2052,6 +2068,7 @@ impl View for AgentsView {
     fn refresh(&mut self, ctx: &Ctx) {
         self.scope_counts.clear();
         self.scope_count_rx = None;
+        self.scope_cache.clear();
         self.content_searcher.borrow_mut().configure(
             ctx.ws.config.search.clone(),
             skills::dict::Dictionaries::load(&ctx.ws.root, &ctx.ws.config.search.dictionaries),
@@ -2094,7 +2111,11 @@ impl View for AgentsView {
             snap: &d.1,
             theme: ctx.theme,
         });
+        let previous_scope = self.scope.clone();
         let actions = self.handle_key_current(k, scoped.as_ref().unwrap_or(ctx));
+        if self.scope != previous_scope {
+            self.refresh_scope(ctx);
+        }
         self.scoped_actions(actions, scoped.as_ref().unwrap_or(ctx))
     }
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
@@ -2140,7 +2161,11 @@ impl View for AgentsView {
             snap: &d.1,
             theme: ctx.theme,
         });
+        let previous_scope = self.scope.clone();
         let actions = self.handle_mouse_current(m, scoped.as_ref().unwrap_or(ctx));
+        if self.scope != previous_scope {
+            self.refresh_scope(ctx);
+        }
         self.scoped_actions(actions, scoped.as_ref().unwrap_or(ctx))
     }
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
@@ -2558,6 +2583,105 @@ mod deployment_scope_tests {
         std::fs::remove_file(directory.join("deployed")).unwrap();
         assert_eq!(count_scope_skills(&directory).label, "1 skill");
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn navigation_reuses_scopes_without_rescan_and_refresh_invalidates_cache() {
+        let tmp = skills::ops::DownloadDir::new("scope-navigation-cost").unwrap();
+        let root = tmp.path().join("root");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(root.join("sample")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            root.join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: example\n---\nbody",
+        )
+        .unwrap();
+        Config {
+            agents: vec![
+                AgentConfig {
+                    key: "claude".into(),
+                    name: "Claude Code".into(),
+                    skills_dir: tmp.path().join("global-claude").display().to_string(),
+                },
+                AgentConfig {
+                    key: "codex".into(),
+                    name: "Codex".into(),
+                    skills_dir: tmp.path().join("global-codex").display().to_string(),
+                },
+            ],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = crate::tui::theme::Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = AgentsView::default();
+        view.discover(&project).unwrap();
+        view.refresh(&ctx);
+        let first = view.scoped.clone().unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let rect = view
+            .scope_rects
+            .iter()
+            .find(|(_, key)| key.starts_with("codex"))
+            .unwrap()
+            .0;
+        let actions = view.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + 1,
+                row: rect.y + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &ctx,
+        );
+        assert!(
+            actions.is_empty(),
+            "clicking an agent must not schedule a library rescan"
+        );
+        assert!(view.scope.starts_with("codex"));
+        let actions = view.handle_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE), &ctx);
+        assert!(actions.is_empty());
+        assert!(view.scope.starts_with("claude"));
+        assert!(std::sync::Arc::ptr_eq(
+            &first,
+            view.scoped.as_ref().unwrap()
+        ));
+        view.move_destination(-1, &ctx);
+        assert!(view.project().is_none());
+        view.move_destination(1, &ctx);
+        assert!(std::sync::Arc::ptr_eq(
+            &first,
+            view.scoped.as_ref().unwrap()
+        ));
+        // An explicit refresh must observe writes made outside the UI too.
+        let target = project.join(".claude/skills");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(ws.skill_path("sample"), target.join("sample")).unwrap();
+        view.refresh(&ctx);
+        assert!(!std::sync::Arc::ptr_eq(
+            &first,
+            view.scoped.as_ref().unwrap()
+        ));
+        assert!(
+            view.scoped
+                .as_ref()
+                .unwrap()
+                .1
+                .agent(&view.scope)
+                .unwrap()
+                .entries
+                .contains_key("sample")
+        );
     }
 
     #[test]

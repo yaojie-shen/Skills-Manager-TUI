@@ -913,19 +913,26 @@ pub fn discover(ws: &mut Workspace, project: &Path) -> Result<()> {
     let dirs = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
         .unwrap_or_default();
-    discover_with_paths(ws, project, &paths::expand_tilde("~"), &dirs)
+    discover_with_paths(
+        ws,
+        project,
+        &paths::expand_tilde("~"),
+        &dirs,
+        &[PathBuf::from("/Applications")],
+    )
 }
 pub fn discover_in(ws: &mut Workspace, project: &Path, home: &Path) -> Result<()> {
-    discover_with_paths(ws, project, home, &[])
+    discover_with_paths(ws, project, home, &[], &[])
 }
 fn discover_with_paths(
     ws: &mut Workspace,
     project: &Path,
     home: &Path,
     dirs: &[PathBuf],
+    applications: &[PathBuf],
 ) -> Result<()> {
     ws.inventory_project = Some(project.to_path_buf());
-    let mut products = crate::agents::detect_in(home, project, dirs);
+    let mut products = crate::agents::detect_with_applications(home, project, dirs, applications);
     for agent in &ws.config.agents {
         if !crate::agents::BUILTINS
             .iter()
