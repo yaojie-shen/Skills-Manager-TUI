@@ -1153,7 +1153,7 @@ impl AgentsView {
                 } else {
                     0
                 }),
-                Constraint::Length(if preset_input { 4 } else { 3 }),
+                Constraint::Length(5),
                 Constraint::Length(if !preset_input && scoped { 3 } else { 0 }),
                 Constraint::Min(3),
             ])
@@ -1174,23 +1174,26 @@ impl AgentsView {
             interiors[i] = block.inner(groups[i]);
             f.render_widget(block, groups[i]);
         }
-        let pills = Rect::new(
-            interiors[2].x,
-            interiors[2].y,
-            interiors[2].width,
-            interiors[2].height.min(1),
-        );
-        let filter = if preset_input {
-            Rect::new(
-                interiors[2].x,
-                interiors[2].y + pills.height,
-                interiors[2].width,
-                interiors[2].height.saturating_sub(pills.height),
-            )
-        } else {
-            groups[3]
-        };
-        let rows = [interiors[0], interiors[1], pills, filter, groups[4]];
+        let preset_rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(interiors[2]);
+        let preset_filter_area = preset_rows[0];
+        if preset_rows[1].height > 0 {
+            f.render_widget(
+                Paragraph::new("─".repeat(preset_rows[1].width as usize)).style(th.dim()),
+                preset_rows[1],
+            );
+        }
+        let rows = [
+            interiors[0],
+            interiors[1],
+            preset_rows[2],
+            groups[3],
+            groups[4],
+        ];
 
         // Agent picker. Big enough to aim at, and it takes the keyboard like
         // anything else on the page rather than hiding behind a bracket key.
@@ -1273,21 +1276,11 @@ impl AgentsView {
             }
             let rect = Rect::new(x, rows[0].y, w, 4.min(rows[0].height));
             let on = a.key == self.scope;
-            let holding = on && self.focus() == Focus::Agents;
             let border = if on { th.accent() } else { th.dim() };
             let block = ratatui::widgets::Block::default()
                 .borders(ratatui::widgets::Borders::ALL)
-                .border_type(if holding {
-                    ratatui::widgets::BorderType::Thick
-                } else {
-                    ratatui::widgets::BorderType::Rounded
-                })
-                .border_style(border)
-                .style(if on {
-                    th.selected_unfocused()
-                } else {
-                    Style::default()
-                });
+                .border_type(ratatui::widgets::BorderType::Rounded)
+                .border_style(border);
             let inner = block.inner(rect).inner(ratatui::layout::Margin {
                 horizontal: 1,
                 vertical: 0,
@@ -1380,21 +1373,19 @@ impl AgentsView {
                     if n > 0 {
                         title.push(Span::styled(chain, th.accent()));
                     }
-                    title.push(Span::styled(part.to_string(), th.tag()));
+                    title.push(Span::styled(
+                        part.to_string(),
+                        if on {
+                            th.tag().add_modifier(Modifier::BOLD)
+                        } else {
+                            th.tag()
+                        },
+                    ));
                 }
                 title.push(Span::raw(" "));
                 let block = ratatui::widgets::Block::bordered()
-                    .border_type(if on && self.focus() == Focus::Scopes {
-                        ratatui::widgets::BorderType::Thick
-                    } else {
-                        ratatui::widgets::BorderType::Rounded
-                    })
+                    .border_type(ratatui::widgets::BorderType::Rounded)
                     .border_style(if on { th.accent() } else { th.dim() })
-                    .style(if on {
-                        th.selected_unfocused()
-                    } else {
-                        Style::default()
-                    })
                     .title(Line::from(title));
                 let inner = block.inner(rect).inner(ratatui::layout::Margin {
                     horizontal: 1,
@@ -1481,18 +1472,17 @@ impl AgentsView {
             }
         }
 
-        if self.focus() == Focus::Presets || self.preset_filter.editing {
+        self.preset_filter.rect = preset_filter_area;
+        self.preset_filter.input.render(
+            f,
+            preset_filter_area,
+            self.preset_filter.editing,
+            " / filter presets · Enter results",
+            th,
+        );
+        if preset_input {
             self.content_filter_rect = Rect::default();
-            self.preset_filter.rect = rows[3];
-            self.preset_filter.input.render(
-                f,
-                rows[3],
-                self.preset_filter.editing,
-                " / filter presets · Enter results",
-                th,
-            );
         } else if !self.destinations.is_empty() {
-            self.preset_filter.rect = Rect::default();
             self.content_filter_rect = rows[3];
             let block = th.block(" filter ", self.filter_editing);
             let inner = block.inner(rows[3]);
