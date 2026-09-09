@@ -579,3 +579,107 @@ fn physical_scopes_keep_shared_private_and_current_directory_separate() {
     assert!(!scopes.iter().any(|s| s.name().contains("shared")));
     assert_eq!(std::fs::read_dir(&cwd).unwrap().count(), 0);
 }
+
+#[test]
+fn linked_scopes_merge_in_both_directions_and_share_preset_operations() {
+    for reverse in [false, true] {
+        let f = Fixture::new(if reverse {
+            "linked-reverse"
+        } else {
+            "linked-forward"
+        });
+        let ws = f.ws();
+        let project = f.0.join("project");
+        let shared = project.join(".agents/skills");
+        let claude = project.join(".claude/skills");
+        let (source, destination, relative) = if reverse {
+            (&shared, &claude, "../.claude/skills")
+        } else {
+            (&claude, &shared, "../.agents/skills")
+        };
+        std::fs::create_dir_all(destination).unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(relative, source).unwrap();
+        let definition = |key| {
+            skills::agents::BUILTINS
+                .iter()
+                .find(|a| a.key == key)
+                .unwrap()
+                .config(false)
+        };
+        let scopes = targets::locations(&ws, &definition("cursor"), &project).unwrap();
+        let merged: Vec<_> = scopes
+            .iter()
+            .filter(|s| s.project.is_some() && !s.links.is_empty())
+            .collect();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].directory.as_ref(), Some(destination));
+        assert_eq!(merged[0].links, vec![(source.clone(), destination.clone())]);
+        let target = |key| {
+            let agent = definition(key);
+            let scope = targets::locations(&ws, &agent, &project)
+                .unwrap()
+                .into_iter()
+                .find(|s| s.project.is_some() && !s.links.is_empty())
+                .unwrap();
+            targets::scope_agent(&ws, &agent, &scope).unwrap()
+        };
+        let claude = target("claude");
+        let codex = target("codex");
+        assert_eq!(claude.skills_path(), codex.skills_path());
+        targets::set_installed(
+            &ws,
+            &claude,
+            Some(&project),
+            &["sample".into()],
+            Some("shared"),
+            true,
+        )
+        .unwrap();
+        assert!(destination.join("sample").is_symlink());
+        assert!(
+            targets::selection(&f.ws(), &codex)
+                .unwrap()
+                .presets
+                .contains_key("shared")
+        );
+        targets::set_installed(
+            &f.ws(),
+            &codex,
+            Some(&project),
+            &["sample".into()],
+            Some("shared"),
+            false,
+        )
+        .unwrap();
+        assert!(!destination.join("sample").exists());
+        assert!(
+            source.is_symlink(),
+            "the directory link must survive removing skills"
+        );
+        assert_eq!(std::fs::read_link(source).unwrap(), PathBuf::from(relative));
+    }
+}
+
+#[test]
+fn foreign_broken_and_cyclic_directory_links_are_not_merged() {
+    let f = Fixture::new("unrecognized-links");
+    let ws = f.ws();
+    let project = f.0.join("project");
+    for dir in [".claude", ".agents", ".cursor", ".codex"] {
+        std::fs::create_dir_all(project.join(dir)).unwrap();
+    }
+    std::os::unix::fs::symlink(&ws.root, project.join(".claude/skills")).unwrap();
+    std::os::unix::fs::symlink("missing", project.join(".agents/skills")).unwrap();
+    std::os::unix::fs::symlink("../.codex/skills", project.join(".cursor/skills")).unwrap();
+    std::os::unix::fs::symlink("../.cursor/skills", project.join(".codex/skills")).unwrap();
+    let agent = skills::agents::BUILTINS
+        .iter()
+        .find(|a| a.key == "cursor")
+        .unwrap()
+        .config(false);
+    let scopes = targets::locations(&ws, &agent, &project).unwrap();
+    let locals: Vec<_> = scopes.iter().filter(|s| s.project.is_some()).collect();
+    assert_eq!(locals.len(), 4);
+    assert!(locals.iter().all(|s| s.links.is_empty()));
+}

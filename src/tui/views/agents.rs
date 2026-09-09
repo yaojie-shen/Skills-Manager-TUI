@@ -119,14 +119,38 @@ fn scope_card_labels(scope: &skills::ops::targets::Scope) -> (String, String, St
     } else {
         "Global"
     };
-    let folder = scope
+    let mut kinds = Vec::new();
+    if let Some(directory) = &scope.directory {
+        kinds.push(scope_directory_kind(directory));
+    }
+    for (source, _) in &scope.links {
+        let kind = scope_directory_kind(source);
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    let kind = kinds.join(" 󰌷 ");
+    let path = scope
         .directory
         .as_ref()
-        .and_then(|p| p.parent())
+        .and_then(|p| {
+            scope
+                .project
+                .as_ref()
+                .and_then(|root| p.strip_prefix(root).ok())
+        })
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| scope.path_label());
+    (tier.into(), kind, path)
+}
+
+fn scope_directory_kind(directory: &std::path::Path) -> String {
+    let folder = directory
+        .parent()
         .and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
         .unwrap_or("custom");
-    let kind = match folder {
+    match folder {
         ".agents" => "Shared".to_string(),
         ".claude" => "Claude".to_string(),
         ".codex" => "Codex".to_string(),
@@ -142,19 +166,7 @@ fn scope_card_labels(scope: &skills::ops::targets::Scope) -> (String, String, St
             })
             .map(|a| a.name.to_string())
             .unwrap_or_else(|| folder.trim_start_matches('.').to_string()),
-    };
-    let path = scope
-        .directory
-        .as_ref()
-        .and_then(|p| {
-            scope
-                .project
-                .as_ref()
-                .and_then(|root| p.strip_prefix(root).ok())
-        })
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| scope.path_label());
-    (tier.into(), kind, path)
+    }
 }
 
 /// `Focus` needs a default for `#[derive(Default)]` on the view.
@@ -1031,7 +1043,14 @@ impl AgentsView {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(4),
-                Constraint::Length(if self.destinations.is_empty() { 0 } else { 4 }),
+                Constraint::Length(if self.destinations.is_empty() {
+                    0
+                } else {
+                    4 + self
+                        .destinations
+                        .get(self.destination)
+                        .map_or(0, |s| s.links.len() as u16)
+                }),
                 Constraint::Length(if self.destinations.is_empty() { 2 } else { 1 }),
                 Constraint::Length(if self.destinations.is_empty() { 0 } else { 3 }),
                 Constraint::Min(1),
@@ -1158,12 +1177,17 @@ impl AgentsView {
                 .iter()
                 .map(|scope| {
                     let (tier, kind, path) = scope_card_labels(scope);
+                    let kind = if ctx.ws.config.ui.icons == skills::config::Icons::Text {
+                        kind.replace("󰌷", "↔")
+                    } else {
+                        kind
+                    };
                     let icon = crate::tui::icons::scope(
                         ctx.ws.config.ui.icons,
                         scope.project.is_none(),
                         false,
                     );
-                    (width(&path).max(width(&format!("{icon}{tier} · {kind}"))) + 4).clamp(18, 36)
+                    (width(&path).max(width(&format!("{icon}{tier} · {kind}"))) + 4).clamp(18, 52)
                         + 1
                 })
                 .collect();
@@ -1183,6 +1207,11 @@ impl AgentsView {
                 let rect = Rect::new(x, band.y, w, 3.min(band.height));
                 let on = i == self.destination;
                 let (tier, kind, path) = scope_card_labels(scope);
+                let kind = if ctx.ws.config.ui.icons == skills::config::Icons::Text {
+                    kind.replace("󰌷", "↔")
+                } else {
+                    kind
+                };
                 let icon = crate::tui::icons::scope(
                     ctx.ws.config.ui.icons,
                     scope.project.is_none(),
@@ -1195,6 +1224,22 @@ impl AgentsView {
                 };
                 let prefix = format!(" {icon}{tier}");
                 let kind = fit(&kind, (w as usize).saturating_sub(width(&prefix) + 6));
+                let mut title = vec![
+                    Span::styled(prefix, range_style.add_modifier(Modifier::BOLD)),
+                    Span::styled(" · ", th.dim()),
+                ];
+                let chain = if ctx.ws.config.ui.icons == skills::config::Icons::Text {
+                    "↔"
+                } else {
+                    "󰌷"
+                };
+                for (n, part) in kind.split(chain).enumerate() {
+                    if n > 0 {
+                        title.push(Span::styled(chain, th.accent()));
+                    }
+                    title.push(Span::styled(part.to_string(), th.tag()));
+                }
+                title.push(Span::raw(" "));
                 let block = ratatui::widgets::Block::bordered()
                     .border_type(if on && self.focus() == Focus::Scopes {
                         ratatui::widgets::BorderType::Thick
@@ -1202,12 +1247,7 @@ impl AgentsView {
                         ratatui::widgets::BorderType::Rounded
                     })
                     .border_style(if on { th.accent() } else { th.dim() })
-                    .title(Line::from(vec![
-                        Span::styled(prefix, range_style.add_modifier(Modifier::BOLD)),
-                        Span::styled(" · ", th.dim()),
-                        Span::styled(kind, th.tag()),
-                        Span::raw(" "),
-                    ]));
+                    .title(Line::from(title));
                 let inner = block.inner(rect).inner(ratatui::layout::Margin {
                     horizontal: 1,
                     vertical: 0,
@@ -1253,6 +1293,29 @@ impl AgentsView {
                     .style(th.dim()),
                     Rect::new(band.x, band.y + 3, band.width, 1),
                 );
+            }
+            if let Some(scope) = self.destinations.get(self.destination) {
+                let display = |path: &std::path::Path| {
+                    scope
+                        .project
+                        .as_ref()
+                        .and_then(|root| path.strip_prefix(root).ok())
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| skills::paths::contract_tilde(path))
+                };
+                for (i, (source, target)) in scope.links.iter().enumerate() {
+                    if 4 + i >= band.height as usize {
+                        break;
+                    }
+                    f.render_widget(
+                        Paragraph::new(crate::tui::app::middle_ellipsis(
+                            &format!(" Linked  {} → {}", display(source), display(target)),
+                            band.width as usize,
+                        ))
+                        .style(th.dim()),
+                        Rect::new(band.x, band.y + 4 + i as u16, band.width, 1),
+                    );
+                }
             }
         }
 

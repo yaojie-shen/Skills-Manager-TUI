@@ -32,6 +32,7 @@ pub struct Scope {
     pub repository: bool,
     pub directory: Option<PathBuf>,
     pub label: Option<String>,
+    pub links: Vec<(PathBuf, PathBuf)>,
 }
 
 impl Scope {
@@ -72,12 +73,14 @@ pub fn discover_scopes(start: &Path) -> Result<Vec<Scope>> {
             repository: false,
             directory: None,
             label: None,
+            links: vec![],
         },
         Scope {
             repository: start.join(".git").exists(),
             project: Some(start),
             directory: None,
             label: None,
+            links: vec![],
         },
     ])
 }
@@ -137,10 +140,82 @@ pub fn locations(ws: &Workspace, configured: &AgentConfig, start: &Path) -> Resu
                 repository: false,
                 directory: Some(dir),
                 label: Some(label),
+                links: vec![],
             });
         }
     }
-    Ok(out)
+    // Only recognize links to another documented skill location. Arbitrary
+    // external directory links retain the existing foreign-directory protection.
+    for local in [false, true] {
+        let mut peers: Vec<PathBuf> = crate::agents::BUILTINS
+            .iter()
+            .flat_map(|a| a.search_dirs(local))
+            .map(|p| {
+                if local {
+                    start.join(p)
+                } else {
+                    paths::expand_tilde(p)
+                }
+            })
+            .collect();
+        peers.extend(
+            out.iter()
+                .filter(|s| s.project.is_some() == local)
+                .filter_map(|s| s.directory.clone()),
+        );
+        peers.sort();
+        peers.dedup();
+        let links: Vec<_> = peers
+            .iter()
+            .filter_map(|source| {
+                let target = std::fs::read_link(source).ok()?;
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    source.parent()?.join(target)
+                };
+                let resolved = std::fs::canonicalize(source).ok()?;
+                if !resolved.is_dir() || (local && !resolved.starts_with(&start)) {
+                    return None;
+                }
+                // Require a real peer directory, rather than recognizing a link
+                // merely because its own resolved path equals itself.
+                let known = peers.contains(&resolved)
+                    || peers.iter().any(|peer| {
+                        std::fs::symlink_metadata(peer).is_ok_and(|m| m.is_dir())
+                            && std::fs::canonicalize(peer).ok().as_ref() == Some(&resolved)
+                    });
+                known.then(|| (source.clone(), resolve(&start, &target), resolved))
+            })
+            .collect();
+        if links.is_empty() {
+            continue;
+        }
+        for scope in out.iter_mut().filter(|s| s.project.is_some() == local) {
+            let Some(dir) = &scope.directory else {
+                continue;
+            };
+            let physical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+            scope.links = links
+                .iter()
+                .filter(|(_, _, target)| *target == physical)
+                .map(|(source, target, _)| (source.clone(), target.clone()))
+                .collect();
+            if !scope.links.is_empty() {
+                scope.directory = Some(physical);
+            }
+        }
+    }
+    let mut merged: Vec<Scope> = Vec::new();
+    for scope in out {
+        if !merged
+            .iter()
+            .any(|s| s.project == scope.project && s.directory == scope.directory)
+        {
+            merged.push(scope);
+        }
+    }
+    Ok(merged)
 }
 
 /// Keep destination IDs compatible with previously registered targets.
@@ -531,13 +606,18 @@ impl Selection {
     }
 }
 
+fn same_directory(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+}
+
 fn recorded_selection(ws: &Workspace, agent: &AgentConfig) -> Result<Option<Selection>> {
     let registry = decoded(&ws.root)?;
     if let Some(selection) = registry.selections.get(&agent.key) {
         return Ok(Some(selection.clone()));
     }
     for other in &registry.agents {
-        if other.skills_path() == agent.skills_path()
+        if same_directory(&other.skills_path(), &agent.skills_path())
             && let Some(selection) = registry.selections.get(&other.key)
         {
             return Ok(Some(selection.clone()));
@@ -755,7 +835,7 @@ fn save_shared_selection(
 ) -> bool {
     let mut changed = false;
     for reader in &registry.agents {
-        if reader.skills_path() == agent.skills_path()
+        if same_directory(&reader.skills_path(), &agent.skills_path())
             && registry.selections.get(&reader.key) != Some(selection)
         {
             changed = true;
