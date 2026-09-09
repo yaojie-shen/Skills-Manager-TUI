@@ -4,10 +4,12 @@
 pub mod agents;
 pub mod cards;
 pub(crate) mod completion;
+pub(crate) mod filter;
 pub mod health;
 pub mod matrix;
 pub mod presets;
 pub mod preview;
+pub mod repos;
 pub mod search;
 pub mod tags;
 
@@ -92,3 +94,6 @@ pub fn wheel(m: &MouseEvent) -> Option<i32> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod navigation_tests;

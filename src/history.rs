@@ -46,6 +46,13 @@ pub type Pair = (String, String);
 
 #[derive(Debug, Clone)]
 pub enum Intent {
+    Group(Vec<Intent>),
+    TargetSelection {
+        agent: crate::config::AgentConfig,
+        project: Option<std::path::PathBuf>,
+        before: crate::ops::targets::Selection,
+        after: crate::ops::targets::Selection,
+    },
     /// Links created and removed together, as one batch: deploy, undeploy,
     /// sync, a preset switched either way, or a whole-directory conversion.
     Links {
@@ -57,20 +64,30 @@ pub enum Intent {
     /// back as one step.
     Meta(Vec<MetaChange>),
     /// A skill fetched into the root. Undoing removes what was fetched.
-    Install { skill: String },
+    Install {
+        skill: String,
+    },
     /// A skill moved to a new name: directory, metadata, every link and every
     /// preset that named it. Undoing is the same move the other way, planned
     /// afresh when it is asked for, so a skill gone or a name taken in the
     /// meantime stops it rather than being written over.
-    Rename { from: String, to: String },
+    Rename {
+        from: String,
+        to: String,
+    },
     /// A preset moved to a new name: its file, and its entry in the
     /// auto-deploy list if it had one. Undone the way a skill rename is, by
     /// planning the move back when it is asked for, so the old name being
     /// taken since stops it.
-    PresetRename { from: String, to: String },
+    PresetRename {
+        from: String,
+        to: String,
+    },
     /// Something that discarded content and so cannot be taken back. Kept so
     /// the log stays honest about everything that happened.
-    OneWay { what: String },
+    OneWay {
+        what: String,
+    },
 }
 
 impl Intent {
@@ -96,6 +113,11 @@ impl Intent {
     /// A short line for the history list.
     pub fn describe(&self) -> String {
         match self {
+            Intent::Group(intents) => intents
+                .iter()
+                .map(Intent::describe)
+                .collect::<Vec<_>>()
+                .join("; "),
             Intent::Links { added, removed } => {
                 let mut parts = Vec::new();
                 if !added.is_empty() {
@@ -105,6 +127,9 @@ impl Intent {
                     parts.push(format!("removed {}", pairs(removed)));
                 }
                 parts.join("; ")
+            }
+            Intent::TargetSelection { agent, .. } => {
+                format!("changed installations in {}", agent.skills_dir)
             }
             Intent::Meta(changes) => describe_changes(changes),
             Intent::Install { skill } => format!("installed {skill}"),
@@ -118,7 +143,10 @@ impl Intent {
     /// updating one to a new revision both discard the old contents, and this
     /// tool keeps no copies of them.
     pub fn reversible(&self) -> bool {
-        !matches!(self, Intent::OneWay { .. })
+        match self {
+            Intent::Group(intents) => intents.iter().all(Intent::reversible),
+            _ => !matches!(self, Intent::OneWay { .. }),
+        }
     }
 }
 
@@ -752,6 +780,7 @@ pub fn preset_description_edit(
 /// under its new name, which the message says.
 pub fn preset_rename(ws: &Workspace, from: &str, to: &str) -> Result<(String, Option<Intent>)> {
     ws.presets.rename(from, to)?;
+    crate::ops::targets::rename_preset_reference(ws, from, to)?;
     let listed = preset::rename_deploy_reference(&ws.root, from, to)
         .with_context(|| format!("preset renamed to {to}, but its auto-deploy entry was not"))?;
     let message = if listed {
@@ -789,6 +818,13 @@ pub enum Plan {
 /// plan inspectable, which the confirmation needs.
 #[derive(Debug, Clone)]
 pub enum WriteBack {
+    Group(Vec<WriteBack>),
+    TargetSelection {
+        agent: crate::config::AgentConfig,
+        project: Option<std::path::PathBuf>,
+        expected: crate::ops::targets::Selection,
+        desired: crate::ops::targets::Selection,
+    },
     RemoveInstalled {
         skill: String,
     },
@@ -809,6 +845,23 @@ pub enum WriteBack {
 impl WriteBack {
     pub fn apply(&self, ws: &Workspace) -> Result<String> {
         match self {
+            WriteBack::Group(writes) => writes
+                .iter()
+                .map(|write| write.apply(ws))
+                .collect::<Result<Vec<_>>>()
+                .map(|messages| messages.join("; ")),
+            WriteBack::TargetSelection {
+                agent,
+                project,
+                expected,
+                desired,
+            } => crate::ops::targets::restore_selection(
+                ws,
+                agent,
+                project.as_deref(),
+                expected,
+                desired,
+            ),
             WriteBack::RemoveInstalled { skill } => {
                 let snap = ws.scan()?;
                 edit::remove(ws, &snap, skill, false).map(|_| format!("removed {skill} again"))
@@ -937,10 +990,49 @@ fn plan_pairs(
     Ok(actions)
 }
 
+fn group_plan(ws: &Workspace, snap: &Snapshot, intents: &[Intent], undo: bool) -> Result<Plan> {
+    let mut writes = Vec::new();
+    let ordered: Vec<_> = if undo {
+        intents.iter().rev().collect()
+    } else {
+        intents.iter().collect()
+    };
+    for intent in ordered {
+        match if undo {
+            undo_plan(ws, snap, intent)?
+        } else {
+            redo_plan(ws, snap, intent)?
+        } {
+            Plan::Write { apply, .. } => writes.push(apply),
+            Plan::Nothing(_) => {}
+            Plan::Links(_) => bail!("mixed history groups are not supported"),
+        }
+    }
+    Ok(Plan::Write {
+        describe: "restore deployment selections".into(),
+        apply: WriteBack::Group(writes),
+    })
+}
+
 /// Work out what undoing `intent` would do, against the tree as it is now.
 pub fn undo_plan(ws: &Workspace, snap: &Snapshot, intent: &Intent) -> Result<Plan> {
     match intent {
+        Intent::Group(intents) => group_plan(ws, snap, intents, true),
         // Reversed: what was added comes out, what was removed goes back.
+        Intent::TargetSelection {
+            agent,
+            project,
+            before,
+            after,
+        } => Ok(Plan::Write {
+            describe: intent.describe(),
+            apply: WriteBack::TargetSelection {
+                agent: agent.clone(),
+                project: project.clone(),
+                expected: after.clone(),
+                desired: before.clone(),
+            },
+        }),
         Intent::Links { added, removed } => links(plan_pairs(ws, snap, removed, added)?, intent),
         Intent::Meta(changes) => meta(
             ws,
@@ -969,6 +1061,21 @@ pub fn undo_plan(ws: &Workspace, snap: &Snapshot, intent: &Intent) -> Result<Pla
 /// Redoing runs the original intent again.
 pub fn redo_plan(ws: &Workspace, snap: &Snapshot, intent: &Intent) -> Result<Plan> {
     match intent {
+        Intent::Group(intents) => group_plan(ws, snap, intents, false),
+        Intent::TargetSelection {
+            agent,
+            project,
+            before,
+            after,
+        } => Ok(Plan::Write {
+            describe: intent.describe(),
+            apply: WriteBack::TargetSelection {
+                agent: agent.clone(),
+                project: project.clone(),
+                expected: before.clone(),
+                desired: after.clone(),
+            },
+        }),
         Intent::Links { added, removed } => links(plan_pairs(ws, snap, added, removed)?, intent),
         Intent::Meta(changes) => meta(ws, changes),
         // Fetching is a fresh network operation, not a reversal of a removal.

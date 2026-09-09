@@ -24,6 +24,12 @@ pub struct Cli {
     /// Skills root (overrides $SKILLS_HOME)
     #[arg(long, global = true, value_name = "DIR")]
     pub root: Option<PathBuf>,
+    /// CLI: use the project store; TUI: use the current directory for deployment scopes
+    #[arg(long, global = true, conflicts_with = "root")]
+    pub local: bool,
+    /// CLI: use <DIR>/.agents/skills; TUI: discover deployment scopes from <DIR>
+    #[arg(long, global = true, value_name = "DIR", conflicts_with = "root")]
+    pub project: Option<PathBuf>,
     /// Machine-readable JSON output
     #[arg(long, global = true)]
     pub json: bool,
@@ -254,6 +260,14 @@ pub struct AgentsArgs {
 #[derive(Subcommand, Debug)]
 pub enum AgentsCommand {
     List,
+    /// List built-in agents and their global/project directories
+    Catalog,
+    /// Register a built-in agent, or a custom agent with --dir
+    Add {
+        agent: String,
+        #[arg(long, value_name = "DIR")]
+        dir: Option<String>,
+    },
     /// Per-entry reconciliation of one or all agents
     Status {
         agent: Option<String>,
@@ -383,15 +397,57 @@ impl Ctx {
     }
 }
 
+impl Cli {
+    pub fn tui_workspace(&self) -> Result<Workspace> {
+        Workspace::open(&paths::resolve_root(self.root.as_deref())?)
+    }
+
+    pub fn workspace(&self, create: bool) -> Result<Workspace> {
+        if self.local || self.project.is_some() {
+            let project = self.project.clone().unwrap_or(std::env::current_dir()?);
+            Workspace::open_local(&project, create)
+        } else {
+            Workspace::open(&paths::resolve_root(self.root.as_deref())?)
+        }
+    }
+}
+
 pub fn run(cli: Cli) -> Result<()> {
-    let root = paths::resolve_root(cli.root.as_deref())?;
+    if matches!(
+        &cli.command,
+        Some(Command::Agents(AgentsArgs {
+            command: Some(AgentsCommand::Catalog)
+        }))
+    ) {
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(skills::agents::BUILTINS)?
+            );
+        } else {
+            for a in skills::agents::BUILTINS {
+                println!("{:<18} {:<28} {}", a.key, a.global_dir, a.local_dir);
+            }
+        }
+        return Ok(());
+    }
+    let create = matches!(
+        &cli.command,
+        Some(
+            Command::Init
+                | Command::Install(_)
+                | Command::Agents(AgentsArgs {
+                    command: Some(AgentsCommand::Add { .. })
+                })
+        )
+    );
+    let ws = cli.workspace(create)?;
     let command = cli
         .command
         .expect("dispatcher only calls run with a subcommand");
     if let Command::Init = command {
-        return cmd_init(&root, cli.json);
+        return cmd_init(&ws.root, cli.json, ws.project.is_some());
     }
-    let ws = Workspace::open(&root)?;
     let ctx = Ctx {
         ws,
         json: cli.json,
@@ -508,12 +564,16 @@ pub fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn cmd_init(root: &std::path::Path, json: bool) -> Result<()> {
+fn cmd_init(root: &std::path::Path, json: bool, local: bool) -> Result<()> {
     use skills::config::Config;
     if Config::exists(root) {
         bail!("config already exists: {}", Config::path(root).display());
     }
-    let cfg = Config::default();
+    let cfg = if local {
+        Config::local_default()
+    } else {
+        Config::default()
+    };
     cfg.save(root)?;
     if json {
         println!("{}", serde_json::json!({"created": Config::path(root)}));
@@ -617,6 +677,13 @@ fn cmd_show(ctx: &Ctx, key: &str) -> Result<()> {
     let r = snap
         .get(key)
         .with_context(|| format!("no such skill: {key}"))?;
+    // A detail request may display the hash; compute only this skill when the
+    // reconciliation did not need its content for a status comparison.
+    let mut detail = r.clone();
+    if detail.name.is_some() && detail.current_hash.is_none() {
+        detail.current_hash = skills::hash::hash_directory(&detail.path).ok();
+    }
+    let r = &detail;
     ctx.out(r, || {
         println!("key:         {}", r.key);
         if let Some(n) = &r.name {
@@ -732,6 +799,7 @@ fn print_status(snap: &Snapshot) {
 fn print_agent(a: &skills::reconcile::AgentReport) {
     let mode = match &a.mode {
         AgentDirMode::Missing => "missing".to_string(),
+        AgentDirMode::SharedRoot => "shared skills root".into(),
         AgentDirMode::DirLinked => "dir-linked (whole directory -> root)".into(),
         AgentDirMode::DirForeign { target } => format!("dir-foreign -> {}", target.display()),
         AgentDirMode::Real => {
@@ -1180,6 +1248,35 @@ fn run_actions(ctx: &Ctx, actions: &[Action], dry_run: bool) -> Result<()> {
 
 fn cmd_agents(ctx: &Ctx, c: Option<AgentsCommand>) -> Result<()> {
     match c.unwrap_or(AgentsCommand::List) {
+        AgentsCommand::Catalog => ctx.out(&skills::agents::BUILTINS, || {
+            for a in skills::agents::BUILTINS {
+                println!("{:<18} {:<28} {}", a.key, a.global_dir, a.local_dir);
+            }
+        }),
+        AgentsCommand::Add { agent, dir } => {
+            let local = ctx.ws.project.is_some();
+            let entry = match dir {
+                Some(skills_dir) => skills::config::AgentConfig {
+                    key: agent.clone(),
+                    name: agent,
+                    skills_dir,
+                },
+                None => skills::agents::BUILTINS
+                    .iter()
+                    .find(|a| a.key == agent)
+                    .with_context(|| {
+                        format!("unknown built-in agent: {agent}; use agents catalog or --dir")
+                    })?
+                    .config(local),
+            };
+            if let Some(project) = &ctx.ws.project {
+                paths::ensure_local_path(project, &project.join(entry.skills_path()))?;
+            }
+            skills::config::Config::add_agent(&ctx.ws.root, &entry, local)?;
+            ctx.out(&entry, || {
+                println!("added {}: {}", entry.key, entry.skills_dir)
+            })
+        }
         AgentsCommand::List => {
             let rows: Vec<serde_json::Value> = ctx
                 .ws
@@ -1465,4 +1562,35 @@ fn preset_links(ctx: &Ctx, name: &str, agents: &[String], dry_run: bool, on: boo
         });
     }
     run_actions(ctx, &actions, dry_run)
+}
+
+#[cfg(test)]
+mod tui_library_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn project_launch_selects_deployment_context_without_opening_a_second_library() {
+        let base = std::env::temp_dir().join(format!("skills-tui-library-{}", std::process::id()));
+        let root = base.join("library");
+        let project = base.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let mut cli = Cli::parse_from(["skills", "--root", root.to_str().unwrap()]);
+        // These fields are deliberately set directly to keep the test independent
+        // of process-wide SKILLS_HOME while checking project launch semantics.
+        cli.project = Some(project.clone());
+        cli.local = true;
+        let ws = cli.tui_workspace().unwrap();
+        assert_eq!(ws.root, root.canonicalize().unwrap());
+        assert!(ws.project.is_none());
+        assert!(!project.join(".agents").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }

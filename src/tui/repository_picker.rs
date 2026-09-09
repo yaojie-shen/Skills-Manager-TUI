@@ -272,7 +272,7 @@ impl RepositoryPicker {
         if self.focus == 1 && self.completion.active() {
             return &[
                 ("↑↓", "suggestions"),
-                ("Tab", "complete"),
+                ("Enter", "complete"),
                 ("Enter", "list"),
                 ("Esc", "close suggestions"),
             ];
@@ -290,7 +290,7 @@ impl RepositoryPicker {
             _ => &[
                 ("type", "edit"),
                 ("Enter/↓", "list"),
-                ("Tab", "focus"),
+                ("↓", "results"),
                 ("Esc", "cancel"),
             ],
         }
@@ -331,7 +331,7 @@ impl RepositoryPicker {
                     self.completion.move_by(1);
                     return vec![];
                 }
-                KeyCode::Tab => {
+                KeyCode::Enter => {
                     self.completion.accept(&mut self.search);
                     self.refilter();
                     self.update_completion(ctx);
@@ -349,7 +349,7 @@ impl RepositoryPicker {
             return vec![Action::CloseModal];
         }
         if self.focus != 2 {
-            if matches!(k.code, KeyCode::Enter | KeyCode::Down | KeyCode::Tab) {
+            if matches!(k.code, KeyCode::Enter | KeyCode::Down) {
                 if self.focus == 0 {
                     let value = self.alias.value().trim();
                     if !skills::util::valid_skill_key(value) {
@@ -403,7 +403,7 @@ impl RepositoryPicker {
             KeyCode::PageUp => self
                 .list
                 .move_by(-(self.list.rows.height as i32), self.shown.len()),
-            KeyCode::Char('/') | KeyCode::Tab => self.focus = 1,
+            KeyCode::Char('/') => self.focus = 1,
             KeyCode::Char('a') => self.focus = 0,
             KeyCode::Char('e') => {
                 if let Some(path) = self.selected()
@@ -748,7 +748,7 @@ mod tests {
         picker.search = Input::with_value("repo:sampl");
         picker.update_completion(&ctx);
         assert!(picker.completion.active());
-        picker.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &ctx);
+        picker.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx);
         assert_eq!(picker.search.value(), "repo:sample/tools ");
         for token in ["tag:", "agent:", "status:modified"] {
             picker.search = Input::with_value(token);

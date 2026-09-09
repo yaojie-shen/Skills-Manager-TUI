@@ -6,8 +6,8 @@ use super::modal::Modal;
 use super::theme::Theme;
 use super::toast::Toasts;
 use super::views::{
-    View, agents::AgentsView, health::HealthView, presets::PresetsView, search::SearchView,
-    tags::TagsView,
+    View, agents::AgentsView, health::HealthView, presets::PresetsView, repos::ReposView,
+    search::SearchView, tags::TagsView,
 };
 use super::widgets::{SPINNER, width};
 use anyhow::Result;
@@ -17,6 +17,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use skills::Workspace;
+#[cfg(test)]
 use skills::config::Config;
 use skills::history::{self, History, Plan};
 use skills::ops::deploy;
@@ -31,23 +32,26 @@ pub enum Tab {
     Presets,
     Agents,
     Health,
+    Repos,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Search,
         Tab::Tags,
         Tab::Presets,
         Tab::Agents,
         Tab::Health,
+        Tab::Repos,
     ];
     pub fn title(self) -> &'static str {
         match self {
-            Tab::Search => "Search",
+            Tab::Search => "Library",
             Tab::Tags => "Tags",
             Tab::Presets => "Presets",
             Tab::Agents => "Agents",
             Tab::Health => "Health",
+            Tab::Repos => "Repos",
         }
     }
     pub fn index(self) -> usize {
@@ -160,6 +164,7 @@ pub struct App {
     pub presets: PresetsView,
     pub agents: AgentsView,
     pub health: HealthView,
+    pub repos: ReposView,
     pub modal: Option<Modal>,
     pending_task_ui: VecDeque<Action>,
     batch_running: bool,
@@ -250,7 +255,17 @@ impl QuitPrompt {
 }
 
 impl App {
-    pub fn new(ws: Workspace, tx: Sender<Msg>) -> Result<Self> {
+    pub fn set_launch_directory(&mut self, start: &std::path::Path) -> Result<()> {
+        self.agents.discover(start)?;
+        self.on_snapshot();
+        Ok(())
+    }
+
+    pub fn new(mut ws: Workspace, tx: Sender<Msg>) -> Result<Self> {
+        Self::discover_local_agents(&mut ws)?;
+        let local_project = ws.project.clone().unwrap_or(std::env::current_dir()?);
+        let mut agents = AgentsView::default();
+        agents.discover(&local_project)?;
         let snap = ws.scan()?;
         let mut app = Self {
             ws,
@@ -260,8 +275,9 @@ impl App {
             search: SearchView::default(),
             tags: TagsView::default(),
             presets: PresetsView::default(),
-            agents: AgentsView::default(),
+            agents,
             health: HealthView::default(),
+            repos: ReposView::default(),
             modal: None,
             pending_task_ui: VecDeque::new(),
             batch_running: false,
@@ -281,6 +297,19 @@ impl App {
         Ok(app)
     }
 
+    fn discover_local_agents(ws: &mut Workspace) -> Result<()> {
+        if let Some(project) = &ws.project {
+            for agent in skills::ops::targets::candidates(ws, Some(project))? {
+                if agent.skills_path().is_dir()
+                    && !ws.config.agents.iter().any(|a| a.key == agent.key)
+                {
+                    ws.config.agents.push(agent);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn should_quit(&self) -> bool {
         self.quit
     }
@@ -296,6 +325,7 @@ impl App {
         self.presets.refresh(&ctx);
         self.agents.refresh(&ctx);
         self.health.refresh(&ctx);
+        self.repos.refresh(&ctx);
         if let Some(m) = self.modal.as_mut() {
             m.refresh(&ctx);
         }
@@ -403,6 +433,9 @@ impl App {
                     self.history.record(intent);
                 }
                 self.search.batch_finished(&outcome.failed);
+                self.tags.batch_finished(&outcome.failed);
+                self.presets.batch_finished(&outcome.failed);
+                self.repos.batch_finished(&outcome.failed);
                 if outcome.errors.is_empty() {
                     self.modal = None;
                     self.toast(outcome.message, Level::Ok);
@@ -450,7 +483,7 @@ impl App {
                     actions.extend([
                         Action::Rescan,
                         Action::Toast(format!(
-                            "installed {} skills — d deploys the selected skill",
+                            "installed {} skills — choose destination agents",
                             keys.len()
                         )),
                         Action::Search {
@@ -462,6 +495,14 @@ impl App {
                             focus_list: true,
                         },
                     ]);
+                    actions.push(Action::OpenModal(Box::new(Modal::batch_deploy(
+                        keys,
+                        &Ctx {
+                            ws: &self.ws,
+                            snap: &self.snap,
+                            theme: &self.theme,
+                        },
+                    ))));
                     actions
                 }
                 Err(e) => vec![
@@ -513,11 +554,19 @@ impl App {
             TaskOutput::Installed(_, Ok(key)) => vec![
                 Action::Record(history::Intent::Install { skill: key.clone() }),
                 Action::Rescan,
-                Action::Toast(format!("installed {key} — press d to deploy it")),
+                Action::Toast(format!("installed {key} — choose destination agents")),
                 Action::Search {
-                    query: key,
+                    query: key.clone(),
                     focus_list: true,
                 },
+                Action::OpenModal(Box::new(Modal::batch_deploy(
+                    vec![key],
+                    &Ctx {
+                        ws: &self.ws,
+                        snap: &self.snap,
+                        theme: &self.theme,
+                    },
+                ))),
             ],
             // Legacy git installs with several skills enter the shared repository picker.
             TaskOutput::Installed(reference, Err(e)) => {
@@ -543,8 +592,11 @@ impl App {
         }
         match self.tab {
             Tab::Search => self.search.paste(text, &ctx),
-            Tab::Tags => self.tags.paste(text),
-            _ => vec![],
+            Tab::Tags => self.tags.paste(text, &ctx),
+            Tab::Presets => self.presets.paste(text, &ctx),
+            Tab::Health => self.health.paste(text, &ctx),
+            Tab::Repos => self.repos.paste(text, &ctx),
+            Tab::Agents => self.agents.paste(text),
         }
     }
 
@@ -552,7 +604,7 @@ impl App {
         if let Some(prompt) = self.quit_prompt.as_mut() {
             match k.code {
                 KeyCode::Esc => self.quit_prompt = None,
-                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                KeyCode::Left | KeyCode::Right => {
                     prompt.quit_selected = !prompt.quit_selected;
                 }
                 KeyCode::Enter => {
@@ -574,6 +626,19 @@ impl App {
             snap: &self.snap,
             theme: &self.theme,
         };
+        if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
+            if self.modal.is_some() || (self.tab == Tab::Tags && self.tags.dialog_open()) {
+                return vec![];
+            }
+            let delta = if k.code == KeyCode::Tab {
+                1
+            } else {
+                Tab::ALL.len() - 1
+            };
+            return vec![Action::SwitchTab(
+                Tab::ALL[(self.tab.index() + delta) % Tab::ALL.len()],
+            )];
+        }
         if let Some(m) = self.modal.as_mut() {
             return m.handle_key(k, &ctx);
         }
@@ -584,8 +649,24 @@ impl App {
         }
         // Any text field that holds the keyboard keeps its digits and slashes;
         // the Tags page has one of its own for colours and merge targets.
+        if self.modal.is_none()
+            && self.tab == Tab::Agents
+            && (self.agents.editing() || k.code == KeyCode::Char('/'))
+        {
+            return self.agents.handle_key(
+                k,
+                &Ctx {
+                    ws: &self.ws,
+                    snap: &self.snap,
+                    theme: &self.theme,
+                },
+            );
+        }
         let in_search_input = (self.tab == Tab::Search && self.search.input_focused())
-            || (self.tab == Tab::Tags && self.tags.input_focused());
+            || (self.tab == Tab::Tags && self.tags.input_focused())
+            || (self.tab == Tab::Presets && self.presets.input_focused())
+            || (self.tab == Tab::Health && self.health.input_focused())
+            || (self.tab == Tab::Repos && self.repos.input_focused());
         match (k.code, k.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return vec![Action::Quit],
             (KeyCode::Char('z'), KeyModifiers::CONTROL) => return self.step(Step::Undo),
@@ -600,24 +681,8 @@ impl App {
             (KeyCode::Char('?'), _) if !in_search_input => {
                 return vec![Action::OpenModal(Box::new(Modal::help()))];
             }
-            (KeyCode::Char(c @ '1'..='5'), KeyModifiers::NONE) if !in_search_input => {
+            (KeyCode::Char(c @ '1'..='6'), KeyModifiers::NONE) if !in_search_input => {
                 return vec![Action::SwitchTab(Tab::ALL[(c as u8 - b'1') as usize])];
-            }
-            (KeyCode::Tab, _) if self.tab != Tab::Search => {
-                return vec![Action::SwitchTab(
-                    Tab::ALL[(self.tab.index() + 1) % Tab::ALL.len()],
-                )];
-            }
-            (KeyCode::BackTab, _) if self.tab != Tab::Search => {
-                return vec![Action::SwitchTab(
-                    Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()],
-                )];
-            }
-            (KeyCode::Char('/'), _) if !in_search_input => {
-                return vec![Action::Search {
-                    query: self.search.query(),
-                    focus_list: false,
-                }];
             }
             _ => {}
         }
@@ -627,6 +692,7 @@ impl App {
             Tab::Presets => self.presets.handle_key(k, &ctx),
             Tab::Agents => self.agents.handle_key(k, &ctx),
             Tab::Health => self.health.handle_key(k, &ctx),
+            Tab::Repos => self.repos.handle_key(k, &ctx),
         }
     }
 
@@ -671,6 +737,7 @@ impl App {
             Tab::Presets => self.presets.handle_mouse(m, &ctx),
             Tab::Agents => self.agents.handle_mouse(m, &ctx),
             Tab::Health => self.health.handle_mouse(m, &ctx),
+            Tab::Repos => self.repos.handle_mouse(m, &ctx),
         }
     }
 
@@ -865,6 +932,11 @@ impl App {
             return;
         }
         self.search.clear_selection();
+        self.search.restore_results(&Ctx {
+            ws: &self.ws,
+            snap: &self.snap,
+            theme: &self.theme,
+        });
         self.tab = t;
         let view: &mut dyn View = match t {
             Tab::Search => &mut self.search,
@@ -872,6 +944,7 @@ impl App {
             Tab::Presets => &mut self.presets,
             Tab::Agents => &mut self.agents,
             Tab::Health => &mut self.health,
+            Tab::Repos => &mut self.repos,
         };
         view.enter();
     }
@@ -984,8 +1057,13 @@ impl App {
         // desired state `sync` plans from, in step with what is written. A
         // file that no longer parses is reported and the last good copy kept,
         // since a hand edit in progress should not take the program down.
-        match Config::load(&self.ws.root) {
-            Ok(config) => self.ws.config = config,
+        match self.ws.load_config() {
+            Ok(config) => {
+                self.ws.config = config;
+                if let Err(e) = Self::discover_local_agents(&mut self.ws) {
+                    self.toast(format!("{e:#}"), Level::Error);
+                }
+            }
             Err(e) => self.toast(format!("{e:#}"), Level::Error),
         }
         self.spawn(Task::Scan);
@@ -998,7 +1076,7 @@ impl App {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
+                Constraint::Length(2),
                 Constraint::Min(3),
                 Constraint::Length(1),
             ])
@@ -1016,6 +1094,7 @@ impl App {
             Tab::Presets => self.presets.draw(f, rows[1], &ctx),
             Tab::Agents => self.agents.draw(f, rows[1], &ctx),
             Tab::Health => self.health.draw(f, rows[1], &ctx),
+            Tab::Repos => self.repos.draw(f, rows[1], &ctx),
         }
         self.draw_footer(f, rows[2]);
         if let Some(m) = self.modal.as_mut() {
@@ -1051,12 +1130,29 @@ impl App {
             spans.push(Span::raw(" "));
             x += w + 1;
         }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        if area.height < 2 {
+            return;
+        }
+        let mut spans = vec![Span::styled(" Library ", th.dim())];
+        x = area.x + width(" Library ") as u16;
         let used = (x - area.x) as usize;
         let available = (area.width as usize).saturating_sub(used);
         let right = if self.tasks_running > 0 {
             super::widgets::fit(&format!("{} working  ", SPINNER[self.spinner]), available)
         } else {
-            let path = skills::paths::contract_tilde(&self.snap.root);
+            let path = format!(
+                "{}{}",
+                if self.ws.project.is_some() {
+                    "local: "
+                } else {
+                    ""
+                },
+                skills::paths::contract_tilde(&self.snap.root)
+            );
             let tail_space = available.min(2);
             format!(
                 "{}{}",
@@ -1067,7 +1163,10 @@ impl App {
         let pad = (area.width as usize).saturating_sub(used + width(&right));
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(right, th.dim()));
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        f.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        );
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
@@ -1081,6 +1180,7 @@ impl App {
                 Tab::Presets => self.presets.hints(),
                 Tab::Agents => self.agents.hints(),
                 Tab::Health => self.health.hints(),
+                Tab::Repos => self.repos.hints(),
             }
         };
         // Results moved out to the notification stack, so the footer is only keys.
@@ -1106,7 +1206,7 @@ impl App {
 pub type Hints = &'static [(&'static str, &'static str)];
 
 /// Fit the root into its header allocation while keeping the directory tail.
-fn middle_ellipsis(text: &str, max: usize) -> String {
+pub(crate) fn middle_ellipsis(text: &str, max: usize) -> String {
     use unicode_segmentation::UnicodeSegmentation;
     if width(text) <= max {
         return text.to_owned();
@@ -1208,7 +1308,13 @@ mod matrix_key_tests {
             1,
             "12/30 complete · querying printer…".into(),
         ));
-        for tab in [Tab::Tags, Tab::Presets, Tab::Agents, Tab::Health] {
+        for tab in [
+            Tab::Tags,
+            Tab::Presets,
+            Tab::Agents,
+            Tab::Health,
+            Tab::Repos,
+        ] {
             app.switch_tab(tab);
             app.handle(Msg::Key(KeyEvent::new(
                 KeyCode::Char('q'),
@@ -1525,12 +1631,15 @@ mod matrix_key_tests {
         app.tab = Tab::Agents;
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         assert!(app.on_key(key(KeyCode::Char('M'))).is_empty());
-        for code in [
-            KeyCode::Tab,
-            KeyCode::BackTab,
-            KeyCode::Char('/'),
-            KeyCode::Char('1'),
-        ] {
+        assert!(matches!(
+            app.on_key(key(KeyCode::Tab)).as_slice(),
+            [Action::SwitchTab(Tab::Health)]
+        ));
+        assert!(matches!(
+            app.on_key(key(KeyCode::BackTab)).as_slice(),
+            [Action::SwitchTab(Tab::Presets)]
+        ));
+        for code in [KeyCode::Char('/'), KeyCode::Char('1')] {
             assert!(app.on_key(key(code)).is_empty());
             assert_eq!(app.tab, Tab::Agents);
         }
@@ -1543,6 +1652,107 @@ mod matrix_key_tests {
             app.on_key(key(KeyCode::BackTab)).as_slice(),
             [Action::SwitchTab(Tab::Presets)]
         ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    #[test]
+    fn deployment_scopes_do_not_switch_the_central_library() {
+        let base = std::env::temp_dir().join(format!("skills-tui-scope-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("root")).unwrap();
+        std::fs::create_dir_all(base.join("project/.git")).unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&base.join("root"))
+        .unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&base.join("root")).unwrap(), tx).unwrap();
+        app.agents.discover(&base.join("project")).unwrap();
+        app.on_snapshot();
+        app.tab = Tab::Agents;
+        app.history.record(history::Intent::Install {
+            skill: "session-step".into(),
+        });
+        let root = app.ws.root.clone();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        assert_eq!(app.ws.root, root);
+        assert!(!app.history.is_empty());
+        assert!(!base.join("project/.agents").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod panel_navigation_tests {
+    use super::*;
+
+    #[test]
+    fn tab_changes_pages_from_inputs_and_returning_clears_temporary_library_scope() {
+        let root = std::env::temp_dir().join(format!("skills-tab-panels-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        for name in ["alpha", "beta"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(
+                root.join(name).join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: tools\n---\nBody"),
+            )
+            .unwrap();
+        }
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.search.focus_input();
+        assert!(matches!(
+            app.on_key(key(KeyCode::Tab)).as_slice(),
+            [Action::SwitchTab(Tab::Tags)]
+        ));
+        app.apply(Action::SelectSkills {
+            keys: vec!["alpha".into()],
+            title: "Temporary selection".into(),
+            checked: None,
+        });
+        app.switch_tab(Tab::Tags);
+        app.switch_tab(Tab::Search);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("beta"));
+        assert!(text.contains("2/2 local"));
+        assert!(!text.contains("Temporary selection"));
+        app.switch_tab(Tab::Tags);
+        app.on_key(key(KeyCode::Char('/')));
+        for c in "tag123/".chars() {
+            assert!(app.on_key(key(KeyCode::Char(c))).is_empty());
+        }
+        assert_eq!(app.tab, Tab::Tags);
+        assert!(matches!(
+            app.on_key(key(KeyCode::Tab)).as_slice(),
+            [Action::SwitchTab(Tab::Presets)]
+        ));
+        app.modal = Some(Modal::new_preset());
+        assert!(app.on_key(key(KeyCode::Tab)).is_empty());
+        assert!(app.modal.is_some());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

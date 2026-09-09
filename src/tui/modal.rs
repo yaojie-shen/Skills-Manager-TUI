@@ -16,7 +16,7 @@ use skills::ops::deploy;
 use skills::ops::edit;
 use skills::ops::install;
 use skills::ops::update::{self, FileChange, Prepared, Take};
-use skills::reconcile::{AgentDirMode, DeployState, EntryState};
+use skills::reconcile::{AgentDirMode, EntryState};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -40,6 +40,7 @@ pub enum InputKind {
 }
 
 pub enum Modal {
+    DeployTargets(Box<super::deploy_picker::DeployPicker>),
     PresetSkills(Box<SearchView>),
     Batch(Box<super::batch::Batch>),
     NameConflict {
@@ -87,11 +88,6 @@ pub enum Modal {
         hint: String,
         rect: Rect,
     },
-    AgentPick {
-        skill: String,
-        list: ListNav,
-        rect: Rect,
-    },
     /// Browse installed repositories; skill pickers use SearchView or RepositoryPicker.
     Picker {
         title: String,
@@ -123,7 +119,7 @@ impl Modal {
         Self::Batch(Box::new(super::batch::Batch::tags(keys, ctx)))
     }
     pub fn batch_deploy(keys: Vec<String>, ctx: &Ctx) -> Self {
-        Self::Batch(Box::new(super::batch::Batch::deploy(keys, ctx)))
+        Self::DeployTargets(Box::new(super::deploy_picker::DeployPicker::new(keys, ctx)))
     }
     pub fn batch_deploy_agent(keys: Vec<String>, agent: &str, ctx: &Ctx) -> Self {
         Self::Batch(Box::new(super::batch::Batch::deploy_agent(
@@ -181,7 +177,7 @@ impl Modal {
             Box::new(move |ws| write(ws).map(|m| (m, None))),
         )
     }
-    fn confirm_meta(title: String, lines: Vec<String>, write: MetaFn) -> Self {
+    pub(crate) fn confirm_meta(title: String, lines: Vec<String>, write: MetaFn) -> Self {
         Modal::ConfirmWrite {
             title,
             lines,
@@ -520,15 +516,6 @@ impl Modal {
         self
     }
 
-    pub fn agent_pick(skill: &str) -> Self {
-        let mut list = ListNav::default();
-        list.select(Some(0));
-        Modal::AgentPick {
-            skill: skill.into(),
-            list,
-            rect: Rect::default(),
-        }
-    }
     pub fn resolve(prepared: Prepared) -> Self {
         let files: Vec<(String, FileChange, Take)> = prepared
             .files
@@ -558,11 +545,7 @@ impl Modal {
         }
     }
 
-    pub fn refresh(&mut self, ctx: &Ctx) {
-        if let Modal::AgentPick { list, .. } = self {
-            list.clamp(ctx.snap.agents.len());
-        }
-    }
+    pub fn refresh(&mut self, _ctx: &Ctx) {}
 
     pub fn hints(&self) -> Hints {
         match self {
@@ -570,6 +553,7 @@ impl Modal {
             Modal::PresetSkills(view) => view.hints(),
             Modal::Batch(p) => p.hints(),
             Modal::Repository(p) => p.hints(),
+            Modal::DeployTargets(p) => p.hints(),
             Modal::Help { .. } | Modal::Message { .. } => &[("Esc", "close")],
             Modal::Confirm { .. } | Modal::ConfirmWrite { .. } => {
                 &[("Enter/y", "apply"), ("Esc/n", "cancel"), ("←→", "buttons")]
@@ -583,7 +567,7 @@ impl Modal {
                 input_focus: true, ..
             } => &[
                 ("type", "filter"),
-                ("↓/Tab", "list"),
+                ("↓", "list"),
                 ("Enter", "browse"),
                 ("Esc", "close"),
             ],
@@ -592,10 +576,9 @@ impl Modal {
                 ("u", "check repo"),
                 ("U", "update repo"),
                 ("↑↓", "move"),
-                ("/Tab", "filter"),
+                ("/", "filter"),
                 ("Esc", "close"),
             ],
-            Modal::AgentPick { .. } => &[("Space/Enter", "toggle"), ("Esc", "close")],
             Modal::Resolve { .. } => &[
                 ("Space", "toggle side"),
                 ("l/u", "all local/upstream"),
@@ -612,6 +595,7 @@ impl Modal {
             Modal::PresetSkills(view) => view.paste(text, ctx),
             Modal::Batch(picker) => picker.paste(text),
             Modal::Repository(picker) => picker.paste(text, ctx),
+            Modal::DeployTargets(p) => p.paste(text),
             Modal::Input { input, .. } => match input.paste(text) {
                 Ok(_) => vec![],
                 Err(error) => vec![Action::Error(error.into())],
@@ -657,6 +641,7 @@ impl Modal {
             Modal::PresetSkills(view) => view.handle_key(k, ctx),
             Modal::Batch(p) => p.key(k, ctx),
             Modal::Repository(p) => p.key(k, ctx),
+            Modal::DeployTargets(p) => p.key(k, ctx),
             Modal::Help { scroll } | Modal::Message { scroll, .. } => match k.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     *scroll = scroll.saturating_add(1);
@@ -688,11 +673,7 @@ impl Modal {
                 KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
                     vec![Action::CloseModal]
                 }
-                KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Tab
-                | KeyCode::Char('h')
-                | KeyCode::Char('l') => {
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
                     *btn = 1 - *btn;
                     vec![]
                 }
@@ -726,11 +707,7 @@ impl Modal {
                 KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
                     vec![Action::CloseModal]
                 }
-                KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Tab
-                | KeyCode::Char('h')
-                | KeyCode::Char('l') => {
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
                     *btn = 1 - *btn;
                     vec![]
                 }
@@ -747,30 +724,6 @@ impl Modal {
                     vec![]
                 }
             },
-            Modal::AgentPick { skill, list, .. } => {
-                let n = ctx.snap.agents.len();
-                match k.code {
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('d') => {
-                        vec![Action::CloseModal]
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        list.move_by(1, n);
-                        vec![]
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        list.move_by(-1, n);
-                        vec![]
-                    }
-                    KeyCode::Enter | KeyCode::Char(' ') => list
-                        .selected()
-                        .map(|i| toggle_agent(ctx, skill, i))
-                        .unwrap_or_default(),
-                    KeyCode::Char(c @ '1'..='9') => {
-                        toggle_agent(ctx, skill, (c as u8 - b'1') as usize)
-                    }
-                    _ => vec![],
-                }
-            }
             Modal::Picker {
                 input,
                 input_focus,
@@ -814,7 +767,6 @@ impl Modal {
                 }
                 match k.code {
                     KeyCode::Esc => return vec![Action::CloseModal],
-                    KeyCode::Tab => *input_focus = !*input_focus,
                     KeyCode::Down | KeyCode::Char('n') if k.code == KeyCode::Down || ctrl => {
                         if *input_focus {
                             *input_focus = false;
@@ -883,7 +835,7 @@ impl Modal {
                         *default_take = Take::Upstream;
                         vec![]
                     }
-                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    KeyCode::Left | KeyCode::Right => {
                         *btn = 1 - *btn;
                         vec![]
                     }
@@ -953,6 +905,7 @@ impl Modal {
             Modal::PresetSkills(view) => view.handle_mouse(m, ctx),
             Modal::Batch(p) => p.mouse(m, ctx),
             Modal::Repository(p) => p.mouse(m, ctx),
+            Modal::DeployTargets(p) => p.mouse(m, ctx),
             Modal::Help { scroll } | Modal::Message { scroll, .. } => {
                 if let Some(d) = wheel {
                     *scroll = (*scroll as i32 + d).max(0) as u16;
@@ -1009,20 +962,6 @@ impl Modal {
                         return vec![Action::CloseModal];
                     }
                     input.click(m.column);
-                }
-                vec![]
-            }
-            Modal::AgentPick { skill, list, rect } => {
-                let n = ctx.snap.agents.len();
-                if let Some(d) = wheel {
-                    list.move_by(d, n);
-                } else if click {
-                    if !rect.contains(at) {
-                        return vec![Action::CloseModal];
-                    }
-                    if let Some((i, _)) = list.click(m.row, n) {
-                        return toggle_agent(ctx, skill, i);
-                    }
                 }
                 vec![]
             }
@@ -1173,13 +1112,14 @@ impl Modal {
                     area.height.saturating_sub(2),
                 );
                 f.render_widget(Clear, r);
-                let block = th.block(" Preset skills ", true);
+                let block = th.block(view.picker_title(), true);
                 let inner = block.inner(r);
                 f.render_widget(block, r);
                 view.draw(f, inner, ctx);
             }
             Modal::Batch(p) => p.draw(f, area, ctx),
             Modal::Repository(p) => p.draw(f, area, ctx),
+            Modal::DeployTargets(p) => p.draw(f, area, ctx),
             Modal::Help { scroll } => {
                 let lines: Vec<Line> = HELP.lines().map(|l| help_line(l, th)).collect();
                 let r = centered(area, 78, lines.len() as u16 + 2);
@@ -1302,50 +1242,6 @@ impl Modal {
                         height: inner.height.saturating_sub(1),
                     },
                 );
-            }
-            Modal::AgentPick { skill, list, rect } => {
-                let rec = ctx.snap.get(skill);
-                let items: Vec<ListItem> = ctx
-                    .snap
-                    .agents
-                    .iter()
-                    .enumerate()
-                    .map(|(i, a)| {
-                        let st = rec.and_then(|r| r.deploy.get(&a.key));
-                        let (mark, style) = match st {
-                            Some(DeployState::Deployed) => ("✓", th.ok()),
-                            Some(DeployState::NotDeployed)
-                            | Some(DeployState::NoAgentDir)
-                            | None => ("—", th.dim()),
-                            Some(DeployState::Broken) => ("!", th.err()),
-                            _ => ("~", th.warn()),
-                        };
-                        let note = match st {
-                            Some(DeployState::Shadow { .. }) => {
-                                "  shadow: real dir in agent, not touched"
-                            }
-                            Some(DeployState::Foreign) => "  foreign link, not touched",
-                            Some(DeployState::NoAgentDir) => "  dir will be created",
-                            _ => "",
-                        };
-                        ListItem::new(Line::from(vec![
-                            Span::styled(format!("[{mark}] "), style),
-                            Span::styled(format!("{} ", i + 1), th.dim()),
-                            Span::raw(format!("{:<10}", a.key)),
-                            Span::styled(a.name.clone(), th.dim()),
-                            Span::styled(note, th.dim()),
-                        ]))
-                    })
-                    .collect();
-                let r = centered(area, 64, items.len() as u16 + 2);
-                *rect = r;
-                f.render_widget(Clear, r);
-                list.set_area_from_block(r);
-                let w = List::new(items)
-                    .block(th.block(format!(" deploy {skill} "), true))
-                    .highlight_style(th.selected())
-                    .highlight_symbol("▸ ");
-                f.render_stateful_widget(w, r, &mut list.state);
             }
             Modal::Picker {
                 title,
@@ -1581,43 +1477,6 @@ fn apply_links(actions: Vec<deploy::Action>, then: Option<Step>) -> Vec<Action> 
     }
 }
 
-fn toggle_agent(ctx: &Ctx, skill: &str, idx: usize) -> Vec<Action> {
-    let Some(agent) = ctx.ws.config.agents.get(idx) else {
-        return vec![];
-    };
-    let Some(rec) = ctx.snap.get(skill) else {
-        return vec![Action::CloseModal];
-    };
-    let deployed = matches!(rec.deploy.get(&agent.key), Some(DeployState::Deployed));
-    let plan = if deployed {
-        deploy::plan_undeploy(
-            ctx.ws,
-            ctx.snap,
-            std::slice::from_ref(&rec.key),
-            std::slice::from_ref(&agent.key),
-        )
-    } else {
-        deploy::plan_deploy(
-            ctx.ws,
-            ctx.snap,
-            std::slice::from_ref(&rec.key),
-            std::slice::from_ref(&agent.key),
-        )
-    };
-    match plan {
-        Ok(actions) => vec![Action::ApplyLinks {
-            title: format!(
-                "{} {} on {}",
-                if deployed { "undeploy" } else { "deploy" },
-                rec.key,
-                agent.key
-            ),
-            actions,
-        }],
-        Err(e) => vec![Action::Error(format!("{e:#}"))],
-    }
-}
-
 fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
     match kind {
         InputKind::Rename { skill } => {
@@ -1840,10 +1699,11 @@ fn help_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
     }
 }
 
-const HELP: &str = "Search
+const HELP: &str = "Library
   type              fuzzy search over name, tags, description, note
-  tag:x agent:y     filters; also status:modified  source:git  untagged
-  Enter / Tab       move focus: input → list → preview   (Esc goes back)
+  tag:x agent:y     filters; also status:managed  source:git  untagged
+  Enter             accept a suggestion / open results / preview
+  arrows            navigate panels and lists (Esc goes back)
   i                 install a skill from a repo or a local path
   t  n  d           tags / note in $EDITOR / deploy picker
   r  s              rename the skill / set where it came from
@@ -1853,7 +1713,15 @@ const HELP: &str = "Search
   t  d  p           selected skills: tags / deploy / add to preset
   Esc               cancel multi-select; hidden selections never participate
   u  U              check upstream / update from upstream (git sources)
+Tags / Presets
+  /                 filter names on the left or skills on the right
+  arrows            navigate lists and move between panels
+  m                 multi-select skills in the current panel
+  Ctrl-A            select current skill results; hidden selections are excluded
+  t / d / p         batch tags / deploy / add to preset
+  x                 in Presets: remove selected skills from that preset
 Agents
+  /                 filter preset pills or skills, according to focus
   a                 adopt an entry the agent has but the root does not
 Mouse
   click             focus panes, select rows, press buttons, switch tabs
@@ -1862,9 +1730,9 @@ Mouse
   wheel             scroll lists and preview
 Global
   Ctrl-Z  Ctrl-Y    undo and redo the last change
-  1-5               switch tabs outside text inputs
-  Tab / Shift-Tab   next / previous tab outside Search
-  /                 back to search      Ctrl-R  rescan      Ctrl-C  quit";
+  1-6               switch tabs outside text inputs
+  Tab / Shift-Tab   next / previous top-level tab (close editing dialogs first)
+  /                 search the focused panel      Ctrl-R  rescan      Ctrl-C  quit";
 
 fn repository_query(alias: &str, ctx: &Ctx) -> String {
     let name = ctx
@@ -1982,7 +1850,7 @@ mod picker_tests {
             (true, Some(0)),
             "up from first row restores filter"
         );
-        modal.handle_key(key(KeyCode::Tab), &ctx);
+        modal.handle_key(key(KeyCode::Down), &ctx);
         assert_eq!(state(&modal), (false, Some(0)));
         let actions = modal.handle_key(key(KeyCode::Enter), &ctx);
         assert!(

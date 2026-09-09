@@ -66,3 +66,32 @@ pub fn resolve_root(flag: Option<&Path>) -> Result<PathBuf> {
 pub fn meta_dir(root: &Path) -> PathBuf {
     root.join(META_DIR)
 }
+
+/// Refuse project targets escaping through `..` or an existing symlink ancestor.
+pub fn ensure_local_path(project: &Path, path: &Path) -> Result<()> {
+    if !path.starts_with(project)
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("local path must stay inside project: {}", path.display());
+    }
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let resolved = std::fs::canonicalize(ancestor)
+                    .with_context(|| format!("resolving local path {}", ancestor.display()))?;
+                if !resolved.starts_with(project) {
+                    bail!(
+                        "local path escapes project through symlink: {}",
+                        path.display()
+                    );
+                }
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}

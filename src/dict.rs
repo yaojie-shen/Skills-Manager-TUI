@@ -12,7 +12,7 @@ use crate::config::DictionaryWeights;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 const TECH_GZ: &[u8] = include_bytes!("../data/dict/tech.tsv.gz");
 const COMMON_GZ: &[u8] = include_bytes!("../data/dict/common.tsv.gz");
@@ -113,12 +113,12 @@ fn decode(gz: &[u8]) -> Table {
     Table::parse(&text)
 }
 
-fn builtin(source: Source) -> &'static Table {
-    static TECH: OnceLock<Table> = OnceLock::new();
-    static COMMON: OnceLock<Table> = OnceLock::new();
+fn builtin(source: Source) -> &'static Arc<Table> {
+    static TECH: OnceLock<Arc<Table>> = OnceLock::new();
+    static COMMON: OnceLock<Arc<Table>> = OnceLock::new();
     match source {
-        Source::Tech => TECH.get_or_init(|| decode(TECH_GZ)),
-        Source::Common => COMMON.get_or_init(|| decode(COMMON_GZ)),
+        Source::Tech => TECH.get_or_init(|| Arc::new(decode(TECH_GZ))),
+        Source::Common => COMMON.get_or_init(|| Arc::new(decode(COMMON_GZ))),
         Source::User => unreachable!("the user table is not built in"),
     }
 }
@@ -126,7 +126,7 @@ fn builtin(source: Source) -> &'static Table {
 /// The weighted set of tables a search runs against.
 #[derive(Debug, Default, Clone)]
 pub struct Dictionaries {
-    entries: Vec<(Source, f32, Table)>,
+    entries: Vec<(Source, f32, Arc<Table>)>,
 }
 
 impl Dictionaries {
@@ -144,7 +144,7 @@ impl Dictionaries {
         {
             let table = Table::parse(&text);
             if !table.is_empty() {
-                d.entries.push((Source::User, w.user, table));
+                d.entries.push((Source::User, w.user, Arc::new(table)));
             }
         }
         d
@@ -152,7 +152,12 @@ impl Dictionaries {
 
     /// Build directly from tables, for tests and callers with their own data.
     pub fn from_tables(entries: Vec<(Source, f32, Table)>) -> Dictionaries {
-        Dictionaries { entries }
+        Dictionaries {
+            entries: entries
+                .into_iter()
+                .map(|(source, weight, table)| (source, weight, Arc::new(table)))
+                .collect(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -224,6 +229,47 @@ mod tests {
 
     fn weights() -> DictionaryWeights {
         DictionaryWeights::default()
+    }
+
+    #[test]
+    fn reload_shares_builtins_but_reads_updated_user_entries() {
+        let root = std::env::temp_dir().join(format!("skills-dict-reload-{}", std::process::id()));
+        let meta = crate::paths::meta_dir(&root);
+        std::fs::create_dir_all(&meta).unwrap();
+        let path = meta.join(USER_FILE);
+        std::fs::write(&path, "fixture-term\t旧词\n").unwrap();
+        let weights = DictionaryWeights {
+            user: 1.0,
+            ..Default::default()
+        };
+        let before = Dictionaries::load(&root, &weights);
+        std::fs::write(&path, "fixture-term\t新词\n").unwrap();
+        let after = Dictionaries::load(&root, &weights);
+        let table = |d: &Dictionaries, source| {
+            d.entries
+                .iter()
+                .find(|(s, _, _)| *s == source)
+                .unwrap()
+                .2
+                .clone()
+        };
+        assert!(Arc::ptr_eq(
+            &table(&before, Source::Tech),
+            &table(&after, Source::Tech)
+        ));
+        assert!(Arc::ptr_eq(
+            &table(&before, Source::Common),
+            &table(&after, Source::Common)
+        ));
+        assert_eq!(
+            table(&before, Source::User).en_to_zh("fixture-term"),
+            &["旧词"]
+        );
+        assert_eq!(
+            table(&after, Source::User).en_to_zh("fixture-term"),
+            &["新词"]
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
