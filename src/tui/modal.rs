@@ -567,7 +567,7 @@ impl Modal {
                 input_focus: true, ..
             } => &[
                 ("type", "filter"),
-                ("↓/Tab", "list"),
+                ("↓", "list"),
                 ("Enter", "browse"),
                 ("Esc", "close"),
             ],
@@ -576,7 +576,7 @@ impl Modal {
                 ("u", "check repo"),
                 ("U", "update repo"),
                 ("↑↓", "move"),
-                ("/Tab", "filter"),
+                ("/", "filter"),
                 ("Esc", "close"),
             ],
             Modal::Resolve { .. } => &[
@@ -673,11 +673,7 @@ impl Modal {
                 KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
                     vec![Action::CloseModal]
                 }
-                KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Tab
-                | KeyCode::Char('h')
-                | KeyCode::Char('l') => {
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
                     *btn = 1 - *btn;
                     vec![]
                 }
@@ -711,11 +707,7 @@ impl Modal {
                 KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
                     vec![Action::CloseModal]
                 }
-                KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Tab
-                | KeyCode::Char('h')
-                | KeyCode::Char('l') => {
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
                     *btn = 1 - *btn;
                     vec![]
                 }
@@ -775,7 +767,6 @@ impl Modal {
                 }
                 match k.code {
                     KeyCode::Esc => return vec![Action::CloseModal],
-                    KeyCode::Tab => *input_focus = !*input_focus,
                     KeyCode::Down | KeyCode::Char('n') if k.code == KeyCode::Down || ctrl => {
                         if *input_focus {
                             *input_focus = false;
@@ -844,7 +835,7 @@ impl Modal {
                         *default_take = Take::Upstream;
                         vec![]
                     }
-                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    KeyCode::Left | KeyCode::Right => {
                         *btn = 1 - *btn;
                         vec![]
                     }
@@ -1711,7 +1702,8 @@ fn help_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
 const HELP: &str = "Library
   type              fuzzy search over name, tags, description, note
   tag:x agent:y     filters; also status:managed  source:git  untagged
-  Enter / Tab       move focus: input → list → preview   (Esc goes back)
+  Enter             accept a suggestion / open results / preview
+  arrows            navigate panels and lists (Esc goes back)
   i                 install a skill from a repo or a local path
   t  n  d           tags / note in $EDITOR / deploy picker
   r  s              rename the skill / set where it came from
@@ -1721,7 +1713,15 @@ const HELP: &str = "Library
   t  d  p           selected skills: tags / deploy / add to preset
   Esc               cancel multi-select; hidden selections never participate
   u  U              check upstream / update from upstream (git sources)
+Tags / Presets
+  /                 filter names on the left or skills on the right
+  arrows            navigate lists and move between panels
+  m                 multi-select skills in the current panel
+  Ctrl-A            select current skill results; hidden selections are excluded
+  t / d / p         batch tags / deploy / add to preset
+  x                 in Presets: remove selected skills from that preset
 Agents
+  /                 filter preset pills or skills, according to focus
   a                 adopt an entry the agent has but the root does not
 Mouse
   click             focus panes, select rows, press buttons, switch tabs
@@ -1731,8 +1731,8 @@ Mouse
 Global
   Ctrl-Z  Ctrl-Y    undo and redo the last change
   1-6               switch tabs outside text inputs
-  Tab / Shift-Tab   next / previous tab outside Library
-  /                 back to Library      Ctrl-R  rescan      Ctrl-C  quit";
+  Tab / Shift-Tab   next / previous top-level tab (close editing dialogs first)
+  /                 search the focused panel      Ctrl-R  rescan      Ctrl-C  quit";
 
 fn repository_query(alias: &str, ctx: &Ctx) -> String {
     let name = ctx
@@ -1850,7 +1850,7 @@ mod picker_tests {
             (true, Some(0)),
             "up from first row restores filter"
         );
-        modal.handle_key(key(KeyCode::Tab), &ctx);
+        modal.handle_key(key(KeyCode::Down), &ctx);
         assert_eq!(state(&modal), (false, Some(0)));
         let actions = modal.handle_key(key(KeyCode::Enter), &ctx);
         assert!(

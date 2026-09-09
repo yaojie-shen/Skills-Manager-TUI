@@ -1,7 +1,6 @@
 //! Tags tab: the tags themselves, and a look at what carries each one.
 //!
-//! Searching by tag is the search page's job (`tag:x`). This page is where a
-//! tag is managed as a thing in its own right: renamed, merged into another,
+//! Each pane filters its own collection. A tag can be managed directly: renamed, merged into another,
 //! deleted, given a colour. The left column is one row per tag, drawn as the
 //! same capsule the cards use so a colour is seen where it is set; the right
 //! pane is the skills under the selected tag, as the cards the search and
@@ -58,6 +57,9 @@ const NO_COLOR: &str = "none";
 pub struct TagsView {
     /// Every tag with how many skills carry it, `(untagged)` last.
     rows: Vec<(String, usize)>,
+    all_rows: Vec<(String, usize)>,
+    filter: super::filter::Filter,
+    skill_search: Option<super::search::SearchView>,
     /// Skills under the selected tag, in snapshot order.
     members: Vec<String>,
     list: CardGrid,
@@ -175,7 +177,17 @@ impl TagsView {
     /// field has focus, so `app.rs` needs to consult this too before a hex
     /// colour with a 1 to 5 in it can be typed here; until it does, nothing
     /// calls it.
-    pub fn paste(&mut self, text: &str) -> Vec<Action> {
+    pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
+        if self.filter.editing {
+            let actions = self.filter.paste(text);
+            self.refilter(ctx);
+            return actions;
+        }
+        if self.focus_grid
+            && let Some(view) = self.skill_search.as_mut()
+        {
+            return view.paste(text, ctx);
+        }
         let Some(prompt) = self.prompt.as_mut() else {
             return vec![];
         };
@@ -191,6 +203,45 @@ impl TagsView {
 
     pub fn input_focused(&self) -> bool {
         self.prompt.is_some()
+            || self.filter.editing
+            || (self.focus_grid
+                && self
+                    .skill_search
+                    .as_ref()
+                    .is_some_and(|v| v.input_focused()))
+    }
+
+    pub fn batch_finished(&mut self, failed: &[String]) {
+        if let Some(view) = self.skill_search.as_mut() {
+            view.batch_finished(failed);
+        }
+    }
+
+    pub fn dialog_open(&self) -> bool {
+        self.prompt.is_some()
+    }
+
+    fn refilter(&mut self, ctx: &Ctx) {
+        let selected = self.selected_tag().map(str::to_owned);
+        self.rows = self
+            .all_rows
+            .iter()
+            .filter(|(tag, _)| self.filter.matches(tag))
+            .cloned()
+            .collect();
+        self.list
+            .select(selected.and_then(|tag| self.rows.iter().position(|r| r.0 == tag)));
+        self.list.clamp(self.rows.len());
+        self.sync_members(ctx.snap);
+    }
+
+    fn search_members(&mut self, ctx: &Ctx) {
+        self.skill_search = Some(super::search::SearchView::panel(
+            self.members.clone(),
+            format!("Tag: {}", self.selected_tag().unwrap_or("none")),
+            ctx,
+        ));
+        self.focus_grid = true;
     }
 
     fn selected_tag(&self) -> Option<&str> {
@@ -207,15 +258,10 @@ impl TagsView {
             .map(str::to_string)
     }
 
-    fn select_skills(&self, checked: Option<String>) -> Vec<Action> {
-        if self.members.is_empty() {
-            return vec![];
-        }
-        vec![Action::SelectSkills {
-            keys: self.members.clone(),
-            title: format!("Tag: {}", self.selected_tag().unwrap_or("untagged")),
-            checked,
-        }]
+    fn select_skills(&mut self, checked: Option<String>, ctx: &Ctx) -> Vec<Action> {
+        self.search_members(ctx);
+        self.skill_search.as_mut().unwrap().start_multi(checked);
+        vec![]
     }
 
     fn selected_member(&self) -> Option<String> {
@@ -228,6 +274,7 @@ impl TagsView {
     /// Recompute the right pane for the tag under the cursor. Called after
     /// every move of the left one, so the two never disagree.
     fn sync_members(&mut self, snap: &Snapshot) {
+        let old_members = self.members.clone();
         let tag = self.selected_tag().map(str::to_string);
         self.members = match tag.as_deref() {
             Some(UNTAGGED) => snap
@@ -244,6 +291,9 @@ impl TagsView {
                 .collect(),
             None => Vec::new(),
         };
+        if old_members != self.members {
+            self.skill_search = None;
+        }
         self.grid.clamp(self.members.len());
     }
 
@@ -655,6 +705,8 @@ fn draw_track(
 
 impl View for TagsView {
     fn refresh(&mut self, ctx: &Ctx) {
+        let selected = self.selected_tag().map(str::to_owned);
+        let panel = self.skill_search.take();
         self.rows = ctx.snap.all_tags().into_iter().collect();
         let untagged = ctx
             .snap
@@ -663,8 +715,21 @@ impl View for TagsView {
             .filter(|s| s.tags.is_empty() && s.status.is_present())
             .count();
         self.rows.push((UNTAGGED.into(), untagged));
+        self.all_rows = self.rows.clone();
+        self.rows.retain(|(tag, _)| self.filter.matches(tag));
+        self.list.select(
+            selected
+                .as_ref()
+                .and_then(|tag| self.rows.iter().position(|r| &r.0 == tag)),
+        );
         self.list.clamp(self.rows.len());
         self.sync_members(ctx.snap);
+        if self.selected_tag() == selected.as_deref()
+            && let Some(mut view) = panel
+        {
+            view.update_panel(self.members.clone(), ctx);
+            self.skill_search = Some(view);
+        }
         self.fresh = ctx.ws.load_config().ok().map(|config| Workspace {
             config,
             ..ctx.ws.clone()
@@ -675,6 +740,28 @@ impl View for TagsView {
         if self.prompt.is_some() {
             return self.prompt_key(k);
         }
+        if self.focus_grid
+            && let Some(view) = self.skill_search.as_mut()
+        {
+            if k.code == KeyCode::Left && view.panel_back() {
+                self.focus_grid = false;
+                return vec![];
+            }
+            return view.handle_key(k, ctx);
+        }
+        if !self.focus_grid && self.filter.key(k) {
+            self.refilter(ctx);
+            return vec![];
+        }
+        if self.focus_grid && matches!(k.code, KeyCode::Char('/' | 'm')) {
+            self.search_members(ctx);
+            let view = self.skill_search.as_mut().unwrap();
+            if k.code == KeyCode::Char('m') {
+                view.focus_list();
+                return view.handle_key(k, ctx);
+            }
+            return vec![];
+        }
         if self.preview.handle_key(k) {
             return vec![];
         }
@@ -682,8 +769,8 @@ impl View for TagsView {
         let m = self.members.len();
         if self.focus_grid {
             return match k.code {
-                KeyCode::Char('m') => self.select_skills(None),
-                KeyCode::Esc | KeyCode::Char('h') | KeyCode::BackTab => {
+                KeyCode::Char('m') => self.select_skills(None, ctx),
+                KeyCode::Esc | KeyCode::Char('h') => {
                     self.focus_grid = false;
                     vec![]
                 }
@@ -786,6 +873,17 @@ impl View for TagsView {
             return vec![];
         }
         let at = (m.column, m.row).into();
+        if m.kind == MouseEventKind::Down(MouseButton::Left) && self.filter.rect.contains(at) {
+            self.focus_grid = false;
+            self.filter.editing = true;
+            return vec![];
+        }
+        if self.right.contains(at)
+            && let Some(view) = self.skill_search.as_mut()
+        {
+            self.focus_grid = true;
+            return view.handle_mouse(m, ctx);
+        }
         if let Some(d) = wheel(&m) {
             if self.left.contains(at) {
                 self.list.move_by(d.signum(), self.rows.len());
@@ -846,7 +944,7 @@ impl View for TagsView {
                     m.row == cell.y + 1
                         && (cell.x + 2..cell.x + 2 + cards::MARKER_W as u16).contains(&m.column)
                 }) {
-                    return self.select_skills(self.selected_member());
+                    return self.select_skills(self.selected_member(), ctx);
                 }
                 if double {
                     return self.open_member();
@@ -869,14 +967,28 @@ impl View for TagsView {
             snap: ctx.snap,
             theme: ctx.theme,
         };
-        self.draw_tags(f, left, ctx);
-        self.draw_members(f, right, ctx);
+        let content = self.filter.draw(f, left, "Filter tags", ctx);
+        self.draw_tags(f, content, ctx);
+        if let Some(view) = self.skill_search.as_mut() {
+            view.set_panel_active(self.focus_grid);
+            view.draw(f, right, ctx);
+        } else {
+            self.draw_members(f, right, ctx);
+        }
         self.preview.draw(f, area, ctx);
         self.draw_prompt(f, area, ctx);
         self.fresh = fresh;
     }
 
     fn hints(&self) -> Hints {
+        if self.filter.editing {
+            return &[("Enter/↓", "tags"), ("Esc", "finish filter")];
+        }
+        if self.focus_grid
+            && let Some(view) = self.skill_search.as_ref()
+        {
+            return view.hints();
+        }
         if let Some(hints) = self.preview.hints() {
             return hints;
         }
@@ -888,12 +1000,14 @@ impl View for TagsView {
                 ("Esc", "cancel"),
             ],
             None if self.focus_grid => &[
+                ("/", "filter skills"),
                 ("Enter", "preview"),
                 ("t", "edit tags"),
                 ("m", "multi-select"),
                 ("←/Esc", "tags"),
             ],
             None => &[
+                ("/", "filter tags"),
                 ("r", "rename"),
                 ("m", "merge"),
                 ("c", "colour"),

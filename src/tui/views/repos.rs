@@ -11,6 +11,7 @@ use ratatui::{
 };
 use skills::repository::{Repository, alias_of};
 
+#[derive(Clone)]
 struct Project {
     name: String,
     local: bool,
@@ -21,6 +22,9 @@ struct Project {
 #[derive(Default)]
 pub struct ReposView {
     projects: Vec<Project>,
+    all_projects: Vec<Project>,
+    filter: super::filter::Filter,
+    skill_search: Option<super::search::SearchView>,
     members: Vec<String>,
     project: Option<usize>,
     nav: ListNav,
@@ -32,6 +36,37 @@ pub struct ReposView {
 }
 
 impl ReposView {
+    pub fn batch_finished(&mut self, failed: &[String]) {
+        if let Some(view) = self.skill_search.as_mut() {
+            view.batch_finished(failed);
+        }
+    }
+
+    pub fn input_focused(&self) -> bool {
+        self.filter.editing
+            || self
+                .skill_search
+                .as_ref()
+                .is_some_and(|v| v.input_focused())
+    }
+    pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
+        if let Some(view) = self.skill_search.as_mut() {
+            return view.paste(text, ctx);
+        }
+        let actions = self.filter.paste(text);
+        self.refilter();
+        actions
+    }
+    fn refilter(&mut self) {
+        self.projects = self
+            .all_projects
+            .iter()
+            .filter(|p| self.filter.matches(&format!("{} {}", p.name, p.source)))
+            .cloned()
+            .collect();
+        self.nav.clamp(self.projects.len());
+    }
+
     fn len(&self) -> usize {
         if self.project.is_some() {
             self.members.len()
@@ -78,6 +113,7 @@ impl ReposView {
 
 impl View for ReposView {
     fn refresh(&mut self, ctx: &Ctx) {
+        let panel = self.skill_search.take();
         let selected_project = self
             .project
             .and_then(|i| self.projects.get(i))
@@ -130,7 +166,9 @@ impl View for ReposView {
                     .push(record.key.clone());
             }
         }
-        self.projects = groups.into_values().collect();
+        self.all_projects = groups.into_values().collect();
+        self.refilter();
+        self.skill_search = None;
         self.project = None;
         self.members.clear();
         self.reading = false;
@@ -151,9 +189,39 @@ impl View for ReposView {
                 self.nav.select(Some(j));
             }
         }
+        if self.project.is_some()
+            && let Some(mut view) = panel
+        {
+            view.update_panel(self.members.clone(), ctx);
+            self.skill_search = Some(view);
+        }
     }
 
-    fn handle_key(&mut self, k: KeyEvent, _ctx: &Ctx) -> Vec<Action> {
+    fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if let Some(view) = self.skill_search.as_mut() {
+            if k.code == KeyCode::Left && view.panel_back() {
+                self.skill_search = None;
+                return vec![];
+            }
+            return view.handle_key(k, ctx);
+        }
+        if self.project.is_none() && self.filter.key(k) {
+            self.refilter();
+            return vec![];
+        }
+        if self.project.is_some() && matches!(k.code, KeyCode::Char('/' | 'm')) {
+            let mut view = super::search::SearchView::panel(
+                self.members.clone(),
+                "Repository skills".into(),
+                ctx,
+            );
+            if k.code == KeyCode::Char('m') {
+                view.focus_list();
+                view.handle_key(k, ctx);
+            }
+            self.skill_search = Some(view);
+            return vec![];
+        }
         match k.code {
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
@@ -169,8 +237,15 @@ impl View for ReposView {
         vec![]
     }
 
-    fn handle_mouse(&mut self, m: MouseEvent, _ctx: &Ctx) -> Vec<Action> {
+    fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        if let Some(view) = self.skill_search.as_mut() {
+            return view.handle_mouse(m, ctx);
+        }
         let point = (m.column, m.row).into();
+        if m.kind == MouseEventKind::Down(MouseButton::Left) && self.filter.rect.contains(point) {
+            self.filter.editing = true;
+            return vec![];
+        }
         if let Some(delta) = wheel(&m) {
             if self.nav.rows.contains(point) {
                 self.reading = false;
@@ -196,6 +271,15 @@ impl View for ReposView {
     }
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        if let Some(view) = self.skill_search.as_mut() {
+            view.draw(f, area, ctx);
+            return;
+        }
+        let area = if self.project.is_none() {
+            self.filter.draw(f, area, "Filter repositories", ctx)
+        } else {
+            area
+        };
         let (left, right) = split_panes(area, 35);
         self.right = right;
         let path = self
@@ -294,11 +378,18 @@ impl View for ReposView {
     }
 
     fn hints(&self) -> Hints {
+        if self.filter.editing {
+            return &[("Enter/↓", "repositories"), ("Esc", "finish filter")];
+        }
+        if let Some(view) = self.skill_search.as_ref() {
+            return view.hints();
+        }
         &[
             ("↑↓", "navigate / scroll"),
             ("Enter/→", "open"),
             ("Esc/←", "back"),
             ("Ctrl+r", "refresh"),
+            ("/", "filter current list"),
             ("q", "library"),
         ]
     }

@@ -86,6 +86,17 @@ impl Completion {
         });
     }
 
+    pub fn healthy_only(&mut self) {
+        self.choices.retain(|choice| {
+            !choice.starts_with("status:")
+                || matches!(
+                    choice.as_str(),
+                    "status:" | "status:managed" | "status:unmanaged"
+                )
+        });
+        self.selected = self.selected.min(self.choices.len().saturating_sub(1));
+    }
+
     pub fn move_by(&mut self, delta: i32) {
         if self.active() {
             self.selected =

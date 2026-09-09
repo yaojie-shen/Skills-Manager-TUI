@@ -69,6 +69,8 @@ struct Row {
 #[derive(Default)]
 pub struct HealthView {
     rows: Vec<Row>,
+    filter: super::filter::Filter,
+    total_issues: usize,
     list: ListNav,
     left: Rect,
     right: Rect,
@@ -88,6 +90,15 @@ fn short_hash(h: &str) -> &str {
 }
 
 impl HealthView {
+    pub fn input_focused(&self) -> bool {
+        self.filter.editing
+    }
+    pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
+        let actions = self.filter.paste(text);
+        self.rebuild(ctx);
+        actions
+    }
+
     fn select_skills(&self, checked: Option<String>) -> Vec<Action> {
         if !self
             .rows
@@ -237,6 +248,38 @@ impl HealthView {
                 });
             }
         }
+        self.total_issues = self.issue_count();
+        self.rows.retain(|row| {
+            row.heading.is_some()
+                || self.filter.matches(&format!(
+                    "{} {} {} {}",
+                    row.key,
+                    row.agent.as_deref().unwrap_or(""),
+                    row.explanation.as_deref().unwrap_or(""),
+                    ctx.snap
+                        .get(&row.key)
+                        .map(|r| status_text(&r.status))
+                        .unwrap_or_default()
+                ))
+        });
+        // Drop empty section headings after filtering.
+        let mut has_child = false;
+        let mut keep = vec![false; self.rows.len()];
+        for (i, row) in self.rows.iter().enumerate().rev() {
+            if row.heading.is_some() {
+                keep[i] = has_child;
+                has_child = false;
+            } else {
+                keep[i] = true;
+                has_child = true;
+            }
+        }
+        let mut i = 0;
+        self.rows.retain(|_| {
+            let yes = keep[i];
+            i += 1;
+            yes
+        });
         let selection = selected
             .and_then(|(agent, key)| {
                 self.rows
@@ -612,6 +655,10 @@ impl View for HealthView {
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.filter.key(k) {
+            self.rebuild(ctx);
+            return vec![];
+        }
         if self.preview.handle_key(k) {
             return vec![];
         }
@@ -707,6 +754,10 @@ impl View for HealthView {
             return vec![];
         }
         let at = (m.column, m.row).into();
+        if m.kind == MouseEventKind::Down(MouseButton::Left) && self.filter.rect.contains(at) {
+            self.filter.editing = true;
+            return vec![];
+        }
         if let Some(d) = wheel(&m) {
             if self.left.contains(at) {
                 self.select_by(d);
@@ -729,6 +780,7 @@ impl View for HealthView {
     }
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        let area = self.filter.draw(f, area, "Filter health issues", ctx);
         let th = ctx.theme;
         // With nothing to show there is nothing to explain either, so the
         // message gets the whole width instead of being squeezed beside an
@@ -739,11 +791,15 @@ impl View for HealthView {
             let block = th.block(" health ", true);
             let inner = block.inner(area);
             f.render_widget(block, area);
-            let msg = format!(
-                "everything is healthy\n{} skills · {} agents checked\nPress c to check git sources for updates.",
-                ctx.snap.skills.len(),
-                ctx.snap.agents.len()
-            );
+            let msg = if self.total_issues > 0 {
+                format!("No matching issues · {} issues in total", self.total_issues)
+            } else {
+                format!(
+                    "everything is healthy\n{} skills · {} agents checked\nPress c to check git sources for updates.",
+                    ctx.snap.skills.len(),
+                    ctx.snap.agents.len()
+                )
+            };
             f.render_widget(
                 Paragraph::new(msg)
                     .style(th.dim())
@@ -825,6 +881,9 @@ impl View for HealthView {
     /// are mutually exclusive, so at most one of `a`, `m`, `x` applies, with
     /// or without `U`.
     fn hints(&self) -> Hints {
+        if self.filter.editing {
+            return &[("Enter/↓", "issues"), ("Esc", "finish filter")];
+        }
         if let Some(hints) = self.preview.hints() {
             return hints;
         }

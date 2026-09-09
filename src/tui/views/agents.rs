@@ -83,6 +83,8 @@ pub struct AgentsView {
     scope_error: Option<String>,
     focus: FocusState,
     presets: Vec<(Preset, PresetStatus)>,
+    all_presets: Vec<(Preset, PresetStatus)>,
+    preset_filter: super::filter::Filter,
     preset_cursor: usize,
     preset_offset: usize,
     entries: CardGrid,
@@ -130,10 +132,32 @@ impl AgentsView {
     }
 
     pub fn editing(&self) -> bool {
-        self.filter_editing
+        self.filter_editing || self.preset_filter.editing
+    }
+
+    fn filter_presets(&mut self) {
+        let selected = self
+            .presets
+            .get(self.preset_cursor)
+            .map(|(p, _)| p.name.clone());
+        self.presets = self
+            .all_presets
+            .iter()
+            .filter(|(p, _)| self.preset_filter.matches(&p.name))
+            .cloned()
+            .collect();
+        self.preset_cursor = selected
+            .and_then(|name| self.presets.iter().position(|(p, _)| p.name == name))
+            .unwrap_or(0);
+        self.preset_offset = 0;
     }
 
     pub fn paste(&mut self, text: &str) -> Vec<Action> {
+        if self.preset_filter.editing {
+            let actions = self.preset_filter.paste(text);
+            self.filter_presets();
+            return actions;
+        }
         if self.filter_editing
             && let Err(error) = self.content_filter.paste(text)
         {
@@ -482,6 +506,10 @@ impl AgentsView {
     }
 
     fn refresh_current(&mut self, ctx: &Ctx) {
+        let selected_preset = self
+            .presets
+            .get(self.preset_cursor)
+            .map(|(p, _)| p.name.clone());
         // A scope pinned to an agent that is gone from the config, or never set,
         // falls back to the first one there is.
         if ctx.ws.config.agent(&self.scope).is_none() {
@@ -532,6 +560,13 @@ impl AgentsView {
                 }
             }
         }
+        self.all_presets = self.presets.clone();
+        self.filter_presets();
+        if let Some(index) =
+            selected_preset.and_then(|name| self.presets.iter().position(|(p, _)| p.name == name))
+        {
+            self.preset_cursor = index;
+        }
         self.preset_cursor = self.preset_cursor.min(self.presets.len().saturating_sub(1));
         let rows = self.rows(ctx);
         self.caps = rows.iter().map(|r| Caps::of(r.state)).collect();
@@ -545,6 +580,12 @@ impl AgentsView {
         if let Some(acts) = self.matrix.handle_key(k, ctx) {
             return acts;
         }
+        if (self.preset_filter.editing || self.focus() == Focus::Presets)
+            && self.preset_filter.key(k)
+        {
+            self.filter_presets();
+            return vec![];
+        }
         if !self.destinations.is_empty() {
             if self.filter_editing {
                 if self.completion.active() {
@@ -557,7 +598,7 @@ impl AgentsView {
                             self.completion.move_by(1);
                             return vec![];
                         }
-                        KeyCode::Tab | KeyCode::Enter => {
+                        KeyCode::Enter => {
                             self.completion.accept(&mut self.content_filter);
                             return vec![];
                         }
@@ -710,7 +751,7 @@ impl AgentsView {
                     self.move_scope(1, ctx);
                     vec![Action::Rescan]
                 }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter | KeyCode::Tab => {
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => {
                     self.set_focus(if self.destinations.is_empty() {
                         Focus::Presets
                     } else {
@@ -836,6 +877,13 @@ impl AgentsView {
         }
         if let Some(acts) = self.matrix.handle_mouse(m, ctx) {
             return acts;
+        }
+        if m.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.preset_filter.rect.contains((m.column, m.row).into())
+            && self.focus() == Focus::Presets
+        {
+            self.preset_filter.editing = true;
+            return vec![];
         }
         if self.filter_editing {
             let (consumed, _) = self.completion.mouse(m, &mut self.content_filter);
@@ -1147,7 +1195,11 @@ impl AgentsView {
             }
         }
 
-        if !self.destinations.is_empty() {
+        if self.focus() == Focus::Presets || self.preset_filter.editing {
+            self.content_filter_rect = Rect::default();
+            self.preset_filter.draw(f, rows[3], "Filter presets", ctx);
+        } else if !self.destinations.is_empty() {
+            self.preset_filter.rect = Rect::default();
             self.content_filter_rect = rows[3];
             let block = th.block(" filter ", self.filter_editing);
             let inner = block.inner(rows[3]);
@@ -1163,21 +1215,30 @@ impl AgentsView {
         {
             // Preset pills.
             self.preset_rects.clear();
+            let label = if self.preset_filter.input.is_empty() {
+                " presets ".to_string()
+            } else {
+                format!(" presets [{}] ", fit(self.preset_filter.input.value(), 16))
+            };
             let mut pills = vec![Span::styled(
-                " presets ",
+                label.clone(),
                 self.label_style(Focus::Presets, th),
             )];
-            let mut x = rows[2].x + width(" presets ") as u16;
+            let mut x = rows[2].x + width(&label) as u16;
             if self.presets.is_empty() {
                 pills.push(Span::styled(
-                    "none yet — create one on the Presets tab",
+                    if self.all_presets.is_empty() {
+                        "none yet — create one on the Presets tab"
+                    } else {
+                        "no matching presets"
+                    },
                     th.dim(),
                 ));
             }
             let (lcap, rcap) = ctx.ws.config.ui.pill_caps.glyphs();
             let caps_w = width(lcap) + width(rcap);
             // Reserve an indicator on each side; every mouse target is a whole pill.
-            let budget = rows[2].width.saturating_sub(13) as usize;
+            let budget = (rows[2].width as usize).saturating_sub(width(&label) + 4);
             let bodies: Vec<String> = self
                 .presets
                 .iter()
@@ -1458,6 +1519,9 @@ impl AgentsView {
     }
 
     fn hints_current(&self) -> Hints {
+        if self.preset_filter.editing {
+            return &[("Enter/↓", "presets"), ("Esc", "finish filter")];
+        }
         if let Some(hints) = self.matrix.hints() {
             return hints;
         }
@@ -1469,6 +1533,7 @@ impl AgentsView {
         }
         if !self.destinations.is_empty() && self.focus() == Focus::Presets {
             return &[
+                ("/", "filter presets"),
                 ("Enter / Space", "install / uninstall preset"),
                 ("x", "uninstall preset"),
                 ("←→", "preset"),
@@ -1478,6 +1543,7 @@ impl AgentsView {
         }
         if !self.destinations.is_empty() && self.focus() == Focus::Entries {
             return &[
+                ("/", "filter skills"),
                 ("i", "install skills"),
                 ("x", "uninstall / repair"),
                 ("m", "multi-uninstall"),
@@ -1658,7 +1724,7 @@ impl View for AgentsView {
                     self.set_focus(Focus::Agents);
                     return vec![];
                 }
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter | KeyCode::Tab => {
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::Enter => {
                     self.set_focus(Focus::Presets);
                     return vec![];
                 }

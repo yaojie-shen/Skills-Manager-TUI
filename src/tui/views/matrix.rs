@@ -127,11 +127,11 @@ impl Matrix {
                 self.row = self.row.saturating_sub(1);
                 vec![]
             }
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+            KeyCode::Right | KeyCode::Char('l') => {
                 self.col = (self.col + 1).min(cols.saturating_sub(1));
                 vec![]
             }
-            KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
+            KeyCode::Left | KeyCode::Char('h') => {
                 self.col = self.col.saturating_sub(1);
                 vec![]
             }
@@ -340,9 +340,9 @@ mod tests {
                 .collect(),
             ..Matrix::default()
         };
-        matrix.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &ctx);
+        matrix.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &ctx);
         assert_eq!(matrix.col, 1);
-        matrix.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &ctx);
+        matrix.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &ctx);
         assert_eq!(matrix.col, 0);
 
         for (w, h) in [(100, 30), (80, 24), (120, 40)] {

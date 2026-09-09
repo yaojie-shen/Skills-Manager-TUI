@@ -433,6 +433,9 @@ impl App {
                     self.history.record(intent);
                 }
                 self.search.batch_finished(&outcome.failed);
+                self.tags.batch_finished(&outcome.failed);
+                self.presets.batch_finished(&outcome.failed);
+                self.repos.batch_finished(&outcome.failed);
                 if outcome.errors.is_empty() {
                     self.modal = None;
                     self.toast(outcome.message, Level::Ok);
@@ -589,9 +592,11 @@ impl App {
         }
         match self.tab {
             Tab::Search => self.search.paste(text, &ctx),
-            Tab::Tags => self.tags.paste(text),
+            Tab::Tags => self.tags.paste(text, &ctx),
+            Tab::Presets => self.presets.paste(text, &ctx),
+            Tab::Health => self.health.paste(text, &ctx),
+            Tab::Repos => self.repos.paste(text, &ctx),
             Tab::Agents => self.agents.paste(text),
-            _ => vec![],
         }
     }
 
@@ -599,7 +604,7 @@ impl App {
         if let Some(prompt) = self.quit_prompt.as_mut() {
             match k.code {
                 KeyCode::Esc => self.quit_prompt = None,
-                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                KeyCode::Left | KeyCode::Right => {
                     prompt.quit_selected = !prompt.quit_selected;
                 }
                 KeyCode::Enter => {
@@ -621,6 +626,19 @@ impl App {
             snap: &self.snap,
             theme: &self.theme,
         };
+        if matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
+            if self.modal.is_some() || (self.tab == Tab::Tags && self.tags.dialog_open()) {
+                return vec![];
+            }
+            let delta = if k.code == KeyCode::Tab {
+                1
+            } else {
+                Tab::ALL.len() - 1
+            };
+            return vec![Action::SwitchTab(
+                Tab::ALL[(self.tab.index() + delta) % Tab::ALL.len()],
+            )];
+        }
         if let Some(m) = self.modal.as_mut() {
             return m.handle_key(k, &ctx);
         }
@@ -645,7 +663,10 @@ impl App {
             );
         }
         let in_search_input = (self.tab == Tab::Search && self.search.input_focused())
-            || (self.tab == Tab::Tags && self.tags.input_focused());
+            || (self.tab == Tab::Tags && self.tags.input_focused())
+            || (self.tab == Tab::Presets && self.presets.input_focused())
+            || (self.tab == Tab::Health && self.health.input_focused())
+            || (self.tab == Tab::Repos && self.repos.input_focused());
         match (k.code, k.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return vec![Action::Quit],
             (KeyCode::Char('z'), KeyModifiers::CONTROL) => return self.step(Step::Undo),
@@ -662,22 +683,6 @@ impl App {
             }
             (KeyCode::Char(c @ '1'..='6'), KeyModifiers::NONE) if !in_search_input => {
                 return vec![Action::SwitchTab(Tab::ALL[(c as u8 - b'1') as usize])];
-            }
-            (KeyCode::Tab, _) if self.tab != Tab::Search => {
-                return vec![Action::SwitchTab(
-                    Tab::ALL[(self.tab.index() + 1) % Tab::ALL.len()],
-                )];
-            }
-            (KeyCode::BackTab, _) if self.tab != Tab::Search => {
-                return vec![Action::SwitchTab(
-                    Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()],
-                )];
-            }
-            (KeyCode::Char('/'), _) if !in_search_input => {
-                return vec![Action::Search {
-                    query: self.search.query(),
-                    focus_list: false,
-                }];
             }
             _ => {}
         }
@@ -927,6 +932,11 @@ impl App {
             return;
         }
         self.search.clear_selection();
+        self.search.restore_results(&Ctx {
+            ws: &self.ws,
+            snap: &self.snap,
+            theme: &self.theme,
+        });
         self.tab = t;
         let view: &mut dyn View = match t {
             Tab::Search => &mut self.search,
@@ -1621,12 +1631,15 @@ mod matrix_key_tests {
         app.tab = Tab::Agents;
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         assert!(app.on_key(key(KeyCode::Char('M'))).is_empty());
-        for code in [
-            KeyCode::Tab,
-            KeyCode::BackTab,
-            KeyCode::Char('/'),
-            KeyCode::Char('1'),
-        ] {
+        assert!(matches!(
+            app.on_key(key(KeyCode::Tab)).as_slice(),
+            [Action::SwitchTab(Tab::Health)]
+        ));
+        assert!(matches!(
+            app.on_key(key(KeyCode::BackTab)).as_slice(),
+            [Action::SwitchTab(Tab::Presets)]
+        ));
+        for code in [KeyCode::Char('/'), KeyCode::Char('1')] {
             assert!(app.on_key(key(code)).is_empty());
             assert_eq!(app.tab, Tab::Agents);
         }
@@ -1674,5 +1687,72 @@ mod scope_tests {
         assert!(!app.history.is_empty());
         assert!(!base.join("project/.agents").exists());
         std::fs::remove_dir_all(base).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod panel_navigation_tests {
+    use super::*;
+
+    #[test]
+    fn tab_changes_pages_from_inputs_and_returning_clears_temporary_library_scope() {
+        let root = std::env::temp_dir().join(format!("skills-tab-panels-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        for name in ["alpha", "beta"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(
+                root.join(name).join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: tools\n---\nBody"),
+            )
+            .unwrap();
+        }
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        app.search.focus_input();
+        assert!(matches!(
+            app.on_key(key(KeyCode::Tab)).as_slice(),
+            [Action::SwitchTab(Tab::Tags)]
+        ));
+        app.apply(Action::SelectSkills {
+            keys: vec!["alpha".into()],
+            title: "Temporary selection".into(),
+            checked: None,
+        });
+        app.switch_tab(Tab::Tags);
+        app.switch_tab(Tab::Search);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("beta"));
+        assert!(text.contains("2/2 local"));
+        assert!(!text.contains("Temporary selection"));
+        app.switch_tab(Tab::Tags);
+        app.on_key(key(KeyCode::Char('/')));
+        for c in "tag123/".chars() {
+            assert!(app.on_key(key(KeyCode::Char(c))).is_empty());
+        }
+        assert_eq!(app.tab, Tab::Tags);
+        assert!(matches!(
+            app.on_key(key(KeyCode::Tab)).as_slice(),
+            [Action::SwitchTab(Tab::Presets)]
+        ));
+        app.modal = Some(Modal::new_preset());
+        assert!(app.on_key(key(KeyCode::Tab)).is_empty());
+        assert!(app.modal.is_some());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

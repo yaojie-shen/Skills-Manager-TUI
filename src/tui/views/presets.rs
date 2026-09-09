@@ -23,6 +23,9 @@ use skills::preset::Preset;
 #[derive(Default)]
 pub struct PresetsView {
     presets: Vec<Preset>,
+    all_presets: Vec<Preset>,
+    filter: super::filter::Filter,
+    skill_search: Option<(String, super::search::SearchView)>,
     list: CardGrid,
     members: CardGrid,
     focus_members: bool,
@@ -50,6 +53,59 @@ enum Pane {
 }
 
 impl PresetsView {
+    pub fn batch_finished(&mut self, failed: &[String]) {
+        if let Some((_, view)) = self.skill_search.as_mut() {
+            view.batch_finished(failed);
+        }
+    }
+
+    pub fn input_focused(&self) -> bool {
+        self.filter.editing
+            || (self.focus_members
+                && self
+                    .skill_search
+                    .as_ref()
+                    .is_some_and(|(_, v)| v.input_focused()))
+    }
+    pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
+        if self.filter.editing {
+            let actions = self.filter.paste(text);
+            self.refilter();
+            return actions;
+        }
+        if self.focus_members
+            && let Some((_, view)) = self.skill_search.as_mut()
+        {
+            return view.paste(text, ctx);
+        }
+        vec![]
+    }
+    fn refilter(&mut self) {
+        let selected = self.selected().map(|p| p.name.clone());
+        self.presets = self
+            .all_presets
+            .iter()
+            .filter(|p| {
+                self.filter.matches(&format!(
+                    "{} {}",
+                    p.name,
+                    p.description.as_deref().unwrap_or("")
+                ))
+            })
+            .cloned()
+            .collect();
+        self.list
+            .select(selected.and_then(|name| self.presets.iter().position(|p| p.name == name)));
+        self.list.clamp(self.presets.len());
+        if self
+            .skill_search
+            .as_ref()
+            .is_some_and(|(name, _)| self.selected().is_none_or(|p| &p.name != name))
+        {
+            self.skill_search = None;
+        }
+    }
+
     fn selected(&self) -> Option<&Preset> {
         self.list.selected().and_then(|i| self.presets.get(i))
     }
@@ -74,15 +130,19 @@ impl PresetsView {
         self.selected().map(|p| p.skills.len()).unwrap_or(0)
     }
 
-    fn select_skills(&self, checked: Option<String>) -> Vec<Action> {
-        let Some(preset) = self.selected().filter(|preset| !preset.skills.is_empty()) else {
-            return vec![];
-        };
-        vec![Action::SelectSkills {
-            keys: preset.skills.clone(),
-            title: format!("Preset: {}", preset.name),
-            checked,
-        }]
+    fn select_skills(&mut self, checked: Option<String>, ctx: &Ctx) -> Vec<Action> {
+        if let Some(preset) = self.selected() {
+            let name = preset.name.clone();
+            let mut view = super::search::SearchView::panel(
+                preset.skills.clone(),
+                format!("Preset: {name}"),
+                ctx,
+            );
+            view.start_multi(checked);
+            self.skill_search = Some((name, view));
+            self.focus_members = true;
+        }
+        vec![]
     }
 
     fn selected_member(&self) -> Option<String> {
@@ -214,7 +274,11 @@ impl PresetsView {
         if self.presets.is_empty() {
             f.render_widget(
                 Paragraph::new(Span::styled(
-                    "no presets yet — press c to create one",
+                    if self.all_presets.is_empty() {
+                        "no presets yet — press c to create one"
+                    } else {
+                        "no matching presets"
+                    },
                     th.dim(),
                 )),
                 Rect {
@@ -388,16 +452,70 @@ impl View for PresetsView {
             .pending
             .clone()
             .or_else(|| self.selected().map(|p| p.name.clone()));
-        self.presets = ctx.ws.presets.list().unwrap_or_default();
+        self.all_presets = ctx.ws.presets.list().unwrap_or_default();
+        self.refilter();
         if let Some(i) = keep.and_then(|k| self.presets.iter().position(|p| p.name == k)) {
             self.list.select(Some(i));
             self.pending = None;
         }
         self.list.clamp(self.presets.len());
         self.members.clamp(self.member_count());
+        if let Some((name, view)) = self.skill_search.as_mut() {
+            let keys = self
+                .all_presets
+                .iter()
+                .find(|p| &p.name == name)
+                .map(|p| p.skills.clone())
+                .unwrap_or_default();
+            view.update_panel(keys, ctx);
+        }
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if !self.focus_members && self.filter.key(k) {
+            self.refilter();
+            return vec![];
+        }
+        if self.focus_members
+            && let Some((name, view)) = self.skill_search.as_mut()
+        {
+            if k.code == KeyCode::Left && view.panel_back() {
+                self.focus_members = false;
+                return vec![];
+            }
+            if view.panel_actions_ready() {
+                if matches!(k.code, KeyCode::Char('x') | KeyCode::Delete) && k.modifiers.is_empty()
+                {
+                    let name = name.clone();
+                    let keys = view.panel_keys(ctx);
+                    return vec![Action::WriteMeta(Box::new(move |ws| {
+                        history::preset_edit(ws, &name, |members| {
+                            members.retain(|key| !keys.contains(key))
+                        })
+                    }))];
+                }
+                if k.code == KeyCode::Char('a') && k.modifiers.is_empty() {
+                    return self.add_members(ctx);
+                }
+            }
+            return view.handle_key(k, ctx);
+        }
+        if self.focus_members && matches!(k.code, KeyCode::Char('/' | 'm')) {
+            if let Some(preset) = self.selected() {
+                let name = preset.name.clone();
+                let mut view = super::search::SearchView::panel(
+                    preset.skills.clone(),
+                    format!("Preset: {name}"),
+                    ctx,
+                );
+                if k.code == KeyCode::Char('m') {
+                    view.focus_list();
+                    view.handle_key(k, ctx);
+                }
+                self.skill_search = Some((name, view));
+            }
+            return vec![];
+        }
         if self.preview.handle_key(k) {
             return vec![];
         }
@@ -412,8 +530,8 @@ impl View for PresetsView {
         let m = self.member_count();
         if self.focus_members {
             return match k.code {
-                KeyCode::Char('m') => self.select_skills(None),
-                KeyCode::Esc | KeyCode::Char('h') | KeyCode::BackTab => {
+                KeyCode::Char('m') => self.select_skills(None, ctx),
+                KeyCode::Esc | KeyCode::Char('h') => {
                     self.focus_members = false;
                     vec![]
                 }
@@ -464,26 +582,30 @@ impl View for PresetsView {
             // back to the search page rather than out of the door.
             KeyCode::Esc => vec![Action::SwitchTab(Tab::Search)],
             KeyCode::Down | KeyCode::Char('j') => {
+                self.skill_search = None;
                 self.list.move_by(1, n);
                 self.members.clamp(self.member_count());
                 vec![]
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                self.skill_search = None;
                 self.list.move_by(-1, n);
                 self.members.clamp(self.member_count());
                 vec![]
             }
             KeyCode::Home | KeyCode::Char('g') => {
+                self.skill_search = None;
                 self.list.first(n);
                 self.members.clamp(self.member_count());
                 vec![]
             }
             KeyCode::End | KeyCode::Char('G') => {
+                self.skill_search = None;
                 self.list.last(n);
                 self.members.clamp(self.member_count());
                 vec![]
             }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if m > 0 {
                     self.focus_members = true;
                     self.members.clamp(m);
@@ -514,6 +636,20 @@ impl View for PresetsView {
             return acts;
         }
         let at = (m.column, m.row).into();
+        if m.kind == MouseEventKind::Down(MouseButton::Left) && self.filter.rect.contains(at) {
+            self.focus_members = false;
+            self.filter.editing = true;
+            return vec![];
+        }
+        if self.right.contains(at)
+            && let Some((_, view)) = self.skill_search.as_mut()
+        {
+            self.focus_members = true;
+            return view.handle_mouse(m, ctx);
+        }
+        if self.left.contains(at) {
+            self.skill_search = None;
+        }
         let mcount = self.member_count();
         if let Some(d) = wheel(&m) {
             if self.left.contains(at) {
@@ -572,7 +708,7 @@ impl View for PresetsView {
                     m.row == cell.y + 1
                         && (cell.x + 2..cell.x + 2 + cards::MARKER_W as u16).contains(&m.column)
                 }) {
-                    return self.select_skills(self.selected_member());
+                    return self.select_skills(self.selected_member(), ctx);
                 }
                 if double {
                     return self.open_member();
@@ -587,13 +723,27 @@ impl View for PresetsView {
         let (left, right) = split_panes(area, 38);
         self.left = left;
         self.right = right;
-        self.draw_presets(f, left, ctx);
-        self.draw_members(f, right, ctx);
+        let content = self.filter.draw(f, left, "Filter presets", ctx);
+        self.draw_presets(f, content, ctx);
+        if let Some((_, view)) = self.skill_search.as_mut() {
+            view.set_panel_active(self.focus_members);
+            view.draw(f, right, ctx);
+        } else {
+            self.draw_members(f, right, ctx);
+        }
         self.preview.draw(f, area, ctx);
         self.matrix.draw(f, area, ctx);
     }
 
     fn hints(&self) -> Hints {
+        if self.filter.editing {
+            return &[("Enter/↓", "presets"), ("Esc", "finish filter")];
+        }
+        if self.focus_members
+            && let Some((_, view)) = self.skill_search.as_ref()
+        {
+            return view.preset_panel_hints();
+        }
         if let Some(hints) = self.matrix.hints() {
             return hints;
         }
@@ -602,6 +752,7 @@ impl View for PresetsView {
         }
         if self.focus_members {
             &[
+                ("/", "filter skills"),
                 ("a", "add skills"),
                 ("x", "remove"),
                 ("m", "multi-select"),
@@ -610,6 +761,7 @@ impl View for PresetsView {
             ]
         } else {
             &[
+                ("/", "filter presets"),
                 ("c", "create"),
                 ("M", "matrix"),
                 ("a", "add skills"),
@@ -765,9 +917,9 @@ mod tests {
         assert!(view.handle_key(key(KeyCode::Char('m')), &ctx).is_empty());
         assert!(view.handle_key(key(KeyCode::Right), &ctx).is_empty());
         let actions = view.handle_key(key(KeyCode::Char('m')), &ctx);
-        assert!(
-            matches!(&actions[..], [Action::SelectSkills { keys, title, checked: None }] if keys == &["printer"] && title == "Preset: reading")
-        );
+        assert!(actions.is_empty());
+        assert!(view.skill_search.is_some());
+        view.skill_search = None;
         assert!(view.handle_key(key(KeyCode::Enter), &ctx).is_empty());
         assert!(view.preview.is_open());
 

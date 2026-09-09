@@ -154,7 +154,7 @@ impl DeployPicker {
             return vec![Action::CloseModal];
         }
         if self.editing {
-            if matches!(k.code, KeyCode::Enter | KeyCode::Tab) {
+            if matches!(k.code, KeyCode::Enter) {
                 self.editing = false;
                 self.reload(ctx);
             } else {

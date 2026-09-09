@@ -161,7 +161,7 @@ impl Batch {
         if self.focus == 0 {
             &[
                 ("type", "filter"),
-                ("↓/Tab", "list"),
+                ("↓", "list"),
                 ("Enter", "choose/create"),
                 ("Ctrl+Enter", "apply"),
                 ("Esc", "cancel"),
@@ -170,7 +170,7 @@ impl Batch {
             &[
                 ("↑↓", "move"),
                 ("Space", "toggle"),
-                ("Tab", "next control"),
+                ("←→", "controls"),
                 ("Ctrl+Enter", "apply"),
                 ("Esc", "cancel"),
             ]
@@ -223,8 +223,8 @@ impl Batch {
             return self.apply(ctx);
         }
         match k.code {
-            KeyCode::Tab => self.focus = (self.focus + 1) % 4,
-            KeyCode::BackTab => self.focus = (self.focus + 3) % 4,
+            KeyCode::Right if self.focus > 0 => self.focus = (self.focus + 1).min(3),
+            KeyCode::Left if self.focus > 1 => self.focus -= 1,
             KeyCode::Down if self.focus == 0 => {
                 self.focus = 1;
                 self.list.clamp(self.shown.len());
