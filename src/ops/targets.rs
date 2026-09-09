@@ -30,10 +30,15 @@ fn load(root: &Path) -> Result<Registry> {
 pub struct Scope {
     pub project: Option<PathBuf>,
     pub repository: bool,
+    pub directory: Option<PathBuf>,
+    pub label: Option<String>,
 }
 
 impl Scope {
     pub fn name(&self) -> String {
+        if let Some(label) = &self.label {
+            return label.clone();
+        }
         self.project
             .as_ref()
             .map(|p| {
@@ -46,6 +51,9 @@ impl Scope {
     }
 
     pub fn path_label(&self) -> String {
+        if let Some(path) = &self.directory {
+            return paths::contract_tilde(path);
+        }
         self.project
             .as_ref()
             .map(|p| paths::contract_tilde(p))
@@ -53,26 +61,166 @@ impl Scope {
     }
 }
 
-/// Include the working directory and every enclosing Git root, nearest first.
-/// Both ordinary repositories and worktrees have a `.git` entry. No checkout
-/// is traversed and discovering a scope never creates agent directories.
+/// Only the launch directory is a local scope, including inside a monorepo.
+/// Discovery never walks ancestors or creates directories.
 pub fn discover_scopes(start: &Path) -> Result<Vec<Scope>> {
     let start = std::fs::canonicalize(start).context("resolving launch directory")?;
     ensure!(start.is_dir(), "launch directory must be a directory");
-    let mut scopes = vec![Scope {
-        project: None,
-        repository: false,
-    }];
-    for path in start.ancestors() {
-        let repository = path.join(".git").is_dir() || path.join(".git").is_file();
-        if path == start || repository {
-            scopes.push(Scope {
-                project: Some(path.into()),
-                repository,
+    Ok(vec![
+        Scope {
+            project: None,
+            repository: false,
+            directory: None,
+            label: None,
+        },
+        Scope {
+            repository: start.join(".git").exists(),
+            project: Some(start),
+            directory: None,
+            label: None,
+        },
+    ])
+}
+
+/// Physical skill directories read by one configured agent. A shared root is
+/// offered only to agents documented to discover it. Explicit config survives.
+pub fn locations(ws: &Workspace, configured: &AgentConfig, start: &Path) -> Result<Vec<Scope>> {
+    let start = std::fs::canonicalize(start).context("resolving launch directory")?;
+    let definition = crate::agents::BUILTINS
+        .iter()
+        .find(|a| a.key == configured.key);
+    let mut out = Vec::new();
+    for local in [false, true] {
+        let mut dirs: Vec<PathBuf> = definition
+            .map(|a| {
+                a.search_dirs(local)
+                    .into_iter()
+                    .map(|p| {
+                        if local {
+                            start.join(p)
+                        } else {
+                            paths::expand_tilde(p)
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if ws.project.is_some() == local {
+            let configured_path = configured.skills_path();
+            if !local || configured_path.starts_with(&start) {
+                dirs.insert(0, configured_path);
+            }
+        }
+        for dir in dirs {
+            if out
+                .iter()
+                .any(|scope: &Scope| scope.directory.as_ref() == Some(&dir))
+            {
+                continue;
+            }
+            let folder = dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "custom".into());
+            let label = format!(
+                "{} {}",
+                if local { "Local" } else { "Global" },
+                if folder == ".agents" {
+                    "shared"
+                } else {
+                    &folder
+                }
+            );
+            out.push(Scope {
+                project: local.then(|| start.clone()),
+                repository: false,
+                directory: Some(dir),
+                label: Some(label),
             });
         }
     }
-    Ok(scopes)
+    Ok(out)
+}
+
+/// Keep destination IDs compatible with previously registered targets.
+pub fn scope_agent(ws: &Workspace, configured: &AgentConfig, scope: &Scope) -> Result<AgentConfig> {
+    let path = scope
+        .directory
+        .as_ref()
+        .context("scope has no skill directory")?;
+    if let Some(project) = &scope.project {
+        paths::ensure_local_path(project, path)?;
+    }
+    if configured.skills_path() == *path {
+        return Ok(configured.clone());
+    }
+    let local = scope.project.is_some();
+    let identity = match &scope.project {
+        Some(project) => format!(
+            "{}:{}",
+            portable(&ws.root, project, ws.project.is_none()).display(),
+            path.strip_prefix(project)?.display()
+        ),
+        None => portable(&ws.root, path, true).display().to_string(),
+    };
+    let digest: String = Sha256::digest(identity.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let key = format!(
+        "{}-{}-{}",
+        configured.key,
+        if local { "local" } else { "global" },
+        &digest[..10]
+    );
+    Ok(AgentConfig {
+        key,
+        name: configured.display_name().into(),
+        skills_dir: path.to_string_lossy().into_owned(),
+    })
+}
+
+/// Every documented physical destination in the selected global/local tier.
+pub fn all_candidates(ws: &Workspace, project: Option<&Path>) -> Result<Vec<AgentConfig>> {
+    let start = project
+        .map(Path::to_path_buf)
+        .unwrap_or(std::env::current_dir()?);
+    let registry = decoded(&ws.root)?;
+    let mut out = Vec::new();
+    for definition in crate::agents::BUILTINS {
+        let configured = ws
+            .config
+            .agent(definition.key)
+            .cloned()
+            .unwrap_or_else(|| definition.config(false));
+        for scope in locations(ws, &configured, &start)?
+            .into_iter()
+            .filter(|s| s.project.is_some() == project.is_some())
+        {
+            let mut agent = scope_agent(ws, &configured, &scope)?;
+            agent.name = format!("{} · {}", definition.name, scope.name());
+            out.push(agent);
+        }
+    }
+    for configured in &ws.config.agents {
+        if crate::agents::BUILTINS
+            .iter()
+            .any(|a| a.key == configured.key)
+            || out.iter().any(|a| a.key == configured.key)
+        {
+            continue;
+        }
+        let matches_scope = if registry.agents.iter().any(|a| a.key == configured.key) {
+            registry.projects.get(&configured.key).map(PathBuf::as_path) == project
+        } else {
+            ws.project.as_deref() == project
+        };
+        if matches_scope {
+            out.push(configured.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// Register a target only when an operation actually writes to it.

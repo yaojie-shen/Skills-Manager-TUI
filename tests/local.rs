@@ -201,7 +201,7 @@ fn shared_readers_sync_union_of_presets_and_undeploy_only_once() {
         &ws.root,
         &skills::agents::BUILTINS
             .iter()
-            .find(|a| a.key == "cline")
+            .find(|a| a.key == "gemini-cli")
             .unwrap()
             .config(true),
         true,
@@ -209,15 +209,15 @@ fn shared_readers_sync_union_of_presets_and_undeploy_only_once() {
     .unwrap();
     ws.config = ws.load_config().unwrap();
     ws.config.deploy.all_to_all = false;
-    ws.config.deploy.presets = vec!["only-cline".into()];
+    ws.config.deploy.presets = vec!["only-gemini-cli".into()];
     let key = "repos/example/sample";
     skill(&ws.root.join(key));
     ws.presets
         .save(&skills::preset::Preset {
-            name: "only-cline".into(),
+            name: "only-gemini-cli".into(),
             description: None,
             skills: vec![key.into()],
-            agents: vec!["cline".into()],
+            agents: vec!["gemini-cli".into()],
         })
         .unwrap();
     let plan = deploy::plan_sync(&ws, &ws.scan().unwrap()).unwrap();
@@ -230,9 +230,14 @@ fn shared_readers_sync_union_of_presets_and_undeploy_only_once() {
     deploy::apply(&plan).unwrap();
     let snap = ws.scan().unwrap();
     assert!(snap.get(key).unwrap().deployed_to().contains(&"codex"));
-    assert!(snap.get(key).unwrap().deployed_to().contains(&"cline"));
-    let plan = deploy::plan_undeploy(&ws, &snap, &[key.into()], &["codex".into(), "cline".into()])
-        .unwrap();
+    assert!(snap.get(key).unwrap().deployed_to().contains(&"gemini-cli"));
+    let plan = deploy::plan_undeploy(
+        &ws,
+        &snap,
+        &[key.into()],
+        &["codex".into(), "gemini-cli".into()],
+    )
+    .unwrap();
     assert_eq!(plan.iter().filter(|a| a.is_change()).count(), 1);
     deploy::apply(&plan).unwrap();
     assert!(ws.root.join(key).join("SKILL.md").is_file());

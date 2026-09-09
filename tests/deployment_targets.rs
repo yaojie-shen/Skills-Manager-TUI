@@ -202,7 +202,7 @@ fn sync_does_not_expand_a_picker_selection_to_every_skill() {
 }
 
 #[test]
-fn discovered_scopes_include_nested_roots_and_worktrees_without_duplicates_or_writes() {
+fn discovered_scopes_use_only_the_launch_directory_without_ancestor_scopes_or_writes() {
     let f = Fixture::new("discovery");
     let outer = f.0.join("project");
     let inner = outer.join("apps/web");
@@ -214,9 +214,7 @@ fn discovered_scopes_include_nested_roots_and_worktrees_without_duplicates_or_wr
     assert!(scopes[0].project.is_none());
     assert_eq!(scopes[1].project.as_ref(), Some(&cwd));
     assert!(!scopes[1].repository);
-    assert_eq!(scopes[2].project.as_ref(), Some(&inner));
-    assert_eq!(scopes[3].project.as_ref(), Some(&outer));
-    assert!(scopes[2].repository && scopes[3].repository);
+    assert_eq!(scopes.len(), 2);
     let root_scopes = targets::discover_scopes(&inner).unwrap();
     assert_eq!(
         root_scopes
@@ -538,4 +536,46 @@ fn repeating_an_install_does_not_rewrite_unchanged_selection_metadata() {
     assert!(intent.is_none());
     assert_eq!(std::fs::metadata(path).unwrap().ino(), before);
     assert!(agent.skills_path().join("sample").is_symlink());
+}
+
+#[test]
+fn physical_scopes_keep_shared_private_and_current_directory_separate() {
+    let f = Fixture::new("physical-scopes");
+    let ws = f.ws();
+    let cwd = f.0.join("project/nested/work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(f.0.join("project/.git")).unwrap();
+    let codex = skills::agents::BUILTINS
+        .iter()
+        .find(|a| a.key == "codex")
+        .unwrap()
+        .config(false);
+    let scopes = targets::locations(&ws, &codex, &cwd).unwrap();
+    assert!(scopes.iter().any(|s| s.name() == "Global shared"));
+    assert!(scopes.iter().any(|s| s.name() == "Global .codex"));
+    let local: Vec<_> = scopes.iter().filter(|s| s.project.is_some()).collect();
+    assert_eq!(local.len(), 1);
+    assert_eq!(
+        local[0].directory.as_ref().unwrap(),
+        &cwd.join(".agents/skills")
+    );
+    assert_eq!(local[0].project.as_ref().unwrap(), &cwd);
+    let old = targets::candidates(&ws, Some(&cwd)).unwrap();
+    let target = targets::scope_agent(&ws, &codex, local[0]).unwrap();
+    assert_eq!(
+        target.key,
+        old.iter()
+            .find(|a| a.key.starts_with("codex-local-"))
+            .unwrap()
+            .key
+    );
+    let claude = skills::agents::BUILTINS
+        .iter()
+        .find(|a| a.key == "claude")
+        .unwrap()
+        .config(false);
+    let scopes = targets::locations(&ws, &claude, &cwd).unwrap();
+    assert_eq!(scopes.len(), 2);
+    assert!(!scopes.iter().any(|s| s.name().contains("shared")));
+    assert_eq!(std::fs::read_dir(&cwd).unwrap().count(), 0);
 }

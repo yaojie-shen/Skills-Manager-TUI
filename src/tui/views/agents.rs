@@ -14,6 +14,7 @@ use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
 use crate::tui::modal::Modal;
 use crate::tui::widgets::{CardGrid, fit, pad, width};
+use anyhow::Context;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -75,6 +76,7 @@ pub struct AgentsView {
     /// Key of the agent on show. Empty only while none is configured.
     scope: String,
     destinations: Vec<skills::ops::targets::Scope>,
+    launch_directory: Option<std::path::PathBuf>,
     destination: usize,
     destination_offset: usize,
     destination_rects: Vec<(Rect, usize)>,
@@ -123,11 +125,8 @@ impl Default for FocusState {
 impl AgentsView {
     pub fn discover(&mut self, start: &std::path::Path) -> anyhow::Result<()> {
         self.destinations = skills::ops::targets::discover_scopes(start)?;
-        self.destination = self
-            .destinations
-            .iter()
-            .position(|s| s.repository)
-            .unwrap_or(1);
+        self.launch_directory = self.destinations.get(1).and_then(|s| s.project.clone());
+        self.destination = 1;
         Ok(())
     }
 
@@ -1636,36 +1635,86 @@ impl AgentsView {
             .as_ref()
             .and_then(|d| d.0.config.agent(&self.scope))
             .map(|a| a.display_name().to_string());
+        let previous = self.destinations.get(self.destination).cloned();
         let result = (|| -> anyhow::Result<_> {
-            let mut ws = ctx.ws.clone();
-            let candidates = skills::ops::targets::candidates(ctx.ws, self.project().as_deref())?;
-            // Keep the configured agent cards, using each agent's local destination.
+            let start = self
+                .launch_directory
+                .as_ref()
+                .context("missing launch directory")?;
             let registered = skills::ops::targets::registered_keys(&ctx.ws.root)?;
-            let configured: Vec<_> = ctx
+            let mut configured: Vec<_> = ctx
                 .ws
                 .config
                 .agents
                 .iter()
-                .filter(|a| !registered.contains(&a.key) || !a.key.contains("-local-"))
-                .collect();
-            ws.config.agents = candidates
-                .into_iter()
                 .filter(|a| {
-                    configured.iter().any(|c| {
-                        a.key == c.key
-                            || a.key.starts_with(&format!("{}-local-", c.key))
-                            || a.name.starts_with(&format!("{} (", c.display_name()))
+                    !registered.contains(&a.key)
+                        || (!a.key.contains("-local-") && !a.key.contains("-global-"))
+                })
+                .cloned()
+                .collect();
+            for definition in skills::agents::BUILTINS {
+                if !configured.iter().any(|a| a.key == definition.key)
+                    && registered.iter().any(|key| {
+                        key.starts_with(&format!("{}-local-", definition.key))
+                            || key.starts_with(&format!("{}-global-", definition.key))
+                    })
+                {
+                    configured.push(definition.config(false));
+                }
+            }
+            let selected = configured
+                .iter()
+                .find(|a| Some(a.display_name()) == old_name.as_deref() || a.key == self.scope)
+                .or_else(|| configured.first());
+            let Some(selected) = selected else {
+                let mut ws = ctx.ws.clone();
+                ws.config.agents.clear();
+                let snap = skills::reconcile::rescope(ctx.snap, &[])?;
+                return Ok(std::sync::Arc::new((ws, snap)));
+            };
+            let locations = skills::ops::targets::locations(ctx.ws, selected, start)?;
+            let index = previous
+                .as_ref()
+                .and_then(|old| {
+                    locations
+                        .iter()
+                        .position(|s| s.directory == old.directory && s.project == old.project)
+                })
+                .or_else(|| {
+                    previous.as_ref().and_then(|old| {
+                        locations
+                            .iter()
+                            .position(|s| s.project.is_some() == old.project.is_some())
                     })
                 })
-                .map(|mut a| {
-                    a.name = a
-                        .name
-                        .trim_end_matches(" (local)")
-                        .trim_end_matches(" (global)")
-                        .to_string();
-                    a
-                })
-                .collect();
+                .unwrap_or(0);
+            let location = locations
+                .get(index)
+                .context("agent has no deployment locations")?;
+            let mut ws = ctx.ws.clone();
+            ws.config.agents.clear();
+            for base in &configured {
+                let candidates = skills::ops::targets::locations(ctx.ws, base, start)?;
+                let chosen = candidates
+                    .iter()
+                    .find(|s| s.directory == location.directory && s.project == location.project)
+                    .or_else(|| {
+                        candidates
+                            .iter()
+                            .find(|s| s.project.is_some() == location.project.is_some())
+                    })
+                    .or_else(|| candidates.first());
+                if let Some(chosen) = chosen {
+                    let target = skills::ops::targets::scope_agent(ctx.ws, base, chosen)?;
+                    if base.key == selected.key {
+                        self.scope = target.key.clone();
+                    }
+                    ws.config.agents.push(target);
+                }
+            }
+            self.destinations = locations;
+            self.destination = index;
             let snap = skills::reconcile::rescope(ctx.snap, &ws.config.agents)?;
             Ok(std::sync::Arc::new((ws, snap)))
         })();
@@ -2179,7 +2228,7 @@ mod deployment_scope_tests {
             .map(|c| c.symbol())
             .collect();
         assert!(text.contains("Global") && text.contains("project"));
-        assert!(text.contains("󰋜") && text.contains("󰊢"));
+        assert!(text.contains("󰋜") && text.contains("󰉋"));
         assert!(text.contains("Target"));
         assert!(view.destination_rects.iter().all(|(r, _)| r.right() <= 80));
         assert_eq!(

@@ -1,7 +1,7 @@
 //! Staged agent deployment with an explicit destination scope.
 use super::{
     app::{Action, Ctx, Hints},
-    widgets::{Input, ListNav, OverlayClear, fit},
+    widgets::{ListNav, OverlayClear, fit},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -16,11 +16,10 @@ use std::path::PathBuf;
 pub struct DeployPicker {
     keys: Vec<String>,
     local: bool,
-    project: Input,
+    project: PathBuf,
     resolved_project: Option<PathBuf>,
     rows: Vec<(AgentConfig, usize, Option<bool>)>,
     list: ListNav,
-    editing: bool,
     error: Option<String>,
     rect: Rect,
     scopes: [Rect; 2],
@@ -38,11 +37,10 @@ impl DeployPicker {
         let mut picker = Self {
             keys,
             local: ctx.ws.project.is_some(),
-            project: Input::with_value(&project.to_string_lossy()),
+            project,
             resolved_project: None,
             rows: vec![],
             list: ListNav::default(),
-            editing: false,
             error: None,
             rect: Rect::default(),
             scopes: [Rect::default(); 2],
@@ -58,15 +56,13 @@ impl DeployPicker {
         self.resolved_project = None;
         let result = (|| -> anyhow::Result<()> {
             if self.local {
-                let path = skills::paths::expand_tilde(self.project.value().trim());
+                let path = &self.project;
                 let path = std::fs::canonicalize(path)?;
                 anyhow::ensure!(path.is_dir(), "project must be an existing directory");
                 self.resolved_project = Some(path);
             }
-            let agents = targets::candidates(ctx.ws, self.resolved_project.as_deref())?;
-            let mut ws = ctx.ws.clone();
-            ws.config.agents = agents.clone();
-            let snap = ws.scan()?;
+            let agents = targets::all_candidates(ctx.ws, self.resolved_project.as_deref())?;
+            let snap = skills::reconcile::rescope(ctx.snap, &agents)?;
             self.rows = agents
                 .into_iter()
                 .map(|a| {
@@ -92,7 +88,6 @@ impl DeployPicker {
     fn scope(&mut self, local: bool, ctx: &Ctx) {
         if self.local != local {
             self.local = local;
-            self.editing = false;
             self.reload(ctx);
         }
     }
@@ -108,10 +103,6 @@ impl DeployPicker {
         }
     }
     fn apply(&mut self) -> Vec<Action> {
-        if self.editing {
-            self.error = Some("Press Enter to confirm the project path first".into());
-            return vec![];
-        }
         let changes: Vec<_> = self
             .rows
             .iter()
@@ -134,38 +125,23 @@ impl DeployPicker {
     pub fn hints(&self) -> Hints {
         &[
             ("g/l", "global/local"),
-            ("p", "project path"),
-            ("Space", "toggle agent"),
+            ("Space", "toggle target"),
             ("↑↓", "move"),
             ("Ctrl+Enter", "apply"),
             ("Esc", "cancel"),
         ]
     }
-    pub fn paste(&mut self, text: &str) -> Vec<Action> {
-        if self.editing
-            && let Err(e) = self.project.paste(text)
-        {
-            self.error = Some(e.into());
-        }
+    pub fn paste(&mut self, _text: &str) -> Vec<Action> {
         vec![]
     }
     pub fn key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         if k.code == KeyCode::Esc {
             return vec![Action::CloseModal];
         }
-        if self.editing {
-            if matches!(k.code, KeyCode::Enter) {
-                self.editing = false;
-                self.reload(ctx);
-            } else {
-                self.project.handle_key(k);
-            }
-            return vec![];
-        }
         match k.code {
             KeyCode::Char('g') => self.scope(false, ctx),
             KeyCode::Char('l') => self.scope(true, ctx),
-            KeyCode::Char('p') if self.local => self.editing = true,
+
             KeyCode::Up => self.list.move_by(-1, self.rows.len()),
             KeyCode::Down => self.list.move_by(1, self.rows.len()),
             KeyCode::Enter if k.modifiers.contains(KeyModifiers::CONTROL) => return self.apply(),
@@ -182,22 +158,15 @@ impl DeployPicker {
                     self.scope(false, ctx);
                 } else if self.scopes[1].contains(at) {
                     self.scope(true, ctx);
-                } else if self.local && self.project_rect.contains(at) {
-                    self.editing = true;
-                    self.project.click(m.column);
                 } else if self.buttons[0].contains(at) {
                     return self.apply();
                 } else if self.buttons[1].contains(at) {
                     return vec![Action::CloseModal];
-                } else if self.list.rows.contains(at) {
-                    if self.editing {
-                        self.editing = false;
-                        self.reload(ctx);
-                    }
-                    if let Some(i) = self.list.row_at(m.row, self.rows.len()) {
-                        self.list.select(Some(i));
-                        self.toggle();
-                    }
+                } else if self.list.rows.contains(at)
+                    && let Some(i) = self.list.row_at(m.row, self.rows.len())
+                {
+                    self.list.select(Some(i));
+                    self.toggle();
                 }
             }
             MouseEventKind::ScrollDown => self.list.move_by(3, self.rows.len()),
@@ -232,9 +201,9 @@ impl DeployPicker {
         }
         self.scopes = [
             Rect::new(inner.x, inner.y, 18, 1),
-            Rect::new(inner.x + 19, inner.y, 20, 1),
+            Rect::new(inner.x + 19, inner.y, 24, 1),
         ];
-        for (i, label) in ["Global (home)", "Local (project)"].iter().enumerate() {
+        for (i, label) in ["Global (home)", "Local (working dir)"].iter().enumerate() {
             f.render_widget(
                 Paragraph::new(format!(
                     "[{}] {label}",
@@ -256,12 +225,12 @@ impl DeployPicker {
             );
             self.project_rect.x += 9;
             self.project_rect.width = self.project_rect.width.saturating_sub(9);
-            self.project.render(
-                f,
+            f.render_widget(
+                Paragraph::new(fit(
+                    &self.project.display().to_string(),
+                    self.project_rect.width as usize,
+                )),
                 self.project_rect,
-                self.editing,
-                "Project directory",
-                ctx.theme,
             );
         } else {
             f.render_widget(
@@ -392,7 +361,7 @@ mod tests {
                 .join("\n");
             if h >= 24 {
                 assert!(text.contains("Global (home)"));
-                assert!(text.contains("Local (project)"));
+                assert!(text.contains("Local (working dir)"));
                 assert!(text.contains("Target:"));
             } else {
                 assert!(text.contains("Enlarge terminal"));
