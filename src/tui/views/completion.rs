@@ -164,7 +164,7 @@ impl Completion {
             ..area
         };
         f.render_widget(OverlayClear, self.rect);
-        let block = ctx.theme.block(" filters · Tab accepts ", true);
+        let block = ctx.theme.block(" filters · Enter accepts ", true);
         let inner = block.inner(self.rect);
         f.render_widget(block, self.rect);
         let lines: Vec<Line> = self

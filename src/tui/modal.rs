@@ -40,14 +40,10 @@ pub enum InputKind {
 }
 
 pub enum Modal {
+    DeploymentChoices(Box<super::name_choices::NameChoices>),
     DeployTargets(Box<super::deploy_picker::DeployPicker>),
     PresetSkills(Box<SearchView>),
     Batch(Box<super::batch::Batch>),
-    NameConflict {
-        title: String,
-        actions: Vec<deploy::Action>,
-        rect: Rect,
-    },
     Repository(Box<super::repository_picker::RepositoryPicker>),
     Help {
         scroll: u16,
@@ -561,14 +557,17 @@ impl Modal {
 
     pub fn hints(&self) -> Hints {
         match self {
-            Modal::NameConflict { .. } => &[("c", "coexist"), ("r", "replace"), ("Esc", "cancel")],
+            Modal::DeploymentChoices(picker) => picker.hints(),
             Modal::PresetSkills(view) => view.hints(),
             Modal::Batch(p) => p.hints(),
             Modal::Repository(p) => p.hints(),
             Modal::DeployTargets(p) => p.hints(),
             Modal::Help { .. } | Modal::Message { .. } => &[("Esc", "close")],
-            Modal::Confirm { .. } | Modal::ConfirmWrite { .. } => {
+            Modal::Confirm { btn: 0, .. } | Modal::ConfirmWrite { btn: 0, .. } => {
                 &[("Enter/y", "apply"), ("Esc/n", "cancel"), ("←→", "buttons")]
+            }
+            Modal::Confirm { .. } | Modal::ConfirmWrite { .. } => {
+                &[("Enter/Esc/n", "cancel"), ("y", "apply"), ("←→", "buttons")]
             }
             Modal::Input {
                 kind: InputKind::Install,
@@ -635,21 +634,7 @@ impl Modal {
     pub fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match self {
-            Modal::NameConflict { title, actions, .. } => match k.code {
-                KeyCode::Esc => vec![Action::CloseModal],
-                KeyCode::Char(c @ ('c' | 'r')) => match deploy::resolve_names(
-                    ctx.snap,
-                    actions,
-                    Some(if c == 'c' { "coexist" } else { "replace" }),
-                ) {
-                    Ok(plan) => vec![Action::OpenModal(Box::new(Modal::confirm(
-                        title.clone(),
-                        plan,
-                    )))],
-                    Err(e) => vec![Action::Error(format!("{e:#}"))],
-                },
-                _ => vec![],
-            },
+            Modal::DeploymentChoices(picker) => picker.key(k),
             Modal::PresetSkills(view) => view.handle_key(k, ctx),
             Modal::Batch(p) => p.key(k, ctx),
             Modal::Repository(p) => p.key(k, ctx),
@@ -902,25 +887,7 @@ impl Modal {
         };
         let click = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
         match self {
-            Modal::NameConflict { rect, .. } => {
-                if click {
-                    if !rect.contains(at) {
-                        return vec![Action::CloseModal];
-                    }
-                    if m.row == rect.bottom().saturating_sub(2) {
-                        let code = if m.column < rect.x + rect.width / 2 {
-                            'c'
-                        } else {
-                            'r'
-                        };
-                        return self.handle_key(
-                            KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE),
-                            ctx,
-                        );
-                    }
-                }
-                vec![]
-            }
+            Modal::DeploymentChoices(picker) => picker.mouse(m),
             Modal::PresetSkills(view) => view.handle_mouse(m, ctx),
             Modal::Batch(p) => p.mouse(m, ctx),
             Modal::Repository(p) => p.mouse(m, ctx),
@@ -1072,62 +1039,7 @@ impl Modal {
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let th = ctx.theme;
         match self {
-            Modal::NameConflict {
-                title,
-                actions,
-                rect,
-            } => {
-                let conflicts = deploy::name_conflicts(ctx.snap, actions);
-                let mut lines = vec![
-                    Line::from("Different folders contain skills with the same frontmatter name."),
-                    Line::from("SKILL.md stays unchanged. Agent selection may be ambiguous."),
-                    Line::from(""),
-                ];
-                lines.extend(conflicts.iter().map(|c| {
-                    Line::from(format!(
-                        "{}: {} ↔ {} ({})",
-                        c.agent,
-                        c.skill,
-                        c.other_path.display(),
-                        c.name
-                    ))
-                }));
-                let r = centered(
-                    area,
-                    100,
-                    (lines.len() as u16 + 5).min(area.height.saturating_sub(2)),
-                );
-                *rect = r;
-                f.render_widget(Clear, r);
-                let block = th.block(format!(" name conflict · {title} "), true);
-                let inner = block.inner(r);
-                f.render_widget(block, r);
-                f.render_widget(
-                    Paragraph::new(lines).wrap(Wrap { trim: false }),
-                    Rect {
-                        height: inner.height.saturating_sub(2),
-                        ..inner
-                    },
-                );
-                f.render_widget(
-                    Paragraph::new("[c] Coexist"),
-                    Rect::new(
-                        inner.x,
-                        inner.bottom().saturating_sub(1),
-                        inner.width / 2,
-                        1,
-                    ),
-                );
-                f.render_widget(
-                    Paragraph::new("[r] Replace managed links"),
-                    Rect::new(
-                        inner.x + inner.width / 2,
-                        inner.bottom().saturating_sub(1),
-                        inner.width - inner.width / 2,
-                        1,
-                    ),
-                );
-            }
+            Modal::DeploymentChoices(picker) => picker.draw(f, area, ctx),
             Modal::PresetSkills(view) => {
                 let r = centered(
                     area,

@@ -14,6 +14,7 @@ mod icons;
 mod latency_bench;
 mod markdown;
 mod modal;
+mod name_choices;
 mod repository_picker;
 mod theme;
 mod toast;

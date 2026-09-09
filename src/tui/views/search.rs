@@ -1492,6 +1492,36 @@ impl View for SearchView {
         if let Some(hints) = self.overlay.hints() {
             return hints;
         }
+        if self.focus == Focus::Input {
+            if self.completion.active() {
+                return &[
+                    ("↑↓", "suggestions"),
+                    ("Enter", "complete"),
+                    ("Esc", "close suggestions"),
+                ];
+            }
+            if self.is_picker() {
+                return &[
+                    ("Enter/↓", "results"),
+                    ("Ctrl+Enter", "apply"),
+                    ("Esc", "cancel"),
+                ];
+            }
+            if self.multi {
+                return &[("Enter/↓", "results"), ("Esc", "cancel selection")];
+            }
+            if self.panel.is_some() {
+                return &[("Enter/↓", "results"), ("Esc", "results")];
+            }
+        }
+        if self.is_picker() && self.focus == Focus::Preview {
+            return &[
+                ("↑↓/j/k", "scroll"),
+                ("e", "expand fields"),
+                ("Esc", "results"),
+                ("/", "filter"),
+            ];
+        }
         if self.is_picker() {
             return &[
                 ("Space", "select"),
@@ -1678,8 +1708,14 @@ mod tests {
         view.set_query("", &ctx);
         view.select_scope(vec!["invalid".into()], "Repair".into(), None, &ctx);
         assert_eq!(view.selected(&ctx).unwrap().key, "invalid");
-        let picker = SearchView::preset_members("example", &ctx);
+        let mut picker = SearchView::preset_members("example", &ctx);
         assert_eq!(picker.hits.len(), 1);
+        picker.focus_input();
+        assert!(!picker.hints().iter().any(|(k, _)| *k == "Space"));
+        picker.focus_list();
+        assert!(picker.hints().iter().any(|(k, _)| *k == "Space"));
+        picker.focus = Focus::Preview;
+        assert!(!picker.hints().iter().any(|(k, _)| *k == "Space"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

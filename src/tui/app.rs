@@ -472,6 +472,15 @@ impl App {
         match out {
             TaskOutput::Batch(outcome) => {
                 self.batch_running = false;
+                if self.batch_modal_owned && matches!(self.modal, Some(Modal::Batch(_))) {
+                    self.modal = None;
+                }
+                self.batch_modal_owned = false;
+                if let Some(pending) = outcome.conflict {
+                    return vec![Action::OpenModal(Box::new(Modal::DeploymentChoices(
+                        Box::new(super::name_choices::NameChoices::new(pending)),
+                    )))];
+                }
                 if let Some(intent) = outcome.intent {
                     self.history.record(intent);
                 }
@@ -479,10 +488,6 @@ impl App {
                 self.tags.batch_finished(&outcome.failed);
                 self.presets.batch_finished(&outcome.failed);
                 self.repos.batch_finished(&outcome.failed);
-                if self.batch_modal_owned && matches!(self.modal, Some(Modal::Batch(_))) {
-                    self.modal = None;
-                }
-                self.batch_modal_owned = false;
                 if outcome.errors.is_empty() {
                     self.toast(outcome.message, Level::Ok);
                 } else {
@@ -931,11 +936,17 @@ impl App {
             }
             Action::ApplyLinks { title, actions } => {
                 if !deploy::name_conflicts(&self.snap, &actions).is_empty() {
-                    self.modal = Some(Modal::NameConflict {
-                        title,
-                        actions,
-                        rect: Rect::default(),
-                    });
+                    match skills::ops::name_choices::Pending::for_actions(
+                        &self.ws, &self.snap, &actions,
+                    ) {
+                        Ok(Some(pending)) => {
+                            self.modal = Some(Modal::DeploymentChoices(Box::new(
+                                super::name_choices::NameChoices::new(pending),
+                            )))
+                        }
+                        Err(error) => self.toast(format!("{error:#}"), Level::Error),
+                        Ok(None) => {}
+                    }
                     return;
                 }
                 if !actions.iter().any(|a| a.is_change()) {
@@ -961,16 +972,19 @@ impl App {
                 self.rescan();
             }
             Action::ConfirmLinks { title, actions } => {
-                self.modal = Some(if deploy::name_conflicts(&self.snap, &actions).is_empty() {
-                    Modal::confirm(title, actions)
-                } else {
-                    Modal::NameConflict {
-                        title,
-                        actions,
-                        rect: Rect::default(),
+                match skills::ops::name_choices::Pending::for_actions(
+                    &self.ws, &self.snap, &actions,
+                ) {
+                    Ok(Some(pending)) => {
+                        self.modal = Some(Modal::DeploymentChoices(Box::new(
+                            super::name_choices::NameChoices::new(pending),
+                        )))
                     }
-                });
+                    Ok(None) => self.modal = Some(Modal::confirm(title, actions)),
+                    Err(error) => self.toast(format!("{error:#}"), Level::Error),
+                }
             }
+
             Action::Record(intent) => self.history.record(intent),
             Action::Step(Step::Undo) => self.history.commit_undo(),
             Action::Step(Step::Redo) => self.history.commit_redo(),
@@ -1006,7 +1020,17 @@ impl App {
                             self.history.record(intent);
                         }
                     }
-                    Err(e) => self.toast(format!("{e:#}"), Level::Error),
+                    Err(e) => {
+                        if let Some(pending) =
+                            e.downcast_ref::<skills::ops::name_choices::Pending>()
+                        {
+                            self.modal = Some(Modal::DeploymentChoices(Box::new(
+                                super::name_choices::NameChoices::new(pending.clone()),
+                            )));
+                        } else {
+                            self.toast(format!("{e:#}"), Level::Error);
+                        }
+                    }
                 }
                 self.rescan();
             }

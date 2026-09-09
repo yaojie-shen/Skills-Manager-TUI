@@ -59,11 +59,13 @@ struct Caps {
     managed: bool,
     /// The agent's own copy, byte for byte what the root has.
     relink: bool,
+    adopt: bool,
 }
 
 impl Caps {
     fn of(state: Option<&EntryState>) -> Caps {
         Caps {
+            adopt: matches!(state, Some(EntryState::AgentOnly)),
             managed: matches!(state, Some(EntryState::Deployed)),
             clean: matches!(state, Some(EntryState::Broken { .. })),
             relink: matches!(state, Some(EntryState::Shadow { same_content: true })),
@@ -78,6 +80,7 @@ type ScopeKey = Vec<(String, std::path::PathBuf)>;
 pub struct AgentsView {
     /// Key of the agent on show. Empty only while none is configured.
     scope: String,
+    can_convert: bool,
     destinations: Vec<skills::ops::targets::Scope>,
     launch_directory: Option<std::path::PathBuf>,
     destination: usize,
@@ -374,6 +377,15 @@ impl AgentsView {
                     let agent = agent.clone();
                     let project = project.clone();
                     Action::WriteMeta(Box::new(move |ws| {
+                        let mut scoped = ws.clone();
+                        scoped.config.agents = vec![agent.clone()];
+                        scoped.project = project.clone();
+                        let snap = scoped.scan_for_links()?;
+                        if let Some(pending) = skills::ops::name_choices::Pending::for_actions(
+                            &scoped, &snap, &actions,
+                        )? {
+                            return Err(pending.into());
+                        }
                         skills::ops::targets::register(ws, &agent, project.as_deref())?;
                         deploy::apply(&actions)?;
                         Ok((
@@ -389,6 +401,15 @@ impl AgentsView {
                         title,
                         actions.iter().map(|a| a.describe()).collect(),
                         Box::new(move |ws| {
+                            let mut scoped = ws.clone();
+                            scoped.config.agents = vec![agent.clone()];
+                            scoped.project = project.clone();
+                            let snap = scoped.scan_for_links()?;
+                            if let Some(pending) = skills::ops::name_choices::Pending::for_actions(
+                                &scoped, &snap, &actions,
+                            )? {
+                                return Err(pending.into());
+                            }
                             skills::ops::targets::register(ws, &agent, project.as_deref())?;
                             deploy::apply(&actions)?;
                             Ok((
@@ -449,26 +470,62 @@ impl AgentsView {
             }
         }
         managed.append(&mut local);
-        if !self.destinations.is_empty() {
+        if !self.destinations.is_empty() && !self.content_filter.value().trim().is_empty() {
+            let mut records = ctx.snap.skills.clone();
+            records.retain(|record| {
+                !report.entries.contains_key(&record.deployment_name())
+                    || matches!(
+                        report.entries.get(&record.deployment_name()),
+                        Some(EntryState::Deployed)
+                    )
+            });
+            for (alias, doc) in &report.documents {
+                if matches!(report.entries.get(alias), Some(EntryState::Deployed)) {
+                    continue;
+                }
+                records.push(skills::reconcile::SkillRecord {
+                    key: alias.clone(),
+                    path: doc.path.clone(),
+                    status: skills::reconcile::SkillStatus::Unmanaged,
+                    name: Some(doc.name.clone()),
+                    description: Some(doc.description.clone()),
+                    body: Some(doc.body.clone()),
+                    external: doc.external,
+                    name_mismatch: doc.name != *alias,
+                    tags: vec![],
+                    note: None,
+                    source: None,
+                    current_hash: None,
+                    baseline_hash: None,
+                    deploy: std::collections::BTreeMap::from([(
+                        self.scope.clone(),
+                        skills::reconcile::DeployState::Deployed,
+                    )]),
+                    meta: None,
+                });
+            }
             let hits = self.content_searcher.borrow_mut().search(
-                &ctx.snap.skills,
+                &records,
                 &skills::search::Query::parse(self.content_filter.value()),
             );
             let order: std::collections::BTreeMap<_, _> = hits
                 .iter()
                 .enumerate()
-                .map(|(i, h)| (ctx.snap.skills[h.index].deployment_name(), i))
+                .map(|(i, h)| (records[h.index].deployment_name(), i))
                 .collect();
             let query = self.content_filter.value().to_lowercase();
             managed.retain(|row| {
                 order.contains_key(row.name)
-                    || (!row.managed && row.name.to_lowercase().contains(&query))
+                    || (!report.documents.contains_key(row.name)
+                        && row.name.to_lowercase().contains(&query))
             });
             managed.sort_by_key(|row| {
-                (
-                    !row.managed,
-                    order.get(row.name).copied().unwrap_or(usize::MAX),
-                )
+                let rank = order.get(row.name).copied().unwrap_or(usize::MAX);
+                if query.is_empty() {
+                    (usize::from(!row.managed), rank)
+                } else {
+                    (rank, usize::from(!row.managed))
+                }
             });
         }
         managed
@@ -682,6 +739,10 @@ impl AgentsView {
                 .cloned()
                 .unwrap_or_default();
         }
+        self.can_convert = ctx
+            .snap
+            .agent(&self.scope)
+            .is_some_and(|a| a.mode == AgentDirMode::DirLinked);
         let scope = self.scope_agents();
         self.presets = ctx
             .ws
@@ -783,14 +844,15 @@ impl AgentsView {
                 }
                 return vec![];
             }
-            if k.code == KeyCode::Char('/') {
+            if k.code == KeyCode::Char('/') && self.focus() == Focus::Entries {
                 self.filter_editing = true;
                 return vec![];
             }
         }
         if !self.destinations.is_empty() {
-            if k.code == KeyCode::Char('i')
-                || (k.code == KeyCode::Char('m') && self.focus() == Focus::Entries)
+            if self.focus() == Focus::Entries
+                && (k.code == KeyCode::Char('i')
+                    || (k.code == KeyCode::Char('m') && self.selected_caps().managed))
             {
                 let Some(agent) = ctx.ws.config.agent(&self.scope).cloned() else {
                     return vec![];
@@ -859,7 +921,7 @@ impl AgentsView {
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
             KeyCode::Char('q') => return vec![Action::SwitchTab(Tab::Search)],
-            KeyCode::Char('M') => {
+            KeyCode::Char('M') if self.focus() == Focus::Presets => {
                 self.matrix.open(ctx);
                 return vec![];
             }
@@ -873,11 +935,11 @@ impl AgentsView {
                 self.move_scope(1, ctx);
                 return vec![];
             }
-            KeyCode::Char('v') => {
+            KeyCode::Char('v') if self.focus() == Focus::Entries => {
                 self.compact = !self.compact;
                 return vec![];
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('s') if self.focus() == Focus::Agents => {
                 let mut ws = ctx.ws.clone();
                 ws.config.agents.retain(|a| a.key == self.scope);
                 let mut snap = ctx.snap.clone();
@@ -890,7 +952,7 @@ impl AgentsView {
                     Err(e) => vec![Action::Error(format!("{e:#}"))],
                 };
             }
-            KeyCode::Char('c') => {
+            KeyCode::Char('c') if self.focus() == Focus::Agents && self.can_convert => {
                 let agent = self.scope.clone();
                 if agent.is_empty() {
                     return vec![Action::Error("no agent is configured".into())];
@@ -972,7 +1034,9 @@ impl AgentsView {
                 let rows = self.rows(ctx);
                 let n = rows.len();
                 match k.code {
-                    KeyCode::Char('m') => return self.select_skills(ctx, None),
+                    KeyCode::Char('m') if self.selected_caps().managed => {
+                        return self.select_skills(ctx, None);
+                    }
                     // Down and up cross a whole row of cards; left and right
                     // walk along one, and only mean anything once there is more
                     // than one column to walk.
@@ -987,18 +1051,14 @@ impl AgentsView {
                         }
                     }
                     KeyCode::Right => self.entries.move_by(1, n),
-                    // On a copy that can be relinked, `l` is the relink key;
-                    // everywhere else it is the vim way of moving right. The
-                    // footer says which it is on the row in hand, and the
-                    // arrow still moves regardless.
-                    KeyCode::Char('l') => {
-                        if self.selected_caps().relink {
-                            return self.repair(ctx, &rows, false);
-                        }
-                        self.entries.move_by(1, n)
+                    KeyCode::Char('l') => self.entries.move_by(1, n),
+                    KeyCode::Char('r') if self.selected_caps().relink => {
+                        return self.repair(ctx, &rows, false);
                     }
                     KeyCode::Left | KeyCode::Char('h') => self.entries.move_by(-1, n),
-                    KeyCode::Char('x') => return self.repair(ctx, &rows, true),
+                    KeyCode::Char('x') if self.selected_caps().clean => {
+                        return self.repair(ctx, &rows, true);
+                    }
                     KeyCode::Home | KeyCode::Char('g') => {
                         self.entries.first(n);
                     }
@@ -1009,7 +1069,7 @@ impl AgentsView {
                     // Only an entry the root knows nothing about can be taken
                     // in; everything else here is either already ours or the
                     // agent's to keep.
-                    KeyCode::Char('a') => {
+                    KeyCode::Char('a') if self.selected_caps().adopt => {
                         let Some(row) = self.entries.selected().and_then(|i| rows.get(i)) else {
                             return vec![Action::Error("nothing selected".into())];
                         };
@@ -1227,13 +1287,20 @@ impl AgentsView {
                 let sub = match report.map(|r| {
                     (
                         &r.mode,
-                        r.count(|s| matches!(s, EntryState::Deployed)),
-                        r.entries.len(),
+                        r.documents
+                            .keys()
+                            .filter(|key| matches!(r.entries.get(*key), Some(EntryState::Deployed)))
+                            .count(),
+                        r.documents.len(),
                     )
                 }) {
                     None | Some((AgentDirMode::Missing, ..)) => "no directory".to_string(),
-                    Some((AgentDirMode::SharedRoot, ..)) => "shared skills root".into(),
-                    Some((AgentDirMode::DirLinked, ..)) => "whole dir linked".into(),
+                    Some((AgentDirMode::SharedRoot, _, total)) => {
+                        format!("{total} skills · shared root")
+                    }
+                    Some((AgentDirMode::DirLinked, _, total)) => {
+                        format!("{total} linked · whole dir")
+                    }
                     Some((AgentDirMode::DirForeign { .. }, ..)) => "dir links elsewhere".into(),
                     Some((AgentDirMode::Real, linked, total)) if total > linked => {
                         format!("{linked} linked · {} own", total - linked)
@@ -1261,13 +1328,18 @@ impl AgentsView {
             let sub = match report.map(|r| {
                 (
                     &r.mode,
-                    r.count(|s| matches!(s, EntryState::Deployed)),
-                    r.entries.len(),
+                    r.documents
+                        .keys()
+                        .filter(|key| matches!(r.entries.get(*key), Some(EntryState::Deployed)))
+                        .count(),
+                    r.documents.len(),
                 )
             }) {
                 None | Some((AgentDirMode::Missing, ..)) => "no directory".to_string(),
-                Some((AgentDirMode::SharedRoot, ..)) => "shared skills root".into(),
-                Some((AgentDirMode::DirLinked, ..)) => "whole dir linked".into(),
+                Some((AgentDirMode::SharedRoot, _, total)) => {
+                    format!("{total} skills · shared root")
+                }
+                Some((AgentDirMode::DirLinked, _, total)) => format!("{total} linked · whole dir"),
                 Some((AgentDirMode::DirForeign { .. }, ..)) => "dir links elsewhere".into(),
                 Some((AgentDirMode::Real, linked, total)) if total > linked => {
                     format!("{linked} linked · {} own", total - linked)
@@ -1603,15 +1675,36 @@ impl AgentsView {
         let left = rows[3];
         self.left = left;
         let rows_data = self.rows(ctx);
-        let counts = match (
-            rows_data.iter().filter(|r| r.managed).count(),
-            rows_data.iter().filter(|r| !r.managed).count(),
+        let report = ctx.snap.agent(&self.scope);
+        self.caps = rows_data
+            .iter()
+            .map(|row| {
+                let mut caps = Caps::of(row.state);
+                caps.adopt &= report.is_some_and(|r| r.documents.contains_key(row.name));
+                caps
+            })
+            .collect();
+        let valid = |row: &&Row<'_>| report.is_some_and(|r| r.documents.contains_key(row.name));
+        let mut counts = match (
+            rows_data.iter().filter(valid).filter(|r| r.managed).count(),
+            rows_data
+                .iter()
+                .filter(valid)
+                .filter(|r| !r.managed)
+                .count(),
         ) {
             (0, 0) => "nothing here yet".to_string(),
             (n, 0) => format!("{n} linked"),
             (0, m) => format!("{m} the agent's own"),
             (n, m) => format!("{n} linked · {m} the agent's own"),
         };
+        let invalid = rows_data.iter().filter(|row| !valid(row)).count();
+        if invalid > 0 {
+            if counts == "nothing here yet" {
+                counts = "0 skills".into();
+            }
+            counts.push_str(&format!(" · {invalid} invalid entries"));
+        }
         let block = th.block(
             format!(" skills · {counts} "),
             self.focus() == Focus::Entries,
@@ -1824,8 +1917,34 @@ impl AgentsView {
         if let Some(hints) = self.preview.hints() {
             return hints;
         }
+        if self.filter_editing && self.completion.active() {
+            return &[
+                ("↑↓", "suggestion"),
+                ("Enter", "complete"),
+                ("Esc", "close suggestions"),
+            ];
+        }
         if !self.destinations.is_empty() && self.filter_editing {
             return &[("Enter", "results"), ("Esc", "results")];
+        }
+        if self.focus() == Focus::Agents && !self.can_convert {
+            return &[
+                ("←→", "agent"),
+                ("↓/Enter", "scopes"),
+                ("s", "sync"),
+                ("[ ]", "agent"),
+                ("Esc/q", "library"),
+            ];
+        }
+        if !self.destinations.is_empty() && self.focus() == Focus::Entries && self.caps.is_empty() {
+            return &[
+                ("/", "filter skills"),
+                ("i", "install"),
+                ("↑", "presets"),
+                ("v", "layout"),
+                ("[ ]", "agent"),
+                ("Esc/q", "library"),
+            ];
         }
         if !self.destinations.is_empty() && self.focus() == Focus::Presets {
             return &[
@@ -1835,27 +1954,72 @@ impl AgentsView {
                 ("←→", "preset"),
                 ("↑", "scopes"),
                 ("↓", "skills"),
+                ("M", "matrix"),
+                ("[ ]", "agent"),
+                ("Esc/q", "library"),
             ];
         }
         if !self.destinations.is_empty() && self.focus() == Focus::Entries {
-            return &[
-                ("/", "filter skills"),
-                ("i", "install skills"),
-                ("x", "uninstall / repair"),
-                ("m", "multi-uninstall"),
-                ("Enter", "preview"),
-                ("↑", "presets"),
-                ("[ ]", "agent"),
-                ("v", "layout"),
-                ("Esc", "library"),
-            ];
+            return match self.selected_caps() {
+                Caps { managed: true, .. } => &[
+                    ("↑↓←→", "skill · ↑ first row: presets"),
+                    ("/", "filter skills"),
+                    ("i", "install"),
+                    ("x", "uninstall"),
+                    ("m", "multi-uninstall"),
+                    ("Enter", "preview"),
+                    ("v", "layout"),
+                    ("[ ]", "agent"),
+                    ("Esc/q", "library"),
+                ],
+                Caps { clean: true, .. } => &[
+                    ("↑↓←→", "skill · ↑ first row: presets"),
+                    ("/", "filter skills"),
+                    ("i", "install"),
+                    ("x", "remove broken link"),
+                    ("Enter", "preview"),
+                    ("v", "layout"),
+                    ("[ ]", "agent"),
+                    ("Esc/q", "library"),
+                ],
+                Caps { relink: true, .. } => &[
+                    ("↑↓←→", "skill · ↑ first row: presets"),
+                    ("/", "filter skills"),
+                    ("i", "install"),
+                    ("r", "relink"),
+                    ("Enter", "preview"),
+                    ("v", "layout"),
+                    ("[ ]", "agent"),
+                    ("Esc/q", "library"),
+                ],
+                Caps { adopt: true, .. } => &[
+                    ("↑↓←→", "skill · ↑ first row: presets"),
+                    ("/", "filter skills"),
+                    ("i", "install"),
+                    ("a", "adopt"),
+                    ("Enter", "preview"),
+                    ("v", "layout"),
+                    ("[ ]", "agent"),
+                    ("Esc/q", "library"),
+                ],
+                _ => &[
+                    ("↑↓←→", "skill · ↑ first row: presets"),
+                    ("/", "filter skills"),
+                    ("i", "install"),
+                    ("Enter", "preview"),
+                    ("v", "layout"),
+                    ("[ ]", "agent"),
+                    ("Esc/q", "library"),
+                ],
+            };
         }
         match self.focus() {
             Focus::Scopes => &[
                 ("←→", "scope"),
                 ("↑", "agents"),
-                ("↓", "presets"),
-                ("Esc", "library"),
+                ("↓/Enter", "presets"),
+                ("[ ]", "agent"),
+                ("Esc/q", "library"),
             ],
             Focus::Presets => &[
                 ("Enter", "deploy / undeploy"),
@@ -1864,8 +2028,8 @@ impl AgentsView {
                 ("←→", "pick preset"),
                 ("↓", "entries"),
                 ("[ ]", "agent"),
-                ("s", "sync"),
-                ("v", "layout"),
+                ("↑", "agents"),
+                ("Esc/q", "library"),
             ],
             // A repair key is shown only on a row it applies to, so the footer
             // never offers something the page would refuse.
@@ -1875,19 +2039,15 @@ impl AgentsView {
                     ("↑", "back to presets"),
                     ("Enter", "preview"),
                     ("x", "clean"),
-                    ("a", "adopt"),
                     ("[ ]", "agent"),
-                    ("c", "convert dir-link"),
                     ("v", "layout"),
                 ],
                 Caps { relink: true, .. } => &[
                     ("j/k", "move"),
                     ("↑", "back to presets"),
                     ("Enter", "preview"),
-                    ("l", "relink"),
-                    ("a", "adopt"),
+                    ("r", "relink"),
                     ("[ ]", "agent"),
-                    ("c", "convert dir-link"),
                     ("v", "layout"),
                 ],
                 Caps { managed: true, .. } => &[
@@ -1898,22 +2058,29 @@ impl AgentsView {
                     ("[ ]", "agent"),
                     ("v", "layout"),
                 ],
-                Caps { .. } => &[
+                Caps { adopt: true, .. } => &[
+                    ("a", "adopt"),
                     ("j/k", "move"),
                     ("↑", "back to presets"),
                     ("Enter", "preview"),
-                    ("a", "adopt"),
                     ("[ ]", "agent"),
-                    ("c", "convert dir-link"),
                     ("v", "layout"),
+                ],
+                _ => &[
+                    ("↑↓←→", "skill"),
+                    ("↑", "presets"),
+                    ("Enter", "preview"),
+                    ("v", "layout"),
+                    ("Esc/q", "library"),
                 ],
             },
             Focus::Agents => &[
                 ("←→", "pick agent"),
-                ("↓", "presets"),
+                ("↓/Enter", "scopes"),
                 ("s", "sync"),
                 ("c", "convert dir-link"),
-                ("v", "layout"),
+                ("[ ]", "agent"),
+                ("Esc/q", "library"),
             ],
         }
     }
@@ -2488,6 +2655,52 @@ mod overflow_tests {
     }
 
     #[test]
+    fn agent_owned_search_uses_declared_names_and_full_content() {
+        let tmp = skills::ops::DownloadDir::new("own-search").unwrap();
+        let root = tmp.path().join("library");
+        let directory = tmp.path().join("agent/skills");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(directory.join("stored-alias")).unwrap();
+        std::fs::write(
+            directory.join("stored-alias/SKILL.md"),
+            "---\nname: Approval Workflow\ndescription: Manage documents\n---\nAnalyze invoices",
+        )
+        .unwrap();
+        let mut ws = Workspace::open(&root).unwrap();
+        ws.config.agents = vec![AgentConfig {
+            key: "example".into(),
+            name: "Example".into(),
+            skills_dir: directory.display().to_string(),
+        }];
+        let snap = ws.scan().unwrap();
+        let theme = Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let mut view = AgentsView {
+            scope: "example".into(),
+            destinations: skills::ops::targets::discover_scopes(tmp.path()).unwrap(),
+            ..Default::default()
+        };
+        for query in [
+            "Approval",
+            "aproval",
+            "invoices",
+            "stored-alias",
+            "agent:example",
+        ] {
+            view.content_filter.set(query);
+            let rows = view.rows(&ctx);
+            assert_eq!(rows.len(), 1, "{query}");
+            assert_eq!(rows[0].name, "stored-alias");
+        }
+        view.content_filter.set("unrelated");
+        assert!(view.rows(&ctx).is_empty());
+    }
+
+    #[test]
     fn selected_pill_is_visible_and_mouse_targets_are_clipped() {
         let root = std::env::temp_dir().join(format!("skills-pills-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -2902,7 +3115,24 @@ mod deployment_scope_tests {
             "presets remain clickable pills beside the skill list"
         );
         assert!(!project.join(".claude").exists(), "browsing must not write");
+        for focus in [Focus::Agents, Focus::Scopes, Focus::Presets] {
+            view.set_focus(focus);
+            let hints = view.hints_current();
+            assert!(
+                !hints
+                    .iter()
+                    .any(|(key, _)| *key == "i" || *key == "m" || *key == "v")
+            );
+            for code in ['i', 'm', 'v', 'a', 'r'] {
+                assert!(
+                    view.handle_key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE), &ctx)
+                        .is_empty()
+                );
+            }
+        }
+
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        view.set_focus(Focus::Entries);
         let actions = view.handle_key(key(KeyCode::Char('i')), &ctx);
         let Action::OpenModal(mut modal) = actions.into_iter().next().unwrap() else {
             panic!("install picker")
@@ -2931,6 +3161,7 @@ mod deployment_scope_tests {
         assert!(!base.join("global/claude/sample").exists());
         assert!(root.join("sample/SKILL.md").exists());
         view.move_destination(1, &ctx);
+        view.set_focus(Focus::Presets);
         view.refresh(&ctx);
         term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
         let actions = view.handle_key(key(KeyCode::Enter), &ctx);
