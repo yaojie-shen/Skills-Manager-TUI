@@ -23,11 +23,6 @@ pub const CARD_H: u16 = 6;
 /// Status and selection share a slot, including a separator before the name.
 pub const MARKER_W: usize = 4;
 
-/// Separator retained for non-skill cards such as presets and agent entries.
-pub fn rule(inner_w: usize, th: &Theme) -> Line<'static> {
-    Line::from(Span::styled("─".repeat(inner_w), th.dim()))
-}
-
 /// Columns that fit in `width`, always at least one.
 pub fn cols_for(width: u16) -> usize {
     ((width / MIN_CARD_W) as usize).max(1)

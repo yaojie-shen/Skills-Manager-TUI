@@ -7,7 +7,7 @@
 //! ours to add and remove, anything else the agent brought itself is shown but
 //! never written to.
 
-use super::cards::{self, CARD_H, cols_for, frame, rule, skill_card};
+use super::cards::{self, CARD_H, cols_for, frame, skill_card};
 use super::matrix::Matrix;
 use super::preview::Overlay;
 use super::{View, wheel};
@@ -79,8 +79,8 @@ pub struct AgentsView {
     launch_directory: Option<std::path::PathBuf>,
     destination: usize,
     destination_offset: usize,
-    scope_counts: std::collections::BTreeMap<std::path::PathBuf, String>,
-    scope_count_rx: Option<std::sync::mpsc::Receiver<(std::path::PathBuf, String)>>,
+    scope_counts: std::collections::BTreeMap<std::path::PathBuf, ScopeInventory>,
+    scope_count_rx: Option<std::sync::mpsc::Receiver<(std::path::PathBuf, ScopeInventory)>>,
     destination_rects: Vec<(Rect, usize)>,
     agent_offset: usize,
     scoped: Option<std::sync::Arc<(skills::Workspace, skills::reconcile::Snapshot)>>,
@@ -114,32 +114,52 @@ pub struct AgentsView {
     matrix: Matrix,
 }
 
+#[derive(Default)]
+struct ScopeInventory {
+    label: String,
+    // Entry directory name -> frontmatter name and description. Never borrow
+    // a central skill's metadata for a different agent-owned copy.
+    descriptions: std::collections::BTreeMap<String, (String, String)>,
+}
+impl ScopeInventory {
+    fn state(label: &str) -> Self {
+        Self {
+            label: label.into(),
+            ..Self::default()
+        }
+    }
+}
+
 /// Count readable skills, including agent-owned folders and deployed links.
 /// Runs off the UI thread; directory errors must not look like an empty folder.
-fn count_scope_skills(path: &std::path::Path) -> String {
+fn count_scope_skills(path: &std::path::Path) -> ScopeInventory {
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
                 && std::fs::symlink_metadata(path).is_err() =>
         {
-            return "Not created".into();
+            return ScopeInventory::state("Not created");
         }
-        Err(_) => return "Unreadable".into(),
+        Err(_) => return ScopeInventory::state("Unreadable"),
     };
-    let mut count = 0;
+    let mut inventory = ScopeInventory::default();
     for entry in entries {
         let Ok(entry) = entry else {
-            return "Unreadable".into();
+            return ScopeInventory::state("Unreadable");
         };
         if entry.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
-        if skills::skill::SkillDoc::load(&entry.path()).is_ok() {
-            count += 1;
+        if let Ok(doc) = skills::skill::SkillDoc::load(&entry.path()) {
+            inventory
+                .descriptions
+                .insert(doc.key, (doc.name, doc.description));
         }
     }
-    format!("{count} {}", if count == 1 { "skill" } else { "skills" })
+    let count = inventory.descriptions.len();
+    inventory.label = format!("{count} {}", if count == 1 { "skill" } else { "skills" });
+    inventory
 }
 
 /// Compact card labels; the full destination remains in the Target row.
@@ -255,7 +275,7 @@ impl AgentsView {
             .directory
             .as_ref()
             .and_then(|p| self.scope_counts.get(p))
-            .map(String::as_str)
+            .map(|inventory| inventory.label.as_str())
             .unwrap_or("Counting…")
     }
 
@@ -1623,27 +1643,27 @@ impl AgentsView {
                     _ => {
                         let (glyph, gs) = glyph_for(row.state, th);
                         let label = state_label(row.state);
+                        let doc = ctx
+                            .snap
+                            .agent(&self.scope)
+                            .and_then(|agent| self.scope_counts.get(&agent.skills_dir))
+                            .and_then(|inventory| inventory.descriptions.get(row.name));
+                        let name = doc.map(|(name, _)| name.as_str()).unwrap_or(row.name);
+                        let fallback = entry_summary(row.state);
+                        let description = doc
+                            .map(|(_, description)| description.as_str())
+                            .filter(|description| !description.is_empty())
+                            .unwrap_or(&fallback);
+                        let summary = cards::summary_lines(description, ci.width as usize);
                         let name_w = (ci.width as usize).saturating_sub(cards::MARKER_W);
                         vec![
                             Line::from(vec![
                                 Span::styled(format!("{glyph}   "), gs),
-                                Span::styled(pad(row.name, name_w), th.dim()),
+                                Span::styled(pad(name, name_w), th.bold()),
                             ]),
-                            Line::from(vec![
-                                Span::raw("  "),
-                                Span::styled(
-                                    fit(
-                                        &entry_summary(row.state),
-                                        (ci.width as usize).saturating_sub(2),
-                                    ),
-                                    th.dim(),
-                                ),
-                            ]),
-                            rule(ci.width as usize, th),
-                            Line::from(vec![
-                                Span::raw("  "),
-                                Span::styled(label, th.dim().add_modifier(Modifier::ITALIC)),
-                            ]),
+                            Line::from(Span::styled(summary[0].clone(), th.dim())),
+                            Line::from(Span::styled(summary[1].clone(), th.dim())),
+                            Line::from(Span::styled(fit(label, ci.width as usize), th.dim())),
                         ]
                     }
                 };
@@ -2240,7 +2260,7 @@ mod overflow_tests {
             std::fs::create_dir_all(dir).unwrap();
             std::fs::write(
                 dir.join("SKILL.md"),
-                format!("---\nname: printer\ndescription: Print documents\n---\n{body}\n"),
+                format!("---\nname: printer\ndescription: {body}\n---\n{body}\n"),
             )
             .unwrap();
         };
@@ -2276,6 +2296,22 @@ mod overflow_tests {
             "agent-owned entries must not enter central skill selection"
         );
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        view.scope_counts
+            .insert(agent_dir.clone(), count_scope_skills(&agent_dir));
+        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let card_text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(card_text.contains("AGENT COPY CONTENT"));
+        assert!(card_text.contains("AGENT ONLY CONTENT"));
+        assert!(
+            !card_text.contains("CENTRAL CONTENT"),
+            "cards must use the agent's own description"
+        );
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         for (name, expected) in [
             ("printer", "AGENT COPY CONTENT"),
@@ -2418,12 +2454,18 @@ mod deployment_scope_tests {
         std::fs::write(directory.join("invalid/SKILL.md"), "invalid").unwrap();
         std::fs::create_dir_all(directory.join("no-skill")).unwrap();
         std::os::unix::fs::symlink(&directory, base.join("shared")).unwrap();
-        assert_eq!(count_scope_skills(&directory), "2 skills");
-        assert_eq!(count_scope_skills(&base.join("shared")), "2 skills");
-        assert_eq!(count_scope_skills(&base.join("missing")), "Not created");
-        assert_eq!(count_scope_skills(&directory.join("broken")), "Unreadable");
+        assert_eq!(count_scope_skills(&directory).label, "2 skills");
+        assert_eq!(count_scope_skills(&base.join("shared")).label, "2 skills");
+        assert_eq!(
+            count_scope_skills(&base.join("missing")).label,
+            "Not created"
+        );
+        assert_eq!(
+            count_scope_skills(&directory.join("broken")).label,
+            "Unreadable"
+        );
         std::fs::remove_file(directory.join("deployed")).unwrap();
-        assert_eq!(count_scope_skills(&directory), "1 skill");
+        assert_eq!(count_scope_skills(&directory).label, "1 skill");
         std::fs::remove_dir_all(base).unwrap();
     }
 
