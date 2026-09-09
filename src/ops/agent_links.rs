@@ -39,7 +39,7 @@ pub fn plan(ws: &Workspace, agent: &str, name: &str, operation: Repair) -> Resul
     if !crate::util::valid_skill_key(name) {
         bail!("invalid agent entry name");
     }
-    let snap = ws.scan()?;
+    let snap = ws.scan_for_links()?;
     let report = snap.agent(agent).context("unknown agent")?;
     if report.mode != AgentDirMode::Real {
         bail!("agent directory must be a real directory");

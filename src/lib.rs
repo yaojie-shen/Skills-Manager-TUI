@@ -112,6 +112,12 @@ impl Workspace {
         reconcile::scan(&self.root, &self.config)
     }
 
+    /// Fresh source/destination inventory for link planning, without unrelated
+    /// baseline verification. Never use this snapshot to display content health.
+    pub fn scan_for_links(&self) -> Result<reconcile::Snapshot> {
+        reconcile::scan_for_links(&self.root, &self.config)
+    }
+
     pub fn skill_path(&self, key: &str) -> PathBuf {
         self.root.join(key)
     }

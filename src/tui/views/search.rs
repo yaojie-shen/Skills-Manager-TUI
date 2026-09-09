@@ -110,9 +110,11 @@ impl SearchView {
     }
 
     fn includes_record(&self, record: &skills::reconcile::SkillRecord) -> bool {
-        self.panel
-            .as_ref()
-            .is_none_or(|(keys, _)| keys.contains(&record.key))
+        (!self.is_picker() || (record.status.is_present() && record.name.is_some()))
+            && self
+                .panel
+                .as_ref()
+                .is_none_or(|(keys, _)| keys.contains(&record.key))
             && (self.is_picker()
                 || self.scope.is_some()
                 || self.panel.is_some()
@@ -649,7 +651,7 @@ impl SearchView {
         };
         let (old, new) = (r.key.clone(), to.clone());
         vec![Action::Write(Box::new(move |ws| {
-            edit::migrate_meta(ws, &old, &new).map(|_| format!("metadata moved {old} → {new}"))
+            edit::migrate_meta(ws, &old, &new).map(|_| format!("migrated {old} → {new}"))
         }))]
     }
     fn act_check(&self, ctx: &Ctx) -> Vec<Action> {
@@ -1644,6 +1646,10 @@ mod tests {
         .save(&root)
         .unwrap();
         let ws = skills::Workspace::open(&root).unwrap();
+        ws.meta
+            .save("missing", &skills::meta::SkillMeta::default())
+            .unwrap();
+        std::fs::write(ws.meta.path("corrupt-missing"), "not valid toml").unwrap();
         let snap = ws.scan().unwrap();
         let theme = crate::tui::theme::Theme::default();
         let ctx = Ctx {
@@ -1653,7 +1659,7 @@ mod tests {
         };
         let mut view = SearchView::default();
         view.refresh(&ctx);
-        assert_eq!(snap.skills.len(), 2);
+        assert_eq!(snap.skills.len(), 4);
         assert_eq!(view.hits.len(), 1);
         assert_eq!(view.selected(&ctx).unwrap().key, "valid");
         let mut terminal =
@@ -1673,7 +1679,7 @@ mod tests {
         view.select_scope(vec!["invalid".into()], "Repair".into(), None, &ctx);
         assert_eq!(view.selected(&ctx).unwrap().key, "invalid");
         let picker = SearchView::preset_members("example", &ctx);
-        assert_eq!(picker.hits.len(), 2);
+        assert_eq!(picker.hits.len(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 

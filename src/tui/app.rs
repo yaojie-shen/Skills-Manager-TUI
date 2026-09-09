@@ -116,6 +116,11 @@ pub enum Action {
     /// Run a write that can be taken back, and log what it changed.
     WriteMeta(MetaFn),
     BatchMeta(MetaFn, Vec<String>),
+    BackgroundWrite {
+        title: String,
+        write: MetaFn,
+        keys: Vec<String>,
+    },
     BatchLinks {
         title: String,
         actions: Vec<deploy::Action>,
@@ -163,16 +168,20 @@ pub struct App {
     pub tags: TagsView,
     pub presets: PresetsView,
     pub agents: AgentsView,
+    agents_dirty: bool,
     pub health: HealthView,
     pub repos: ReposView,
     pub modal: Option<Modal>,
     pending_task_ui: VecDeque<Action>,
     batch_running: bool,
+    batch_modal_owned: bool,
     pub toasts: Toasts,
     pub history: History,
     tasks_running: usize,
     next_task_id: u64,
     spinner: usize,
+    last_root_poll: std::time::Instant,
+    root_stamp: Option<skills::reconcile::watch::Stamp>,
     tx: Sender<Msg>,
     external: Option<External>,
     quit: bool,
@@ -255,19 +264,41 @@ impl QuitPrompt {
 }
 
 impl App {
-    pub fn set_launch_directory(&mut self, start: &std::path::Path) -> Result<()> {
-        skills::ops::targets::discover(&mut self.ws, start)?;
-        self.agents.discover(start)?;
-        self.on_snapshot();
-        Ok(())
+    #[cfg(test)]
+    pub(super) fn benchmark_apply(&mut self, action: Action) {
+        self.apply(action);
     }
 
-    pub fn new(mut ws: Workspace, tx: Sender<Msg>) -> Result<Self> {
+    #[cfg(test)]
+    pub(super) fn benchmark_drain(&mut self, rx: &std::sync::mpsc::Receiver<Msg>) {
+        while self.tasks_running > 0 {
+            self.handle(rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap());
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new(ws: Workspace, tx: Sender<Msg>) -> Result<Self> {
+        Self::new_with_launch_directory(ws, tx, None)
+    }
+
+    pub fn new_with_launch_directory(
+        mut ws: Workspace,
+        tx: Sender<Msg>,
+        start: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        if let Some(start) = start {
+            ws.inventory_project = Some(start.to_path_buf());
+        }
         Self::discover_local_agents(&mut ws)?;
-        let local_project = ws.project.clone().unwrap_or(std::env::current_dir()?);
+        let local_project = ws
+            .inventory_project
+            .clone()
+            .or_else(|| ws.project.clone())
+            .unwrap_or(std::env::current_dir()?);
         let mut agents = AgentsView::default();
         agents.discover(&local_project)?;
         let snap = ws.scan()?;
+        let root_stamp = skills::reconcile::watch::stamp(&ws.root, &ws.config).ok();
         let mut app = Self {
             ws,
             snap,
@@ -277,16 +308,20 @@ impl App {
             tags: TagsView::default(),
             presets: PresetsView::default(),
             agents,
+            agents_dirty: true,
             health: HealthView::default(),
             repos: ReposView::default(),
             modal: None,
             pending_task_ui: VecDeque::new(),
             batch_running: false,
+            batch_modal_owned: false,
             toasts: Toasts::default(),
             history: History::default(),
             tasks_running: 0,
             next_task_id: 0,
             spinner: 0,
+            last_root_poll: std::time::Instant::now(),
+            root_stamp,
             tx,
             external: None,
             quit: false,
@@ -320,7 +355,11 @@ impl App {
         self.search.refresh(&ctx);
         self.tags.refresh(&ctx);
         self.presets.refresh(&ctx);
-        self.agents.refresh(&ctx);
+        self.agents_dirty = true;
+        if self.tab == Tab::Agents {
+            self.agents.refresh(&ctx);
+            self.agents_dirty = false;
+        }
         self.health.refresh(&ctx);
         self.repos.refresh(&ctx);
         if let Some(m) = self.modal.as_mut() {
@@ -375,6 +414,13 @@ impl App {
             Msg::Tick => {
                 self.spinner = (self.spinner + 1) % SPINNER.len();
                 self.toasts.expire();
+                if self.tasks_running == 0
+                    && !self.task_ui_blocked()
+                    && self.last_root_poll.elapsed() >= std::time::Duration::from_secs(2)
+                {
+                    self.last_root_poll = std::time::Instant::now();
+                    self.spawn(Task::PollRoot);
+                }
                 Vec::new()
             }
             Msg::Resize => Vec::new(),
@@ -433,17 +479,13 @@ impl App {
                 self.tags.batch_finished(&outcome.failed);
                 self.presets.batch_finished(&outcome.failed);
                 self.repos.batch_finished(&outcome.failed);
-                if outcome.errors.is_empty() {
+                if self.batch_modal_owned && matches!(self.modal, Some(Modal::Batch(_))) {
                     self.modal = None;
+                }
+                self.batch_modal_owned = false;
+                if outcome.errors.is_empty() {
                     self.toast(outcome.message, Level::Ok);
                 } else {
-                    self.modal = Some(Modal::message(
-                        format!(
-                            "Batch result · {} skills need attention",
-                            outcome.failed.len()
-                        ),
-                        outcome.errors,
-                    ));
                     self.toast(
                         format!(
                             "{}; {} skills need attention",
@@ -454,7 +496,14 @@ impl App {
                     );
                 }
                 self.rescan();
-                vec![]
+                if outcome.errors.is_empty() {
+                    vec![]
+                } else {
+                    vec![Action::OpenModal(Box::new(Modal::message(
+                        "Operation needs attention",
+                        outcome.errors,
+                    )))]
+                }
             }
 
             TaskOutput::RepositoryFetched(_, Ok(fetched)) => {
@@ -510,12 +559,29 @@ impl App {
                 ],
             },
 
-            TaskOutput::Scan(Ok(snap)) => {
+            TaskOutput::RootStamp(Ok(stamp)) => {
+                let changed = self.root_stamp.as_ref() != Some(&stamp);
+                if !self.task_ui_blocked() && self.tasks_running == 0 {
+                    self.root_stamp = Some(stamp);
+                    if changed {
+                        return vec![Action::Rescan];
+                    }
+                }
+                Vec::new()
+            }
+            // A move can temporarily remove a directory while it is being polled.
+            // Keep the last good snapshot and retry; explicit rescans report errors.
+            TaskOutput::RootStamp(Err(_)) => Vec::new(),
+            TaskOutput::Scan(Ok(snap), stamp) => {
+                self.root_stamp = stamp;
                 self.snap = snap;
                 self.on_snapshot();
                 Vec::new()
             }
-            TaskOutput::Scan(Err(e)) => vec![Action::Error(format!("scan failed: {e:#}"))],
+            TaskOutput::Scan(Err(e), _) => {
+                self.root_stamp = None;
+                vec![Action::Error(format!("scan failed: {e:#}"))]
+            }
             TaskOutput::Check(results) => {
                 self.search.remember_checks(&results);
                 let ctx = Ctx {
@@ -576,7 +642,9 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) -> Vec<Action> {
-        if self.quit_prompt.is_some() || self.batch_running {
+        if self.quit_prompt.is_some()
+            || (self.batch_running && matches!(self.modal, Some(Modal::Batch(_))))
+        {
             return vec![];
         }
         let ctx = Ctx {
@@ -615,7 +683,7 @@ impl App {
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return vec![Action::Quit];
         }
-        if self.batch_running {
+        if self.batch_running && matches!(self.modal, Some(Modal::Batch(_))) {
             return vec![];
         }
         let ctx = Ctx {
@@ -706,7 +774,7 @@ impl App {
             }
             return vec![];
         }
-        if self.batch_running {
+        if self.batch_running && matches!(self.modal, Some(Modal::Batch(_))) {
             return vec![];
         }
         let ctx = Ctx {
@@ -739,6 +807,27 @@ impl App {
     }
 
     fn apply(&mut self, action: Action) {
+        if self.batch_running
+            && matches!(
+                &action,
+                Action::Write(_)
+                    | Action::Spawn(_)
+                    | Action::EditNote(_)
+                    | Action::WriteMeta(_)
+                    | Action::SubmitInput(_)
+                    | Action::ApplyLinks { .. }
+                    | Action::BatchMeta(..)
+                    | Action::BatchLinks { .. }
+                    | Action::BackgroundWrite { .. }
+            )
+        {
+            self.toast(
+                "An operation is still running; retry when it finishes",
+                Level::Info,
+            );
+            return;
+        }
+
         match action {
             Action::SelectAgentSkills {
                 keys,
@@ -892,6 +981,9 @@ impl App {
                 }
                 self.rescan();
             }
+            Action::BackgroundWrite { title, write, keys } => {
+                self.spawn_batch(super::event::BatchWork::Metadata(write, keys), title);
+            }
             Action::BatchMeta(write, keys) => {
                 self.spawn_batch(
                     super::event::BatchWork::Metadata(write, keys.clone()),
@@ -935,6 +1027,14 @@ impl App {
             theme: &self.theme,
         });
         self.tab = t;
+        if t == Tab::Agents && self.agents_dirty {
+            self.agents.refresh(&Ctx {
+                ws: &self.ws,
+                snap: &self.snap,
+                theme: &self.theme,
+            });
+            self.agents_dirty = false;
+        }
         let view: &mut dyn View = match t {
             Tab::Search => &mut self.search,
             Tab::Tags => &mut self.tags,
@@ -949,6 +1049,12 @@ impl App {
     /// Take one step back or forward. The plan is worked out against the tree
     /// as it stands, so anything changed since is skipped rather than forced.
     fn step(&mut self, dir: Step) -> Vec<Action> {
+        if self.batch_running {
+            return vec![Action::Toast(
+                "An operation is still running; retry when it finishes".into(),
+            )];
+        }
+
         let entry = match dir {
             Step::Undo => self.history.last(),
             Step::Redo => self.history.next_redo(),
@@ -1008,6 +1114,7 @@ impl App {
             return;
         }
         self.batch_running = true;
+        self.batch_modal_owned = matches!(self.modal, Some(Modal::Batch(_)));
         self.next_task_id += 1;
         let id = self.next_task_id;
         self.tasks_running += 1;
@@ -1031,7 +1138,7 @@ impl App {
         self.next_task_id += 1;
         let id = self.next_task_id;
         let label = match &task {
-            Task::Scan => None,
+            Task::Scan | Task::PollRoot => None,
             Task::DiscoverRepository(reference) => Some(format!("Clone {reference}")),
             Task::InstallRepository(selection) => {
                 Some(format!("Install {}", selection.fetched.repository.alias))
@@ -1285,6 +1392,96 @@ mod matrix_key_tests {
         assert!(rendered.contains("note unchanged on printer"));
         assert!(!rendered.contains("note saved"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn background_poll_refreshes_external_moves_and_deletions_and_waits_for_dialogs() {
+        let tmp = skills::ops::DownloadDir::new("tui-external-refresh").unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("old")).unwrap();
+        std::fs::write(root.join("old/SKILL.md"), "---\nname: old\n---\nBody").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root)
+        .unwrap();
+        let ws = Workspace::open(root).unwrap();
+        skills::ops::edit::tag_add(&ws, "old", &["keep".into()]).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(ws, tx).unwrap();
+        std::fs::rename(root.join("old"), root.join("new")).unwrap();
+        app.last_root_poll = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        app.modal = Some(Modal::help());
+        app.handle(Msg::Tick);
+        assert_eq!(app.tasks_running, 0);
+        app.modal = None;
+        app.handle(Msg::Tick);
+        assert_eq!(app.tasks_running, 1);
+        while app.tasks_running > 0 {
+            app.handle(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+        }
+        assert!(app.snap.get("new").is_some());
+        assert!(matches!(
+            app.snap.get("old").unwrap().status,
+            skills::reconcile::SkillStatus::Renamed { .. }
+        ));
+        std::fs::remove_dir_all(root.join("new")).unwrap();
+        app.last_root_poll = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        app.handle(Msg::Tick);
+        while app.tasks_running > 0 {
+            app.handle(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+        }
+        assert!(app.snap.get("new").is_none());
+        assert_eq!(
+            app.snap.get("old").unwrap().status,
+            skills::reconcile::SkillStatus::Missing
+        );
+        assert_eq!(app.ws.meta.load("old").unwrap().unwrap().tags, vec!["keep"]);
+        app.last_root_poll = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        app.handle(Msg::Tick);
+        let id = app.next_task_id;
+        app.handle(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+        assert_eq!(
+            app.next_task_id, id,
+            "unchanged roots must not launch a scan"
+        );
+    }
+
+    #[test]
+    fn background_write_keeps_navigation_responsive_and_preserves_new_dialog() {
+        let tmp = skills::ops::DownloadDir::new("responsive-write").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(tmp.path()).unwrap(), tx).unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        app.apply(Action::BackgroundWrite {
+            title: "Slow operation".into(),
+            keys: vec![],
+            write: Box::new(move |_| {
+                wait.recv().unwrap();
+                Ok(("done".into(), None))
+            }),
+        });
+        assert!(app.batch_running);
+        app.handle(Msg::Key(KeyEvent::from(KeyCode::Tab)));
+        assert_eq!(app.tab, Tab::Tags);
+        app.apply(Action::Write(Box::new(|_| {
+            panic!("overlapping writes must be blocked")
+        })));
+        app.modal = Some(Modal::help());
+        release.send(()).unwrap();
+        app.benchmark_drain(&rx);
+        assert!(
+            app.modal.is_some(),
+            "worker completion must not close a newer dialog"
+        );
+        assert!(!app.batch_running);
     }
 
     #[test]

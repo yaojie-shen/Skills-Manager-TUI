@@ -834,23 +834,26 @@ impl AgentsView {
                 };
                 let project = self.project();
                 let key = record.key.clone();
-                return vec![Action::OpenModal(Box::new(Modal::confirm_meta(
-                    format!("Uninstall {} from {}", record.key, agent.display_name()),
-                    vec![
-                        format!("Remove link from {}", agent.skills_dir),
-                        "The central skill is kept.".into(),
-                    ],
-                    Box::new(move |ws| {
-                        skills::ops::targets::set_installed(
-                            ws,
-                            &agent,
-                            project.as_deref(),
-                            &[key],
-                            None,
-                            false,
-                        )
-                    }),
-                )))];
+                return vec![Action::OpenModal(Box::new(
+                    Modal::confirm_meta(
+                        format!("Uninstall {} from {}", record.key, agent.display_name()),
+                        vec![
+                            format!("Remove link from {}", agent.skills_dir),
+                            "The central skill is kept.".into(),
+                        ],
+                        Box::new(move |ws| {
+                            skills::ops::targets::set_installed(
+                                ws,
+                                &agent,
+                                project.as_deref(),
+                                &[key],
+                                None,
+                                false,
+                            )
+                        }),
+                    )
+                    .in_background(vec![record.key.clone()]),
+                ))];
             }
         }
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);

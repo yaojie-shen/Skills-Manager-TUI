@@ -556,7 +556,7 @@ pub fn apply_scoped(
             paths::ensure_local_path(project, &agent.skills_path())?;
         }
     }
-    let snap = scoped.scan()?;
+    let snap = scoped.scan_for_links()?;
     let mut actions = Vec::new();
     let mut visited = std::collections::BTreeMap::new();
     for (agent, on, _) in changes {
@@ -588,7 +588,7 @@ pub fn apply_scoped(
     }
     for (agent, on, _) in changes {
         if !on {
-            let selection = selection(ws, agent)?;
+            let selection = selection_from_snapshot(ws, agent, &snap)?;
             for key in keys {
                 ensure!(
                     !selection
@@ -607,7 +607,8 @@ pub fn apply_scoped(
         if !applied.insert(agent.skills_path()) {
             continue;
         }
-        let (message, intent) = set_installed(ws, agent, project.as_deref(), keys, None, *on)?;
+        let (message, intent) =
+            set_installed_scanned(ws, agent, project.as_deref(), keys, None, *on, &snap)?;
         messages.push(message);
         if let Some(intent) = intent {
             intents.push(intent);
@@ -665,7 +666,7 @@ pub fn selection(ws: &Workspace, agent: &AgentConfig) -> Result<Selection> {
     }
     let mut scoped = ws.clone();
     scoped.config.agents = vec![agent.clone()];
-    Ok(inferred_selection(&scoped.scan()?, agent))
+    Ok(inferred_selection(&scoped.scan_for_links()?, agent))
 }
 
 /// UI callers already have a matching snapshot; never scan again just to infer
@@ -711,7 +712,20 @@ pub fn set_installed(
     on: bool,
 ) -> Result<(String, Option<crate::history::Intent>)> {
     let snap = scan_target(ws, agent)?;
-    let before = selection_from_snapshot(ws, agent, &snap)?;
+    set_installed_scanned(ws, agent, project, keys, preset, on, &snap)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_installed_scanned(
+    ws: &Workspace,
+    agent: &AgentConfig,
+    project: Option<&Path>,
+    keys: &[String],
+    preset: Option<&str>,
+    on: bool,
+    snap: &crate::reconcile::Snapshot,
+) -> Result<(String, Option<crate::history::Intent>)> {
+    let before = selection_from_snapshot(ws, agent, snap)?;
     let mut after = before.clone();
     if let Some(preset) = preset {
         if on {
@@ -732,7 +746,7 @@ pub fn set_installed(
             after.manual.remove(key);
         }
     }
-    let message = restore_scanned_selection(ws, agent, project, &before, &after, &snap)?;
+    let message = restore_scanned_selection(ws, agent, project, &before, &after, snap)?;
     let intent = (before != after).then(|| crate::history::Intent::TargetSelection {
         agent: agent.clone(),
         project: project.map(Path::to_path_buf),
@@ -756,7 +770,7 @@ pub fn restore_selection(
 fn scan_target(ws: &Workspace, agent: &AgentConfig) -> Result<crate::reconcile::Snapshot> {
     let mut scoped = ws.clone();
     scoped.config.agents = vec![agent.clone()];
-    scoped.scan()
+    scoped.scan_for_links()
 }
 
 /// Share one fresh scan across inference, validation, and planning. Filesystem

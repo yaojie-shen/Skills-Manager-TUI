@@ -56,7 +56,7 @@ pub enum Command {
     Note(NoteArgs),
     /// Record the current content as the new baseline (accept local changes)
     Accept { skill: String },
-    /// Move metadata of a missing skill onto its renamed directory
+    /// Repair an external move: migrate metadata, deployment links and references
     Migrate { old: String, new: String },
     /// Install a skill from a git repo, GitHub shorthand, or local path
     Install(InstallArgs),
@@ -468,7 +468,7 @@ pub fn run(cli: Cli) -> Result<()> {
             edit::migrate_meta(&ctx.ws, &old, &new)?;
             ctx.out(
                 &serde_json::json!({"migrated": {"from": old, "to": new}}),
-                || println!("metadata moved {old} -> {new}"),
+                || println!("migrated {old} -> {new}"),
             )
         }
         Command::Install(a) => cmd_install(&ctx, a),

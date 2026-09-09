@@ -338,6 +338,31 @@ fn central_renames_and_removals_update_target_installation_references() {
 }
 
 #[test]
+fn external_moves_update_registered_target_references_and_links() {
+    let f = Fixture::new("external-move-references");
+    let project = f.0.join("project");
+    let agent = targets::candidates(&f.ws(), Some(&project))
+        .unwrap()
+        .remove(0);
+    let ws = f.ws();
+    skills::ops::edit::tag_add(&ws, "sample", &["keep".into()]).unwrap();
+    targets::set_installed(&ws, &agent, Some(&project), &["sample".into()], None, true).unwrap();
+    std::fs::rename(ws.root.join("sample"), ws.root.join("moved")).unwrap();
+    // The workspace predates registration: migration must reload destinations.
+    skills::ops::edit::migrate_meta(&ws, "sample", "moved").unwrap();
+    let selection = targets::selection(&ws, &agent).unwrap();
+    assert!(selection.manual.contains("moved"));
+    assert!(!selection.manual.contains("sample"));
+    assert_eq!(
+        std::fs::read_link(agent.skills_path().join("moved")).unwrap(),
+        ws.root.join("moved")
+    );
+    assert!(!skills::util::is_symlink(
+        &agent.skills_path().join("sample")
+    ));
+}
+
+#[test]
 fn moving_a_library_and_its_project_keeps_relative_target_identity() {
     let f = Fixture::new("portable");
     let project = f.0.join("project");
