@@ -1,4 +1,4 @@
-//! Built-in skill locations. Sources and compatibility notes: docs/agents.md.
+//! Built-in skill locations.
 use crate::config::AgentConfig;
 use serde::Serialize;
 
