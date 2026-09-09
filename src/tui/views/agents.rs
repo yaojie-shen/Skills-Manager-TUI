@@ -1050,7 +1050,10 @@ impl AgentsView {
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
             && self.content_filter_rect.contains((m.column, m.row).into())
         {
+            self.set_focus(Focus::Entries);
+            self.preset_filter.editing = false;
             self.filter_editing = true;
+            self.content_filter.click(m.column);
             return vec![];
         }
         let at = (m.column, m.row).into();
@@ -1140,7 +1143,6 @@ impl AgentsView {
     fn draw_current(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         self.update_scope_counts();
         let th = ctx.theme;
-        let preset_input = self.focus() == Focus::Presets || self.preset_filter.editing;
         let scoped = !self.destinations.is_empty();
         let groups = Layout::default()
             .direction(Direction::Vertical)
@@ -1155,8 +1157,7 @@ impl AgentsView {
                     0
                 }),
                 Constraint::Length(5),
-                Constraint::Length(if !preset_input && scoped { 3 } else { 0 }),
-                Constraint::Min(3),
+                Constraint::Min(5),
             ])
             .split(area);
         self.group_rects = [groups[0], groups[1], groups[2]];
@@ -1189,13 +1190,7 @@ impl AgentsView {
                 preset_rows[1],
             );
         }
-        let rows = [
-            interiors[0],
-            interiors[1],
-            preset_rows[2],
-            groups[3],
-            groups[4],
-        ];
+        let rows = [interiors[0], interiors[1], preset_rows[2], groups[3]];
 
         // Agent picker. Big enough to aim at, and it takes the keyboard like
         // anything else on the page rather than hiding behind a bracket key.
@@ -1482,21 +1477,6 @@ impl AgentsView {
             " / filter presets · Enter results",
             th,
         );
-        if preset_input {
-            self.content_filter_rect = Rect::default();
-        } else if !self.destinations.is_empty() {
-            self.content_filter_rect = rows[3];
-            let block = th.block(" filter ", self.filter_editing);
-            let inner = block.inner(rows[3]);
-            f.render_widget(block, rows[3]);
-            self.content_filter.render(
-                f,
-                inner,
-                self.filter_editing,
-                "Filter skills…   tag:x  agent:y  repo:owner/repo",
-                th,
-            );
-        }
         {
             // Preset pills.
             self.preset_rects.clear();
@@ -1612,10 +1592,9 @@ impl AgentsView {
         // The whole width goes to the entries. A detail pane here only ever had
         // the selected preset's members to show, which the pills already count
         // and the list below already spells out one skill at a time.
-        let left = rows[4];
+        let left = rows[3];
         self.left = left;
         let rows_data = self.rows(ctx);
-        let cards = !self.compact && left.height >= 12;
         let counts = match (
             rows_data.iter().filter(|r| r.managed).count(),
             rows_data.iter().filter(|r| !r.managed).count(),
@@ -1631,6 +1610,30 @@ impl AgentsView {
         );
         let inner = block.inner(left);
         f.render_widget(block, left);
+        self.content_filter_rect = Rect::new(inner.x, inner.y, inner.width, inner.height.min(1));
+        self.content_filter.render(
+            f,
+            self.content_filter_rect,
+            self.filter_editing,
+            " / filter skills…   tag:x  agent:y  repo:owner/repo",
+            th,
+        );
+        let separator_height = u16::from(inner.height >= 3);
+        if separator_height > 0 {
+            f.render_widget(
+                Paragraph::new("─".repeat(inner.width as usize)).style(th.dim()),
+                Rect::new(inner.x, inner.y + 1, inner.width, 1),
+            );
+        }
+        let header_height = self.content_filter_rect.height + separator_height;
+        let inner = Rect::new(
+            inner.x,
+            inner.y + header_height,
+            inner.width,
+            inner.height.saturating_sub(header_height),
+        );
+
+        let cards = !self.compact && inner.height >= CARD_H;
 
         if rows_data.is_empty() && !self.destinations.is_empty() {
             f.render_widget(
@@ -2579,6 +2582,36 @@ mod deployment_scope_tests {
         assert_eq!(view.scoped.as_ref().unwrap().0.root, ws.root);
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let search_area = view.content_filter_rect;
+        let skills_area = view.left;
+        assert!(skills_area.contains((search_area.x, search_area.y).into()));
+        for focus in [Focus::Agents, Focus::Scopes, Focus::Presets, Focus::Entries] {
+            view.set_focus(focus);
+            term.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+            assert_eq!(
+                view.content_filter_rect, search_area,
+                "search stays inside Skills for every focus"
+            );
+            assert_eq!(view.left, skills_area, "focus must not shift the layout");
+        }
+        view.set_focus(Focus::Presets);
+        view.preset_filter.editing = true;
+        assert!(
+            view.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: search_area.x,
+                    row: search_area.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &ctx
+            )
+            .is_empty()
+        );
+        assert_eq!(view.focus(), Focus::Entries);
+        assert!(view.filter_editing);
+        assert!(!view.preset_filter.editing);
+        view.filter_editing = false;
         let selection = (view.scope.clone(), view.destination, view.preset_cursor);
         for (index, expected) in [Focus::Agents, Focus::Scopes, Focus::Presets]
             .into_iter()
