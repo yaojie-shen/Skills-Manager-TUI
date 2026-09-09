@@ -155,9 +155,18 @@ pub struct AgentReport {
     pub mode: AgentDirMode,
     /// entry name -> state (only for `Real`).
     pub entries: BTreeMap<String, EntryState>,
+    /// Successfully parsed skills; invalid entries remain in `entries` for Health.
+    #[serde(skip)]
+    pub documents: BTreeMap<String, crate::skill::SkillDoc>,
 }
 
 impl AgentReport {
+    pub fn valid_count(&self, pred: impl Fn(&EntryState) -> bool) -> usize {
+        self.documents
+            .keys()
+            .filter(|key| self.entries.get(*key).is_some_and(&pred))
+            .count()
+    }
     pub fn count(&self, pred: impl Fn(&EntryState) -> bool) -> usize {
         self.entries.values().filter(|s| pred(s)).count()
     }
@@ -572,12 +581,14 @@ fn scan_agent(
         skills_dir: dir.clone(),
         mode: AgentDirMode::Missing,
         entries: BTreeMap::new(),
+        documents: BTreeMap::new(),
     };
     let meta = match std::fs::symlink_metadata(&dir) {
         Ok(m) => m,
         Err(_) => return Ok(report),
     };
-    if meta.file_type().is_symlink() {
+    let shared_link = crate::agents::linked_skill_directory(&dir);
+    if meta.file_type().is_symlink() && shared_link.is_none() {
         let target = link_target_abs(&dir).unwrap_or_default();
         let resolved = std::fs::canonicalize(&dir).unwrap_or(target.clone());
         report.mode = if resolved == root {
@@ -585,9 +596,16 @@ fn scan_agent(
         } else {
             AgentDirMode::DirForeign { target }
         };
+        if report.mode == AgentDirMode::DirLinked {
+            for (key, record) in records.iter().filter(|(key, _)| !key.contains('/')) {
+                if let Ok(doc) = crate::skill::SkillDoc::load(&record.path) {
+                    report.documents.insert(key.clone(), doc);
+                }
+            }
+        }
         return Ok(report);
     }
-    if !meta.is_dir() {
+    if !meta.is_dir() && shared_link.is_none() {
         return Ok(report);
     }
     report.mode = if std::fs::canonicalize(&dir).ok().as_deref() == Some(root) {
@@ -654,6 +672,9 @@ fn scan_agent(
         } else {
             continue;
         };
+        if let Ok(doc) = crate::skill::SkillDoc::load(&p) {
+            report.documents.insert(name.clone(), doc);
+        }
         report.entries.insert(name, state);
     }
     Ok(report)

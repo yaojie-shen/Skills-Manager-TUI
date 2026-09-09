@@ -283,11 +283,13 @@ impl Index {
                     e[field.idx()] = e[field.idx()].saturating_add(1);
                 }
             };
-            add(Field::Name, &r.key, &mut doc);
-            if let Some(n) = &r.name
-                && n != &r.key
-            {
-                add(Field::Name, n, &mut doc);
+            if let Some(name) = &r.name {
+                add(Field::Name, name, &mut doc);
+                if name != &r.key {
+                    add(Field::Body, &r.key, &mut doc);
+                }
+            } else {
+                add(Field::Name, &r.key, &mut doc);
             }
             for t in &r.tags {
                 add(Field::Tag, t, &mut doc);
@@ -1019,6 +1021,16 @@ mod tests {
             deploy: BTreeMap::new(),
             meta: None,
         }
+    }
+
+    #[test]
+    fn declared_name_outweighs_directory_alias() {
+        let mut records = vec![rec("needle", "", "", &[]), rec("stored-alias", "", "", &[])];
+        records[0].name = Some("unrelated".into());
+        records[1].name = Some("needle".into());
+        let mut searcher = Searcher::new();
+        let hits = searcher.search(&records, &Query::parse("needle"));
+        assert_eq!(keys(&records, &hits), ["stored-alias", "needle"]);
     }
 
     #[test]

@@ -1065,10 +1065,8 @@ pub fn name_conflicts(snap: &Snapshot, actions: &[Action]) -> Vec<NameConflict> 
                 continue;
             }
             let other = snap.skills.iter().find(|s| s.deployment_name() == *alias);
-            let actual_name = crate::skill::SkillDoc::load(&other_path)
-                .ok()
-                .map(|d| d.name);
-            if actual_name.as_ref() == Some(name) {
+            let actual_name = report.documents.get(alias).map(|d| &d.name);
+            if actual_name == Some(name) {
                 conflicts.push(NameConflict {
                     agent: agent.clone(),
                     skill: skill.clone(),

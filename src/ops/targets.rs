@@ -183,18 +183,11 @@ fn locations_in(
                 } else {
                     source.parent()?.join(target)
                 };
-                let resolved = std::fs::canonicalize(source).ok()?;
-                if !resolved.is_dir() || (local && !resolved.starts_with(&start)) {
+                let resolved = crate::agents::linked_skill_directory(source)?;
+                if local && !resolved.starts_with(&start) {
                     return None;
                 }
-                // Require a real peer directory, rather than recognizing a link
-                // merely because its own resolved path equals itself.
-                let known = peers.contains(&resolved)
-                    || peers.iter().any(|peer| {
-                        std::fs::symlink_metadata(peer).is_ok_and(|m| m.is_dir())
-                            && std::fs::canonicalize(peer).ok().as_ref() == Some(&resolved)
-                    });
-                known.then(|| (source.clone(), resolve(&start, &target), resolved))
+                Some((source.clone(), resolve(&start, &target), resolved))
             })
             .collect();
         if links.is_empty() {

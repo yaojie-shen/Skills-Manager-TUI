@@ -803,8 +803,8 @@ fn print_agent(a: &skills::reconcile::AgentReport) {
         AgentDirMode::DirLinked => "dir-linked (whole directory -> root)".into(),
         AgentDirMode::DirForeign { target } => format!("dir-foreign -> {}", target.display()),
         AgentDirMode::Real => {
-            let d = a.count(|s| matches!(s, skills::reconcile::EntryState::Deployed));
-            let other = a.entries.len() - d;
+            let d = a.valid_count(|s| matches!(s, skills::reconcile::EntryState::Deployed));
+            let other = a.documents.len() - d;
             format!(
                 "real dir, {d} deployed{}",
                 if other > 0 {

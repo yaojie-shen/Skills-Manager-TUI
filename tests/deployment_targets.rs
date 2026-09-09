@@ -993,3 +993,57 @@ fn detection_combines_cli_aliases_system_apps_and_browser_extensions() {
             .contains("codex")
     );
 }
+
+#[test]
+fn shared_directory_links_have_identical_base_scan_and_scope_reports() {
+    for reverse in [false, true] {
+        let f = Fixture::new(if reverse {
+            "base-shared-reverse"
+        } else {
+            "base-shared-forward"
+        });
+        let mut ws = f.ws();
+        let project = f.0.join("project");
+        let claude = project.join(".claude/skills");
+        let shared = project.join(".agents/skills");
+        let (source, target) = if reverse {
+            (&shared, &claude)
+        } else {
+            (&claude, &shared)
+        };
+        std::fs::create_dir_all(target.join("invalid")).unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(target, source).unwrap();
+        std::os::unix::fs::symlink(ws.root.join("sample"), target.join("sample")).unwrap();
+        std::os::unix::fs::symlink(project.join("absent"), target.join("broken")).unwrap();
+        ws.config.agents = vec![
+            AgentConfig {
+                key: "claude".into(),
+                name: "Claude".into(),
+                skills_dir: claude.display().to_string(),
+            },
+            AgentConfig {
+                key: "codex".into(),
+                name: "Codex".into(),
+                skills_dir: shared.display().to_string(),
+            },
+        ];
+        let snap = ws.scan().unwrap();
+        for report in &snap.agents {
+            assert_eq!(report.mode, skills::reconcile::AgentDirMode::Real);
+            assert_eq!(report.documents.len(), 1);
+            assert_eq!(
+                report.entries.len(),
+                3,
+                "health still sees invalid and broken entries"
+            );
+            assert_eq!(
+                report.valid_count(|s| matches!(s, skills::reconcile::EntryState::Deployed)),
+                1
+            );
+        }
+        assert_eq!(snap.agents[0].entries, snap.agents[1].entries);
+        let scoped = skills::reconcile::rescope(&snap, &ws.config.agents).unwrap();
+        assert_eq!(scoped.agents[0].entries, snap.agents[0].entries);
+    }
+}

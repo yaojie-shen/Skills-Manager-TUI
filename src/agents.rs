@@ -147,3 +147,44 @@ pub fn defaults(local: bool) -> Vec<AgentConfig> {
 
 mod detection;
 pub use detection::{detect_in, detect_with_applications};
+
+/// Recognize a directory link only when it resolves to another documented
+/// skill directory in the same scope. Arbitrary external links stay foreign.
+pub fn linked_skill_directory(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !std::fs::symlink_metadata(path).ok()?.is_symlink() {
+        return None;
+    }
+    let resolved = std::fs::canonicalize(path).ok()?;
+    if !resolved.is_dir() {
+        return None;
+    }
+    let global: Vec<_> = BUILTINS
+        .iter()
+        .flat_map(|a| a.search_dirs(false))
+        .map(crate::paths::expand_tilde)
+        .collect();
+    let mut peers = Vec::new();
+    if global.iter().any(|p| p == path) {
+        peers.extend(global);
+    }
+    for suffix in BUILTINS.iter().flat_map(|a| a.search_dirs(true)) {
+        if path.ends_with(suffix) {
+            let base = path
+                .ancestors()
+                .nth(std::path::Path::new(suffix).components().count())?;
+            peers.extend(
+                BUILTINS
+                    .iter()
+                    .flat_map(|a| a.search_dirs(true))
+                    .map(|s| base.join(s)),
+            );
+        }
+    }
+    peers
+        .into_iter()
+        .any(|peer| {
+            std::fs::symlink_metadata(&peer).is_ok_and(|m| m.is_dir())
+                && std::fs::canonicalize(peer).ok().as_ref() == Some(&resolved)
+        })
+        .then_some(resolved)
+}
