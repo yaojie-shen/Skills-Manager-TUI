@@ -79,6 +79,8 @@ pub struct AgentsView {
     launch_directory: Option<std::path::PathBuf>,
     destination: usize,
     destination_offset: usize,
+    scope_counts: std::collections::BTreeMap<std::path::PathBuf, String>,
+    scope_count_rx: Option<std::sync::mpsc::Receiver<(std::path::PathBuf, String)>>,
     destination_rects: Vec<(Rect, usize)>,
     agent_offset: usize,
     scoped: Option<std::sync::Arc<(skills::Workspace, skills::reconcile::Snapshot)>>,
@@ -110,6 +112,34 @@ pub struct AgentsView {
     preview: Overlay,
     /// The whole preset × agent picture, over the page.
     matrix: Matrix,
+}
+
+/// Count readable skills, including agent-owned folders and deployed links.
+/// Runs off the UI thread; directory errors must not look like an empty folder.
+fn count_scope_skills(path: &std::path::Path) -> String {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(path).is_err() =>
+        {
+            return "Not created".into();
+        }
+        Err(_) => return "Unreadable".into(),
+    };
+    let mut count = 0;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return "Unreadable".into();
+        };
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        if skills::skill::SkillDoc::load(&entry.path()).is_ok() {
+            count += 1;
+        }
+    }
+    format!("{count} {}", if count == 1 { "skill" } else { "skills" })
 }
 
 /// Compact card labels; the full destination remains in the Target row.
@@ -180,6 +210,55 @@ impl Default for FocusState {
 }
 
 impl AgentsView {
+    fn update_scope_counts(&mut self) {
+        if let Some(rx) = &self.scope_count_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok((path, count)) => {
+                        self.scope_counts.insert(path, count);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.scope_count_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+        if self.scope_count_rx.is_some() {
+            return;
+        }
+        let paths: Vec<_> = self
+            .destinations
+            .iter()
+            .filter_map(|s| s.directory.as_ref())
+            .filter(|p| !self.scope_counts.contains_key(*p))
+            .cloned()
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.scope_count_rx = Some(rx);
+        std::thread::spawn(move || {
+            for path in paths {
+                let count = count_scope_skills(&path);
+                if tx.send((path, count)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    fn scope_count(&self, scope: &skills::ops::targets::Scope) -> &str {
+        scope
+            .directory
+            .as_ref()
+            .and_then(|p| self.scope_counts.get(p))
+            .map(String::as_str)
+            .unwrap_or("Counting…")
+    }
+
     pub fn discover(&mut self, start: &std::path::Path) -> anyhow::Result<()> {
         self.destinations = skills::ops::targets::discover_scopes(start)?;
         self.launch_directory = self.destinations.get(1).and_then(|s| s.project.clone());
@@ -1038,6 +1117,7 @@ impl AgentsView {
     }
 
     fn draw_current(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        self.update_scope_counts();
         let th = ctx.theme;
         let rows = Layout::default()
             .direction(Direction::Vertical)
@@ -1187,7 +1267,10 @@ impl AgentsView {
                         scope.project.is_none(),
                         false,
                     );
-                    (width(&path).max(width(&format!("{icon}{tier} · {kind}"))) + 4).clamp(18, 52)
+                    ((width(&path) + 2 + width(self.scope_count(scope)))
+                        .max(width(&format!("{icon}{tier} · {kind}")))
+                        + 4)
+                    .clamp(18, 52)
                         + 1
                 })
                 .collect();
@@ -1253,13 +1336,27 @@ impl AgentsView {
                     vertical: 0,
                 });
                 f.render_widget(block, rect);
+                let count = fit(self.scope_count(scope), inner.width as usize);
+                let count_width = width(&count) as u16;
+                let path_width = inner.width.saturating_sub(count_width + 2);
                 f.render_widget(
-                    Paragraph::new(crate::tui::app::middle_ellipsis(
-                        &path,
-                        inner.width as usize,
-                    ))
-                    .style(th.dim()),
-                    inner,
+                    Paragraph::new(crate::tui::app::middle_ellipsis(&path, path_width as usize))
+                        .style(th.dim()),
+                    Rect::new(inner.x, inner.y, path_width, inner.height),
+                );
+                let count_style = match self.scope_count(scope) {
+                    "Unreadable" => th.warn(),
+                    "Not created" | "Counting…" => th.dim(),
+                    _ => th.bold(),
+                };
+                f.render_widget(
+                    Paragraph::new(count).style(count_style),
+                    Rect::new(
+                        inner.right().saturating_sub(count_width),
+                        inner.y,
+                        count_width,
+                        inner.height,
+                    ),
                 );
                 self.destination_rects.push((rect, i));
                 x += w + 1;
@@ -1876,6 +1973,8 @@ impl View for AgentsView {
         self.enter_current();
     }
     fn refresh(&mut self, ctx: &Ctx) {
+        self.scope_counts.clear();
+        self.scope_count_rx = None;
         self.content_searcher.borrow_mut().configure(
             ctx.ws.config.search.clone(),
             skills::dict::Dictionaries::load(&ctx.ws.root, &ctx.ws.config.search.dictionaries),
@@ -2299,6 +2398,35 @@ mod deployment_scope_tests {
         Workspace,
         config::{AgentConfig, Config},
     };
+    #[test]
+    fn scope_counts_include_owned_and_linked_skills_but_exclude_invalid_entries() {
+        let base = std::env::temp_dir().join(format!("skills-scope-counts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let directory = base.join("skills");
+        std::fs::create_dir_all(directory.join("owned")).unwrap();
+        std::fs::create_dir_all(base.join("upstream")).unwrap();
+        for path in [directory.join("owned"), base.join("upstream")] {
+            std::fs::write(
+                path.join("SKILL.md"),
+                "---\nname: sample\ndescription: test\n---\nbody",
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink(base.join("upstream"), directory.join("deployed")).unwrap();
+        std::os::unix::fs::symlink(base.join("missing"), directory.join("broken")).unwrap();
+        std::fs::create_dir_all(directory.join("invalid")).unwrap();
+        std::fs::write(directory.join("invalid/SKILL.md"), "invalid").unwrap();
+        std::fs::create_dir_all(directory.join("no-skill")).unwrap();
+        std::os::unix::fs::symlink(&directory, base.join("shared")).unwrap();
+        assert_eq!(count_scope_skills(&directory), "2 skills");
+        assert_eq!(count_scope_skills(&base.join("shared")), "2 skills");
+        assert_eq!(count_scope_skills(&base.join("missing")), "Not created");
+        assert_eq!(count_scope_skills(&directory.join("broken")), "Unreadable");
+        std::fs::remove_file(directory.join("deployed")).unwrap();
+        assert_eq!(count_scope_skills(&directory), "1 skill");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn cards_bind_operations_to_the_selected_scope_without_changing_the_library() {
         let base =
