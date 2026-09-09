@@ -6,17 +6,18 @@ use super::modal::Modal;
 use super::theme::Theme;
 use super::toast::Toasts;
 use super::views::{
-    View, agents::AgentsView, health::HealthView, presets::PresetsView, search::SearchView,
-    tags::TagsView,
+    View, agents::AgentsView, health::HealthView, presets::PresetsView, repos::ReposView,
+    search::SearchView, tags::TagsView,
 };
 use super::widgets::{SPINNER, width};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use skills::Workspace;
+#[cfg(test)]
 use skills::config::Config;
 use skills::history::{self, History, Plan};
 use skills::ops::deploy;
@@ -31,15 +32,17 @@ pub enum Tab {
     Presets,
     Agents,
     Health,
+    Repos,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Search,
         Tab::Tags,
         Tab::Presets,
         Tab::Agents,
         Tab::Health,
+        Tab::Repos,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -48,6 +51,7 @@ impl Tab {
             Tab::Presets => "Presets",
             Tab::Agents => "Agents",
             Tab::Health => "Health",
+            Tab::Repos => "Repos",
         }
     }
     pub fn index(self) -> usize {
@@ -87,6 +91,7 @@ pub enum Action {
     /// Keep the input and cursor until validation and synchronous writes succeed.
     SubmitInput(Vec<Action>),
     SwitchTab(Tab),
+    SwitchScope(bool),
     /// Land on a preset by name once the list next reloads: after creating
     /// or renaming one, the card to look at is the one that has just changed.
     SelectPreset(String),
@@ -160,6 +165,7 @@ pub struct App {
     pub presets: PresetsView,
     pub agents: AgentsView,
     pub health: HealthView,
+    pub repos: ReposView,
     pub modal: Option<Modal>,
     pending_task_ui: VecDeque<Action>,
     batch_running: bool,
@@ -173,6 +179,10 @@ pub struct App {
     quit: bool,
     quit_prompt: Option<QuitPrompt>,
     tab_rects: Vec<(Rect, Tab)>,
+    scope_rects: Vec<(Rect, bool)>,
+    global_root: Option<std::path::PathBuf>,
+    local_project: std::path::PathBuf,
+    scope_histories: std::collections::BTreeMap<std::path::PathBuf, History>,
     body: Rect,
 }
 
@@ -250,7 +260,14 @@ impl QuitPrompt {
 }
 
 impl App {
-    pub fn new(ws: Workspace, tx: Sender<Msg>) -> Result<Self> {
+    pub fn new(mut ws: Workspace, tx: Sender<Msg>) -> Result<Self> {
+        Self::discover_local_agents(&mut ws)?;
+        let global_root = if ws.project.is_none() {
+            Some(ws.root.clone())
+        } else {
+            skills::paths::resolve_root(None).ok()
+        };
+        let local_project = ws.project.clone().unwrap_or(std::env::current_dir()?);
         let snap = ws.scan()?;
         let mut app = Self {
             ws,
@@ -262,6 +279,7 @@ impl App {
             presets: PresetsView::default(),
             agents: AgentsView::default(),
             health: HealthView::default(),
+            repos: ReposView::default(),
             modal: None,
             pending_task_ui: VecDeque::new(),
             batch_running: false,
@@ -275,10 +293,60 @@ impl App {
             quit: false,
             quit_prompt: None,
             tab_rects: Vec::new(),
+            scope_rects: Vec::new(),
+            global_root,
+            local_project,
+            scope_histories: Default::default(),
             body: Rect::default(),
         };
         app.on_snapshot();
         Ok(app)
+    }
+
+    fn discover_local_agents(ws: &mut Workspace) -> Result<()> {
+        if let Some(project) = &ws.project {
+            for agent in skills::ops::targets::candidates(ws, Some(project))? {
+                if agent.skills_path().is_dir()
+                    && !ws.config.agents.iter().any(|a| a.key == agent.key)
+                {
+                    ws.config.agents.push(agent);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn switch_scope(&mut self, local: bool) -> Result<()> {
+        if local == self.ws.project.is_some() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.tasks_running == 0 && !self.batch_running && self.pending_task_ui.is_empty(),
+            "Wait for background work before switching scope"
+        );
+        let ws = if local {
+            Workspace::open_local(&self.local_project, true)?
+        } else {
+            Workspace::open(
+                self.global_root
+                    .as_deref()
+                    .context("No global root configured; set SKILLS_HOME or the root pointer")?,
+            )?
+        };
+        let mut next = Self::new(ws, self.tx.clone())?;
+        next.global_root = self.global_root.clone();
+        next.local_project = self.local_project.clone();
+        next.next_task_id = self.next_task_id;
+        next.tab = self.tab;
+        self.scope_histories
+            .insert(self.ws.root.clone(), std::mem::take(&mut self.history));
+        next.history = self
+            .scope_histories
+            .remove(&next.ws.root)
+            .unwrap_or_default();
+        next.scope_histories = std::mem::take(&mut self.scope_histories);
+        *self = next;
+        Ok(())
     }
 
     pub fn should_quit(&self) -> bool {
@@ -296,6 +364,7 @@ impl App {
         self.presets.refresh(&ctx);
         self.agents.refresh(&ctx);
         self.health.refresh(&ctx);
+        self.repos.refresh(&ctx);
         if let Some(m) = self.modal.as_mut() {
             m.refresh(&ctx);
         }
@@ -450,7 +519,7 @@ impl App {
                     actions.extend([
                         Action::Rescan,
                         Action::Toast(format!(
-                            "installed {} skills — d deploys the selected skill",
+                            "installed {} skills — choose destination agents",
                             keys.len()
                         )),
                         Action::Search {
@@ -462,6 +531,14 @@ impl App {
                             focus_list: true,
                         },
                     ]);
+                    actions.push(Action::OpenModal(Box::new(Modal::batch_deploy(
+                        keys,
+                        &Ctx {
+                            ws: &self.ws,
+                            snap: &self.snap,
+                            theme: &self.theme,
+                        },
+                    ))));
                     actions
                 }
                 Err(e) => vec![
@@ -513,11 +590,19 @@ impl App {
             TaskOutput::Installed(_, Ok(key)) => vec![
                 Action::Record(history::Intent::Install { skill: key.clone() }),
                 Action::Rescan,
-                Action::Toast(format!("installed {key} — press d to deploy it")),
+                Action::Toast(format!("installed {key} — choose destination agents")),
                 Action::Search {
-                    query: key,
+                    query: key.clone(),
                     focus_list: true,
                 },
+                Action::OpenModal(Box::new(Modal::batch_deploy(
+                    vec![key],
+                    &Ctx {
+                        ws: &self.ws,
+                        snap: &self.snap,
+                        theme: &self.theme,
+                    },
+                ))),
             ],
             // Legacy git installs with several skills enter the shared repository picker.
             TaskOutput::Installed(reference, Err(e)) => {
@@ -584,6 +669,9 @@ impl App {
         }
         // Any text field that holds the keyboard keeps its digits and slashes;
         // the Tags page has one of its own for colours and merge targets.
+        if k.code == KeyCode::F(6) {
+            return vec![Action::SwitchScope(self.ws.project.is_none())];
+        }
         let in_search_input = (self.tab == Tab::Search && self.search.input_focused())
             || (self.tab == Tab::Tags && self.tags.input_focused());
         match (k.code, k.modifiers) {
@@ -600,7 +688,7 @@ impl App {
             (KeyCode::Char('?'), _) if !in_search_input => {
                 return vec![Action::OpenModal(Box::new(Modal::help()))];
             }
-            (KeyCode::Char(c @ '1'..='5'), KeyModifiers::NONE) if !in_search_input => {
+            (KeyCode::Char(c @ '1'..='6'), KeyModifiers::NONE) if !in_search_input => {
                 return vec![Action::SwitchTab(Tab::ALL[(c as u8 - b'1') as usize])];
             }
             (KeyCode::Tab, _) if self.tab != Tab::Search => {
@@ -627,6 +715,7 @@ impl App {
             Tab::Presets => self.presets.handle_key(k, &ctx),
             Tab::Agents => self.agents.handle_key(k, &ctx),
             Tab::Health => self.health.handle_key(k, &ctx),
+            Tab::Repos => self.repos.handle_key(k, &ctx),
         }
     }
 
@@ -655,6 +744,14 @@ impl App {
             return modal.handle_mouse(m, &ctx);
         }
         if let MouseEventKind::Down(MouseButton::Left) = m.kind
+            && let Some((_, local)) = self
+                .scope_rects
+                .iter()
+                .find(|(r, _)| r.contains((m.column, m.row).into()))
+        {
+            return vec![Action::SwitchScope(*local)];
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind
             && let Some((_, tab)) = self
                 .tab_rects
                 .iter()
@@ -671,6 +768,7 @@ impl App {
             Tab::Presets => self.presets.handle_mouse(m, &ctx),
             Tab::Agents => self.agents.handle_mouse(m, &ctx),
             Tab::Health => self.health.handle_mouse(m, &ctx),
+            Tab::Repos => self.repos.handle_mouse(m, &ctx),
         }
     }
 
@@ -745,6 +843,11 @@ impl App {
                         self.toast(format!("{error:#}"), Level::Error);
                         break;
                     }
+                }
+            }
+            Action::SwitchScope(local) => {
+                if let Err(e) = self.switch_scope(local) {
+                    self.toast(format!("{e:#}"), Level::Error);
                 }
             }
             Action::SwitchTab(t) => {
@@ -872,6 +975,7 @@ impl App {
             Tab::Presets => &mut self.presets,
             Tab::Agents => &mut self.agents,
             Tab::Health => &mut self.health,
+            Tab::Repos => &mut self.repos,
         };
         view.enter();
     }
@@ -984,8 +1088,13 @@ impl App {
         // desired state `sync` plans from, in step with what is written. A
         // file that no longer parses is reported and the last good copy kept,
         // since a hand edit in progress should not take the program down.
-        match Config::load(&self.ws.root) {
-            Ok(config) => self.ws.config = config,
+        match self.ws.load_config() {
+            Ok(config) => {
+                self.ws.config = config;
+                if let Err(e) = Self::discover_local_agents(&mut self.ws) {
+                    self.toast(format!("{e:#}"), Level::Error);
+                }
+            }
             Err(e) => self.toast(format!("{e:#}"), Level::Error),
         }
         self.spawn(Task::Scan);
@@ -998,7 +1107,7 @@ impl App {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),
+                Constraint::Length(2),
                 Constraint::Min(3),
                 Constraint::Length(1),
             ])
@@ -1016,6 +1125,7 @@ impl App {
             Tab::Presets => self.presets.draw(f, rows[1], &ctx),
             Tab::Agents => self.agents.draw(f, rows[1], &ctx),
             Tab::Health => self.health.draw(f, rows[1], &ctx),
+            Tab::Repos => self.repos.draw(f, rows[1], &ctx),
         }
         self.draw_footer(f, rows[2]);
         if let Some(m) = self.modal.as_mut() {
@@ -1051,12 +1161,46 @@ impl App {
             spans.push(Span::raw(" "));
             x += w + 1;
         }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        self.scope_rects.clear();
+        if area.height < 2 {
+            return;
+        }
+        let mut spans = Vec::new();
+        x = area.x;
+        for (label, local) in [(" Global ", false), (" Local ", true)] {
+            let w = width(label) as u16;
+            if x + w <= area.right() {
+                self.scope_rects
+                    .push((Rect::new(x, area.y + 1, w, 1), local));
+                spans.push(Span::styled(
+                    label,
+                    if local == self.ws.project.is_some() {
+                        th.selected()
+                    } else {
+                        th.dim()
+                    },
+                ));
+                x += w;
+            }
+        }
         let used = (x - area.x) as usize;
         let available = (area.width as usize).saturating_sub(used);
         let right = if self.tasks_running > 0 {
             super::widgets::fit(&format!("{} working  ", SPINNER[self.spinner]), available)
         } else {
-            let path = skills::paths::contract_tilde(&self.snap.root);
+            let path = format!(
+                "{}{}",
+                if self.ws.project.is_some() {
+                    "local: "
+                } else {
+                    ""
+                },
+                skills::paths::contract_tilde(&self.snap.root)
+            );
             let tail_space = available.min(2);
             format!(
                 "{}{}",
@@ -1067,7 +1211,10 @@ impl App {
         let pad = (area.width as usize).saturating_sub(used + width(&right));
         spans.push(Span::raw(" ".repeat(pad)));
         spans.push(Span::styled(right, th.dim()));
-        f.render_widget(Paragraph::new(Line::from(spans)), area);
+        f.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        );
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
@@ -1081,6 +1228,7 @@ impl App {
                 Tab::Presets => self.presets.hints(),
                 Tab::Agents => self.agents.hints(),
                 Tab::Health => self.health.hints(),
+                Tab::Repos => self.repos.hints(),
             }
         };
         // Results moved out to the notification stack, so the footer is only keys.
@@ -1208,7 +1356,13 @@ mod matrix_key_tests {
             1,
             "12/30 complete · querying printer…".into(),
         ));
-        for tab in [Tab::Tags, Tab::Presets, Tab::Agents, Tab::Health] {
+        for tab in [
+            Tab::Tags,
+            Tab::Presets,
+            Tab::Agents,
+            Tab::Health,
+            Tab::Repos,
+        ] {
             app.switch_tab(tab);
             app.handle(Msg::Key(KeyEvent::new(
                 KeyCode::Char('q'),
@@ -1544,5 +1698,61 @@ mod matrix_key_tests {
             [Action::SwitchTab(Tab::Presets)]
         ));
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    #[test]
+    fn local_agents_show_existing_project_skills_and_scope_switch_preserves_history() {
+        let base = std::env::temp_dir().join(format!("skills-tui-scope-{}", std::process::id()));
+        let global = base.join("global");
+        let project = base.join("project");
+        std::fs::create_dir_all(&global).unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&global)
+        .unwrap();
+        for path in [".agents/skills/local-skill", ".cursor/skills/cursor-only"] {
+            let dir = project.join(path);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                "---\nname: example\ndescription: example\n---\n",
+            )
+            .unwrap();
+        }
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&global).unwrap(), tx).unwrap();
+        app.local_project = project.canonicalize().unwrap();
+        app.tab = Tab::Agents;
+        app.history.record(history::Intent::Install {
+            skill: "global-step".into(),
+        });
+        app.switch_scope(true).unwrap();
+        assert!(app.ws.project.is_some());
+        assert!(app.snap.get("local-skill").is_some());
+        assert!(
+            app.snap
+                .agents
+                .iter()
+                .any(|a| a.entries.contains_key("cursor-only"))
+        );
+        assert!(app.history.is_empty());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(app.scope_rects.len(), 2);
+        app.tasks_running = 1;
+        assert!(app.switch_scope(false).is_err());
+        app.tasks_running = 0;
+        app.switch_scope(false).unwrap();
+        assert_eq!(app.ws.root, global.canonicalize().unwrap());
+        assert!(!app.history.is_empty());
+        assert!(app.snap.get("local-skill").is_none());
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

@@ -7,6 +7,7 @@
 
 mod app;
 mod batch;
+mod deploy_picker;
 mod event;
 mod icons;
 mod markdown;
@@ -25,14 +26,11 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use std::path::Path;
 use std::sync::mpsc;
 
 type Term = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
-pub fn run(root: Option<&Path>) -> Result<()> {
-    let root = skills::paths::resolve_root(root)?;
-    let ws = skills::Workspace::open(&root)?;
+pub fn run(ws: skills::Workspace) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let mut app = app::App::new(ws, tx.clone())?;
 

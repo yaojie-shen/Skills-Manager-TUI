@@ -8,6 +8,7 @@ pub mod health;
 pub mod matrix;
 pub mod presets;
 pub mod preview;
+pub mod repos;
 pub mod search;
 pub mod tags;
 

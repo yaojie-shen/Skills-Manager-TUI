@@ -169,7 +169,8 @@ pub fn rename(ws: &Workspace, snap: &Snapshot, old: &str, new: &str) -> Result<V
         .agents
         .iter()
         .filter(|a| {
-            a.mode == AgentDirMode::Real
+            (a.mode == AgentDirMode::Real
+                || (a.mode == AgentDirMode::SharedRoot && old.contains('/')))
                 && matches!(
                     a.entries.get(&crate::repository::default_deploy_name(old)),
                     Some(EntryState::Deployed)
@@ -183,11 +184,15 @@ pub fn rename(ws: &Workspace, snap: &Snapshot, old: &str, new: &str) -> Result<V
     std::fs::rename(&from, &to).with_context(|| format!("renaming {old} -> {new}"))?;
     log.push(format!("renamed directory {old} -> {new}"));
     ws.meta.rename(old, new)?;
+    let mut linked = std::collections::BTreeSet::new();
     for a in &agents {
         let cfg = ws.config.agent(a).context("agent vanished")?;
         let link = cfg
             .skills_path()
             .join(crate::repository::default_deploy_name(new));
+        if link == to || !linked.insert(link.clone()) {
+            continue;
+        }
         std::os::unix::fs::symlink(&to, &link)?;
         log.push(format!("relinked {a}/{new}"));
     }
@@ -216,7 +221,10 @@ pub fn remove(ws: &Workspace, snap: &Snapshot, key: &str, keep_meta: bool) -> Re
     let agents: Vec<String> = snap
         .agents
         .iter()
-        .filter(|a| a.mode == AgentDirMode::Real && a.entries.contains_key(key))
+        .filter(|a| {
+            (a.mode == AgentDirMode::Real || a.mode == AgentDirMode::SharedRoot)
+                && a.entries.contains_key(&rec.deployment_name())
+        })
         .map(|a| a.key.clone())
         .collect();
     if !agents.is_empty() {

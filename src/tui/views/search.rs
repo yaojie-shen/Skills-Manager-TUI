@@ -422,7 +422,10 @@ impl SearchView {
     }
     fn act_deploy(&self, ctx: &Ctx) -> Vec<Action> {
         match self.need_present(ctx, "deploy") {
-            Ok(r) => vec![Action::OpenModal(Box::new(Modal::agent_pick(&r.key)))],
+            Ok(r) => vec![Action::OpenModal(Box::new(Modal::batch_deploy(
+                vec![r.key.clone()],
+                ctx,
+            )))],
             Err(a) => vec![a],
         }
     }

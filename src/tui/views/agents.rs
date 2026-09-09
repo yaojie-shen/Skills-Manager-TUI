@@ -636,6 +636,7 @@ impl View for AgentsView {
                 )
             }) {
                 None | Some((AgentDirMode::Missing, ..)) => "no directory".to_string(),
+                Some((AgentDirMode::SharedRoot, ..)) => "shared skills root".into(),
                 Some((AgentDirMode::DirLinked, ..)) => "whole dir linked".into(),
                 Some((AgentDirMode::DirForeign { .. }, ..)) => "dir links elsewhere".into(),
                 Some((AgentDirMode::Real, linked, total)) if total > linked => {

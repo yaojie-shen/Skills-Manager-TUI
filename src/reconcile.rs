@@ -84,6 +84,7 @@ pub struct SkillRecord {
     pub tags: Vec<String>,
     pub note: Option<String>,
     pub source: Option<crate::meta::Source>,
+    /// Calculated only when needed for baseline, rename, or shadow comparison.
     pub current_hash: Option<String>,
     pub baseline_hash: Option<String>,
     /// agent key -> state
@@ -114,6 +115,8 @@ pub enum AgentDirMode {
     Missing,
     /// The whole skills dir is a symlink to the skills root.
     DirLinked,
+    /// The agent reads the root directly; its real directories must never be relinked.
+    SharedRoot,
     /// The skills dir is a symlink to somewhere else.
     DirForeign { target: PathBuf },
     /// A real directory containing per-skill entries.
@@ -185,6 +188,27 @@ impl Snapshot {
 
 /// Scan the root and every agent. Pure read.
 pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
+    scan_with_hash(root, config, &mut hash_directory)
+}
+
+// Cache only within this scan: a later scan must observe every content change.
+fn cached_hash(
+    path: &Path,
+    hashes: &mut HashMap<PathBuf, Option<String>>,
+    hash: &mut dyn FnMut(&Path) -> Result<String>,
+) -> Option<String> {
+    hashes
+        .entry(path.to_path_buf())
+        .or_insert_with(|| hash(path).ok())
+        .clone()
+}
+
+fn scan_with_hash(
+    root: &Path,
+    config: &Config,
+    hash: &mut dyn FnMut(&Path) -> Result<String>,
+) -> Result<Snapshot> {
+    let mut hashes = HashMap::new();
     // Compare canonical symlink targets with a canonical root, including when
     // this public function is called directly instead of through Workspace.
     let root = crate::paths::resolve_root(Some(root))?;
@@ -198,6 +222,27 @@ pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if !valid_skill_key(&name) || !entry.path().is_dir() {
+            continue;
+        }
+        if name == "local" && !entry.path().join("SKILL.md").exists() && !is_symlink(&entry.path())
+        {
+            for skill in std::fs::read_dir(entry.path())? {
+                let skill = skill?;
+                let leaf = skill.file_name().to_string_lossy().into_owned();
+                if skill.file_type()?.is_dir() && valid_skill_key(&leaf) {
+                    if skill.path().join("SKILL.md").is_file() {
+                        discovered.push((format!("local/{leaf}"), skill.path()));
+                    } else {
+                        for member in std::fs::read_dir(skill.path())? {
+                            let member = member?;
+                            let name = member.file_name().to_string_lossy().into_owned();
+                            if member.file_type()?.is_dir() && valid_skill_key(&name) {
+                                discovered.push((format!("local/{leaf}/{name}"), member.path()));
+                            }
+                        }
+                    }
+                }
+            }
             continue;
         }
         if name == "repos" && !entry.path().join("SKILL.md").exists() && !is_symlink(&entry.path())
@@ -229,18 +274,28 @@ pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
             discovered.push((name, entry.path()));
         }
     }
+    // Per-skill aliases into repository storage are deployments, not second skills.
+    let aliases: std::collections::BTreeSet<PathBuf> = discovered
+        .iter()
+        .filter(|(key, _)| key.contains('/'))
+        .filter_map(|(key, path)| {
+            let alias = root.join(crate::repository::default_deploy_name(key));
+            (is_symlink(&alias)
+                && std::fs::canonicalize(&alias).ok() == std::fs::canonicalize(path).ok())
+            .then_some(alias)
+        })
+        .collect();
     for (name, path) in discovered {
+        if aliases.contains(&path) {
+            continue;
+        }
         let external = is_symlink(&path);
-        let (status, doc, current_hash) = match SkillDoc::load(&path) {
-            Ok(doc) => {
-                let h = hash_directory(&path).ok();
-                (SkillStatus::Unmanaged, Some(doc), h)
-            }
+        let (status, doc) = match SkillDoc::load(&path) {
+            Ok(doc) => (SkillStatus::Unmanaged, Some(doc)),
             Err(e) => (
                 SkillStatus::Invalid {
                     reason: e.to_string(),
                 },
-                None,
                 None,
             ),
         };
@@ -261,7 +316,7 @@ pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
                 tags: Vec::new(),
                 note: None,
                 source: None,
-                current_hash,
+                current_hash: None,
                 baseline_hash: None,
                 deploy: BTreeMap::new(),
                 meta: None,
@@ -295,6 +350,9 @@ pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
                 rec.source = meta.source.clone();
                 rec.baseline_hash = meta.baseline.as_ref().map(|b| b.hash.clone());
                 if rec.status == SkillStatus::Unmanaged {
+                    if rec.baseline_hash.is_some() {
+                        rec.current_hash = cached_hash(&rec.path, &mut hashes, hash);
+                    }
                     rec.status = match (&rec.current_hash, &rec.baseline_hash) {
                         (Some(cur), Some(base)) if cur == base => {
                             SkillStatus::Managed { no_baseline: false }
@@ -331,7 +389,19 @@ pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
         }
     }
 
-    // 3. Rename detection: missing meta with baseline hash == unmanaged dir hash, unique both ways.
+    // 3. Only hash unmanaged directories when a missing baseline needs rename candidates.
+    // The candidates still have to be unique in both directions.
+    if records
+        .values()
+        .any(|r| r.status == SkillStatus::Missing && r.baseline_hash.is_some())
+    {
+        for rec in records
+            .values_mut()
+            .filter(|r| r.status == SkillStatus::Unmanaged)
+        {
+            rec.current_hash = cached_hash(&rec.path, &mut hashes, hash);
+        }
+    }
     let mut by_hash_unmanaged: HashMap<String, Vec<String>> = HashMap::new();
     for r in records.values() {
         if r.status == SkillStatus::Unmanaged
@@ -372,9 +442,12 @@ pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
     // 4. Agents.
     let mut agents = Vec::new();
     for a in &config.agents {
-        agents.push(scan_agent(root, a, &records)?);
+        agents.push(scan_agent(root, a, &records, &mut hashes, hash)?);
     }
     for rec in records.values_mut() {
+        if rec.current_hash.is_none() {
+            rec.current_hash = hashes.get(&rec.path).cloned().flatten();
+        }
         for a in &agents {
             let state = deploy_state(a, &rec.key, rec.current_hash.as_deref(), root);
             rec.deploy.insert(a.key.clone(), state);
@@ -392,6 +465,8 @@ fn scan_agent(
     root: &Path,
     a: &AgentConfig,
     records: &BTreeMap<String, SkillRecord>,
+    hashes: &mut HashMap<PathBuf, Option<String>>,
+    hash: &mut dyn FnMut(&Path) -> Result<String>,
 ) -> Result<AgentReport> {
     let dir = a.skills_path();
     let mut report = AgentReport {
@@ -418,7 +493,11 @@ fn scan_agent(
     if !meta.is_dir() {
         return Ok(report);
     }
-    report.mode = AgentDirMode::Real;
+    report.mode = if std::fs::canonicalize(&dir).ok().as_deref() == Some(root) {
+        AgentDirMode::SharedRoot
+    } else {
+        AgentDirMode::Real
+    };
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -434,7 +513,7 @@ fn scan_agent(
                 None => EntryState::Broken { target },
                 Some(res) => {
                     if records.values().any(|r| {
-                        r.key.starts_with("repos/")
+                        r.key.contains('/')
                             && r.deployment_name() == name
                             && std::fs::canonicalize(&r.path).ok().as_ref() == Some(&res)
                     }) || (res.parent() == Some(root)
@@ -452,6 +531,11 @@ fn scan_agent(
                     }
                 }
             }
+        } else if ft.is_dir()
+            && report.mode == AgentDirMode::SharedRoot
+            && records.contains_key(&name)
+        {
+            EntryState::Deployed
         } else if ft.is_dir() {
             let central = records
                 .values()
@@ -459,8 +543,11 @@ fn scan_agent(
                 .map(|r| r.path.clone())
                 .unwrap_or_else(|| root.join(&name));
             if central.is_dir() {
-                let same = match (hash_directory(&central), hash_directory(&p)) {
-                    (Ok(a), Ok(b)) => a == b,
+                let same = match (
+                    cached_hash(&central, hashes, hash),
+                    cached_hash(&p, hashes, hash),
+                ) {
+                    (Some(a), Some(b)) => a == b,
                     _ => false,
                 };
                 EntryState::Shadow { same_content: same }
@@ -478,18 +565,166 @@ fn scan_agent(
 fn deploy_state(a: &AgentReport, key: &str, _hash: Option<&str>, _root: &Path) -> DeployState {
     match &a.mode {
         AgentDirMode::Missing => DeployState::NoAgentDir,
-        AgentDirMode::DirLinked if key.starts_with("repos/") => DeployState::NotDeployed,
+        AgentDirMode::DirLinked if key.contains('/') => DeployState::NotDeployed,
         AgentDirMode::DirLinked => DeployState::Deployed,
         AgentDirMode::DirForeign { .. } => DeployState::NotDeployed,
-        AgentDirMode::Real => match a.entries.get(&crate::repository::default_deploy_name(key)) {
-            None => DeployState::NotDeployed,
-            Some(EntryState::Deployed) => DeployState::Deployed,
-            Some(EntryState::Broken { .. }) => DeployState::Broken,
-            Some(EntryState::Foreign { .. }) => DeployState::Foreign,
-            Some(EntryState::Shadow { same_content }) => DeployState::Shadow {
-                same_content: *same_content,
-            },
-            Some(EntryState::AgentOnly) => DeployState::NotDeployed,
-        },
+        AgentDirMode::Real | AgentDirMode::SharedRoot => {
+            match a.entries.get(&crate::repository::default_deploy_name(key)) {
+                None => DeployState::NotDeployed,
+                Some(EntryState::Deployed) => DeployState::Deployed,
+                Some(EntryState::Broken { .. }) => DeployState::Broken,
+                Some(EntryState::Foreign { .. }) => DeployState::Foreign,
+                Some(EntryState::Shadow { same_content }) => DeployState::Shadow {
+                    same_content: *same_content,
+                },
+                Some(EntryState::AgentOnly) => DeployState::NotDeployed,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod scan_cost_tests {
+    use super::*;
+    use crate::meta::{Baseline, SkillMeta};
+
+    fn skill(root: &Path, key: &str) -> PathBuf {
+        let path = root.join(key);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("SKILL.md"),
+            "---\nname: example\ndescription: test\n---\nBody\n",
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn browsing_without_comparisons_never_hashes_skill_trees() {
+        let tmp = crate::ops::DownloadDir::new("scan-no-hash").unwrap();
+        let root = tmp.path();
+        skill(root, "repos/demo/one");
+        skill(root, "two");
+        MetaStore::new(root)
+            .save("two", &SkillMeta::default())
+            .unwrap();
+        let config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+        let snap = scan_with_hash(root, &config, &mut |path| {
+            panic!("browsing must not traverse {}", path.display())
+        })
+        .unwrap();
+        assert_eq!(
+            snap.get("repos/demo/one").unwrap().status,
+            SkillStatus::Unmanaged
+        );
+        assert_eq!(
+            snap.get("two").unwrap().status,
+            SkillStatus::Managed { no_baseline: true }
+        );
+        assert!(snap.skills.iter().all(|r| r.current_hash.is_none()));
+    }
+
+    #[test]
+    fn baseline_changes_and_rename_ambiguity_are_still_detected() {
+        let tmp = crate::ops::DownloadDir::new("scan-required-hash").unwrap();
+        let root = tmp.path();
+        let path = skill(root, "one");
+        let meta = SkillMeta {
+            baseline: Some(Baseline {
+                hash: hash_directory(&path).unwrap(),
+                hash_algo: crate::hash::HASH_ALGO,
+            }),
+            ..Default::default()
+        };
+        MetaStore::new(root).save("one", &meta).unwrap();
+        skill(root, "unrelated");
+        let config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+        let mut reads = vec![];
+        let snap = scan_with_hash(root, &config, &mut |path| {
+            reads.push(path.to_path_buf());
+            hash_directory(path)
+        })
+        .unwrap();
+        assert_eq!(reads, vec![path.canonicalize().unwrap()]);
+        assert_eq!(
+            snap.get("one").unwrap().status,
+            SkillStatus::Managed { no_baseline: false }
+        );
+        std::fs::write(path.join("script.py"), "print('changed')").unwrap();
+        assert_eq!(
+            scan(root, &config).unwrap().get("one").unwrap().status,
+            SkillStatus::Modified
+        );
+        std::fs::remove_file(path.join("script.py")).unwrap();
+        std::fs::rename(&path, root.join("renamed")).unwrap();
+        // Both unmanaged directories have the same content, so no unique rename.
+        assert_eq!(
+            scan(root, &config).unwrap().get("one").unwrap().status,
+            SkillStatus::Missing
+        );
+        std::fs::write(root.join("unrelated/extra.txt"), "different").unwrap();
+        assert_eq!(
+            scan(root, &config).unwrap().get("one").unwrap().status,
+            SkillStatus::Renamed {
+                to: "renamed".into()
+            }
+        );
+    }
+
+    #[test]
+    fn shadow_comparisons_share_hashes_only_within_one_scan() {
+        let tmp = crate::ops::DownloadDir::new("scan-shadows").unwrap();
+        let root = tmp.path().join("root");
+        let central = skill(&root, "one");
+        let a = tmp.path().join("agent-a");
+        let b = tmp.path().join("agent-b");
+        skill(&a, "one");
+        skill(&b, "one");
+        let config = Config {
+            agents: vec![
+                AgentConfig {
+                    key: "a".into(),
+                    name: "A".into(),
+                    skills_dir: a.display().to_string(),
+                },
+                AgentConfig {
+                    key: "b".into(),
+                    name: "B".into(),
+                    skills_dir: b.display().to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut reads = vec![];
+        let snap = scan_with_hash(&root, &config, &mut |path| {
+            reads.push(path.to_path_buf());
+            hash_directory(path)
+        })
+        .unwrap();
+        assert_eq!(
+            reads
+                .iter()
+                .filter(|p| **p == central.canonicalize().unwrap())
+                .count(),
+            1
+        );
+        assert_eq!(reads.len(), 3);
+        assert_eq!(
+            snap.get("one").unwrap().deploy["b"],
+            DeployState::Shadow { same_content: true }
+        );
+        std::fs::write(b.join("one/changed.txt"), "changed").unwrap();
+        assert_eq!(
+            scan(&root, &config).unwrap().get("one").unwrap().deploy["b"],
+            DeployState::Shadow {
+                same_content: false
+            }
+        );
     }
 }
