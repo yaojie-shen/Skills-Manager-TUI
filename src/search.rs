@@ -242,6 +242,8 @@ struct Posting {
 struct Doc {
     /// Tokens per field (for length normalization).
     len: [u32; 6],
+    names: Vec<String>,
+    name_terms: Vec<String>,
 }
 
 /// Inverted index over a set of skill records.
@@ -263,6 +265,16 @@ impl Index {
         let mut totals = [0u64; 6];
         for (doc_id, r) in records.iter().enumerate() {
             let mut doc = Doc::default();
+            doc.names
+                .push(r.key.rsplit('/').next().unwrap_or(&r.key).to_lowercase());
+            if let Some(name) = &r.name {
+                doc.names.push(name.to_lowercase());
+            }
+            doc.name_terms = doc
+                .names
+                .iter()
+                .flat_map(|name| tokenize(name).into_iter().map(|t| t.term))
+                .collect();
             let mut tf: HashMap<String, [u16; 6]> = HashMap::new();
             let mut add = |field: Field, text: &str, doc: &mut Doc| {
                 for t in tokenize(text) {
@@ -377,7 +389,7 @@ impl Index {
                 }
                 let d = damerau_levenshtein(q, v, max_dist);
                 if d <= max_dist {
-                    out.insert(v.clone(), if d == 1 { 0.6 } else { 0.4 });
+                    out.insert(v.clone(), if d == 1 { 0.35 } else { 0.2 });
                 }
             }
         }
@@ -537,11 +549,40 @@ impl Index {
             .into_values()
             .filter(|h| h.matched_words == total)
             .collect();
+        // Literal name matches must not lose to rare typo expansions or long
+        // bodies. BM25F still ranks results within each relevance tier.
+        let literal = phrase_terms(text);
+        let normalized = text.trim().to_lowercase();
+        let relevance = |hit: &RawHit| {
+            let doc = &self.docs[hit.doc];
+            let name_count = literal
+                .iter()
+                .filter(|term| doc.name_terms.contains(term))
+                .count();
+            let literal_count = literal
+                .iter()
+                .filter(|term| {
+                    self.postings
+                        .get(*term)
+                        .is_some_and(|ps| ps.binary_search_by_key(&hit.doc, |p| p.doc).is_ok())
+                })
+                .count();
+            (
+                doc.names.contains(&normalized),
+                name_count == literal.len(),
+                literal_count == literal.len(),
+                name_count,
+                literal_count,
+            )
+        };
+        let relevance: HashMap<_, _> = hits.iter().map(|hit| (hit.doc, relevance(hit))).collect();
         hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.doc.cmp(&b.doc))
+            relevance[&b.doc].cmp(&relevance[&a.doc]).then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.doc.cmp(&b.doc))
+            })
         });
         for h in hits.iter_mut() {
             h.fields.sort();
@@ -1135,6 +1176,44 @@ mod tests {
         assert_eq!(recs[hits[0].index].key, "counter");
         let hits = s.search(&recs, &Query::parse("0"));
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn paper_name_matches_outrank_body_prefix_and_typo_results() {
+        let mut target = rec("repos/author--tools/research-paper-writing", "", "", &[]);
+        target.name = Some("research-paper-writing".into());
+        let mut records = vec![
+            rec("pager", "pager", &"pager ".repeat(100), &[]),
+            rec("paperwork", "", "", &[]),
+            rec("body-only", "", &"paper ".repeat(100), &[]),
+            target,
+        ];
+        // Common literal terms must still beat rare corrected terms (IDF).
+        for i in 0..20 {
+            records.push(rec(&format!("other-{i}"), "paper", "", &[]));
+        }
+        let mut searcher = Searcher::new();
+        let hits = searcher.search(&records, &Query::parse("paper"));
+        assert_eq!(hits[0].index, 3);
+        let body = hits.iter().position(|h| h.index == 2).unwrap();
+        let typo = hits.iter().position(|h| h.index == 0).unwrap();
+        assert!(body < typo, "literal body match precedes corrected name");
+        assert!(hits[0].terms.contains(&"paper".into()));
+        assert_eq!(
+            searcher.search(&records, &Query::parse("research-paper-writing"))[0].index,
+            3
+        );
+        assert_eq!(
+            searcher.search(&records, &Query::parse("reserach paper"))[0].index,
+            3
+        );
+        searcher.cfg.fuzzy = false;
+        assert!(
+            !searcher
+                .search(&records, &Query::parse("paper"))
+                .iter()
+                .any(|h| h.index == 0)
+        );
     }
 
     #[test]

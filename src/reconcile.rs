@@ -11,6 +11,8 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+pub mod watch;
+
 /// State of a skill relative to its metadata (§7.2).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -188,7 +190,7 @@ impl Snapshot {
 
 /// Scan the root and every agent. Pure read.
 pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
-    scan_with_hash(root, config, &mut hash_directory)
+    scan_inventory(root, config, &mut hash_directory, true, true)
 }
 
 /// Refresh deployment reports against an existing library snapshot. Scope browsing
@@ -214,21 +216,40 @@ pub fn rescope(snapshot: &Snapshot, destinations: &[AgentConfig]) -> Result<Snap
     for record in records.values_mut() {
         record.deploy.clear();
         for agent in &agents {
-            record.deploy.insert(
-                agent.key.clone(),
-                deploy_state(
-                    agent,
-                    &record.key,
-                    record.current_hash.as_deref(),
-                    &snapshot.root,
-                ),
-            );
+            record
+                .deploy
+                .insert(agent.key.clone(), deploy_state(agent, record));
         }
     }
     Ok(Snapshot {
         root: snapshot.root.clone(),
         skills: records.into_values().collect(),
         agents,
+    })
+}
+
+fn parallel_hashes(paths: &[PathBuf]) -> HashMap<PathBuf, Option<String>> {
+    if paths.is_empty() {
+        return HashMap::new();
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(4);
+    std::thread::scope(|scope| {
+        let jobs: Vec<_> = paths
+            .chunks(paths.len().div_ceil(workers))
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|path| (path.clone(), hash_directory(path).ok()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .flat_map(|job| job.join().expect("hash worker panicked"))
+            .collect()
     })
 }
 
@@ -244,10 +265,28 @@ fn cached_hash(
         .clone()
 }
 
+/// Fresh inventory for link planning. Baseline/rename statuses are not verified:
+/// use `scan` for display, health checks and content updates. Shadow comparisons
+/// and actual destination inspection remain fresh, including before mutations.
+pub fn scan_for_links(root: &Path, config: &Config) -> Result<Snapshot> {
+    scan_inventory(root, config, &mut hash_directory, false, false)
+}
+
+#[cfg(test)]
 fn scan_with_hash(
     root: &Path,
     config: &Config,
     hash: &mut dyn FnMut(&Path) -> Result<String>,
+) -> Result<Snapshot> {
+    scan_inventory(root, config, hash, true, false)
+}
+
+fn scan_inventory(
+    root: &Path,
+    config: &Config,
+    hash: &mut dyn FnMut(&Path) -> Result<String>,
+    verify_content: bool,
+    parallel: bool,
 ) -> Result<Snapshot> {
     let mut hashes = HashMap::new();
     // Compare canonical symlink targets with a canonical root, including when
@@ -390,18 +429,6 @@ fn scan_with_hash(
                 rec.note = meta.note.clone();
                 rec.source = meta.source.clone();
                 rec.baseline_hash = meta.baseline.as_ref().map(|b| b.hash.clone());
-                if rec.status == SkillStatus::Unmanaged {
-                    if rec.baseline_hash.is_some() {
-                        rec.current_hash = cached_hash(&rec.path, &mut hashes, hash);
-                    }
-                    rec.status = match (&rec.current_hash, &rec.baseline_hash) {
-                        (Some(cur), Some(base)) if cur == base => {
-                            SkillStatus::Managed { no_baseline: false }
-                        }
-                        (Some(_), Some(_)) => SkillStatus::Modified,
-                        _ => SkillStatus::Managed { no_baseline: true },
-                    };
-                }
                 rec.meta = Some(meta);
             }
             Ok(None) => {}
@@ -430,11 +457,40 @@ fn scan_with_hash(
         }
     }
 
+    // Collect baseline work once, then share completed hashes with agent/shadow
+    // comparisons. Limit concurrency to avoid an unbounded disk/FD fan-out.
+    if verify_content && parallel {
+        let paths: Vec<_> = records
+            .values()
+            .filter(|r| {
+                r.status == SkillStatus::Unmanaged && r.meta.is_some() && r.baseline_hash.is_some()
+            })
+            .map(|r| r.path.clone())
+            .collect();
+        hashes.extend(parallel_hashes(&paths));
+    }
+    for rec in records
+        .values_mut()
+        .filter(|r| r.status == SkillStatus::Unmanaged && r.meta.is_some())
+    {
+        if verify_content && rec.baseline_hash.is_some() {
+            rec.current_hash = cached_hash(&rec.path, &mut hashes, hash);
+        }
+        rec.status = match (&rec.current_hash, &rec.baseline_hash) {
+            (Some(cur), Some(base)) if cur == base => SkillStatus::Managed { no_baseline: false },
+            (Some(_), Some(_)) => SkillStatus::Modified,
+            _ => SkillStatus::Managed {
+                no_baseline: verify_content || rec.baseline_hash.is_none(),
+            },
+        };
+    }
+
     // 3. Only hash unmanaged directories when a missing baseline needs rename candidates.
     // The candidates still have to be unique in both directions.
-    if records
-        .values()
-        .any(|r| r.status == SkillStatus::Missing && r.baseline_hash.is_some())
+    if verify_content
+        && records
+            .values()
+            .any(|r| r.status == SkillStatus::Missing && r.baseline_hash.is_some())
     {
         for rec in records
             .values_mut()
@@ -490,7 +546,7 @@ fn scan_with_hash(
             rec.current_hash = hashes.get(&rec.path).cloned().flatten();
         }
         for a in &agents {
-            let state = deploy_state(a, &rec.key, rec.current_hash.as_deref(), root);
+            let state = deploy_state(a, rec);
             rec.deploy.insert(a.key.clone(), state);
         }
     }
@@ -603,10 +659,13 @@ fn scan_agent(
     Ok(report)
 }
 
-fn deploy_state(a: &AgentReport, key: &str, _hash: Option<&str>, _root: &Path) -> DeployState {
+fn deploy_state(a: &AgentReport, record: &SkillRecord) -> DeployState {
+    let key = &record.key;
     match &a.mode {
         AgentDirMode::Missing => DeployState::NoAgentDir,
-        AgentDirMode::DirLinked if key.contains('/') => DeployState::NotDeployed,
+        AgentDirMode::DirLinked if key.contains('/') || record.name.is_none() => {
+            DeployState::NotDeployed
+        }
         AgentDirMode::DirLinked => DeployState::Deployed,
         AgentDirMode::DirForeign { .. } => DeployState::NotDeployed,
         AgentDirMode::Real | AgentDirMode::SharedRoot => {
@@ -638,6 +697,108 @@ mod scan_cost_tests {
         )
         .unwrap();
         path
+    }
+
+    #[test]
+    fn link_planning_skips_unrelated_baselines_but_compares_shadow_contents() {
+        let tmp = crate::ops::DownloadDir::new("link-scan-cost").unwrap();
+        let root = tmp.path().join("root");
+        let path = skill(&root, "one");
+        let meta = SkillMeta {
+            baseline: Some(Baseline {
+                hash: hash_directory(&path).unwrap(),
+                hash_algo: crate::hash::HASH_ALGO,
+            }),
+            ..Default::default()
+        };
+        MetaStore::new(&root).save("one", &meta).unwrap();
+        std::fs::write(path.join("script.py"), "changed").unwrap();
+        let mut config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+        let snap = scan_inventory(
+            &root,
+            &config,
+            &mut |_| panic!("link planning must not hash unrelated baselines"),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(snap.get("one").unwrap().status.is_present());
+        assert!(snap.get("one").unwrap().current_hash.is_none());
+        let agent = tmp.path().join("agent");
+        skill(&agent, "one");
+        config.agents.push(AgentConfig {
+            key: "a".into(),
+            name: "A".into(),
+            skills_dir: agent.display().to_string(),
+        });
+        assert_eq!(
+            scan_for_links(&root, &config)
+                .unwrap()
+                .get("one")
+                .unwrap()
+                .deploy["a"],
+            DeployState::Shadow {
+                same_content: false
+            }
+        );
+        std::fs::write(agent.join("one/script.py"), "changed").unwrap();
+        assert_eq!(
+            scan_for_links(&root, &config)
+                .unwrap()
+                .get("one")
+                .unwrap()
+                .deploy["a"],
+            DeployState::Shadow { same_content: true }
+        );
+        assert_eq!(
+            scan(&root, &config).unwrap().get("one").unwrap().status,
+            SkillStatus::Modified
+        );
+    }
+
+    #[test]
+    fn parallel_scan_matches_serial_health_and_observes_later_content_changes() {
+        let tmp = crate::ops::DownloadDir::new("parallel-scan").unwrap();
+        let root = tmp.path();
+        for i in 0..12 {
+            let key = format!("skill-{i}");
+            let path = skill(root, &key);
+            std::fs::write(path.join("unique"), key.as_bytes()).unwrap();
+            MetaStore::new(root)
+                .save(
+                    &key,
+                    &SkillMeta {
+                        baseline: Some(Baseline {
+                            hash: hash_directory(&path).unwrap(),
+                            hash_algo: crate::hash::HASH_ALGO,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        std::fs::rename(root.join("skill-0"), root.join("moved")).unwrap();
+        std::fs::remove_dir_all(root.join("skill-1")).unwrap();
+        let config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+        for body in ["edit one", "edit two, different bytes"] {
+            std::fs::write(root.join("skill-2/unique"), body).unwrap();
+            let parallel = scan(root, &config).unwrap();
+            let serial = scan_with_hash(root, &config, &mut hash_directory).unwrap();
+            assert_eq!(
+                serde_json::to_value(&parallel).unwrap(),
+                serde_json::to_value(&serial).unwrap()
+            );
+            assert_eq!(
+                parallel.get("skill-2").unwrap().status,
+                SkillStatus::Modified
+            );
+        }
     }
 
     #[test]

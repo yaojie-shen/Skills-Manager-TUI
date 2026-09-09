@@ -75,6 +75,7 @@ pub enum Modal {
         title: String,
         lines: Vec<String>,
         write: Option<MetaFn>,
+        background: Option<Vec<String>>,
         /// Set when this confirmation is a history step.
         then: Option<Step>,
         btn: usize,
@@ -182,12 +183,21 @@ impl Modal {
             title,
             lines,
             write: Some(write),
+            background: None,
             then: None,
             btn: 1,
             btn_rects: Vec::new(),
             rect: Rect::default(),
         }
     }
+    /// Run an expensive confirmed operation without blocking terminal input.
+    pub(crate) fn in_background(mut self, keys: Vec<String>) -> Self {
+        if let Self::ConfirmWrite { background, .. } = &mut self {
+            *background = Some(keys);
+        }
+        self
+    }
+
     pub fn tags(skill: &str, tags: &[String]) -> Self {
         Modal::Input {
             title: format!(" tags for {skill} "),
@@ -302,7 +312,7 @@ impl Modal {
             format!(" rename {old} "),
             lines,
             Box::new(move |ws| {
-                let snap = ws.scan()?;
+                let snap = ws.scan_for_links()?;
                 edit::rename(ws, &snap, &from, &to)?;
                 Ok((
                     format!("renamed {from} to {to}"),
@@ -387,10 +397,11 @@ impl Modal {
                 "This unlinks it from every agent, deletes the directory and its metadata.".into(),
             ],
             Box::new(move |ws| {
-                let snap = ws.scan()?;
+                let snap = ws.scan_for_links()?;
                 edit::remove(ws, &snap, &k, false).map(|_| format!("removed {k}"))
             }),
         )
+        .in_background(vec![skill.to_string()])
     }
     /// Delete a directory that is not a usable skill. The common cause is a
     /// `git checkout` or `git clean` that removed the files but left the
@@ -412,10 +423,11 @@ impl Modal {
             format!(" discard {skill} "),
             lines,
             Box::new(move |ws| {
-                let snap = ws.scan()?;
+                let snap = ws.scan_for_links()?;
                 edit::remove(ws, &snap, &k, false).map(|_| format!("discarded {k}"))
             }),
         )
+        .in_background(vec![skill.to_string()])
     }
 
     /// Forget the tags and notes of a skill whose directory is gone.
@@ -688,17 +700,24 @@ impl Modal {
                 _ => vec![],
             },
             Modal::ConfirmWrite {
-                write, then, btn, ..
+                write,
+                then,
+                btn,
+                background,
+                title,
+                ..
             } => match k.code {
                 KeyCode::Char('y') => write
                     .take()
-                    .map(|w| write_actions(w, then.take()))
+                    .map(|w| write_actions(w, then.take(), background.take(), title.clone()))
                     .unwrap_or_default(),
                 KeyCode::Enter => {
                     if *btn == 0 {
                         write
                             .take()
-                            .map(|w| write_actions(w, then.take()))
+                            .map(|w| {
+                                write_actions(w, then.take(), background.take(), title.clone())
+                            })
                             .unwrap_or_default()
                     } else {
                         vec![Action::CloseModal]
@@ -939,6 +958,8 @@ impl Modal {
             Modal::ConfirmWrite {
                 write,
                 then,
+                background,
+                title,
                 btn_rects,
                 rect,
                 ..
@@ -947,7 +968,9 @@ impl Modal {
                     if btn_rects.first().is_some_and(|r| r.contains(at)) {
                         return write
                             .take()
-                            .map(|w| write_actions(w, then.take()))
+                            .map(|w| {
+                                write_actions(w, then.take(), background.take(), title.clone())
+                            })
                             .unwrap_or_default();
                     }
                     if btn_rects.get(1).is_some_and(|r| r.contains(at)) || !rect.contains(at) {
@@ -1427,8 +1450,21 @@ fn refilter(query: &str, items: &[PickItem], shown: &mut Vec<usize>) {
 }
 
 /// A confirmed write, plus the history move it belongs to when it is a step.
-fn write_actions(w: MetaFn, then: Option<Step>) -> Vec<Action> {
-    let mut out = vec![Action::CloseModal, Action::WriteMeta(w)];
+fn write_actions(
+    w: MetaFn,
+    then: Option<Step>,
+    background: Option<Vec<String>>,
+    title: String,
+) -> Vec<Action> {
+    let action = match (background, then) {
+        (Some(keys), None) => Action::BackgroundWrite {
+            title,
+            write: w,
+            keys,
+        },
+        _ => Action::WriteMeta(w),
+    };
+    let mut out = vec![Action::CloseModal, action];
     if let Some(step) = then {
         out.push(Action::Step(step));
     }

@@ -9,6 +9,7 @@
 use crate::util::is_ignored_name;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -34,6 +35,7 @@ pub fn hash_directory(dir: &Path) -> Result<String> {
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
     for (rel, entry) in entries {
         let ft = entry.file_type();
         if ft.is_symlink() {
@@ -45,7 +47,14 @@ pub fn hash_directory(dir: &Path) -> Result<String> {
         } else if ft.is_file() {
             hasher.update(rel.as_bytes());
             hasher.update(b"\0");
-            hasher.update(std::fs::read(entry.path())?);
+            let mut file = std::fs::File::open(entry.path())?;
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
             hasher.update(b"\0");
         }
     }
@@ -56,4 +65,28 @@ pub fn hash_directory(dir: &Path) -> Result<String> {
 
 pub fn default_algo() -> u32 {
     HASH_ALGO
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_keeps_v1_hash_format_across_buffer_boundaries() {
+        let tmp = crate::ops::DownloadDir::new("stream-hash").unwrap();
+        let data = vec![b'x'; 150_000];
+        std::fs::write(tmp.path().join("a"), &data).unwrap();
+        std::fs::write(tmp.path().join("empty"), []).unwrap();
+        std::fs::write(tmp.path().join("ignored.pyc"), "ignore me").unwrap();
+        std::os::unix::fs::symlink("a", tmp.path().join("link")).unwrap();
+        let mut bytes = b"a\0".to_vec();
+        bytes.extend(&data);
+        bytes.extend(b"\0empty\0\0link\0->a\0");
+        let hex: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let expected = format!("sha256:{hex}");
+        assert_eq!(hash_directory(tmp.path()).unwrap(), expected);
+    }
 }

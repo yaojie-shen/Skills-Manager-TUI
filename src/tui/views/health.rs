@@ -511,7 +511,7 @@ impl HealthView {
                 meta_lines(&mut lines);
                 actions.push(action(
                     "m",
-                    format!("migrate: move the metadata to \"{to}\""),
+                    format!("migrate: move metadata, repair links and references to \"{to}\""),
                 ));
             }
             SkillStatus::Invalid { reason } => {
@@ -722,7 +722,7 @@ impl View for HealthView {
                         let (old, new) = (r.key.clone(), to.clone());
                         vec![Action::Write(Box::new(move |ws| {
                             edit::migrate_meta(ws, &old, &new)
-                                .map(|_| format!("metadata moved {old} → {new}"))
+                                .map(|_| format!("migrated {old} → {new}"))
                         }))]
                     }
                     _ => vec![],

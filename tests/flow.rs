@@ -142,6 +142,7 @@ fn missing_and_rename_detection() {
     f.add_skill("gamma", "g");
     let ws = f.ws();
     edit::tag_add(&ws, "gamma", &["x".into()]).unwrap();
+    std::os::unix::fs::symlink(&f.root, &f.agent_a).unwrap();
 
     std::fs::rename(f.root.join("gamma"), f.root.join("gamma2")).unwrap();
     let snap = ws.scan().unwrap();
@@ -152,6 +153,10 @@ fn missing_and_rename_detection() {
         }
     );
     assert_eq!(snap.get("gamma2").unwrap().status, SkillStatus::Unmanaged);
+    assert_eq!(
+        snap.get("gamma").unwrap().deploy["a"],
+        DeployState::NotDeployed
+    );
 
     edit::migrate_meta(&ws, "gamma", "gamma2").unwrap();
     let snap = ws.scan().unwrap();
@@ -161,6 +166,103 @@ fn missing_and_rename_detection() {
     std::fs::remove_dir_all(f.root.join("gamma2")).unwrap();
     let snap = ws.scan().unwrap();
     assert_eq!(snap.get("gamma2").unwrap().status, SkillStatus::Missing);
+    assert_eq!(
+        snap.get("gamma2").unwrap().deploy["a"],
+        DeployState::NotDeployed
+    );
+}
+
+#[test]
+fn external_move_repairs_links_presets_and_preserves_metadata() {
+    let f = Fixture::new("external-move");
+    f.add_skill("old", "move me");
+    let ws = f.ws();
+    edit::tag_add(&ws, "old", &["keep".into()]).unwrap();
+    ws.presets
+        .save(&Preset {
+            name: "daily".into(),
+            skills: vec!["old".into(), "local/new".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    std::fs::create_dir_all(&f.agent_a).unwrap();
+    std::fs::create_dir_all(&f.agent_b).unwrap();
+    std::os::unix::fs::symlink(f.root.join("old"), f.agent_a.join("old")).unwrap();
+    // An unrelated link with the old name must never be touched.
+    std::os::unix::fs::symlink(f.base.join("elsewhere"), f.agent_b.join("old")).unwrap();
+    std::fs::create_dir_all(f.root.join("local")).unwrap();
+    std::fs::rename(f.root.join("old"), f.root.join("local/new")).unwrap();
+    edit::migrate_meta(&ws, "old", "local/new").unwrap();
+    assert!(!skills::util::is_symlink(&f.agent_a.join("old")));
+    assert_eq!(
+        link_state(&f.agent_a, "new"),
+        Some(f.root.join("local/new"))
+    );
+    assert_eq!(
+        link_state(&f.agent_b, "old"),
+        Some(f.base.join("elsewhere"))
+    );
+    assert_eq!(
+        ws.presets.load("daily").unwrap().unwrap().skills,
+        vec!["local/new"]
+    );
+    let snap = ws.scan().unwrap();
+    assert!(snap.get("old").is_none());
+    assert_eq!(snap.get("local/new").unwrap().tags, vec!["keep"]);
+}
+
+#[test]
+fn external_move_conflict_is_detected_before_any_link_or_metadata_changes() {
+    let f = Fixture::new("external-conflict");
+    f.add_skill("old", "move me");
+    let ws = f.ws();
+    edit::tag_add(&ws, "old", &["keep".into()]).unwrap();
+    for agent in [&f.agent_a, &f.agent_b] {
+        std::fs::create_dir_all(agent).unwrap();
+        std::os::unix::fs::symlink(f.root.join("old"), agent.join("old")).unwrap();
+    }
+    std::fs::create_dir(f.agent_b.join("new")).unwrap();
+    std::fs::rename(f.root.join("old"), f.root.join("new")).unwrap();
+    assert!(edit::migrate_meta(&ws, "old", "new").is_err());
+    assert!(ws.meta.exists("old"));
+    assert!(!ws.meta.exists("new"));
+    for agent in [&f.agent_a, &f.agent_b] {
+        assert_eq!(link_state(agent, "old"), Some(f.root.join("old")));
+    }
+    assert!(!f.agent_a.join("new").exists());
+}
+
+#[test]
+fn external_move_preserves_deployment_name_when_moving_between_repositories() {
+    let f = Fixture::new("external-same-name");
+    f.add_skill("repos/a/one", "move me");
+    let ws = f.ws();
+    edit::tag_add(&ws, "repos/a/one", &["keep".into()]).unwrap();
+    std::fs::create_dir_all(&f.agent_a).unwrap();
+    std::os::unix::fs::symlink(f.root.join("repos/a/one"), f.agent_a.join("one")).unwrap();
+    std::os::unix::fs::symlink(f.root.join("repos/a/one"), f.root.join("one")).unwrap();
+    std::fs::create_dir_all(f.root.join("repos/b")).unwrap();
+    std::fs::rename(f.root.join("repos/a/one"), f.root.join("repos/b/one")).unwrap();
+    edit::migrate_meta(&ws, "repos/a/one", "repos/b/one").unwrap();
+    for dir in [&f.agent_a, &f.root] {
+        assert_eq!(link_state(dir, "one"), Some(f.root.join("repos/b/one")));
+    }
+}
+
+#[test]
+fn migration_rejects_existing_source_and_missing_or_external_destination() {
+    let f = Fixture::new("external-validation");
+    f.add_skill("old", "keep me");
+    f.add_skill("new", "different");
+    let ws = f.ws();
+    edit::tag_add(&ws, "old", &["keep".into()]).unwrap();
+    assert!(edit::migrate_meta(&ws, "old", "new").is_err());
+    std::fs::remove_dir_all(f.root.join("old")).unwrap();
+    assert!(edit::migrate_meta(&ws, "old", "missing").is_err());
+    std::fs::rename(f.root.join("new"), f.base.join("outside")).unwrap();
+    std::os::unix::fs::symlink(f.base.join("outside"), f.root.join("new")).unwrap();
+    assert!(edit::migrate_meta(&ws, "old", "new").is_err());
+    assert!(ws.meta.exists("old"));
 }
 
 #[test]

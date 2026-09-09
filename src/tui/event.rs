@@ -26,6 +26,7 @@ pub enum Task {
     DiscoverRepository(String),
     InstallRepository(Box<super::repository_picker::InstallSelection>),
     Scan,
+    PollRoot,
     Check(Vec<String>),
     Prepare(String),
     /// Fetch a skill from a git repository or a local path into the root.
@@ -44,7 +45,8 @@ pub enum TaskOutput {
         Box<super::repository_picker::InstallSelection>,
         Result<Vec<String>>,
     ),
-    Scan(Result<Snapshot>),
+    Scan(Result<Snapshot>, Option<skills::reconcile::watch::Stamp>),
+    RootStamp(Result<skills::reconcile::watch::Stamp>),
     Check(Vec<(String, Result<CheckResult>)>),
     Prepared(String, Result<Prepared>),
     /// The reference asked for, and the key it landed under.
@@ -174,7 +176,15 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                     );
                     TaskOutput::RepositoryInstalled(selection, result)
                 }
-                Task::Scan => TaskOutput::Scan(ws.scan()),
+                Task::Scan => {
+                    // Capture before scanning: changes during the scan must still
+                    // invalidate the next poll, while our own writes need no second scan.
+                    let stamp = skills::reconcile::watch::stamp(&ws.root, &ws.config).ok();
+                    TaskOutput::Scan(ws.scan(), stamp)
+                }
+                Task::PollRoot => {
+                    TaskOutput::RootStamp(skills::reconcile::watch::stamp(&ws.root, &ws.config))
+                }
                 Task::Check(keys) => {
                     let total = keys.len();
                     TaskOutput::Check(
@@ -242,7 +252,7 @@ impl BatchWork {
             Self::Links(actions, keys) => {
                 use skills::{history, ops::deploy};
                 // Recheck names in the worker against the current filesystem.
-                match ws.scan() {
+                match ws.scan_for_links() {
                     Ok(snap) if deploy::name_conflicts(&snap, &actions).is_empty() => {}
                     result => {
                         let error = match result {

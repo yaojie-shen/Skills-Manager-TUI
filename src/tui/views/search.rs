@@ -110,9 +110,11 @@ impl SearchView {
     }
 
     fn includes_record(&self, record: &skills::reconcile::SkillRecord) -> bool {
-        self.panel
-            .as_ref()
-            .is_none_or(|(keys, _)| keys.contains(&record.key))
+        (!self.is_picker() || (record.status.is_present() && record.name.is_some()))
+            && self
+                .panel
+                .as_ref()
+                .is_none_or(|(keys, _)| keys.contains(&record.key))
             && (self.is_picker()
                 || self.scope.is_some()
                 || self.panel.is_some()
@@ -484,10 +486,12 @@ impl SearchView {
             .into_iter()
             .filter(|hit| self.includes_record(&ctx.snap.skills[hit.index]))
             .collect();
-        // Keep relevance within each group; repository installs follow local skills.
-        self.hits.sort_by_key(|hit| {
-            skills::repository::alias_of(&ctx.snap.skills[hit.index].key).is_some()
-        });
+        // Browsing groups sources; text searches preserve relevance across panels.
+        if q.text.trim().is_empty() {
+            self.hits.sort_by_key(|hit| {
+                skills::repository::alias_of(&ctx.snap.skills[hit.index].key).is_some()
+            });
+        }
         if let Some((keys, _)) = self.panel.as_ref().or(self.scope.as_ref()) {
             self.hits
                 .retain(|hit| keys.contains(&ctx.snap.skills[hit.index].key));
@@ -647,7 +651,7 @@ impl SearchView {
         };
         let (old, new) = (r.key.clone(), to.clone());
         vec![Action::Write(Box::new(move |ws| {
-            edit::migrate_meta(ws, &old, &new).map(|_| format!("metadata moved {old} → {new}"))
+            edit::migrate_meta(ws, &old, &new).map(|_| format!("migrated {old} → {new}"))
         }))]
     }
     fn act_check(&self, ctx: &Ctx) -> Vec<Action> {
@@ -1642,6 +1646,10 @@ mod tests {
         .save(&root)
         .unwrap();
         let ws = skills::Workspace::open(&root).unwrap();
+        ws.meta
+            .save("missing", &skills::meta::SkillMeta::default())
+            .unwrap();
+        std::fs::write(ws.meta.path("corrupt-missing"), "not valid toml").unwrap();
         let snap = ws.scan().unwrap();
         let theme = crate::tui::theme::Theme::default();
         let ctx = Ctx {
@@ -1651,7 +1659,7 @@ mod tests {
         };
         let mut view = SearchView::default();
         view.refresh(&ctx);
-        assert_eq!(snap.skills.len(), 2);
+        assert_eq!(snap.skills.len(), 4);
         assert_eq!(view.hits.len(), 1);
         assert_eq!(view.selected(&ctx).unwrap().key, "valid");
         let mut terminal =
@@ -1671,7 +1679,7 @@ mod tests {
         view.select_scope(vec!["invalid".into()], "Repair".into(), None, &ctx);
         assert_eq!(view.selected(&ctx).unwrap().key, "invalid");
         let picker = SearchView::preset_members("example", &ctx);
-        assert_eq!(picker.hits.len(), 2);
+        assert_eq!(picker.hits.len(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1739,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_installs_follow_local_results_without_changing_filtering() {
+    fn text_search_preserves_relevance_across_local_and_repository_results() {
         let root =
             std::env::temp_dir().join(format!("skills-search-groups-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -1755,7 +1763,7 @@ mod tests {
             std::fs::write(
                 path.join("SKILL.md"),
                 format!(
-                    "---\nname: {}\ndescription: shared tools\n---\nBody",
+                    "---\nname: {}\ndescription: shared tools\n---\nBody mentions calendar",
                     name.rsplit('/').next().unwrap()
                 ),
             )
@@ -1781,7 +1789,7 @@ mod tests {
             assert_eq!(keys, ["printer", "repos/sampleorg--kit/calendar"]);
         }
         view.set_query("calendar", &ctx);
-        assert_eq!(view.hits.len(), 1);
+        assert_eq!(view.hits.len(), 2);
         assert_eq!(
             view.selected(&ctx).unwrap().key,
             "repos/sampleorg--kit/calendar"

@@ -338,6 +338,31 @@ fn central_renames_and_removals_update_target_installation_references() {
 }
 
 #[test]
+fn external_moves_update_registered_target_references_and_links() {
+    let f = Fixture::new("external-move-references");
+    let project = f.0.join("project");
+    let agent = targets::candidates(&f.ws(), Some(&project))
+        .unwrap()
+        .remove(0);
+    let ws = f.ws();
+    skills::ops::edit::tag_add(&ws, "sample", &["keep".into()]).unwrap();
+    targets::set_installed(&ws, &agent, Some(&project), &["sample".into()], None, true).unwrap();
+    std::fs::rename(ws.root.join("sample"), ws.root.join("moved")).unwrap();
+    // The workspace predates registration: migration must reload destinations.
+    skills::ops::edit::migrate_meta(&ws, "sample", "moved").unwrap();
+    let selection = targets::selection(&ws, &agent).unwrap();
+    assert!(selection.manual.contains("moved"));
+    assert!(!selection.manual.contains("sample"));
+    assert_eq!(
+        std::fs::read_link(agent.skills_path().join("moved")).unwrap(),
+        ws.root.join("moved")
+    );
+    assert!(!skills::util::is_symlink(
+        &agent.skills_path().join("sample")
+    ));
+}
+
+#[test]
 fn moving_a_library_and_its_project_keeps_relative_target_identity() {
     let f = Fixture::new("portable");
     let project = f.0.join("project");
@@ -554,7 +579,7 @@ fn physical_scopes_keep_shared_private_and_current_directory_separate() {
     assert!(scopes.iter().any(|s| s.name() == "Global shared"));
     assert!(scopes.iter().any(|s| s.name() == "Global .codex"));
     let local: Vec<_> = scopes.iter().filter(|s| s.project.is_some()).collect();
-    assert_eq!(local.len(), 1);
+    assert_eq!(local.len(), 2);
     assert_eq!(
         local[0].directory.as_ref().unwrap(),
         &cwd.join(".agents/skills")
@@ -682,4 +707,222 @@ fn foreign_broken_and_cyclic_directory_links_are_not_merged() {
     let locals: Vec<_> = scopes.iter().filter(|s| s.project.is_some()).collect();
     assert_eq!(locals.len(), 4);
     assert!(locals.iter().all(|s| s.links.is_empty()));
+}
+
+#[test]
+fn inventory_hides_config_only_products_and_ignores_shared_directories() {
+    let f = Fixture::new("installed-only");
+    let project = f.0.join("project");
+    let home = f.0.join("fake-home");
+    std::fs::create_dir_all(home.join(".agents/skills")).unwrap();
+    std::fs::create_dir_all(project.join(".agents/skills")).unwrap();
+    let mut ws = f.ws();
+    ws.config.agents = skills::agents::defaults(false);
+    targets::discover_in(&mut ws, &project, &home).unwrap();
+    assert_eq!(targets::visible_agents(&ws).count(), 0);
+    assert_eq!(ws.config.agents.len(), 2, "saved destinations are retained");
+    for dir in [
+        ".codex",
+        ".cursor",
+        ".claude",
+        ".gemini",
+        ".config/opencode",
+    ] {
+        std::fs::create_dir_all(home.join(dir).join("skills")).unwrap();
+        std::fs::create_dir_all(project.join(dir).join("skills")).unwrap();
+    }
+    targets::discover_in(&mut ws, &project, &home).unwrap();
+    assert_eq!(
+        targets::visible_agents(&ws).count(),
+        0,
+        "leftover product directories are not installs"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    let binary = home.join(".local/bin/codex");
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::write(&binary, "not executed").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    targets::discover_in(&mut ws, &project, &home).unwrap();
+    assert!(targets::visible_agents(&ws).count() > 0);
+    assert!(targets::visible_agents(&ws).all(|a| targets::product_key(a) == "codex"));
+    std::fs::remove_file(binary).unwrap();
+    targets::discover_in(&mut ws, &project, &home).unwrap();
+    assert_eq!(
+        targets::visible_agents(&ws).count(),
+        0,
+        "discovery refreshes evidence"
+    );
+}
+
+#[test]
+fn executable_agent_is_detected_before_any_configuration_directory_exists() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("executable-detection");
+    let bin = f.0.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for (name, mode) in [("claude", 0o755), ("codex", 0o644)] {
+        let path = bin.join(name);
+        std::fs::write(&path, "must not execute").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    assert_eq!(
+        skills::agents::detect_in(&f.0.join("home"), &f.0.join("project"), &[bin]),
+        std::collections::BTreeSet::from(["claude".into()])
+    );
+}
+
+#[test]
+fn mixed_scope_selection_registers_each_project_and_validates_before_writing() {
+    let f = Fixture::new("mixed");
+    let ws = f.ws();
+    let project = f.0.join("project");
+    let home = AgentConfig {
+        key: "home".into(),
+        name: "Home".into(),
+        skills_dir: f.0.join("fake-home/skills").display().to_string(),
+    };
+    let local = AgentConfig {
+        key: "local".into(),
+        name: "Local".into(),
+        skills_dir: project.join(".claude/skills").display().to_string(),
+    };
+    assert!(
+        targets::apply_scoped(
+            &ws,
+            &["sample".into()],
+            &[
+                (home.clone(), true, Some(project.clone())),
+                (local.clone(), true, Some(project.clone()))
+            ]
+        )
+        .is_err()
+    );
+    assert!(!home.skills_path().exists());
+    targets::apply_scoped(
+        &ws,
+        &["sample".into()],
+        &[
+            (home.clone(), true, None),
+            (local.clone(), true, Some(project.clone())),
+        ],
+    )
+    .unwrap();
+    let reopened = f.ws();
+    assert!(
+        targets::candidates(&reopened, None)
+            .unwrap()
+            .iter()
+            .any(|a| a.key == home.key)
+    );
+    assert!(
+        !targets::candidates(&reopened, None)
+            .unwrap()
+            .iter()
+            .any(|a| a.key == local.key)
+    );
+    assert!(
+        targets::candidates(&reopened, Some(&project))
+            .unwrap()
+            .iter()
+            .any(|a| a.key == local.key)
+    );
+}
+
+#[test]
+fn mixed_scope_changes_preserve_preset_ownership_and_undo_both_destinations() {
+    let f = Fixture::new("mixed-reasons-undo");
+    let ws = f.ws();
+    let home = AgentConfig {
+        key: "sample-home".into(),
+        name: "Home".into(),
+        skills_dir: f.0.join("home/skills").display().to_string(),
+    };
+    let project = f.0.join("project");
+    let local = AgentConfig {
+        key: "sample-local".into(),
+        name: "Local".into(),
+        skills_dir: project.join(".custom/skills").display().to_string(),
+    };
+    let keys = vec!["sample".into()];
+    targets::set_installed(&ws, &local, Some(&project), &keys, Some("keep"), true).unwrap();
+    assert!(
+        targets::apply_scoped(
+            &ws,
+            &keys,
+            &[
+                (home.clone(), true, None),
+                (local.clone(), false, Some(project.clone()))
+            ]
+        )
+        .is_err()
+    );
+    assert!(!home.skills_path().exists());
+    let (_, intent) = targets::apply_scoped(
+        &ws,
+        &keys,
+        &[
+            (home.clone(), true, None),
+            (local.clone(), true, Some(project.clone())),
+        ],
+    )
+    .unwrap();
+    assert!(
+        targets::selection(&ws, &home)
+            .unwrap()
+            .manual
+            .contains("sample")
+    );
+    assert!(
+        targets::selection(&ws, &local)
+            .unwrap()
+            .manual
+            .contains("sample")
+    );
+    let reopened = f.ws();
+    let skills::history::Plan::Write { apply, .. } =
+        skills::history::undo_plan(&reopened, &reopened.scan().unwrap(), &intent.unwrap()).unwrap()
+    else {
+        panic!("expected grouped selection undo")
+    };
+    apply.apply(&reopened).unwrap();
+    assert!(!home.skills_path().join("sample").exists());
+    assert!(local.skills_path().join("sample").exists());
+    let selection = targets::selection(&reopened, &local).unwrap();
+    assert!(selection.manual.is_empty());
+    assert!(selection.presets.contains_key("keep"));
+}
+
+#[test]
+fn detection_requires_valid_app_bundle_or_registered_extension_payload() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("installed-evidence");
+    let home = f.0.join("home");
+    let project = f.0.join("project");
+    let bundle = home.join("Applications/Trae.app/Contents");
+    std::fs::create_dir_all(bundle.join("MacOS")).unwrap();
+    std::fs::write(bundle.join("Info.plist"), "fixture").unwrap();
+    assert!(skills::agents::detect_in(&home, &project, &[]).is_empty());
+    let binary = bundle.join("MacOS/Trae");
+    std::fs::write(&binary, "not executed").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let extensions = home.join(".vscode/extensions");
+    let extension = extensions.join("anthropic.claude-code-1.0.0");
+    std::fs::create_dir_all(&extension).unwrap();
+    std::fs::write(
+        extension.join("package.json"),
+        r#"{"publisher":"anthropic","name":"claude-code","main":"extension.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(extension.join("extension.js"), "fixture").unwrap();
+    assert_eq!(
+        skills::agents::detect_in(&home, &project, &[]),
+        std::collections::BTreeSet::from(["trae".into()])
+    );
+    std::fs::write(extensions.join("extensions.json"), r#"[{"identifier":{"id":"anthropic.claude-code"},"relativeLocation":"anthropic.claude-code-1.0.0"}]"#).unwrap();
+    assert_eq!(
+        skills::agents::detect_in(&home, &project, &[]),
+        std::collections::BTreeSet::from(["claude".into(), "trae".into()])
+    );
+    std::fs::remove_file(extension.join("extension.js")).unwrap();
+    assert!(!skills::agents::detect_in(&home, &project, &[]).contains("claude"));
 }
