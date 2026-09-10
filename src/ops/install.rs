@@ -259,7 +259,6 @@ pub fn install(ws: &Workspace, r: &InstallRef, name: Option<&str>) -> Result<Str
                 .with_context(|| format!("placing {}", dest.display()))?;
         }
         let meta = SkillMeta {
-            schema: crate::meta::SCHEMA,
             tags: Vec::new(),
             note: None,
             installed_name: Some(SkillDoc::load(&dest)?.name),
@@ -296,7 +295,6 @@ pub fn adopt(ws: &Workspace, path: &Path, name: Option<&str>) -> Result<String> 
             bail!("{key} already has metadata");
         }
         let meta = SkillMeta {
-            schema: crate::meta::SCHEMA,
             source: Some(Source::Local { path: None }),
             baseline: Some(Baseline {
                 hash: hash_directory(&dest)?,
@@ -325,7 +323,6 @@ pub fn adopt(ws: &Workspace, path: &Path, name: Option<&str>) -> Result<String> 
         std::os::unix::fs::symlink(&dest, &path)?;
     }
     let meta = SkillMeta {
-        schema: crate::meta::SCHEMA,
         source: Some(Source::Local {
             path: Some(crate::paths::contract_tilde(&path)),
         }),

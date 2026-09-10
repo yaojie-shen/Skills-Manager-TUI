@@ -1679,7 +1679,12 @@ mod tests {
         ws.meta
             .save("missing", &skills::meta::SkillMeta::default())
             .unwrap();
-        std::fs::write(ws.meta.path("corrupt-missing"), "not valid toml").unwrap();
+        let text = std::fs::read_to_string(ws.meta.path("missing")).unwrap();
+        std::fs::write(
+            ws.meta.path("corrupt-missing"),
+            format!("{text}\n[skills.corrupt-missing]\ntags = 42\n"),
+        )
+        .unwrap();
         let snap = ws.scan().unwrap();
         let theme = crate::tui::theme::Theme::default();
         let ctx = Ctx {

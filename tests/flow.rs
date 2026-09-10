@@ -96,10 +96,7 @@ fn scan_tags_notes_and_baseline() {
             .iter()
             .all(|s| s.status == SkillStatus::Unmanaged)
     );
-    assert!(
-        !ws.meta.dir.join("alpha.toml").exists(),
-        "scan must not write"
-    );
+    assert!(!ws.meta.exists("alpha"), "scan must not write");
 
     edit::tag_add(&ws, "alpha", &["ops".into(), "ml".into()]).unwrap();
     edit::note_set(&ws, "alpha", Some("hello\nworld")).unwrap();
@@ -411,7 +408,7 @@ fn install_local_rename_remove() {
     let snap = ws.scan().unwrap();
     assert!(snap.get("renamed").is_none());
     assert!(!f.agent_a.join("renamed").exists());
-    assert!(!ws.meta.dir.join("renamed.toml").exists());
+    assert!(!ws.meta.exists("renamed"));
 }
 
 #[test]

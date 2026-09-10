@@ -1,4 +1,4 @@
-//! Per-skill metadata files: `<root>/.skills-meta/<key>.toml`.
+//! Local metadata in local.toml; repository identity and skills in repos/<alias>.toml.
 //!
 //! Reading uses serde; writing goes through `toml_edit` so that comments and
 //! key order written by hand survive round trips.
@@ -8,14 +8,10 @@ use crate::util::write_atomic;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use toml_edit::{Array, DocumentMut, Item, Table, value};
-
-pub const SCHEMA: u32 = 1;
+use toml_edit::{DocumentMut, Item, Table, value};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SkillMeta {
-    #[serde(default = "default_schema")]
-    pub schema: u32,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -27,10 +23,6 @@ pub struct SkillMeta {
     pub source: Option<Source>,
     #[serde(default)]
     pub baseline: Option<Baseline>,
-}
-
-fn default_schema() -> u32 {
-    SCHEMA
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -115,167 +107,319 @@ impl MetaStore {
     }
 
     pub fn path(&self, key: &str) -> PathBuf {
-        self.dir.join(format!("{key}.toml"))
+        match crate::repository::alias_of(key) {
+            Some(alias) => self.dir.join("repos").join(format!("{alias}.toml")),
+            None => self.dir.join("local.toml"),
+        }
     }
-
-    pub fn exists(&self, key: &str) -> bool {
-        self.path(key).is_file()
+    fn entry(key: &str) -> &str {
+        if crate::repository::alias_of(key).is_some() {
+            key.rsplit('/').next().unwrap()
+        } else {
+            key
+        }
     }
-
-    /// Load metadata for `key`. `Ok(None)` when no file exists; `Err` when it is unreadable.
-    pub fn load(&self, key: &str) -> Result<Option<SkillMeta>> {
-        let path = self.path(key);
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                let meta: SkillMeta = toml::from_str(&text)
-                    .with_context(|| format!("invalid metadata: {}", path.display()))?;
-                Ok(Some(meta))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    pub(crate) fn lock(&self) -> Result<std::fs::File> {
+        std::fs::create_dir_all(&self.dir)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.dir.join(".metadata.lock"))?;
+        file.lock()?;
+        Ok(file)
+    }
+    pub(crate) fn read(path: &Path) -> Result<DocumentMut> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => text
+                .parse()
+                .with_context(|| format!("invalid metadata: {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DocumentMut::new()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
     }
-
-    /// Keys of every metadata file present.
-    pub fn list_keys(&self) -> Result<Vec<String>> {
-        let mut keys = Vec::new();
-        let rd = match std::fs::read_dir(&self.dir) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(keys),
-            Err(e) => return Err(e.into()),
+    pub fn exists(&self, key: &str) -> bool {
+        self.load(key).map(|m| m.is_some()).unwrap_or(true)
+    }
+    pub fn load(&self, key: &str) -> Result<Option<SkillMeta>> {
+        let doc = Self::read(&self.path(key))?;
+        let document: toml::Value = toml::from_str(&doc.to_string())?;
+        let Some(mut value) = document
+            .get("skills")
+            .and_then(|s| s.get(Self::entry(key)))
+            .cloned()
+        else {
+            return Ok(None);
         };
-        for entry in rd {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if matches!(name.as_str(), "repos" | "local") && entry.file_type()?.is_dir() {
-                for file in walkdir::WalkDir::new(entry.path()).follow_links(false) {
-                    let file = file?;
-                    if file.file_type().is_file()
-                        && file.path().extension().is_some_and(|e| e == "toml")
-                    {
-                        let relative = file.path().strip_prefix(&self.dir)?.to_string_lossy();
-                        let key = relative.trim_end_matches(".toml");
-                        if crate::repository::valid_id(key) {
-                            keys.push(key.to_string());
-                        }
-                    }
+        if let Some(source) = value.get_mut("source").and_then(toml::Value::as_table_mut)
+            && source.get("type").and_then(toml::Value::as_str) == Some("git")
+            && crate::repository::alias_of(key).is_some()
+        {
+            source.insert(
+                "url".into(),
+                doc.get("url")
+                    .and_then(Item::as_str)
+                    .context("repository URL missing")?
+                    .into(),
+            );
+            if let Some(branch) = doc.get("branch").and_then(Item::as_str) {
+                source.insert("branch".into(), branch.into());
+            }
+        }
+        Ok(Some(value.try_into()?))
+    }
+    pub fn list_keys(&self) -> Result<Vec<String>> {
+        let mut files = vec![(self.dir.join("local.toml"), String::new())];
+        let repos = self.dir.join("repos");
+        if repos.is_dir() {
+            for entry in std::fs::read_dir(repos)? {
+                let path = entry?.path();
+                if path.is_file() && path.extension().is_some_and(|e| e == "toml") {
+                    let alias = path.file_stem().unwrap().to_string_lossy();
+                    anyhow::ensure!(
+                        crate::util::valid_skill_key(&alias),
+                        "invalid repository alias"
+                    );
+                    files.push((path.clone(), format!("repos/{alias}/")));
                 }
-            } else if entry.file_type()?.is_file()
-                && name != crate::config::CONFIG_FILE
-                && name != "deployment-targets.toml"
-                && !name.starts_with('.')
-                && let Some(stem) = name.strip_suffix(".toml")
-            {
-                keys.push(stem.to_string());
+            }
+        }
+        let mut keys = Vec::new();
+        for (path, prefix) in files {
+            let doc = Self::read(&path)?;
+            if let Some(skills) = doc.get("skills") {
+                let skills = skills.as_table().context("skills must be a table")?;
+                for (name, _) in skills {
+                    let key = format!("{prefix}{name}");
+                    anyhow::ensure!(
+                        crate::repository::valid_id(&key),
+                        "invalid skill identity: {key}"
+                    );
+                    keys.push(key);
+                }
             }
         }
         keys.sort();
         Ok(keys)
     }
-
-    /// Write metadata, preserving comments and unknown keys of an existing file.
-    pub fn save(&self, key: &str, meta: &SkillMeta) -> Result<()> {
-        let path = self.path(key);
-        let mut doc = match std::fs::read_to_string(&path) {
-            Ok(text) => text
-                .parse::<DocumentMut>()
-                .with_context(|| format!("invalid metadata: {}", path.display()))?,
-            Err(_) => DocumentMut::new(),
-        };
-        doc["schema"] = value(meta.schema as i64);
-        let mut tags = Array::new();
-        for t in &meta.tags {
-            tags.push(t.as_str());
-        }
-        doc["tags"] = value(tags);
-        match &meta.note {
-            Some(n) if !n.is_empty() => {
-                doc["note"] = value(n.as_str());
+    fn put(doc: &mut DocumentMut, key: &str, meta: &SkillMeta) -> Result<()> {
+        let mut item = toml::to_string(meta)?
+            .parse::<DocumentMut>()?
+            .as_table()
+            .clone();
+        if let Some(alias) = crate::repository::alias_of(key)
+            && let Some(Source::Git { url, branch, .. }) = &meta.source
+        {
+            anyhow::ensure!(
+                doc.get("url")
+                    .and_then(Item::as_str)
+                    .is_none_or(|u| u == url),
+                "repository URL differs from skill source"
+            );
+            anyhow::ensure!(
+                doc.get("branch")
+                    .and_then(Item::as_str)
+                    .is_none_or(|b| Some(b) == branch.as_deref()),
+                "repository branch differs from skill source"
+            );
+            doc["alias"] = value(alias);
+            doc["url"] = value(url.as_str());
+            if let Some(branch) = branch {
+                doc["branch"] = value(branch.as_str());
             }
-            _ => {
-                doc.remove("note");
-            }
-        }
-        match &meta.installed_name {
-            Some(name) => {
-                doc["installed_name"] = value(name.as_str());
-            }
-            None => {
-                doc.remove("installed_name");
+            if let Some(source) = item.get_mut("source").and_then(Item::as_table_mut) {
+                source.remove("url");
+                source.remove("branch");
             }
         }
-        match &meta.source {
-            Some(src) => {
-                let mut t = Table::new();
-                match src {
-                    Source::Git {
-                        url,
-                        subpath,
-                        branch,
-                        revision,
-                    } => {
-                        t["type"] = value("git");
-                        t["url"] = value(url.as_str());
-                        if let Some(p) = subpath {
-                            t["subpath"] = value(p.as_str());
-                        }
-                        if let Some(b) = branch {
-                            t["branch"] = value(b.as_str());
-                        }
-                        if let Some(r) = revision {
-                            t["revision"] = value(r.as_str());
-                        }
-                    }
-                    Source::Local { path } => {
-                        t["type"] = value("local");
-                        if let Some(p) = path {
-                            t["path"] = value(p.as_str());
-                        }
-                    }
+        if doc.get("skills").is_none() {
+            doc["skills"] = Item::Table(Table::new());
+        }
+        let skills = doc["skills"]
+            .as_table_mut()
+            .context("skills must be a table")?;
+        let name = Self::entry(key);
+        // Retain unknown fields and comments in the selected entry and its siblings.
+        if let Some(existing) = skills.get_mut(name).and_then(Item::as_table_mut) {
+            for field in ["tags", "note", "installed_name", "source", "baseline"] {
+                if let Some(new) = item.remove(field) {
+                    existing[field] = new;
+                } else {
+                    existing.remove(field);
                 }
-                doc["source"] = Item::Table(t);
             }
-            None => {
-                doc.remove("source");
-            }
+        } else {
+            skills[name] = Item::Table(item);
         }
-        match &meta.baseline {
-            Some(b) => {
-                let mut t = Table::new();
-                t["hash"] = value(b.hash.as_str());
-                t["hash_algo"] = value(b.hash_algo as i64);
-                doc["baseline"] = Item::Table(t);
-            }
-            None => {
-                doc.remove("baseline");
-            }
-        }
+        Ok(())
+    }
+    pub fn save(&self, key: &str, meta: &SkillMeta) -> Result<()> {
+        crate::ops::require_key(key)?;
+        let _lock = self.lock()?;
+        let path = self.path(key);
+        let mut doc = Self::read(&path)?;
+        Self::put(&mut doc, key, meta)?;
         write_atomic(&path, doc.to_string().as_bytes())
     }
-
     pub fn remove(&self, key: &str) -> Result<()> {
+        let _lock = self.lock()?;
         let path = self.path(key);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        let mut doc = Self::read(&path)?;
+        if let Some(skills) = doc.get_mut("skills").and_then(Item::as_table_mut)
+            && skills.remove(Self::entry(key)).is_some()
+        {
+            write_atomic(&path, doc.to_string().as_bytes())?;
         }
+        Ok(())
     }
-
     pub fn rename(&self, old: &str, new: &str) -> Result<()> {
-        let from = self.path(old);
-        if !from.exists() {
+        crate::ops::require_key(new)?;
+        if old == new {
             return Ok(());
         }
-        std::fs::create_dir_all(self.path(new).parent().context("metadata parent missing")?)?;
-        std::fs::rename(&from, self.path(new))
-            .with_context(|| format!("renaming metadata {old} -> {new}"))
+        let _lock = self.lock()?;
+        let Some(meta) = self.load(old)? else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            self.load(new)?.is_none(),
+            "destination metadata already exists"
+        );
+        let from = self.path(old);
+        let to = self.path(new);
+        let mut source = Self::read(&from)?;
+        if from == to {
+            let entry = source["skills"]
+                .as_table_mut()
+                .unwrap()
+                .remove(Self::entry(old))
+                .unwrap();
+            source["skills"][Self::entry(new)] = entry;
+            return write_atomic(&from, source.to_string().as_bytes());
+        }
+        let original = Self::read(&to)?;
+        let mut target = original.clone();
+        if target.get("skills").is_none() {
+            target["skills"] = Item::Table(Table::new());
+        }
+        target["skills"][Self::entry(new)] = source["skills"][Self::entry(old)].clone();
+        Self::put(&mut target, new, &meta)?;
+        write_atomic(&to, target.to_string().as_bytes())?;
+        source["skills"]
+            .as_table_mut()
+            .unwrap()
+            .remove(Self::entry(old));
+        if let Err(error) = write_atomic(&from, source.to_string().as_bytes()) {
+            write_atomic(&to, original.to_string().as_bytes())?;
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_file_preserves_siblings_and_serializes_concurrent_writes() {
+        let temp = crate::ops::DownloadDir::new("metadata-concurrent").unwrap();
+        let store = MetaStore::new(temp.path());
+        std::thread::scope(|scope| {
+            for i in 0..12 {
+                let store = store.clone();
+                scope.spawn(move || {
+                    store
+                        .save(
+                            &format!("skill-{i}"),
+                            &SkillMeta {
+                                note: Some(format!("note-{i}")),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap()
+                });
+            }
+        });
+        assert_eq!(store.list_keys().unwrap().len(), 12);
+        store.rename("skill-0", "renamed").unwrap();
+        store.remove("skill-1").unwrap();
+        assert!(store.load("skill-0").unwrap().is_none());
+        assert_eq!(
+            store.load("renamed").unwrap().unwrap().note.as_deref(),
+            Some("note-0")
+        );
+        assert_eq!(store.list_keys().unwrap().len(), 11);
+    }
+
+    #[test]
+    fn repository_identity_and_skill_versions_share_one_file() {
+        let temp = crate::ops::DownloadDir::new("metadata-repo").unwrap();
+        let ws = crate::Workspace::open(temp.path()).unwrap();
+        let repo = crate::repository::Repository {
+            alias: "owner--repo".into(),
+            url: "https://example.com/owner/repo".into(),
+            branch: "main".into(),
+        };
+        repo.save(&ws).unwrap();
+        for (key, revision) in [("review", "one"), ("print", "two")] {
+            ws.meta
+                .save(
+                    &format!("repos/{}/{key}", repo.alias),
+                    &SkillMeta {
+                        source: Some(Source::Git {
+                            url: repo.url.clone(),
+                            branch: Some(repo.branch.clone()),
+                            subpath: Some(format!("skills/{key}")),
+                            revision: Some(revision.into()),
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        repo.save(&ws).unwrap();
+        let text = std::fs::read_to_string(ws.meta.path("repos/owner--repo/review")).unwrap();
+        assert_eq!(text.matches(&repo.url).count(), 1);
+        assert_eq!(ws.meta.list_keys().unwrap().len(), 2);
+        ws.meta.remove("repos/owner--repo/review").unwrap();
+        assert!(ws.meta.load("repos/owner--repo/print").unwrap().is_some());
+        assert_eq!(
+            crate::repository::Repository::list(temp.path()).unwrap(),
+            vec![repo]
+        );
+    }
+
+    #[test]
+    fn old_per_skill_and_repository_files_are_not_read() {
+        let temp = crate::ops::DownloadDir::new("metadata-no-legacy").unwrap();
+        let store = MetaStore::new(temp.path());
+        std::fs::create_dir_all(store.dir.join(".repositories")).unwrap();
+        std::fs::write(store.dir.join("old.toml"), "tags = ['old']").unwrap();
+        std::fs::write(
+            store.dir.join(".repositories/old.toml"),
+            "alias = 'old'\nurl = 'old'\nbranch = 'main'",
+        )
+        .unwrap();
+        assert!(store.list_keys().unwrap().is_empty());
+        assert!(
+            crate::repository::Repository::list(temp.path())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.load("old").unwrap().is_none());
+    }
+
+    #[test]
+    fn deployment_registry_is_not_a_skill() {
+        let tmp = std::env::temp_dir().join(format!("skills-meta-registry-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join(".skills-meta")).unwrap();
+        let store = MetaStore::new(&tmp);
+        std::fs::write(store.dir.join("deployment-targets.toml"), "agents = []\n").unwrap();
+        store.save("example", &SkillMeta::default()).unwrap();
+        assert_eq!(store.list_keys().unwrap(), vec!["example"]);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 
     #[test]
     fn roundtrip_preserves_comments() {
@@ -285,7 +429,7 @@ mod tests {
         let store = MetaStore::new(&tmp);
         std::fs::write(
             store.path("foo"),
-            "# hand written comment\nschema = 1\ntags = [\"a\"]\nnote = \"hi\"\n",
+            "# hand written comment\n[skills.foo]\ntags = [\"a\"]\nnote = \"hi\"\n",
         )
         .unwrap();
         let mut meta = store.load("foo").unwrap().unwrap();

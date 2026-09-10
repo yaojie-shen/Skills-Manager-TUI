@@ -19,10 +19,7 @@ pub fn load_or_init(ws: &Workspace, key: &str) -> Result<SkillMeta> {
     if !path.is_dir() {
         bail!("no such skill: {key}");
     }
-    let mut meta = SkillMeta {
-        schema: crate::meta::SCHEMA,
-        ..Default::default()
-    };
+    let mut meta = SkillMeta::default();
     if let Ok(h) = hash_directory(&path) {
         meta.baseline = Some(Baseline {
             hash: h,

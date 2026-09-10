@@ -661,8 +661,13 @@ mod tests {
         let fixture = Fixture::new();
         let ws = Workspace::open(&fixture.0).unwrap();
         edit::tag_add(&ws, "alpha", &["existing".into()]).unwrap();
+        let text = std::fs::read_to_string(ws.meta.path("alpha")).unwrap();
+        std::fs::write(
+            ws.meta.path("beta"),
+            format!("{text}\n[skills.beta]\ntags = 42\n"),
+        )
+        .unwrap();
         let before = std::fs::read(ws.meta.path("alpha")).unwrap();
-        std::fs::write(ws.meta.path("beta"), "broken = [").unwrap();
         let snap = ws.scan().unwrap();
         let theme = super::super::theme::Theme::default();
         let ctx = Ctx {

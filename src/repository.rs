@@ -79,11 +79,11 @@ pub struct Repository {
 impl Repository {
     pub fn path(root: &Path, alias: &str) -> PathBuf {
         crate::paths::meta_dir(root)
-            .join(".repositories")
+            .join("repos")
             .join(format!("{alias}.toml"))
     }
     pub fn list(root: &Path) -> Result<Vec<Self>> {
-        let dir = crate::paths::meta_dir(root).join(".repositories");
+        let dir = crate::paths::meta_dir(root).join("repos");
         if !dir.exists() {
             return Ok(vec![]);
         }
@@ -91,7 +91,12 @@ impl Repository {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             if entry.path().extension().is_some_and(|e| e == "toml") {
-                let repo: Self = toml::from_str(&std::fs::read_to_string(entry.path())?)?;
+                let text = std::fs::read_to_string(entry.path())?;
+                let doc: toml::Value = toml::from_str(&text)?;
+                if doc.get("url").is_none() {
+                    continue;
+                }
+                let repo: Self = doc.try_into()?;
                 if !valid_skill_key(&repo.alias) {
                     bail!("invalid repository alias")
                 }
@@ -131,14 +136,14 @@ impl Repository {
         Ok(())
     }
     pub fn save(&self, ws: &Workspace) -> Result<()> {
+        let _lock = ws.meta.lock()?;
         self.validate(ws)?;
-        if Self::path(&ws.root, &self.alias).exists() {
-            return Ok(());
-        }
-        write_atomic(
-            &Self::path(&ws.root, &self.alias),
-            toml::to_string_pretty(self)?.as_bytes(),
-        )
+        let path = Self::path(&ws.root, &self.alias);
+        let mut doc = crate::meta::MetaStore::read(&path)?;
+        doc["alias"] = toml_edit::value(self.alias.as_str());
+        doc["url"] = toml_edit::value(self.url.as_str());
+        doc["branch"] = toml_edit::value(self.branch.as_str());
+        write_atomic(&path, doc.to_string().as_bytes())
     }
 }
 
