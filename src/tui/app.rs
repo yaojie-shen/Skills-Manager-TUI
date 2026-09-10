@@ -1204,7 +1204,7 @@ impl App {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),
+                Constraint::Length(1),
                 Constraint::Min(3),
                 Constraint::Length(1),
             ])
@@ -1258,42 +1258,28 @@ impl App {
             spans.push(Span::raw(" "));
             x += w + 1;
         }
-        f.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect::new(area.x, area.y, area.width, 1),
-        );
-        if area.height < 2 {
-            return;
-        }
-        let mut spans = vec![Span::styled(" Library ", th.dim())];
-        x = area.x + width(" Library ") as u16;
         let used = (x - area.x) as usize;
-        let available = (area.width as usize).saturating_sub(used);
         let right = if self.tasks_running > 0 {
-            super::widgets::fit(&format!("{} working  ", SPINNER[self.spinner]), available)
+            format!("{} working  ", SPINNER[self.spinner])
         } else {
-            let path = format!(
-                "{}{}",
+            format!(
+                "{}{}  ",
                 if self.ws.project.is_some() {
                     "local: "
                 } else {
                     ""
                 },
                 skills::paths::contract_tilde(&self.snap.root)
-            );
-            let tail_space = available.min(2);
-            format!(
-                "{}{}",
-                middle_ellipsis(&path, available - tail_space),
-                " ".repeat(tail_space)
             )
         };
-        let pad = (area.width as usize).saturating_sub(used + width(&right));
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(right, th.dim()));
+        if used + width(&right) < area.width as usize {
+            let pad = area.width as usize - used - width(&right);
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(right, th.dim()));
+        }
         f.render_widget(
             Paragraph::new(Line::from(spans)),
-            Rect::new(area.x, area.y + 1, area.width, 1),
+            Rect::new(area.x, area.y, area.width, 1),
         );
     }
 

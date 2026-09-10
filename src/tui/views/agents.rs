@@ -85,6 +85,7 @@ pub struct AgentsView {
     launch_directory: Option<std::path::PathBuf>,
     destination: usize,
     destination_offset: usize,
+    agent_directories: std::collections::BTreeMap<String, Vec<std::path::PathBuf>>,
     scope_counts: std::collections::BTreeMap<std::path::PathBuf, ScopeInventory>,
     scope_count_rx: Option<std::sync::mpsc::Receiver<(std::path::PathBuf, ScopeInventory)>>,
     destination_rects: Vec<(Rect, usize)>,
@@ -261,6 +262,7 @@ impl AgentsView {
             .destinations
             .iter()
             .filter_map(|s| s.directory.as_ref())
+            .chain(self.agent_directories.values().flatten())
             .filter(|p| !self.scope_counts.contains_key(*p))
             .cloned()
             .collect();
@@ -286,6 +288,24 @@ impl AgentsView {
             .and_then(|p| self.scope_counts.get(p))
             .map(|inventory| inventory.label.as_str())
             .unwrap_or("Counting…")
+    }
+
+    fn agent_skill_count(&self, key: &str) -> Option<String> {
+        let directories = self.agent_directories.get(key)?;
+        let mut total = 0;
+        for directory in directories {
+            let Some(inventory) = self.scope_counts.get(directory) else {
+                return Some("Counting…".into());
+            };
+            if inventory.label == "Unreadable" {
+                return Some("Unreadable".into());
+            }
+            total += inventory.descriptions.len();
+        }
+        Some(format!(
+            "{total} {} total",
+            if total == 1 { "skill" } else { "skills" }
+        ))
     }
 
     pub fn discover(&mut self, start: &std::path::Path) -> anyhow::Result<()> {
@@ -1307,6 +1327,7 @@ impl AgentsView {
                     }
                     Some((AgentDirMode::Real, linked, _)) => format!("{linked} linked"),
                 };
+                let sub = self.agent_skill_count(&a.key).unwrap_or(sub);
                 (width(a.display_name()).max(width(&sub)) + 4).max(14) + 1
             })
             .collect();
@@ -1346,6 +1367,7 @@ impl AgentsView {
                 }
                 Some((AgentDirMode::Real, linked, _)) => format!("{linked} linked"),
             };
+            let sub = self.agent_skill_count(&a.key).unwrap_or(sub);
             let name = a.display_name().to_string();
             let w = (width(&name).max(width(&sub)) + 4).max(14) as u16;
             if x + w > rows[0].right() {
@@ -2168,6 +2190,7 @@ impl AgentsView {
                 .context("agent has no deployment locations")?;
             let mut ws = ctx.ws.clone();
             ws.config.agents.clear();
+            self.agent_directories.clear();
             for base in &configured {
                 let candidates = skills::ops::targets::locations(ctx.ws, base, start)?;
                 let chosen = candidates
@@ -2184,6 +2207,15 @@ impl AgentsView {
                     if base.key == selected.key {
                         self.scope = target.key.clone();
                     }
+                    let directories = candidates
+                        .iter()
+                        .filter_map(|scope| scope.directory.as_ref())
+                        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    self.agent_directories
+                        .insert(target.key.clone(), directories);
                     ws.config.agents.push(target);
                 }
             }
@@ -2830,6 +2862,10 @@ mod deployment_scope_tests {
         }
         .save(&root)
         .unwrap();
+        let global = tmp.path().join("global-claude");
+        std::fs::create_dir_all(&global).unwrap();
+        let global = std::fs::canonicalize(global).unwrap();
+        std::os::unix::fs::symlink(root.join("sample"), global.join("sample")).unwrap();
         let ws = Workspace::open(&root).unwrap();
         let snap = ws.scan().unwrap();
         let theme = crate::tui::theme::Theme::default();
@@ -2841,6 +2877,32 @@ mod deployment_scope_tests {
         let mut view = AgentsView::default();
         view.discover(&project).unwrap();
         view.refresh(&ctx);
+        let directories = view.agent_directories[&view.scope].clone();
+        assert!(directories.contains(&global));
+        assert!(
+            directories.contains(
+                &std::fs::canonicalize(&project)
+                    .unwrap()
+                    .join(".claude/skills")
+            )
+        );
+        for directory in &directories {
+            view.scope_counts
+                .insert(directory.clone(), ScopeInventory::default());
+        }
+        view.scope_counts
+            .insert(global.clone(), count_scope_skills(&global));
+        assert_eq!(
+            view.agent_skill_count(&view.scope).as_deref(),
+            Some("1 skill total")
+        );
+        view.move_destination(1, &ctx);
+        assert_eq!(view.agent_directories[&view.scope], directories);
+        assert_eq!(
+            view.agent_skill_count(&view.scope).as_deref(),
+            Some("1 skill total")
+        );
+        view.move_destination(-1, &ctx);
         let first = view.scoped.clone().unwrap();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
