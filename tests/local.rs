@@ -182,6 +182,14 @@ fn shared_source_rename_preserves_directory_and_shared_alias_removal_cleans_link
     );
     let key = "repos/example/sample";
     skill(&ws.root.join(key));
+    let conflict =
+        deploy::plan_deploy(&ws, &ws.scan().unwrap(), &[key.into()], &["codex".into()]).unwrap();
+    assert!(deploy::apply(&conflict).is_err());
+    std::fs::write(
+        ws.root.join(key).join("SKILL.md"),
+        "---\nname: repo-sample\n---\nbody",
+    )
+    .unwrap();
     deploy::apply(
         &deploy::plan_deploy(&ws, &ws.scan().unwrap(), &[key.into()], &["codex".into()]).unwrap(),
     )

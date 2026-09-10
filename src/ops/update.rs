@@ -3,7 +3,7 @@
 use crate::Workspace;
 use crate::hash::{HASH_ALGO, hash_directory};
 use crate::meta::{Baseline, Source};
-use crate::ops::{DownloadDir, fresh_staging, git, swap_dir};
+use crate::ops::{DownloadDir, fresh_staging, git};
 use crate::reconcile::{SkillStatus, Snapshot};
 use crate::util::{copy_dir, is_ignored_name};
 use anyhow::{Context, Result, bail};
@@ -101,6 +101,8 @@ pub struct Prepared {
     pub from_revision: Option<String>,
     pub to_revision: String,
     pub status: String,
+    /// Newly discovered sources are informational; updating never installs them.
+    pub new_skills: Vec<String>,
     /// relative path -> classification (only when the skill is modified locally)
     pub files: BTreeMap<String, FileChange>,
     #[serde(skip)]
@@ -109,6 +111,12 @@ pub struct Prepared {
     pub workdir: PathBuf,
     #[serde(skip)]
     pub baseline_dir: Option<PathBuf>,
+    #[serde(skip)]
+    expected_name: String,
+    #[serde(skip)]
+    expected_meta: Box<crate::meta::SkillMeta>,
+    #[serde(skip)]
+    expected_hash: String,
 }
 
 impl Prepared {
@@ -130,7 +138,7 @@ pub fn prepare(_ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> 
         .meta
         .clone()
         .with_context(|| format!("{key} has no metadata"))?;
-    let (url, subpath, branch, revision) = match meta.source {
+    let (url, subpath, branch, revision) = match meta.source.clone() {
         Some(Source::Git {
             url,
             subpath,
@@ -143,6 +151,17 @@ pub fn prepare(_ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> 
         SkillStatus::Managed { .. } | SkillStatus::Modified => {}
         ref s => bail!("cannot update a skill in state {}", s.label()),
     }
+    let local = crate::skill::SkillDoc::load(&rec.path)?;
+    let expected_name = meta
+        .installed_name
+        .clone()
+        .unwrap_or_else(|| local.name.clone());
+    anyhow::ensure!(
+        local.name == expected_name,
+        "local skill name changed; keeping local copy and deployments"
+    );
+    let expected_hash = hash_directory(&rec.path)?;
+
     let download = DownloadDir::new("update")?;
     let work = download.path().to_path_buf();
     let clone = work.join("clone");
@@ -167,6 +186,46 @@ pub fn prepare(_ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> 
     if !upstream_src.join(crate::skill::SKILL_FILE).is_file() {
         bail!("upstream no longer has a skill at {sub:?}; keeping local copy");
     }
+    let upstream = crate::skill::SkillDoc::load(&upstream_src)
+        .context("upstream skill is invalid; keeping local copy and deployments")?;
+    anyhow::ensure!(
+        upstream.name == local.name,
+        "upstream skill name changed from {:?} to {:?}; keeping local copy and deployments",
+        local.name,
+        upstream.name
+    );
+    let installed_paths: Vec<_> = snap
+        .skills
+        .iter()
+        .filter_map(|s| match &s.source {
+            Some(Source::Git {
+                url: source_url,
+                subpath,
+                ..
+            }) if source_url == &url => Some(subpath.as_deref().unwrap_or("")),
+            _ => None,
+        })
+        .collect();
+    let mut new_skills = Vec::new();
+    for entry in walkdir::WalkDir::new(&clone)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
+    {
+        let entry = entry?;
+        if entry.file_type().is_file() && entry.file_name() == crate::skill::SKILL_FILE {
+            let directory = entry.path().parent().context("missing skill parent")?;
+            let path = directory.strip_prefix(&clone)?.to_string_lossy();
+            if !installed_paths
+                .iter()
+                .any(|p| *p == path || crate::repository::overlaps(p, &path))
+                && crate::skill::SkillDoc::load(directory).is_ok()
+            {
+                new_skills.push(path.into_owned());
+            }
+        }
+    }
+    new_skills.sort();
     let upstream_dir = work.join("upstream");
     copy_dir(&upstream_src, &upstream_dir)?;
     let _ = std::fs::remove_dir_all(upstream_dir.join(".git"));
@@ -176,10 +235,14 @@ pub fn prepare(_ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> 
         from_revision: revision.clone(),
         to_revision,
         status: rec.status.label().to_string(),
+        new_skills,
         files: BTreeMap::new(),
         upstream_dir,
         workdir: work.clone(),
         baseline_dir: None,
+        expected_name,
+        expected_meta: Box::new(meta),
+        expected_hash,
     };
 
     if rec.status == SkillStatus::Modified {
@@ -272,52 +335,61 @@ fn classify(
     Ok(out)
 }
 
-/// Apply a prepared update. `take` is the default side; `per_file` overrides it per path.
+/// Apply the complete upstream content, or keep local content and metadata untouched.
 pub fn apply(
     ws: &Workspace,
     prepared: &Prepared,
     take: Take,
     per_file: &BTreeMap<String, Take>,
 ) -> Result<()> {
+    anyhow::ensure!(
+        per_file.is_empty(),
+        "per-file merging is not supported; choose local or upstream for the whole skill"
+    );
+    if take == Take::Local {
+        prepared.cleanup();
+        return Ok(());
+    }
     let key = &prepared.skill;
+
     let dest = ws.skill_path(key);
+    anyhow::ensure!(
+        ws.meta.load(key)?.as_ref() == Some(prepared.expected_meta.as_ref())
+            && hash_directory(&dest)? == prepared.expected_hash,
+        "local skill or source metadata changed since update was prepared; refresh and retry"
+    );
     let result_dir = fresh_staging(&ws.root, "update-result")?;
     let result = (|| -> Result<()> {
-        if prepared.needs_resolution() {
-            // Start from the chosen default side, then overlay per-file picks.
-            let (base_side, other_side) = match take {
-                Take::Upstream => (&prepared.upstream_dir, dest.clone()),
-                Take::Local => (&dest, prepared.upstream_dir.clone()),
-            };
-            copy_dir(base_side, &result_dir)?;
-            for (rel, side) in per_file {
-                if *side == take {
-                    continue;
-                }
-                let src = other_side.join(rel);
-                let dst = result_dir.join(rel);
-                if src.is_file() {
-                    if let Some(p) = dst.parent() {
-                        std::fs::create_dir_all(p)?;
-                    }
-                    std::fs::copy(&src, &dst)?;
-                } else {
-                    let _ = std::fs::remove_file(&dst);
-                }
-            }
-        } else {
-            copy_dir(&prepared.upstream_dir, &result_dir)?;
-        }
-        swap_dir(&ws.root, &dest, &result_dir)?;
+        copy_dir(&prepared.upstream_dir, &result_dir)?;
+        let document = crate::skill::SkillDoc::load(&result_dir)
+            .context("updated skill is invalid; keeping local copy and deployments")?;
+        anyhow::ensure!(
+            document.name == prepared.expected_name,
+            "update would rename the skill; keeping local copy and deployments"
+        );
+
         let mut meta = ws.meta.load(key)?.context("metadata vanished")?;
         if let Some(Source::Git { revision, .. }) = meta.source.as_mut() {
             *revision = Some(prepared.to_revision.clone());
         }
+        meta.installed_name = Some(prepared.expected_name.clone());
         meta.baseline = Some(Baseline {
-            hash: hash_directory(&dest)?,
+            hash: hash_directory(&result_dir)?,
             hash_algo: HASH_ALGO,
         });
-        ws.meta.save(key, &meta)?;
+        let backup = fresh_staging(&ws.root, "update-backup")?;
+        std::fs::rename(&dest, &backup)?;
+        if let Err(error) = std::fs::rename(&result_dir, &dest) {
+            std::fs::rename(&backup, &dest).context("could not restore original skill")?;
+            return Err(error.into());
+        }
+        if let Err(error) = ws.meta.save(key, &meta) {
+            std::fs::rename(&dest, &result_dir)?;
+            std::fs::rename(&backup, &dest).context("could not restore original skill")?;
+            return Err(error);
+        }
+        let _ = std::fs::remove_dir_all(backup);
+
         prepared.cleanup();
         Ok(())
     })();

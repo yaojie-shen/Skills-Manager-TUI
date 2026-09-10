@@ -526,7 +526,19 @@ impl App {
             }
             TaskOutput::RepositoryInstalled(selection, result) => match result {
                 Ok(keys) => {
+                    let aliases: Vec<_> = selection
+                        .names
+                        .iter()
+                        .filter(|(path, name)| **name != selection.fetched.local_name(path))
+                        .map(|(path, name)| format!("{path} → {name}"))
+                        .collect();
                     selection.fetched.cleanup();
+                    if keys.is_empty() {
+                        return vec![Action::Toast(
+                            "Already installed; skipped without changes".into(),
+                        )];
+                    }
+
                     let mut actions: Vec<Action> = keys
                         .iter()
                         .map(|key| Action::Record(history::Intent::Install { skill: key.clone() }))
@@ -534,8 +546,16 @@ impl App {
                     actions.extend([
                         Action::Rescan,
                         Action::Toast(format!(
-                            "installed {} skills — choose destination agents",
-                            keys.len()
+                            "installed {} skills{} — choose destination agents",
+                            keys.len(),
+                            if aliases.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    "; warning: folder aliases {} (declared names unchanged)",
+                                    aliases.join(", ")
+                                )
+                            }
                         )),
                         Action::Search {
                             query: format!(

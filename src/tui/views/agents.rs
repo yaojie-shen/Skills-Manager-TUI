@@ -2695,7 +2695,7 @@ mod overflow_tests {
         std::fs::create_dir_all(directory.join("stored-alias")).unwrap();
         std::fs::write(
             directory.join("stored-alias/SKILL.md"),
-            "---\nname: Approval Workflow\ndescription: Manage documents\n---\nAnalyze invoices",
+            "---\nname: approval-workflow\ndescription: Manage documents\n---\nAnalyze invoices",
         )
         .unwrap();
         let mut ws = Workspace::open(&root).unwrap();
@@ -3044,7 +3044,7 @@ mod deployment_scope_tests {
         std::fs::create_dir_all(project.join(".git")).unwrap();
         std::fs::write(
             root.join("sample/SKILL.md"),
-            "---\nname: Sample Skill\ndescription: a useful skill\n---\nbody\n",
+            "---\nname: sample-skill\ndescription: a useful skill\n---\nbody\n",
         )
         .unwrap();
         Config {

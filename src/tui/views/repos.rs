@@ -406,7 +406,7 @@ mod tests {
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(
             skill.join("SKILL.md"),
-            "---\nname: Example\ndescription: Sample skill\n---\n# Usage\nHello world",
+            "---\nname: example\ndescription: Sample skill\n---\n# Usage\nHello world",
         )
         .unwrap();
         skills::config::Config {

@@ -90,7 +90,8 @@ impl Pending {
         snap: &Snapshot,
         actions: &[deploy::Action],
     ) -> Result<Option<Self>> {
-        let mut groups: BTreeMap<(PathBuf, String), BTreeMap<PathBuf, Candidate>> = BTreeMap::new();
+        type Candidates = BTreeMap<(PathBuf, Option<String>), Candidate>;
+        let mut groups: BTreeMap<(PathBuf, String), Candidates> = BTreeMap::new();
         for conflict in deploy::name_conflicts(snap, actions) {
             let report = snap
                 .agent(&conflict.agent)
@@ -100,11 +101,13 @@ impl Pending {
                 .entry((directory.clone(), conflict.name))
                 .or_default();
             let path = directory.join(crate::repository::default_deploy_name(&conflict.skill));
-            options.entry(path.clone()).or_insert(Candidate {
-                key: Some(conflict.skill),
-                path,
-                archive_hash: None,
-            });
+            options
+                .entry((path.clone(), Some(conflict.skill.clone())))
+                .or_insert(Candidate {
+                    key: Some(conflict.skill),
+                    path,
+                    archive_hash: None,
+                });
             let path = directory.join(
                 conflict
                     .other_path
@@ -116,11 +119,13 @@ impl Pending {
             } else {
                 None
             };
-            options.entry(path.clone()).or_insert(Candidate {
-                key: conflict.other_skill,
-                path,
-                archive_hash,
-            });
+            options
+                .entry((path.clone(), conflict.other_skill.clone()))
+                .or_insert(Candidate {
+                    key: conflict.other_skill,
+                    path,
+                    archive_hash,
+                });
         }
         if groups.is_empty() {
             return Ok(None);
@@ -143,18 +148,51 @@ impl Pending {
                 .all(|(directory, _)| unique.contains_key(directory)),
             "conflicting target has no selection plan"
         );
+        // Folder and declared-name conflicts can overlap; present each connected
+        // set once so choosing in a later group cannot undo an earlier choice.
+        let mut merged: Vec<Group> = Vec::new();
+        for ((directory, name), candidates) in groups {
+            let mut group = Group {
+                directory,
+                name,
+                candidates: candidates.into_values().collect(),
+            };
+            let mut index = 0;
+            while index < merged.len() {
+                if merged[index].directory == group.directory
+                    && merged[index].candidates.iter().any(|a| {
+                        group
+                            .candidates
+                            .iter()
+                            .any(|b| a.path == b.path && a.key == b.key)
+                    })
+                {
+                    let previous = merged.remove(index);
+                    for candidate in previous.candidates {
+                        if !group
+                            .candidates
+                            .iter()
+                            .any(|c| c.path == candidate.path && c.key == candidate.key)
+                        {
+                            group.candidates.push(candidate);
+                        }
+                    }
+                    index = 0;
+                } else {
+                    index += 1;
+                }
+            }
+            group
+                .candidates
+                .sort_by(|a, b| (&a.path, &a.key).cmp(&(&b.path, &b.key)));
+            merged.push(group);
+        }
         Ok(Some(Self {
             changes: unique.into_values().collect(),
-            groups: groups
-                .into_iter()
-                .map(|((directory, name), candidates)| Group {
-                    directory,
-                    name,
-                    candidates: candidates.into_values().collect(),
-                })
-                .collect(),
+            groups: merged,
         }))
     }
+
     pub fn keys(&self) -> Vec<String> {
         self.changes.iter().flat_map(|c| c.after.skills()).collect()
     }

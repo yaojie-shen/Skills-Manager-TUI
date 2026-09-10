@@ -530,23 +530,22 @@ impl Modal {
             .iter()
             .filter(|(_, c)| **c != FileChange::Unchanged)
             .map(|(f, c)| {
-                let take = match c {
-                    FileChange::LocalChanged => Take::Local,
-                    _ => Take::Upstream,
-                };
+                let take = Take::Local;
                 (f.clone(), *c, take)
             })
             .collect();
         let mut list = ListNav::default();
         list.clamp(files.len());
-        if !prepared.needs_resolution() {
-            // Clean update: still show what changes, but nothing to pick.
-        }
+        let default_take = if prepared.needs_resolution() {
+            Take::Local
+        } else {
+            Take::Upstream
+        };
         Modal::Resolve {
             prepared: Some(prepared),
             files,
             list,
-            default_take: Take::Upstream,
+            default_take,
             btn: 0,
             btn_rects: Vec::new(),
             rect: Rect::default(),
@@ -592,7 +591,7 @@ impl Modal {
             ],
             Modal::Resolve { .. } => &[
                 ("Space", "toggle side"),
-                ("l/u", "all local/upstream"),
+                ("l/u", "keep local/use upstream"),
                 ("Enter", "apply"),
                 ("Esc", "cancel"),
             ],
@@ -818,10 +817,9 @@ impl Modal {
                         vec![]
                     }
                     KeyCode::Char(' ') => {
-                        if let Some(i) = list.selected()
-                            && let Some(f) = files.get_mut(i)
-                        {
-                            f.2 = flip(f.2);
+                        *default_take = flip(*default_take);
+                        for f in files.iter_mut() {
+                            f.2 = *default_take;
                         }
                         vec![]
                     }
@@ -857,18 +855,19 @@ impl Modal {
                             return vec![Action::CloseModal];
                         };
                         let default = *default_take;
-                        let per_file: BTreeMap<String, Take> = files
-                            .iter()
-                            .filter(|(_, _, t)| *t != default)
-                            .map(|(f, _, t)| (f.clone(), *t))
-                            .collect();
+                        let per_file = BTreeMap::new();
                         let key = p.skill.clone();
                         let rev = skills::meta::short_rev(&p.to_revision).to_string();
                         vec![
                             Action::CloseModal,
                             Action::Write(Box::new(move |ws| {
-                                update::apply(ws, &p, default, &per_file)
-                                    .map(|_| format!("{key} updated to {rev}"))
+                                update::apply(ws, &p, default, &per_file).map(|_| {
+                                    if default == Take::Local {
+                                        format!("{key}: kept local; update skipped")
+                                    } else {
+                                        format!("{key} updated to {rev}")
+                                    }
+                                })
                             })),
                         ]
                     }
@@ -1024,9 +1023,12 @@ impl Modal {
                         return vec![Action::CloseModal, Action::Toast("update cancelled".into())];
                     }
                     if let Some((i, _)) = list.click(m.row, n)
-                        && let Some(f) = files.get_mut(i)
+                        && files.get(i).is_some()
                     {
-                        f.2 = flip(f.2);
+                        *default_take = flip(*default_take);
+                        for f in files.iter_mut() {
+                            f.2 = *default_take;
+                        }
                     }
                 }
                 vec![]
@@ -1276,7 +1278,7 @@ impl Modal {
                         Span::raw(skills::meta::short_rev(&p.to_revision).to_string()),
                         Span::styled(
                             if p.needs_resolution() {
-                                "   modified locally — pick a side per file"
+                                "   modified locally — choose the whole skill"
                             } else {
                                 "   clean update"
                             },
@@ -1288,7 +1290,7 @@ impl Modal {
                         ),
                     ]),
                     Line::from(vec![
-                        Span::styled("default  ", th.dim()),
+                        Span::styled("whole skill  ", th.dim()),
                         Span::styled(format!("{default_take:?}").to_lowercase(), th.accent()),
                         Span::styled(
                             if p.baseline_dir.is_some() {
@@ -1299,7 +1301,14 @@ impl Modal {
                             th.dim(),
                         ),
                     ]),
-                    Line::from(""),
+                    Line::from(if p.new_skills.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "New upstream skills (not installed): {}",
+                            p.new_skills.join(", ")
+                        )
+                    }),
                 ];
                 f.render_widget(
                     Paragraph::new(head),
@@ -1342,7 +1351,7 @@ impl Modal {
                     .highlight_symbol("▸ ");
                 f.render_stateful_widget(w, list_area, &mut list.state);
                 if files.is_empty() {
-                    f.render_widget(Paragraph::new(Span::styled("no file-level differences; applying replaces the directory with upstream", th.dim())), list_area);
+                    f.render_widget(Paragraph::new(Span::styled("No content diff to display. Local skips; upstream replaces the whole skill.", th.dim())), list_area);
                 }
                 *btn_rects = draw_buttons(f, inner, &[("Apply", 0), ("Cancel", 0)], *btn, th);
             }

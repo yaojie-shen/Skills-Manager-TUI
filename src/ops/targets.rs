@@ -834,6 +834,8 @@ fn restore_scanned_selection(
         return Err(pending.into());
     }
     let actions = super::deploy::resolve_names(snap, &actions, None)?;
+    let mut actions = actions;
+    actions.sort_by_key(|a| !matches!(a, super::deploy::Action::Unlink { .. }));
     for action in &actions {
         if let super::deploy::Action::Skip { reason, skill, .. } = action {
             let missing_removal = removed.contains(skill)
@@ -858,11 +860,36 @@ fn restore_scanned_selection(
     if save_shared_selection(&mut registry, agent, desired) {
         save(ws, &registry)?;
     }
-    Ok(format!(
+    let mut message = format!(
         "{} · {}",
         agent.display_name(),
         super::deploy::summarize(&actions)
-    ))
+    );
+    let names: std::collections::BTreeSet<_> = desired_keys
+        .iter()
+        .filter_map(|key| snap.get(key).and_then(|s| s.name.as_ref()))
+        .collect();
+    for other in &registry.agents {
+        if other.skills_path() == agent.skills_path()
+            || registry.projects.get(&other.key).map(PathBuf::as_path) == project
+        {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(other.skills_path()) {
+            for entry in entries.flatten() {
+                if let Ok(doc) = crate::skill::SkillDoc::load(&entry.path())
+                    && names.contains(&doc.name)
+                {
+                    message.push_str(&format!(
+                        "; warning: {} also exists in scope {} (unchanged)",
+                        doc.name,
+                        other.skills_path().display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(message)
 }
 
 /// Keep persisted installation references aligned with central library edits.

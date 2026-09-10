@@ -189,25 +189,9 @@ pub fn default_name(r: &InstallRef, fetched: &Fetched) -> String {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        InstallRef::Git { url, subpath, .. } => match subpath {
-            Some(s) if !s.is_empty() => Path::new(s)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            _ => {
-                let doc = SkillDoc::load(&fetched.skill_dir).ok();
-                doc.map(|d| d.name)
-                    .filter(|n| crate::util::valid_skill_key(n))
-                    .unwrap_or_else(|| {
-                        url.trim_end_matches('/')
-                            .trim_end_matches(".git")
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or("skill")
-                            .to_string()
-                    })
-            }
-        },
+        InstallRef::Git { .. } => SkillDoc::load(&fetched.skill_dir)
+            .map(|doc| doc.name)
+            .unwrap_or_default(),
     }
 }
 
@@ -278,6 +262,7 @@ pub fn install(ws: &Workspace, r: &InstallRef, name: Option<&str>) -> Result<Str
             schema: crate::meta::SCHEMA,
             tags: Vec::new(),
             note: None,
+            installed_name: Some(SkillDoc::load(&dest)?.name),
             source: Some(fetched.source.clone()),
             baseline: Some(Baseline {
                 hash: hash_directory(&dest)?,

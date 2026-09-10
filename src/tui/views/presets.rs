@@ -829,7 +829,7 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(
             path.join("SKILL.md"),
-            "---\nname: 文档工具\ndescription: Document tools\n---\nBody",
+            "---\nname: document-tools\ndescription: Document tools\n---\nBody",
         )
         .unwrap();
         let mut ws = Workspace::open(root.path()).unwrap();
@@ -852,7 +852,7 @@ mod tests {
         assert_eq!(lines.len(), 4);
         assert!(lines[0].to_string().ends_with("2 skills"));
         assert!(lines[1].to_string().starts_with("Document tools"));
-        assert!(lines[3].to_string().contains("文档工具"));
+        assert!(lines[3].to_string().contains("document-tools"));
         assert!(lines[3].to_string().contains("! 1 missing"));
         assert!(lines[3].to_string().ends_with("auto"));
         assert!(

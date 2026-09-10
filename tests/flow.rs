@@ -236,6 +236,11 @@ fn external_move_conflict_is_detected_before_any_link_or_metadata_changes() {
 fn external_move_preserves_deployment_name_when_moving_between_repositories() {
     let f = Fixture::new("external-same-name");
     f.add_skill("repos/a/one", "move me");
+    std::fs::write(
+        f.root.join("repos/a/one/SKILL.md"),
+        "---\nname: one\n---\nmove me",
+    )
+    .unwrap();
     let ws = f.ws();
     edit::tag_add(&ws, "repos/a/one", &["keep".into()]).unwrap();
     std::fs::create_dir_all(&f.agent_a).unwrap();
@@ -333,7 +338,7 @@ fn deploy_undeploy_sync_and_convert() {
         }
     );
     let actions = deploy::plan_deploy(&ws, &snap, &["two".into()], &["b".into()]).unwrap();
-    assert!(matches!(actions[0], Action::Skip { .. }));
+    assert!(deploy::apply(&actions).is_err());
 
     // Broken link is repaired by sync; sync also re-links `one` to A (all_to_all).
     std::fs::remove_dir_all(f.agent_b.join("two")).unwrap();
@@ -520,17 +525,39 @@ fn git_install_check_update_conflict() {
     assert_eq!(prepared.files["SKILL.md"], FileChange::UpstreamChanged);
     assert_eq!(prepared.files["extra.md"], FileChange::LocalChanged);
 
-    // Take upstream by default but keep the local extra.md.
+    // Mixed updates are rejected; keeping local preserves metadata too.
     let mut per_file = std::collections::BTreeMap::new();
     per_file.insert("extra.md".to_string(), Take::Local);
-    update::apply(&ws, &prepared, Take::Upstream, &per_file).unwrap();
+    assert!(update::apply(&ws, &prepared, Take::Upstream, &per_file).is_err());
+    let before = ws.meta.load("up").unwrap();
+    update::apply(
+        &ws,
+        &prepared,
+        Take::Local,
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(ws.meta.load("up").unwrap(), before);
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("up/extra.md")).unwrap(),
+        "extra local\n"
+    );
+    let prepared = update::prepare(&ws, &ws.scan().unwrap(), "up").unwrap();
+    update::apply(
+        &ws,
+        &prepared,
+        Take::Upstream,
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+
     assert_eq!(
         std::fs::read_to_string(f.root.join("up/SKILL.md")).unwrap(),
         "---\nname: up\ndescription: v2\n---\nbody v2\n"
     );
     assert_eq!(
         std::fs::read_to_string(f.root.join("up/extra.md")).unwrap(),
-        "extra local\n"
+        "extra v1\n"
     );
     let snap = ws.scan().unwrap();
     let rec = snap.get("up").unwrap();
@@ -603,8 +630,16 @@ fn preset_status_activation_and_overlap() {
     assert_eq!((st.installed, st.total), (0, 4));
     assert_eq!(st.state(), PresetState::Inactive);
 
-    // Activating daily leaves agent A's shadowed "two" alone.
+    // A conflict blocks the whole batch until the conflicting source is excluded.
     let actions = plan_preset_activate(&ws, &snap, &daily, &scope).unwrap();
+    assert!(deploy::apply(&actions).is_err());
+    assert!(!f.agent_b.join("one").exists());
+    let actions: Vec<_> = actions
+        .into_iter()
+        .filter(
+            |a| !matches!(a, Action::Link { agent, skill, .. } if agent == "a" && skill == "two"),
+        )
+        .collect();
     deploy::apply(&actions).unwrap();
     let snap = ws.scan().unwrap();
     assert_eq!(
@@ -633,6 +668,13 @@ fn preset_status_activation_and_overlap() {
 
     // Clicking it fills in the rest.
     let actions = plan_preset_activate(&ws, &snap, &extra, &scope).unwrap();
+    assert!(deploy::apply(&actions).is_err());
+    let actions: Vec<_> = actions
+        .into_iter()
+        .filter(
+            |a| !matches!(a, Action::Link { agent, skill, .. } if agent == "a" && skill == "two"),
+        )
+        .collect();
     deploy::apply(&actions).unwrap();
     let snap = ws.scan().unwrap();
     let st = preset_status(&snap, &extra, &scope);

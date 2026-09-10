@@ -34,7 +34,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
     /// Resolve duplicate frontmatter names when deploying
-    #[arg(long, global = true, value_parser = ["coexist", "replace"])]
+    #[arg(long, global = true, value_parser = ["replace"])]
     pub same_name: Option<String>,
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -229,8 +229,8 @@ pub struct UpdateArgs {
     /// Which side wins for a locally modified skill: local | upstream
     #[arg(long)]
     pub take: Option<Take>,
-    /// Per-file choice: path=local|upstream (repeatable)
-    #[arg(long = "take-file", value_name = "PATH=SIDE")]
+    /// Removed: updates now require one choice for the whole skill
+    #[arg(long = "take-file", value_name = "PATH=SIDE", hide = true)]
     pub take_file: Vec<String>,
     /// Alias for --take upstream
     #[arg(long)]
@@ -1018,7 +1018,13 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
                 }
                 names.insert(paths[0].clone(), name.clone());
             }
-            let keys = fetched.install(&ctx.ws, &paths, &names)?;
+            let mut notices = Vec::new();
+            let keys = fetched.install_with_progress(&ctx.ws, &paths, &names, &mut |message| {
+                if message.starts_with("Warning:") || message.starts_with("Already installed:") {
+                    notices.push(message.to_string());
+                }
+            })?;
+
             let actions = if a.deploy_to.is_empty() {
                 vec![]
             } else {
@@ -1029,8 +1035,11 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
                 actions
             };
             ctx.out(
-                &serde_json::json!({"installed": keys, "actions": actions}),
+                &serde_json::json!({"installed": keys, "actions": actions, "notices": notices}),
                 || {
+                    for notice in &notices {
+                        println!("{notice}");
+                    }
                     for key in &keys {
                         println!("installed {key}");
                     }
@@ -1136,16 +1145,21 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
     } else {
         a.take
     };
-    let mut per_file: BTreeMap<String, Take> = BTreeMap::new();
-    for spec in &a.take_file {
-        let (p, side) = spec
-            .rsplit_once('=')
-            .with_context(|| format!("expected PATH=SIDE, got {spec:?}"))?;
-        per_file.insert(p.to_string(), side.parse()?);
-    }
+    anyhow::ensure!(
+        a.take_file.is_empty(),
+        "choose --take local or --take upstream for the whole skill; per-file merging is not supported"
+    );
+    let per_file = BTreeMap::new();
     let mut report = Vec::new();
     for k in keys {
-        let prepared = update::prepare(&ctx.ws, &snap, &k)?;
+        let prepared = match update::prepare(&ctx.ws, &snap, &k) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                report.push(serde_json::json!({"skill": k, "result": "skipped", "reason": format!("{error:#}")}));
+                continue;
+            }
+        };
+
         let up_to_date = prepared.from_revision.as_deref() == Some(prepared.to_revision.as_str());
         let mut entry = serde_json::to_value(&prepared)?;
         if up_to_date {
@@ -1159,12 +1173,31 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
             prepared.cleanup();
         } else {
             update::apply(&ctx.ws, &prepared, take.unwrap_or_default(), &per_file)?;
-            entry["result"] = "updated".into();
+            entry["result"] = if take == Some(Take::Local) {
+                "skipped-local"
+            } else {
+                "updated"
+            }
+            .into();
         }
         report.push(entry);
     }
     ctx.out(&report, || {
         for e in &report {
+            if let Some(reason) = e["reason"].as_str() {
+                println!("{}: {reason}", e["skill"].as_str().unwrap_or(""));
+            }
+            if let Some(new) = e["new_skills"].as_array()
+                && !new.is_empty()
+            {
+                println!(
+                    "New upstream skills (not installed): {}",
+                    new.iter()
+                        .filter_map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
             let skill = e["skill"].as_str().unwrap_or("");
             let result = e["result"].as_str().unwrap_or("");
             println!(

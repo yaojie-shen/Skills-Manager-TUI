@@ -692,7 +692,17 @@ fn deploy_state(a: &AgentReport, record: &SkillRecord) -> DeployState {
         AgentDirMode::Real | AgentDirMode::SharedRoot => {
             match a.entries.get(&crate::repository::default_deploy_name(key)) {
                 None => DeployState::NotDeployed,
-                Some(EntryState::Deployed) => DeployState::Deployed,
+                Some(EntryState::Deployed) => {
+                    let destination = a.skills_dir.join(record.deployment_name());
+                    if std::fs::canonicalize(destination).ok()
+                        == std::fs::canonicalize(&record.path).ok()
+                    {
+                        DeployState::Deployed
+                    } else {
+                        DeployState::NotDeployed
+                    }
+                }
+
                 Some(EntryState::Broken { .. }) => DeployState::Broken,
                 Some(EntryState::Foreign { .. }) => DeployState::Foreign,
                 Some(EntryState::Shadow { same_content }) => DeployState::Shadow {

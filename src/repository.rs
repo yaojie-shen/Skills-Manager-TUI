@@ -11,13 +11,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Assign predictable directory names without changing an explicit user alias.
-/// Sorted paths claim their basename first; later collisions use the full path,
+/// Sorted paths claim their declared name first; later collisions use the full path,
 /// then numeric suffixes. Reserve overrides before allocating any defaults.
 pub fn resolve_local_names(
     paths: &[String],
     overrides: &BTreeMap<String, String>,
     occupied: &BTreeSet<String>,
-    root_name: &str,
+    declared_names: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>> {
     let sorted: BTreeSet<_> = paths.iter().collect();
     if sorted.len() != paths.len() {
@@ -43,18 +43,16 @@ pub fn resolve_local_names(
         if result.contains_key(path) {
             continue;
         }
-        let base = if path.is_empty() {
-            root_name
-        } else {
-            path.rsplit('/').next().unwrap()
-        };
+        let base = declared_names
+            .get(path)
+            .context("missing declared skill name")?;
         if !valid_skill_key(base) {
             bail!("invalid default local skill name for {path:?}: {base:?}; choose a local name")
         }
         let mut name = base.to_string();
         if used.contains(&name) {
             let fallback = if path.is_empty() {
-                root_name.to_string()
+                base.to_string()
             } else {
                 path.replace('/', "--")
             };
@@ -312,23 +310,9 @@ impl FetchedRepository {
         result
     }
     pub fn local_name(&self, path: &str) -> String {
-        if path.is_empty() {
-            if let Ok(doc) = crate::skill::SkillDoc::load(&self.workdir)
-                && valid_skill_key(&doc.name)
-            {
-                return doc.name;
-            }
-            self.repository
-                .url
-                .trim_end_matches('/')
-                .trim_end_matches(".git")
-                .rsplit('/')
-                .next()
-                .unwrap_or("skill")
-                .to_string()
-        } else {
-            path.rsplit('/').next().unwrap_or(path).to_string()
-        }
+        crate::skill::SkillDoc::load(&self.workdir.join(path))
+            .map(|doc| doc.name)
+            .unwrap_or_default()
     }
 
     /// Preview the same collision resolution used when publishing the install.
@@ -352,7 +336,15 @@ impl FetchedRepository {
                 occupied.insert(entry?.file_name().to_string_lossy().into_owned());
             }
         }
-        resolve_local_names(paths, overrides, &occupied, &self.local_name(""))
+        resolve_local_names(
+            paths,
+            overrides,
+            &occupied,
+            &paths
+                .iter()
+                .map(|p| (p.clone(), self.local_name(p)))
+                .collect(),
+        )
     }
 
     pub fn install(
@@ -375,22 +367,42 @@ impl FetchedRepository {
         if paths.is_empty() {
             bail!("select at least one skill")
         }
-        let names = self.resolved_names(ws, paths, names)?;
         let existing = ws.scan()?;
+        let paths: Vec<String> = paths.iter().filter(|path| {
+            let installed = existing.skills.iter().any(|r| {
+                matches!(&r.source, Some(Source::Git { url, subpath, .. })
+                    if url == &self.repository.url && subpath.as_deref().unwrap_or("") == path.as_str())
+            });
+            if installed {
+                progress(&format!("Already installed: {path}; skipped"));
+            }
+            !installed
+        }).cloned().collect();
+        if paths.is_empty() {
+            return Ok(vec![]);
+        }
+        let paths = paths.as_slice();
+        for path in paths {
+            validate_subpath(path)?;
+            crate::skill::SkillDoc::load(&self.workdir.join(path))
+                .with_context(|| format!("invalid skill at {path}/SKILL.md"))?;
+        }
+        let names = self.resolved_names(ws, paths, names)?;
+
         let mut keys = Vec::new();
         for path in paths {
             validate_subpath(path)?;
             if !self.choices.contains(path) {
                 bail!("skill path was not discovered: {path}")
             }
-            if existing.skills.iter().any(|r| {
-                crate::repository::alias_of(&r.key) == Some(self.repository.alias.as_str())
-                    && matches!(&r.source, Some(Source::Git { url, subpath, .. })
-                        if url == &self.repository.url && subpath.as_deref().unwrap_or("") == path)
-            }) {
-                bail!("skill at {path:?} is already installed in this repository")
-            }
             let name = names.get(path).expect("resolved selected path");
+            if *name != self.local_name(path) {
+                progress(&format!(
+                    "Warning: {path} declares {}; stored as {name} (name unchanged)",
+                    self.local_name(path)
+                ));
+            }
+
             if !valid_skill_key(name) {
                 bail!("invalid local skill name: {name:?}")
             }
@@ -430,17 +442,6 @@ impl FetchedRepository {
                 }
             }
         }
-        // Check all name collisions before placing anything.
-        let mut names: std::collections::BTreeSet<String> = existing
-            .skills
-            .iter()
-            .map(|s| s.deployment_name())
-            .collect();
-        for key in &keys {
-            if !names.insert(default_deploy_name(key)) {
-                bail!("deployment name collision for {key}; choose a different local skill name")
-            }
-        }
         // Prepare every copy before publishing any skill directory.
         let transaction = fresh_staging(&ws.root, "repository-install")?;
         std::fs::create_dir_all(&transaction)?;
@@ -452,6 +453,7 @@ impl FetchedRepository {
                 crate::util::copy_dir(&self.workdir.join(path), &staged)?;
                 let _ = std::fs::remove_dir_all(staged.join(".git"));
                 metas.push(crate::meta::SkillMeta {
+                    installed_name: Some(crate::skill::SkillDoc::load(&staged)?.name),
                     source: Some(Source::Git {
                         url: self.repository.url.clone(),
                         branch: Some(self.repository.branch.clone()),

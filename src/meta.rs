@@ -20,6 +20,9 @@ pub struct SkillMeta {
     pub tags: Vec<String>,
     #[serde(default)]
     pub note: Option<String>,
+    /// Declared name captured at installation; directory aliases are independent.
+    #[serde(default)]
+    pub installed_name: Option<String>,
     #[serde(default)]
     pub source: Option<Source>,
     #[serde(default)]
@@ -159,6 +162,7 @@ impl MetaStore {
                 }
             } else if entry.file_type()?.is_file()
                 && name != crate::config::CONFIG_FILE
+                && name != "deployment-targets.toml"
                 && !name.starts_with('.')
                 && let Some(stem) = name.strip_suffix(".toml")
             {
@@ -190,6 +194,14 @@ impl MetaStore {
             }
             _ => {
                 doc.remove("note");
+            }
+        }
+        match &meta.installed_name {
+            Some(name) => {
+                doc["installed_name"] = value(name.as_str());
+            }
+            None => {
+                doc.remove("installed_name");
             }
         }
         match &meta.source {
