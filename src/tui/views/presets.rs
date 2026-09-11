@@ -141,18 +141,6 @@ impl PresetsView {
     fn refresh_groups(&mut self, ctx: &Ctx) {
         self.tags_enabled = ctx.ws.config.tags_enabled;
         let selected = self.tag_groups.get(self.tag_cursor).map(|g| g.0.clone());
-        let mut all: Vec<String> = ctx
-            .snap
-            .skills
-            .iter()
-            .filter(|r| r.status.is_present())
-            .map(|r| r.key.clone())
-            .collect();
-        if let Some(p) = self.selected() {
-            all.extend(p.skills.clone());
-        }
-        all.sort();
-        all.dedup();
         self.tag_groups.clear();
         if self.tags_enabled {
             let mut names: std::collections::BTreeSet<String> =
@@ -177,18 +165,9 @@ impl PresetsView {
             .and_then(|name| self.tag_groups.iter().position(|g| g.0 == name))
             .unwrap_or(0);
         self.visible_members = self
-            .tag_groups
-            .get(self.tag_cursor)
-            .map(|g| g.1.clone())
-            .unwrap_or_else(|| {
-                if ctx.ws.config.tags_enabled {
-                    self.selected()
-                        .map(|p| p.skills.clone())
-                        .unwrap_or_default()
-                } else {
-                    all
-                }
-            });
+            .selected()
+            .map(|p| p.skills.clone())
+            .unwrap_or_default();
         self.members.clamp(self.member_count());
     }
 
@@ -533,8 +512,7 @@ impl PresetsView {
                         .as_ref()
                         .map(|s| s.kind().to_string())
                         .unwrap_or_default();
-                    let mut lines = skill_card(r, ctx, ci.width as usize, None, &tail, &[]);
-                    lines[0].spans[0] = cards::checkbox_marker(p.skills.contains(key), th);
+                    let lines = skill_card(r, ctx, ci.width as usize, None, &tail, &[]);
                     lines.into_iter().map(|l| (ci, l)).collect::<Vec<_>>()
                 }
                 // A member with no directory behind it is the one thing on
@@ -662,11 +640,13 @@ impl View for PresetsView {
                     self.focus_tags = false;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    return self.toggle_members(self.visible_members.clone());
+                    return self.toggle_members(self.tag_groups[self.tag_cursor].1.clone());
                 }
-                KeyCode::Char('a') => return self.edit_members(self.visible_members.clone(), true),
+                KeyCode::Char('a') => {
+                    return self.edit_members(self.tag_groups[self.tag_cursor].1.clone(), true);
+                }
                 KeyCode::Char('x') | KeyCode::Delete => {
-                    return self.edit_members(self.visible_members.clone(), false);
+                    return self.edit_members(self.tag_groups[self.tag_cursor].1.clone(), false);
                 }
                 KeyCode::Char('/' | 'm') => {
                     self.focus_tags = false;
@@ -674,22 +654,18 @@ impl View for PresetsView {
                 }
                 _ => return vec![],
             }
-            self.visible_members = self.tag_groups[self.tag_cursor].1.clone();
             self.members.first(self.member_count());
             self.skill_search = None;
             return vec![];
         }
-        if self.focus_members && self.skill_search.is_none() {
-            if k.code == KeyCode::Up
-                && self.members.selected().unwrap_or(0) < self.members.cols()
-                && self.tags_enabled
-            {
-                self.focus_tags = true;
-                return vec![];
-            }
-            if k.code == KeyCode::Char(' ') {
-                return self.toggle_members(self.selected_member().into_iter().collect());
-            }
+        if self.focus_members
+            && self.skill_search.is_none()
+            && k.code == KeyCode::Up
+            && self.members.selected().unwrap_or(0) < self.members.cols()
+            && self.tags_enabled
+        {
+            self.focus_tags = true;
+            return vec![];
         }
 
         if !self.focus_members && self.filter.key(k) {
@@ -856,7 +832,6 @@ impl View for PresetsView {
             && let Some((index, _)) = self.tag_rects.iter().find(|(_, rect)| rect.contains(at))
         {
             self.tag_cursor = *index;
-            self.visible_members = self.tag_groups[*index].1.clone();
             self.members.first(self.member_count());
             self.focus_members = true;
             self.focus_tags = true;
@@ -932,15 +907,9 @@ impl View for PresetsView {
                     self.members.clamp(self.member_count());
                 }
             } else if self.right.contains(at)
-                && let Some((index, double)) = self.members.click(m.column, m.row)
+                && let Some((_, double)) = self.members.click(m.column, m.row)
             {
                 self.focus_members = true;
-                if self.members.cell(index).is_some_and(|cell| {
-                    m.row == cell.y + 1
-                        && (cell.x + 2..cell.x + 2 + cards::MARKER_W as u16).contains(&m.column)
-                }) {
-                    return self.toggle_members(self.selected_member().into_iter().collect());
-                }
                 if double {
                     return self.open_member();
                 }
@@ -994,7 +963,6 @@ impl View for PresetsView {
         }
         if self.focus_members {
             &[
-                ("Space", "toggle member"),
                 ("/", "filter skills"),
                 ("a", "add skills"),
                 ("x", "remove"),
@@ -1253,6 +1221,9 @@ mod tag_group_tests {
         assert!(!screen.contains("Untagged"));
         assert!(!screen.contains("All 1/"));
         assert_eq!(view.tag_groups.len(), 2);
+        assert!(!screen.contains("[✓]"));
+        assert!(!screen.contains("[ ]"));
+        assert_eq!(view.visible_members, ["alpha"]);
         let (index, rect) = view
             .tag_rects
             .iter()
@@ -1269,7 +1240,7 @@ mod tag_group_tests {
             &ctx,
         );
         assert_eq!(view.tag_cursor, index);
-        assert_eq!(view.visible_members, ["alpha", "beta"]);
+        assert_eq!(view.visible_members, ["alpha"]);
         let keys = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let Action::WriteMeta(add) = view.handle_key(keys(KeyCode::Char('a')), &ctx).remove(0)
         else {
@@ -1308,7 +1279,7 @@ mod tag_group_tests {
         view.refresh(&ctx);
         terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
         assert!(view.tag_rects.is_empty());
-        assert_eq!(view.visible_members.len(), 3);
+        assert_eq!(view.visible_members, ["gamma"]);
         assert!(!Tab::visible(false).contains(&Tab::Tags));
         assert!(Tab::visible(true).contains(&Tab::Tags));
         assert_eq!(
