@@ -31,6 +31,8 @@ pub struct PickItem {
 pub enum InputKind {
     Tags { skill: String },
     PresetName,
+    TagName,
+    TagDescription { name: String },
     PresetDescription { name: String },
     RenamePreset { old: String },
     RenameTag { old: String },
@@ -40,14 +42,10 @@ pub enum InputKind {
 }
 
 pub enum Modal {
+    DeploymentChoices(Box<super::name_choices::NameChoices>),
     DeployTargets(Box<super::deploy_picker::DeployPicker>),
     PresetSkills(Box<SearchView>),
     Batch(Box<super::batch::Batch>),
-    NameConflict {
-        title: String,
-        actions: Vec<deploy::Action>,
-        rect: Rect,
-    },
     Repository(Box<super::repository_picker::RepositoryPicker>),
     Help {
         scroll: u16,
@@ -75,6 +73,7 @@ pub enum Modal {
         title: String,
         lines: Vec<String>,
         write: Option<MetaFn>,
+        background: Option<Vec<String>>,
         /// Set when this confirmation is a history step.
         then: Option<Step>,
         btn: usize,
@@ -182,12 +181,21 @@ impl Modal {
             title,
             lines,
             write: Some(write),
+            background: None,
             then: None,
             btn: 1,
             btn_rects: Vec::new(),
             rect: Rect::default(),
         }
     }
+    /// Run an expensive confirmed operation without blocking terminal input.
+    pub(crate) fn in_background(mut self, keys: Vec<String>) -> Self {
+        if let Self::ConfirmWrite { background, .. } = &mut self {
+            *background = Some(keys);
+        }
+        self
+    }
+
     pub fn tags(skill: &str, tags: &[String]) -> Self {
         Modal::Input {
             title: format!(" tags for {skill} "),
@@ -250,6 +258,26 @@ impl Modal {
         }
     }
 
+    pub fn new_tag() -> Self {
+        Self::Input {
+            title: " create tag ".into(),
+            input: Input::default(),
+            kind: InputKind::TagName,
+            hint: "name · Enter create · Esc cancel".into(),
+            rect: Rect::default(),
+        }
+    }
+
+    pub fn tag_description(name: &str, current: Option<&str>) -> Self {
+        Self::Input {
+            title: format!(" description of {name} "),
+            input: Input::with_value(current.unwrap_or_default()),
+            kind: InputKind::TagDescription { name: name.into() },
+            hint: "one sentence · Enter save · empty clears · Esc cancel".into(),
+            rect: Rect::default(),
+        }
+    }
+
     pub fn rename_tag(old: &str) -> Self {
         Modal::Input {
             title: format!(" rename tag {old} "),
@@ -302,7 +330,7 @@ impl Modal {
             format!(" rename {old} "),
             lines,
             Box::new(move |ws| {
-                let snap = ws.scan()?;
+                let snap = ws.scan_for_links()?;
                 edit::rename(ws, &snap, &from, &to)?;
                 Ok((
                     format!("renamed {from} to {to}"),
@@ -387,10 +415,11 @@ impl Modal {
                 "This unlinks it from every agent, deletes the directory and its metadata.".into(),
             ],
             Box::new(move |ws| {
-                let snap = ws.scan()?;
+                let snap = ws.scan_for_links()?;
                 edit::remove(ws, &snap, &k, false).map(|_| format!("removed {k}"))
             }),
         )
+        .in_background(vec![skill.to_string()])
     }
     /// Delete a directory that is not a usable skill. The common cause is a
     /// `git checkout` or `git clean` that removed the files but left the
@@ -412,10 +441,11 @@ impl Modal {
             format!(" discard {skill} "),
             lines,
             Box::new(move |ws| {
-                let snap = ws.scan()?;
+                let snap = ws.scan_for_links()?;
                 edit::remove(ws, &snap, &k, false).map(|_| format!("discarded {k}"))
             }),
         )
+        .in_background(vec![skill.to_string()])
     }
 
     /// Forget the tags and notes of a skill whose directory is gone.
@@ -522,23 +552,22 @@ impl Modal {
             .iter()
             .filter(|(_, c)| **c != FileChange::Unchanged)
             .map(|(f, c)| {
-                let take = match c {
-                    FileChange::LocalChanged => Take::Local,
-                    _ => Take::Upstream,
-                };
+                let take = Take::Local;
                 (f.clone(), *c, take)
             })
             .collect();
         let mut list = ListNav::default();
         list.clamp(files.len());
-        if !prepared.needs_resolution() {
-            // Clean update: still show what changes, but nothing to pick.
-        }
+        let default_take = if prepared.needs_resolution() {
+            Take::Local
+        } else {
+            Take::Upstream
+        };
         Modal::Resolve {
             prepared: Some(prepared),
             files,
             list,
-            default_take: Take::Upstream,
+            default_take,
             btn: 0,
             btn_rects: Vec::new(),
             rect: Rect::default(),
@@ -549,14 +578,17 @@ impl Modal {
 
     pub fn hints(&self) -> Hints {
         match self {
-            Modal::NameConflict { .. } => &[("c", "coexist"), ("r", "replace"), ("Esc", "cancel")],
+            Modal::DeploymentChoices(picker) => picker.hints(),
             Modal::PresetSkills(view) => view.hints(),
             Modal::Batch(p) => p.hints(),
             Modal::Repository(p) => p.hints(),
             Modal::DeployTargets(p) => p.hints(),
             Modal::Help { .. } | Modal::Message { .. } => &[("Esc", "close")],
-            Modal::Confirm { .. } | Modal::ConfirmWrite { .. } => {
+            Modal::Confirm { btn: 0, .. } | Modal::ConfirmWrite { btn: 0, .. } => {
                 &[("Enter/y", "apply"), ("Esc/n", "cancel"), ("←→", "buttons")]
+            }
+            Modal::Confirm { .. } | Modal::ConfirmWrite { .. } => {
+                &[("Enter/Esc/n", "cancel"), ("y", "apply"), ("←→", "buttons")]
             }
             Modal::Input {
                 kind: InputKind::Install,
@@ -581,7 +613,7 @@ impl Modal {
             ],
             Modal::Resolve { .. } => &[
                 ("Space", "toggle side"),
-                ("l/u", "all local/upstream"),
+                ("l/u", "keep local/use upstream"),
                 ("Enter", "apply"),
                 ("Esc", "cancel"),
             ],
@@ -623,21 +655,7 @@ impl Modal {
     pub fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match self {
-            Modal::NameConflict { title, actions, .. } => match k.code {
-                KeyCode::Esc => vec![Action::CloseModal],
-                KeyCode::Char(c @ ('c' | 'r')) => match deploy::resolve_names(
-                    ctx.snap,
-                    actions,
-                    Some(if c == 'c' { "coexist" } else { "replace" }),
-                ) {
-                    Ok(plan) => vec![Action::OpenModal(Box::new(Modal::confirm(
-                        title.clone(),
-                        plan,
-                    )))],
-                    Err(e) => vec![Action::Error(format!("{e:#}"))],
-                },
-                _ => vec![],
-            },
+            Modal::DeploymentChoices(picker) => picker.key(k),
             Modal::PresetSkills(view) => view.handle_key(k, ctx),
             Modal::Batch(p) => p.key(k, ctx),
             Modal::Repository(p) => p.key(k, ctx),
@@ -688,17 +706,24 @@ impl Modal {
                 _ => vec![],
             },
             Modal::ConfirmWrite {
-                write, then, btn, ..
+                write,
+                then,
+                btn,
+                background,
+                title,
+                ..
             } => match k.code {
                 KeyCode::Char('y') => write
                     .take()
-                    .map(|w| write_actions(w, then.take()))
+                    .map(|w| write_actions(w, then.take(), background.take(), title.clone()))
                     .unwrap_or_default(),
                 KeyCode::Enter => {
                     if *btn == 0 {
                         write
                             .take()
-                            .map(|w| write_actions(w, then.take()))
+                            .map(|w| {
+                                write_actions(w, then.take(), background.take(), title.clone())
+                            })
                             .unwrap_or_default()
                     } else {
                         vec![Action::CloseModal]
@@ -814,10 +839,9 @@ impl Modal {
                         vec![]
                     }
                     KeyCode::Char(' ') => {
-                        if let Some(i) = list.selected()
-                            && let Some(f) = files.get_mut(i)
-                        {
-                            f.2 = flip(f.2);
+                        *default_take = flip(*default_take);
+                        for f in files.iter_mut() {
+                            f.2 = *default_take;
                         }
                         vec![]
                     }
@@ -853,18 +877,19 @@ impl Modal {
                             return vec![Action::CloseModal];
                         };
                         let default = *default_take;
-                        let per_file: BTreeMap<String, Take> = files
-                            .iter()
-                            .filter(|(_, _, t)| *t != default)
-                            .map(|(f, _, t)| (f.clone(), *t))
-                            .collect();
+                        let per_file = BTreeMap::new();
                         let key = p.skill.clone();
                         let rev = skills::meta::short_rev(&p.to_revision).to_string();
                         vec![
                             Action::CloseModal,
                             Action::Write(Box::new(move |ws| {
-                                update::apply(ws, &p, default, &per_file)
-                                    .map(|_| format!("{key} updated to {rev}"))
+                                update::apply(ws, &p, default, &per_file).map(|_| {
+                                    if default == Take::Local {
+                                        format!("{key}: kept local; update skipped")
+                                    } else {
+                                        format!("{key} updated to {rev}")
+                                    }
+                                })
                             })),
                         ]
                     }
@@ -883,25 +908,7 @@ impl Modal {
         };
         let click = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
         match self {
-            Modal::NameConflict { rect, .. } => {
-                if click {
-                    if !rect.contains(at) {
-                        return vec![Action::CloseModal];
-                    }
-                    if m.row == rect.bottom().saturating_sub(2) {
-                        let code = if m.column < rect.x + rect.width / 2 {
-                            'c'
-                        } else {
-                            'r'
-                        };
-                        return self.handle_key(
-                            KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE),
-                            ctx,
-                        );
-                    }
-                }
-                vec![]
-            }
+            Modal::DeploymentChoices(picker) => picker.mouse(m),
             Modal::PresetSkills(view) => view.handle_mouse(m, ctx),
             Modal::Batch(p) => p.mouse(m, ctx),
             Modal::Repository(p) => p.mouse(m, ctx),
@@ -939,6 +946,8 @@ impl Modal {
             Modal::ConfirmWrite {
                 write,
                 then,
+                background,
+                title,
                 btn_rects,
                 rect,
                 ..
@@ -947,7 +956,9 @@ impl Modal {
                     if btn_rects.first().is_some_and(|r| r.contains(at)) {
                         return write
                             .take()
-                            .map(|w| write_actions(w, then.take()))
+                            .map(|w| {
+                                write_actions(w, then.take(), background.take(), title.clone())
+                            })
                             .unwrap_or_default();
                     }
                     if btn_rects.get(1).is_some_and(|r| r.contains(at)) || !rect.contains(at) {
@@ -1034,9 +1045,12 @@ impl Modal {
                         return vec![Action::CloseModal, Action::Toast("update cancelled".into())];
                     }
                     if let Some((i, _)) = list.click(m.row, n)
-                        && let Some(f) = files.get_mut(i)
+                        && files.get(i).is_some()
                     {
-                        f.2 = flip(f.2);
+                        *default_take = flip(*default_take);
+                        for f in files.iter_mut() {
+                            f.2 = *default_take;
+                        }
                     }
                 }
                 vec![]
@@ -1049,62 +1063,7 @@ impl Modal {
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let th = ctx.theme;
         match self {
-            Modal::NameConflict {
-                title,
-                actions,
-                rect,
-            } => {
-                let conflicts = deploy::name_conflicts(ctx.snap, actions);
-                let mut lines = vec![
-                    Line::from("Different folders contain skills with the same frontmatter name."),
-                    Line::from("SKILL.md stays unchanged. Agent selection may be ambiguous."),
-                    Line::from(""),
-                ];
-                lines.extend(conflicts.iter().map(|c| {
-                    Line::from(format!(
-                        "{}: {} ↔ {} ({})",
-                        c.agent,
-                        c.skill,
-                        c.other_path.display(),
-                        c.name
-                    ))
-                }));
-                let r = centered(
-                    area,
-                    100,
-                    (lines.len() as u16 + 5).min(area.height.saturating_sub(2)),
-                );
-                *rect = r;
-                f.render_widget(Clear, r);
-                let block = th.block(format!(" name conflict · {title} "), true);
-                let inner = block.inner(r);
-                f.render_widget(block, r);
-                f.render_widget(
-                    Paragraph::new(lines).wrap(Wrap { trim: false }),
-                    Rect {
-                        height: inner.height.saturating_sub(2),
-                        ..inner
-                    },
-                );
-                f.render_widget(
-                    Paragraph::new("[c] Coexist"),
-                    Rect::new(
-                        inner.x,
-                        inner.bottom().saturating_sub(1),
-                        inner.width / 2,
-                        1,
-                    ),
-                );
-                f.render_widget(
-                    Paragraph::new("[r] Replace managed links"),
-                    Rect::new(
-                        inner.x + inner.width / 2,
-                        inner.bottom().saturating_sub(1),
-                        inner.width - inner.width / 2,
-                        1,
-                    ),
-                );
-            }
+            Modal::DeploymentChoices(picker) => picker.draw(f, area, ctx),
             Modal::PresetSkills(view) => {
                 let r = centered(
                     area,
@@ -1121,7 +1080,14 @@ impl Modal {
             Modal::Repository(p) => p.draw(f, area, ctx),
             Modal::DeployTargets(p) => p.draw(f, area, ctx),
             Modal::Help { scroll } => {
-                let lines: Vec<Line> = HELP.lines().map(|l| help_line(l, th)).collect();
+                let lines: Vec<Line> = HELP
+                    .lines()
+                    .filter(|l| {
+                        ctx.ws.config.tags_enabled
+                            || (!l.to_lowercase().contains("tag") && !l.starts_with("  t "))
+                    })
+                    .map(|l| help_line(l, th))
+                    .collect();
                 let r = centered(area, 78, lines.len() as u16 + 2);
                 f.render_widget(Clear, r);
                 f.render_widget(
@@ -1341,7 +1307,7 @@ impl Modal {
                         Span::raw(skills::meta::short_rev(&p.to_revision).to_string()),
                         Span::styled(
                             if p.needs_resolution() {
-                                "   modified locally — pick a side per file"
+                                "   modified locally — choose the whole skill"
                             } else {
                                 "   clean update"
                             },
@@ -1353,7 +1319,7 @@ impl Modal {
                         ),
                     ]),
                     Line::from(vec![
-                        Span::styled("default  ", th.dim()),
+                        Span::styled("whole skill  ", th.dim()),
                         Span::styled(format!("{default_take:?}").to_lowercase(), th.accent()),
                         Span::styled(
                             if p.baseline_dir.is_some() {
@@ -1364,7 +1330,14 @@ impl Modal {
                             th.dim(),
                         ),
                     ]),
-                    Line::from(""),
+                    Line::from(if p.new_skills.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "New upstream skills (not installed): {}",
+                            p.new_skills.join(", ")
+                        )
+                    }),
                 ];
                 f.render_widget(
                     Paragraph::new(head),
@@ -1407,7 +1380,7 @@ impl Modal {
                     .highlight_symbol("▸ ");
                 f.render_stateful_widget(w, list_area, &mut list.state);
                 if files.is_empty() {
-                    f.render_widget(Paragraph::new(Span::styled("no file-level differences; applying replaces the directory with upstream", th.dim())), list_area);
+                    f.render_widget(Paragraph::new(Span::styled("No content diff to display. Local skips; upstream replaces the whole skill.", th.dim())), list_area);
                 }
                 *btn_rects = draw_buttons(f, inner, &[("Apply", 0), ("Cancel", 0)], *btn, th);
             }
@@ -1427,8 +1400,21 @@ fn refilter(query: &str, items: &[PickItem], shown: &mut Vec<usize>) {
 }
 
 /// A confirmed write, plus the history move it belongs to when it is a step.
-fn write_actions(w: MetaFn, then: Option<Step>) -> Vec<Action> {
-    let mut out = vec![Action::CloseModal, Action::WriteMeta(w)];
+fn write_actions(
+    w: MetaFn,
+    then: Option<Step>,
+    background: Option<Vec<String>>,
+    title: String,
+) -> Vec<Action> {
+    let action = match (background, then) {
+        (Some(keys), None) => Action::BackgroundWrite {
+            title,
+            write: w,
+            keys,
+        },
+        _ => Action::WriteMeta(w),
+    };
+    let mut out = vec![Action::CloseModal, action];
     if let Some(step) = then {
         out.push(Action::Step(step));
     }
@@ -1530,10 +1516,10 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
                     edit::tag_set(ws, &skill, &tags).map(|m| {
                         format!(
                             "{skill}: {}",
-                            if m.tags.is_empty() {
+                            if m.is_empty() {
                                 "no tags".into()
                             } else {
-                                m.tags.join(", ")
+                                m.join(", ")
                             }
                         )
                     })
@@ -1606,6 +1592,52 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
                 ))],
                 Err(e) => vec![Action::Error(format!("{e:#}"))],
             }
+        }
+        InputKind::TagName => {
+            let name = value.trim().to_string();
+            if name.is_empty() {
+                return vec![];
+            }
+            let selected = name.clone();
+            vec![
+                Action::WriteMeta(Box::new(move |ws| {
+                    anyhow::ensure!(
+                        name != "(untagged)" && !name.contains(','),
+                        "invalid tag name"
+                    );
+                    history::tag_edit(ws, |ws| {
+                        let mut exists = false;
+                        skills::config::Config::edit_tags(&ws.root, |tags| {
+                            exists = tags.iter().any(|t| t.name == name);
+                            if !exists {
+                                tags.push(skills::config::TagConfig {
+                                    name: name.clone(),
+                                    skills: vec![],
+                                    color: None,
+                                    description: None,
+                                });
+                            }
+                        })?;
+                        anyhow::ensure!(!exists, "tag {name} already exists");
+                        Ok(format!("created {name} — press a to add skills"))
+                    })
+                })),
+                Action::SelectTag(selected),
+            ]
+        }
+        InputKind::TagDescription { name } => {
+            let name = name.clone();
+            let description = value.trim().to_string();
+            vec![Action::WriteMeta(Box::new(move |ws| {
+                history::tag_edit(ws, |ws| {
+                    skills::config::Config::edit_tags(&ws.root, |tags| {
+                        if let Some(tag) = tags.iter_mut().find(|t| t.name == name) {
+                            tag.description = (!description.is_empty()).then_some(description);
+                        }
+                    })?;
+                    Ok(format!("updated description of {name}"))
+                })
+            }))]
         }
         InputKind::RenameTag { old } => {
             let old = old.clone();
@@ -1700,8 +1732,9 @@ fn help_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
 }
 
 const HELP: &str = "Library
+  F2                settings
   type              fuzzy search over name, tags, description, note
-  tag:x agent:y     filters; also status:managed  source:git  untagged
+  tag:x agent:y     filters; also status:modified  source:repository  untagged
   Enter             accept a suggestion / open results / preview
   arrows            navigate panels and lists (Esc goes back)
   i                 install a skill from a repo or a local path
@@ -1714,12 +1747,16 @@ const HELP: &str = "Library
   Esc               cancel multi-select; hidden selections never participate
   u  U              check upstream / update from upstream (git sources)
 Tags / Presets
+  c / a             create a group / add skills
+  e / r / D         description / rename / delete group
+  C / m             Tags: color / merge (left panel)
   /                 filter names on the left or skills on the right
   arrows            navigate lists and move between panels
   m                 multi-select skills in the current panel
   Ctrl-A            select current skill results; hidden selections are excluded
   t / d / p         batch tags / deploy / add to preset
-  x                 in Presets: remove selected skills from that preset
+  x                 remove selected skills from the current tag or preset
+  Enter / click     toggle or create a tag immediately; Esc closes the picker
 Agents
   /                 filter preset pills or skills, according to focus
   a                 adopt an entry the agent has but the root does not

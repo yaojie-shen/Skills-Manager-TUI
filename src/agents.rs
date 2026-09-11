@@ -53,6 +53,18 @@ agents![
     ),
     ("trae", "Trae", "~/.trae/skills", ".trae/skills"),
     ("trae-cn", "Trae CN", "~/.trae-cn/skills", ".trae/skills"),
+    (
+        "trae-cli",
+        "TraeCode CLI",
+        "~/.trae/skills",
+        ".agents/skills"
+    ),
+    (
+        "trae-cli-v1",
+        "TraeCode CLI 1.x",
+        "~/.traecli/skills",
+        ".traecli/skills"
+    ),
     ("cline", "Cline", "~/.cline/skills", ".cline/skills"),
     ("roo", "Roo Code", "~/.roo/skills", ".roo/skills"),
     (
@@ -85,8 +97,15 @@ impl AgentDefinition {
             self.global_dir
         }];
         let extra: &[&str] = match (self.key, local) {
+            // Verified with public CLI 2.0 (0.204.1-tob) offline discovery.
+            ("trae-cli", false) => &["~/.agents/skills"],
+            ("trae-cli", true) => &[".trae/skills"],
+            // https://docs.trae.cn/cli_skills (CLI 1.x)
+            ("trae-cli-v1", false) => &["~/.trae-cn/skills"],
+            ("trae-cli-v1", true) => &[".trae/skills"],
             // https://learn.chatgpt.com/docs/build-skills (legacy user root retained)
             ("codex", false) => &["~/.agents/skills"],
+            ("codex", true) => &[".codex/skills"],
             // https://cursor.com/docs/skills
             ("cursor", false) => &["~/.agents/skills", "~/.claude/skills", "~/.codex/skills"],
             ("cursor", true) => &[".agents/skills", ".claude/skills", ".codex/skills"],
@@ -142,4 +161,48 @@ impl AgentDefinition {
 
 pub fn defaults(local: bool) -> Vec<AgentConfig> {
     BUILTINS[..2].iter().map(|a| a.config(local)).collect()
+}
+
+mod detection;
+pub use detection::{detect_in, detect_with_applications};
+
+/// Recognize a directory link only when it resolves to another documented
+/// skill directory in the same scope. Arbitrary external links stay foreign.
+pub fn linked_skill_directory(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !std::fs::symlink_metadata(path).ok()?.is_symlink() {
+        return None;
+    }
+    let resolved = std::fs::canonicalize(path).ok()?;
+    if !resolved.is_dir() {
+        return None;
+    }
+    let global: Vec<_> = BUILTINS
+        .iter()
+        .flat_map(|a| a.search_dirs(false))
+        .map(crate::paths::expand_tilde)
+        .collect();
+    let mut peers = Vec::new();
+    if global.iter().any(|p| p == path) {
+        peers.extend(global);
+    }
+    for suffix in BUILTINS.iter().flat_map(|a| a.search_dirs(true)) {
+        if path.ends_with(suffix) {
+            let base = path
+                .ancestors()
+                .nth(std::path::Path::new(suffix).components().count())?;
+            peers.extend(
+                BUILTINS
+                    .iter()
+                    .flat_map(|a| a.search_dirs(true))
+                    .map(|s| base.join(s)),
+            );
+        }
+    }
+    peers
+        .into_iter()
+        .any(|peer| {
+            std::fs::symlink_metadata(&peer).is_ok_and(|m| m.is_dir())
+                && std::fs::canonicalize(peer).ok().as_ref() == Some(&resolved)
+        })
+        .then_some(resolved)
 }

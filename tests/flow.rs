@@ -26,6 +26,7 @@ impl Fixture {
         std::fs::create_dir_all(&root).unwrap();
         let root = std::fs::canonicalize(root).unwrap();
         let cfg = Config {
+            tags_enabled: true,
             schema: 1,
             agents: vec![
                 AgentConfig {
@@ -91,38 +92,30 @@ fn scan_tags_notes_and_baseline() {
 
     let snap = ws.scan().unwrap();
     assert_eq!(snap.skills.len(), 2);
-    assert!(
-        snap.skills
-            .iter()
-            .all(|s| s.status == SkillStatus::Unmanaged)
-    );
-    assert!(
-        !ws.meta.dir.join("alpha.toml").exists(),
-        "scan must not write"
-    );
+    assert!(snap.skills.iter().all(|s| s.status == SkillStatus::Local));
+    assert!(!ws.meta.exists("alpha"), "scan must not write");
 
     edit::tag_add(&ws, "alpha", &["ops".into(), "ml".into()]).unwrap();
-    edit::note_set(&ws, "alpha", Some("hello\nworld")).unwrap();
+    assert!(edit::note_set(&ws, "alpha", Some("hello\nworld")).is_err());
     let snap = ws.scan().unwrap();
     let a = snap.get("alpha").unwrap();
-    assert_eq!(a.tags, vec!["ops", "ml"]);
-    assert_eq!(a.note.as_deref(), Some("hello\nworld"));
+    assert_eq!(a.tags, vec!["ml", "ops"]);
+    assert!(a.note.is_none());
     assert_eq!(
         a.status,
-        SkillStatus::Managed { no_baseline: false },
-        "first write records a baseline"
+        SkillStatus::Local,
+        "metadata edits do not change local status"
     );
 
-    // Local edit -> modified; accept -> managed again.
+    // Local edits remain healthy without tracking a baseline.
     std::fs::write(f.root.join("alpha/extra.md"), "more").unwrap();
     let snap = ws.scan().unwrap();
-    assert_eq!(snap.get("alpha").unwrap().status, SkillStatus::Modified);
-    edit::accept(&ws, "alpha").unwrap();
+    assert_eq!(snap.get("alpha").unwrap().status, SkillStatus::Local);
+    assert!(edit::accept(&ws, "alpha").is_err());
+    assert!(ws.meta.load("alpha").unwrap().is_none());
+    assert!(!ws.meta.path("alpha").exists());
     let snap = ws.scan().unwrap();
-    assert_eq!(
-        snap.get("alpha").unwrap().status,
-        SkillStatus::Managed { no_baseline: false }
-    );
+    assert_eq!(snap.get("alpha").unwrap().status, SkillStatus::Local);
 
     // Tag rename/delete across skills.
     edit::tag_add(&ws, "beta", &["ops".into()]).unwrap();
@@ -142,16 +135,16 @@ fn missing_and_rename_detection() {
     f.add_skill("gamma", "g");
     let ws = f.ws();
     edit::tag_add(&ws, "gamma", &["x".into()]).unwrap();
+    std::os::unix::fs::symlink(&f.root, &f.agent_a).unwrap();
 
     std::fs::rename(f.root.join("gamma"), f.root.join("gamma2")).unwrap();
     let snap = ws.scan().unwrap();
+    assert_eq!(snap.get("gamma").unwrap().status, SkillStatus::Missing);
+    assert_eq!(snap.get("gamma2").unwrap().status, SkillStatus::Local);
     assert_eq!(
-        snap.get("gamma").unwrap().status,
-        SkillStatus::Renamed {
-            to: "gamma2".into()
-        }
+        snap.get("gamma").unwrap().deploy["a"],
+        DeployState::NotDeployed
     );
-    assert_eq!(snap.get("gamma2").unwrap().status, SkillStatus::Unmanaged);
 
     edit::migrate_meta(&ws, "gamma", "gamma2").unwrap();
     let snap = ws.scan().unwrap();
@@ -161,6 +154,118 @@ fn missing_and_rename_detection() {
     std::fs::remove_dir_all(f.root.join("gamma2")).unwrap();
     let snap = ws.scan().unwrap();
     assert_eq!(snap.get("gamma2").unwrap().status, SkillStatus::Missing);
+    assert_eq!(
+        snap.get("gamma2").unwrap().deploy["a"],
+        DeployState::NotDeployed
+    );
+}
+
+#[test]
+fn external_move_repairs_links_presets_and_preserves_metadata() {
+    let f = Fixture::new("external-move");
+    f.add_skill("old", "move me");
+    let ws = f.ws();
+    edit::tag_add(&ws, "old", &["keep".into()]).unwrap();
+    ws.presets
+        .save(&Preset {
+            name: "daily".into(),
+            skills: vec!["old".into(), "local/new".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    std::fs::create_dir_all(&f.agent_a).unwrap();
+    std::fs::create_dir_all(&f.agent_b).unwrap();
+    std::os::unix::fs::symlink(f.root.join("old"), f.agent_a.join("old")).unwrap();
+    // An unrelated link with the old name must never be touched.
+    std::os::unix::fs::symlink(f.base.join("elsewhere"), f.agent_b.join("old")).unwrap();
+    std::fs::create_dir_all(f.root.join("local")).unwrap();
+    std::fs::rename(f.root.join("old"), f.root.join("local/new")).unwrap();
+    edit::migrate_meta(&ws, "old", "local/new").unwrap();
+    assert!(!skills::util::is_symlink(&f.agent_a.join("old")));
+    assert_eq!(
+        link_state(&f.agent_a, "new"),
+        Some(f.root.join("local/new"))
+    );
+    assert_eq!(
+        link_state(&f.agent_b, "old"),
+        Some(f.base.join("elsewhere"))
+    );
+    assert_eq!(
+        ws.presets.load("daily").unwrap().unwrap().skills,
+        vec!["local/new"]
+    );
+    let snap = ws.scan().unwrap();
+    assert!(snap.get("old").is_none());
+    assert_eq!(snap.get("local/new").unwrap().tags, vec!["keep"]);
+}
+
+#[test]
+fn external_move_conflict_is_detected_before_any_link_or_metadata_changes() {
+    let f = Fixture::new("external-conflict");
+    f.add_skill("old", "move me");
+    let ws = f.ws();
+    edit::tag_add(&ws, "old", &["keep".into()]).unwrap();
+    for agent in [&f.agent_a, &f.agent_b] {
+        std::fs::create_dir_all(agent).unwrap();
+        std::os::unix::fs::symlink(f.root.join("old"), agent.join("old")).unwrap();
+    }
+    std::fs::create_dir(f.agent_b.join("new")).unwrap();
+    std::fs::rename(f.root.join("old"), f.root.join("new")).unwrap();
+    assert!(edit::migrate_meta(&ws, "old", "new").is_err());
+    assert_eq!(
+        skills::config::Config::load(&ws.root)
+            .unwrap()
+            .skill_tags("old"),
+        vec!["keep"]
+    );
+    assert!(!ws.meta.exists("new"));
+    for agent in [&f.agent_a, &f.agent_b] {
+        assert_eq!(link_state(agent, "old"), Some(f.root.join("old")));
+    }
+    assert!(!f.agent_a.join("new").exists());
+}
+
+#[test]
+fn external_move_preserves_deployment_name_when_moving_between_repositories() {
+    let f = Fixture::new("external-same-name");
+    f.add_skill("repos/a/one", "move me");
+    std::fs::write(
+        f.root.join("repos/a/one/SKILL.md"),
+        "---\nname: one\n---\nmove me",
+    )
+    .unwrap();
+    let ws = f.ws();
+    edit::tag_add(&ws, "repos/a/one", &["keep".into()]).unwrap();
+    std::fs::create_dir_all(&f.agent_a).unwrap();
+    std::os::unix::fs::symlink(f.root.join("repos/a/one"), f.agent_a.join("one")).unwrap();
+    std::os::unix::fs::symlink(f.root.join("repos/a/one"), f.root.join("one")).unwrap();
+    std::fs::create_dir_all(f.root.join("repos/b")).unwrap();
+    std::fs::rename(f.root.join("repos/a/one"), f.root.join("repos/b/one")).unwrap();
+    edit::migrate_meta(&ws, "repos/a/one", "repos/b/one").unwrap();
+    for dir in [&f.agent_a, &f.root] {
+        assert_eq!(link_state(dir, "one"), Some(f.root.join("repos/b/one")));
+    }
+}
+
+#[test]
+fn migration_rejects_existing_source_and_missing_or_external_destination() {
+    let f = Fixture::new("external-validation");
+    f.add_skill("old", "keep me");
+    f.add_skill("new", "different");
+    let ws = f.ws();
+    edit::tag_add(&ws, "old", &["keep".into()]).unwrap();
+    assert!(edit::migrate_meta(&ws, "old", "new").is_err());
+    std::fs::remove_dir_all(f.root.join("old")).unwrap();
+    assert!(edit::migrate_meta(&ws, "old", "missing").is_err());
+    std::fs::rename(f.root.join("new"), f.base.join("outside")).unwrap();
+    std::os::unix::fs::symlink(f.base.join("outside"), f.root.join("new")).unwrap();
+    assert!(edit::migrate_meta(&ws, "old", "new").is_err());
+    assert_eq!(
+        skills::config::Config::load(&ws.root)
+            .unwrap()
+            .skill_tags("old"),
+        vec!["keep"]
+    );
 }
 
 #[test]
@@ -231,7 +336,7 @@ fn deploy_undeploy_sync_and_convert() {
         }
     );
     let actions = deploy::plan_deploy(&ws, &snap, &["two".into()], &["b".into()]).unwrap();
-    assert!(matches!(actions[0], Action::Skip { .. }));
+    assert!(deploy::apply(&actions).is_err());
 
     // Broken link is repaired by sync; sync also re-links `one` to A (all_to_all).
     std::fs::remove_dir_all(f.agent_b.join("two")).unwrap();
@@ -265,11 +370,8 @@ fn install_local_rename_remove() {
     assert_eq!(key, "srcskill");
     let snap = ws.scan().unwrap();
     let rec = snap.get("srcskill").unwrap();
-    assert_eq!(rec.status, SkillStatus::Managed { no_baseline: false });
-    assert!(matches!(
-        rec.source,
-        Some(skills::meta::Source::Local { .. })
-    ));
+    assert_eq!(rec.status, SkillStatus::Local);
+    assert!(rec.source.is_none());
     assert!(
         !ws.meta
             .dir
@@ -304,7 +406,7 @@ fn install_local_rename_remove() {
     let snap = ws.scan().unwrap();
     assert!(snap.get("renamed").is_none());
     assert!(!f.agent_a.join("renamed").exists());
-    assert!(!ws.meta.dir.join("renamed.toml").exists());
+    assert!(!ws.meta.exists("renamed"));
 }
 
 #[test]
@@ -378,7 +480,7 @@ fn git_install_check_update_conflict() {
     assert_eq!(key, "up");
     let snap = ws.scan().unwrap();
     let rec = snap.get("up").unwrap();
-    assert_eq!(rec.status, SkillStatus::Managed { no_baseline: false });
+    assert_eq!(rec.status, SkillStatus::Repository);
     match &rec.source {
         Some(skills::meta::Source::Git {
             revision,
@@ -418,23 +520,45 @@ fn git_install_check_update_conflict() {
     assert_eq!(prepared.files["SKILL.md"], FileChange::UpstreamChanged);
     assert_eq!(prepared.files["extra.md"], FileChange::LocalChanged);
 
-    // Take upstream by default but keep the local extra.md.
+    // Mixed updates are rejected; keeping local preserves metadata too.
     let mut per_file = std::collections::BTreeMap::new();
     per_file.insert("extra.md".to_string(), Take::Local);
-    update::apply(&ws, &prepared, Take::Upstream, &per_file).unwrap();
+    assert!(update::apply(&ws, &prepared, Take::Upstream, &per_file).is_err());
+    let before = ws.meta.load("up").unwrap();
+    update::apply(
+        &ws,
+        &prepared,
+        Take::Local,
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    assert_eq!(ws.meta.load("up").unwrap(), before);
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("up/extra.md")).unwrap(),
+        "extra local\n"
+    );
+    let prepared = update::prepare(&ws, &ws.scan().unwrap(), "up").unwrap();
+    update::apply(
+        &ws,
+        &prepared,
+        Take::Upstream,
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+
     assert_eq!(
         std::fs::read_to_string(f.root.join("up/SKILL.md")).unwrap(),
         "---\nname: up\ndescription: v2\n---\nbody v2\n"
     );
     assert_eq!(
         std::fs::read_to_string(f.root.join("up/extra.md")).unwrap(),
-        "extra local\n"
+        "extra v1\n"
     );
     let snap = ws.scan().unwrap();
     let rec = snap.get("up").unwrap();
     assert_eq!(
         rec.status,
-        SkillStatus::Managed { no_baseline: false },
+        SkillStatus::Repository,
         "baseline refreshed after update"
     );
     match &rec.source {
@@ -466,7 +590,7 @@ fn preset_status_activation_and_overlap() {
     for k in ["one", "two", "three"] {
         f.add_skill(k, k);
     }
-    // A local skill only agent A has, plus one shadowing a managed name.
+    // A local skill only agent A has, plus one shadowing a tracked name.
     std::fs::create_dir_all(f.agent_a.join("local-only")).unwrap();
     std::fs::write(
         f.agent_a.join("local-only/SKILL.md"),
@@ -501,8 +625,16 @@ fn preset_status_activation_and_overlap() {
     assert_eq!((st.installed, st.total), (0, 4));
     assert_eq!(st.state(), PresetState::Inactive);
 
-    // Activating daily leaves agent A's shadowed "two" alone.
+    // A conflict blocks the whole batch until the conflicting source is excluded.
     let actions = plan_preset_activate(&ws, &snap, &daily, &scope).unwrap();
+    assert!(deploy::apply(&actions).is_err());
+    assert!(!f.agent_b.join("one").exists());
+    let actions: Vec<_> = actions
+        .into_iter()
+        .filter(
+            |a| !matches!(a, Action::Link { agent, skill, .. } if agent == "a" && skill == "two"),
+        )
+        .collect();
     deploy::apply(&actions).unwrap();
     let snap = ws.scan().unwrap();
     assert_eq!(
@@ -531,6 +663,13 @@ fn preset_status_activation_and_overlap() {
 
     // Clicking it fills in the rest.
     let actions = plan_preset_activate(&ws, &snap, &extra, &scope).unwrap();
+    assert!(deploy::apply(&actions).is_err());
+    let actions: Vec<_> = actions
+        .into_iter()
+        .filter(
+            |a| !matches!(a, Action::Link { agent, skill, .. } if agent == "a" && skill == "two"),
+        )
+        .collect();
     deploy::apply(&actions).unwrap();
     let snap = ws.scan().unwrap();
     let st = preset_status(&snap, &extra, &scope);
@@ -865,7 +1004,7 @@ fn aliased_roots_use_the_same_identity_for_adopt_and_deployment() {
     let before = std::fs::read(skill.join("SKILL.md")).unwrap();
     install::adopt(&ws, &alias.join("printer"), None).unwrap();
     assert_eq!(std::fs::read(skill.join("SKILL.md")).unwrap(), before);
-    assert!(ws.meta.exists("printer"));
+    assert!(!ws.meta.exists("printer"));
 
     std::fs::create_dir_all(&f.agent_a).unwrap();
     std::os::unix::fs::symlink(alias.join("printer"), f.agent_a.join("printer")).unwrap();
@@ -897,6 +1036,20 @@ fn note_editor_only_saves_successful_content_changes() {
     let f = Fixture::new("note-editor");
     f.add_skill("printer", "Print documents");
     let ws = f.ws();
+    ws.meta
+        .save(
+            "printer",
+            &skills::meta::SkillMeta {
+                source: Some(skills::meta::Source::Git {
+                    url: "https://example.com/repo".into(),
+                    branch: None,
+                    subpath: None,
+                    revision: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     let run = |editor: &str| {
         std::process::Command::new(env!("CARGO_BIN_EXE_skills"))
             .args([
@@ -912,12 +1065,12 @@ fn note_editor_only_saves_successful_content_changes() {
             .unwrap()
     };
 
-    // Quitting an untouched buffer must not turn an unmanaged skill into a
-    // managed one merely by creating an empty note and baseline.
+    // Quitting an untouched buffer must not turn an unidentified skill into a
+    // tracked one merely by creating an empty note and baseline.
     let output = run("true");
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("note unchanged"));
-    assert!(ws.meta.load("printer").unwrap().is_none());
+    assert!(ws.meta.load("printer").unwrap().unwrap().note.is_none());
 
     edit::note_set(&ws, "printer", Some("Original note\n")).unwrap();
     let meta_path = ws.meta.path("printer");
@@ -940,4 +1093,21 @@ fn note_editor_only_saves_successful_content_changes() {
         ws.meta.load("printer").unwrap().unwrap().note.as_deref(),
         Some("updated")
     );
+}
+
+#[test]
+fn local_tags_do_not_create_metadata_and_notes_are_rejected() {
+    let f = Fixture::new("local-metadata");
+    f.add_skill("alpha", "first skill");
+    let ws = f.ws();
+    edit::tag_add(&ws, "alpha", &["keep".into()]).unwrap();
+    assert!(edit::note_set(&ws, "alpha", Some("note")).is_err());
+    assert!(ws.meta.load("alpha").unwrap().is_none());
+    assert!(!f.root.join(".skills-meta/local.toml").exists());
+    let snap = ws.scan().unwrap();
+    let rec = snap.get("alpha").unwrap();
+    assert_eq!(rec.status, SkillStatus::Local);
+    assert_eq!(rec.tags, vec!["keep"]);
+    assert!(rec.baseline_hash.is_none());
+    assert!(rec.current_hash.is_none());
 }

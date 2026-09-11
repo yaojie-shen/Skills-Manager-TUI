@@ -1,4 +1,4 @@
-//! Health tab: everything that is not managed/unmanaged, plus update checks.
+//! Health tab: skill problems and update checks.
 //!
 //! The list on the left says *that* something is wrong; the pane on the right
 //! says *why* the selected item is here and which keys can do something about
@@ -40,18 +40,18 @@ impl Caps {
         Caps {
             accept: matches!(
                 r.status,
-                SkillStatus::Modified | SkillStatus::Managed { no_baseline: true }
+                SkillStatus::Modified | SkillStatus::MissingBaseline
             ),
             migrate: matches!(r.status, SkillStatus::Renamed { .. }),
             clean: matches!(r.status, SkillStatus::Missing | SkillStatus::Invalid { .. }),
-            // `update::prepare` refuses anything but managed and modified, so
+            // `update::prepare` requires usable repository content, so
             // offering `U` for a missing or invalid skill would only produce
             // an error toast.
             update: git
                 && update_available
                 && matches!(
                     r.status,
-                    SkillStatus::Managed { .. } | SkillStatus::Modified
+                    SkillStatus::Repository | SkillStatus::MissingBaseline | SkillStatus::Modified
                 ),
         }
     }
@@ -435,7 +435,7 @@ impl HealthView {
                     "accept the current content as the new baseline".into(),
                 ));
             }
-            SkillStatus::Managed { no_baseline: true } => {
+            SkillStatus::MissingBaseline => {
                 lines.push(text(
                     "The metadata has no baseline hash, which happens when it was written by \
                      hand, so local changes cannot be detected until one is recorded."
@@ -452,12 +452,15 @@ impl HealthView {
                     "record the current content hash as the baseline".into(),
                 ));
             }
-            SkillStatus::Managed { no_baseline: false } | SkillStatus::Unmanaged => {
+            SkillStatus::Local | SkillStatus::Repository => {
                 lines.push(text(
                     "The skill itself is fine; it is listed because of the last update check."
                         .into(),
                 ));
                 source_line(&mut lines);
+            }
+            SkillStatus::MissingSource => {
+                lines.push(text("This repository skill has no upstream source record. Restore its source metadata before checking for updates.".into()));
             }
             SkillStatus::Missing => {
                 lines.push(text(format!(
@@ -495,7 +498,7 @@ impl HealthView {
             SkillStatus::Renamed { to } => {
                 lines.push(text(format!(
                     "The baseline hash in this metadata equals the current content of the \
-                     unmanaged directory \"{to}\", and neither hash matches anything else, so \
+                     unidentified directory \"{to}\", and neither hash matches anything else, so \
                      the directory was most likely renamed from \"{key}\" to \"{to}\"."
                 )));
                 lines.push(kv(
@@ -511,7 +514,7 @@ impl HealthView {
                 meta_lines(&mut lines);
                 actions.push(action(
                     "m",
-                    format!("migrate: move the metadata to \"{to}\""),
+                    format!("migrate: move metadata, repair links and references to \"{to}\""),
                 ));
             }
             SkillStatus::Invalid { reason } => {
@@ -535,8 +538,8 @@ impl HealthView {
             SkillStatus::CorruptMeta { error } => {
                 lines.push(kv("error", error.clone(), th));
                 lines.push(text(format!(
-                    "The metadata file could not be parsed, so the skill is treated as \
-                     unmanaged. The file is never overwritten automatically; fix or delete {} \
+                    "The metadata file could not be parsed, so its metadata is unavailable. \
+                     The file is never overwritten automatically; fix or delete {} \
                      by hand.",
                     ctx.ws.meta.path(&key).display()
                 )));
@@ -570,7 +573,7 @@ impl HealthView {
                     actions.push(action(
                         "",
                         format!(
-                            "updating needs the skill present and managed; it is {}",
+                            "updating requires an existing skill with upstream information; it is {}",
                             r.status.label()
                         ),
                     ));
@@ -722,7 +725,7 @@ impl View for HealthView {
                         let (old, new) = (r.key.clone(), to.clone());
                         vec![Action::Write(Box::new(move |ws| {
                             edit::migrate_meta(ws, &old, &new)
-                                .map(|_| format!("metadata moved {old} → {new}"))
+                                .map(|_| format!("migrated {old} → {new}"))
                         }))]
                     }
                     _ => vec![],

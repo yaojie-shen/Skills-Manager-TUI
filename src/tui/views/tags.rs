@@ -1,12 +1,12 @@
 //! Tags tab: the tags themselves, and a look at what carries each one.
 //!
-//! Each pane filters its own collection. A tag can be managed directly: renamed, merged into another,
-//! deleted, given a colour. The left column is one row per tag, drawn as the
-//! same capsule the cards use so a colour is seen where it is set; the right
+//! Each pane filters its own collection. A tag can be edited directly: renamed, merged into another,
+//! deleted, given a colour. The left column uses spaced text rows with colour
+//! markers; the right
 //! pane is the skills under the selected tag, as the cards the search and
 //! presets pages use, so a skill reads the same wherever it turns up.
 
-use super::cards::{self, CARD_H, cols_for, frame, skill_card, tag_fill, tag_pills};
+use super::cards::{self, CARD_H, cols_for, frame, skill_card, tag_fill};
 use super::preview::Overlay;
 use super::{View, split_panes, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
@@ -235,12 +235,48 @@ impl TagsView {
         self.sync_members(ctx.snap);
     }
 
+    pub fn select(&mut self, name: &str, snap: &Snapshot) {
+        self.filter = super::filter::Filter::default();
+        self.rows = self.all_rows.clone();
+        self.list
+            .select(self.rows.iter().position(|(tag, _)| tag == name));
+        self.skill_search = None;
+        self.focus_grid = false;
+        self.sync_members(snap);
+    }
+
+    fn add_members(&self, ctx: &Ctx) -> Vec<Action> {
+        match self.actionable_tag() {
+            Some(tag) => vec![Action::OpenModal(Box::new(Modal::PresetSkills(Box::new(
+                super::search::SearchView::tag_members(&tag, ctx),
+            ))))],
+            None => vec![],
+        }
+    }
+
+    fn remove_members(&self, keys: Vec<String>) -> Vec<Action> {
+        let Some(tag) = self.actionable_tag() else {
+            return vec![];
+        };
+        vec![Action::WriteMeta(Box::new(move |ws| {
+            history::tag_edit(ws, |ws| {
+                Config::edit_tags(&ws.root, |tags| {
+                    if let Some(group) = tags.iter_mut().find(|t| t.name == tag) {
+                        group.skills.retain(|key| !keys.contains(key));
+                    }
+                })?;
+                Ok(format!("removed {} skill(s) from {tag}", keys.len()))
+            })
+        }))]
+    }
+
     fn search_members(&mut self, ctx: &Ctx) {
         self.skill_search = Some(super::search::SearchView::panel(
             self.members.clone(),
             format!("Tag: {}", self.selected_tag().unwrap_or("none")),
             ctx,
         ));
+        self.skill_search.as_mut().unwrap().hide_tags = true;
         self.focus_grid = true;
     }
 
@@ -425,19 +461,6 @@ impl TagsView {
         vec![]
     }
 
-    /// One tag as a capsule, in the colour it has or the one being tried.
-    fn pill(name: &str, fill: Color, ctx: &Ctx) -> Vec<Span<'static>> {
-        let (lcap, rcap) = ctx.ws.config.ui.pill_caps.glyphs();
-        vec![
-            Span::styled(lcap.to_string(), Style::default().fg(fill)),
-            Span::styled(
-                format!(" {name} "),
-                Style::default().bg(fill).fg(cards::ink(fill)),
-            ),
-            Span::styled(rcap.to_string(), Style::default().fg(fill)),
-        ]
-    }
-
     fn draw_tags(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let th = ctx.theme;
         let focused = !self.focus_grid && self.prompt.is_none();
@@ -460,18 +483,24 @@ impl TagsView {
             let count = count.to_string();
             let count_w = width(&count).max(3);
             // The count sits at the right edge; whatever is left after the
-            // marker and the count goes to the pill and the description.
+            // marker and the count goes to the name and the description.
             let body_w = w.saturating_sub(2 + count_w + 1);
             let mut spans = vec![Span::styled(if on { "▸ " } else { "  " }, th.accent())];
             let mut used = 0;
             if tag == UNTAGGED {
                 let s = fit(UNTAGGED, body_w);
                 used += width(&s);
-                spans.push(Span::styled(s, th.dim()));
+                spans.push(Span::raw(s));
             } else {
-                let pills = tag_pills(std::slice::from_ref(tag), ctx, body_w);
-                used += pills.iter().map(|s| width(&s.content)).sum::<usize>();
-                spans.extend(pills);
+                let marker = fit("● ", body_w);
+                used += width(&marker);
+                spans.push(Span::styled(
+                    marker,
+                    Style::default().fg(tag_fill(tag, ctx)),
+                ));
+                let name = fit(tag, body_w.saturating_sub(used));
+                used += width(&name);
+                spans.push(Span::raw(name));
                 let desc = ctx
                     .ws
                     .config
@@ -488,7 +517,7 @@ impl TagsView {
                 }
             }
             spans.push(Span::raw(" ".repeat(body_w.saturating_sub(used) + 1)));
-            spans.push(Span::styled(pad(&count, count_w), th.dim()));
+            spans.push(Span::raw(pad(&count, count_w)));
             let style = if on && focused {
                 th.selected()
             } else if on {
@@ -519,7 +548,7 @@ impl TagsView {
             title.push(Span::styled("untagged", th.bold()));
         } else {
             title.push(Span::raw("tagged "));
-            title.extend(Self::pill(&tag, tag_fill(&tag, ctx), ctx));
+            title.extend(cards::pill(format!(" {tag} "), tag_fill(&tag, ctx), ctx));
         }
         title.push(Span::styled(format!(" · {count} "), th.dim()));
         let block = th.block(Line::from(title), focused);
@@ -565,7 +594,7 @@ impl TagsView {
                 .as_ref()
                 .map(|s| s.kind().to_string())
                 .unwrap_or_default();
-            let lines = skill_card(r, ctx, ci.width as usize, None, &tail, &[]);
+            let lines = skill_card(r, ctx, ci.width as usize, None, &tail, &[], false);
             f.render_widget(Paragraph::new(lines), ci);
         }
         draw_track(f, inner, &self.grid, selected, &mut self.grid_track, th);
@@ -612,16 +641,22 @@ impl TagsView {
         let mut preview = vec![Span::raw("  ")];
         match p.ask {
             Ask::Merge => {
-                preview.extend(Self::pill(&p.tag, tag_fill(&p.tag, ctx), ctx));
+                preview.extend(cards::pill(
+                    format!(" {} ", p.tag),
+                    tag_fill(&p.tag, ctx),
+                    ctx,
+                ));
                 preview.push(Span::styled(" → ", th.dim()));
                 match p.chosen() {
-                    Some(into) => preview.extend(Self::pill(into, tag_fill(into, ctx), ctx)),
+                    Some(into) => {
+                        preview.extend(cards::pill(format!(" {into} "), tag_fill(into, ctx), ctx))
+                    }
                     None => preview.push(Span::styled("nothing matches", th.dim())),
                 }
             }
             Ask::Color => match p.color() {
-                Some(Some(c)) => preview.extend(Self::pill(&p.tag, c, ctx)),
-                Some(None) => preview.extend(Self::pill(&p.tag, th.tag, ctx)),
+                Some(Some(c)) => preview.extend(cards::pill(format!(" {} ", p.tag), c, ctx)),
+                Some(None) => preview.extend(cards::pill(format!(" {} ", p.tag), th.tag, ctx)),
                 None => preview.push(Span::styled("not a colour", th.warn())),
             },
         }
@@ -638,13 +673,13 @@ impl TagsView {
             .map(|&i| {
                 let name = &p.choices[i];
                 let spans = match p.ask {
-                    Ask::Merge => Self::pill(name, tag_fill(name, ctx), ctx),
+                    Ask::Merge => cards::pill(format!(" {name} "), tag_fill(name, ctx), ctx),
                     Ask::Color if name == NO_COLOR => {
                         vec![Span::styled("none — the default", th.dim())]
                     }
                     Ask::Color => {
                         let fill = name.parse::<Color>().unwrap_or(th.tag);
-                        let mut s = Self::pill(&p.tag, fill, ctx);
+                        let mut s = cards::pill(format!(" {} ", p.tag), fill, ctx);
                         s.push(Span::styled(format!("  {name}"), th.dim()));
                         s
                     }
@@ -707,7 +742,11 @@ impl View for TagsView {
     fn refresh(&mut self, ctx: &Ctx) {
         let selected = self.selected_tag().map(str::to_owned);
         let panel = self.skill_search.take();
-        self.rows = ctx.snap.all_tags().into_iter().collect();
+        let mut counts = ctx.snap.all_tags();
+        for tag in &ctx.ws.config.tags {
+            counts.entry(tag.name.clone()).or_insert(0);
+        }
+        self.rows = counts.into_iter().collect();
         let untagged = ctx
             .snap
             .skills
@@ -746,6 +785,15 @@ impl View for TagsView {
             if k.code == KeyCode::Left && view.panel_back() {
                 self.focus_grid = false;
                 return vec![];
+            }
+            if view.panel_actions_ready() && k.modifiers.is_empty() {
+                if matches!(k.code, KeyCode::Char('x') | KeyCode::Delete) {
+                    let keys = view.panel_keys(ctx);
+                    return self.remove_members(keys);
+                }
+                if k.code == KeyCode::Char('a') {
+                    return self.add_members(ctx);
+                }
             }
             return view.handle_key(k, ctx);
         }
@@ -809,6 +857,10 @@ impl View for TagsView {
                     self.grid.last(m);
                     vec![]
                 }
+                KeyCode::Char('a') => self.add_members(ctx),
+                KeyCode::Char('x') | KeyCode::Delete => {
+                    self.remove_members(self.selected_member().into_iter().collect())
+                }
                 KeyCode::Enter => self.open_member(),
                 // Fixing one skill's tags from here saves a trip to search,
                 // which is where the same key lives.
@@ -856,8 +908,26 @@ impl View for TagsView {
                 None => vec![],
             },
             KeyCode::Char('m') => self.ask_merge(),
-            KeyCode::Char('c') => self.ask_color(),
-            KeyCode::Char('x') | KeyCode::Delete => match self.actionable_tag() {
+            KeyCode::Char('c') => vec![Action::OpenModal(Box::new(Modal::new_tag()))],
+            KeyCode::Char('a') => self.add_members(ctx),
+            KeyCode::Char('e') => match self.actionable_tag() {
+                Some(tag) => {
+                    let description = ctx
+                        .ws
+                        .config
+                        .tags
+                        .iter()
+                        .find(|t| t.name == tag)
+                        .and_then(|t| t.description.as_deref());
+                    vec![Action::OpenModal(Box::new(Modal::tag_description(
+                        &tag,
+                        description,
+                    )))]
+                }
+                None => vec![],
+            },
+            KeyCode::Char('C') => self.ask_color(),
+            KeyCode::Char('D' | 'x') | KeyCode::Delete => match self.actionable_tag() {
                 Some(t) => vec![Action::OpenModal(Box::new(Modal::delete_tag(&t)))],
                 None => vec![],
             },
@@ -1002,16 +1072,21 @@ impl View for TagsView {
             None if self.focus_grid => &[
                 ("/", "filter skills"),
                 ("Enter", "preview"),
+                ("a", "add skills"),
+                ("x", "remove from tag"),
                 ("t", "edit tags"),
                 ("m", "multi-select"),
                 ("←/Esc", "tags"),
             ],
             None => &[
                 ("/", "filter tags"),
+                ("c", "create"),
+                ("a", "add skills"),
+                ("e", "description"),
                 ("r", "rename"),
                 ("m", "merge"),
-                ("c", "colour"),
-                ("x", "delete"),
+                ("C", "colour"),
+                ("D", "delete tag"),
                 ("Enter/→", "skills"),
                 ("q", "library"),
             ],

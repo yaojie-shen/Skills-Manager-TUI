@@ -88,6 +88,15 @@ pub fn discover_scopes(start: &Path) -> Result<Vec<Scope>> {
 /// Physical skill directories read by one configured agent. A shared root is
 /// offered only to agents documented to discover it. Explicit config survives.
 pub fn locations(ws: &Workspace, configured: &AgentConfig, start: &Path) -> Result<Vec<Scope>> {
+    locations_in(ws, configured, start, &paths::expand_tilde("~"))
+}
+
+fn locations_in(
+    ws: &Workspace,
+    configured: &AgentConfig,
+    start: &Path,
+    home: &Path,
+) -> Result<Vec<Scope>> {
     let start = std::fs::canonicalize(start).context("resolving launch directory")?;
     let definition = crate::agents::BUILTINS
         .iter()
@@ -102,7 +111,7 @@ pub fn locations(ws: &Workspace, configured: &AgentConfig, start: &Path) -> Resu
                         if local {
                             start.join(p)
                         } else {
-                            paths::expand_tilde(p)
+                            home.join(p.trim_start_matches("~/"))
                         }
                     })
                     .collect()
@@ -174,18 +183,11 @@ pub fn locations(ws: &Workspace, configured: &AgentConfig, start: &Path) -> Resu
                 } else {
                     source.parent()?.join(target)
                 };
-                let resolved = std::fs::canonicalize(source).ok()?;
-                if !resolved.is_dir() || (local && !resolved.starts_with(&start)) {
+                let resolved = crate::agents::linked_skill_directory(source)?;
+                if local && !resolved.starts_with(&start) {
                     return None;
                 }
-                // Require a real peer directory, rather than recognizing a link
-                // merely because its own resolved path equals itself.
-                let known = peers.contains(&resolved)
-                    || peers.iter().any(|peer| {
-                        std::fs::symlink_metadata(peer).is_ok_and(|m| m.is_dir())
-                            && std::fs::canonicalize(peer).ok().as_ref() == Some(&resolved)
-                    });
-                known.then(|| (source.clone(), resolve(&start, &target), resolved))
+                Some((source.clone(), resolve(&start, &target), resolved))
             })
             .collect();
         if links.is_empty() {
@@ -258,18 +260,29 @@ pub fn scope_agent(ws: &Workspace, configured: &AgentConfig, scope: &Scope) -> R
 
 /// Every documented physical destination in the selected global/local tier.
 pub fn all_candidates(ws: &Workspace, project: Option<&Path>) -> Result<Vec<AgentConfig>> {
+    all_candidates_in(ws, project, &paths::expand_tilde("~"))
+}
+
+pub fn all_candidates_in(
+    ws: &Workspace,
+    project: Option<&Path>,
+    home: &Path,
+) -> Result<Vec<AgentConfig>> {
     let start = project
         .map(Path::to_path_buf)
         .unwrap_or(std::env::current_dir()?);
     let registry = decoded(&ws.root)?;
     let mut out = Vec::new();
     for definition in crate::agents::BUILTINS {
-        let configured = ws
-            .config
-            .agent(definition.key)
-            .cloned()
-            .unwrap_or_else(|| definition.config(false));
-        for scope in locations(ws, &configured, &start)?
+        let configured = ws.config.agent(definition.key).cloned().unwrap_or_else(|| {
+            let mut agent = definition.config(false);
+            agent.skills_dir = home
+                .join(definition.global_dir.trim_start_matches("~/"))
+                .display()
+                .to_string();
+            agent
+        });
+        for scope in locations_in(ws, &configured, &start, home)?
             .into_iter()
             .filter(|s| s.project.is_some() == project.is_some())
         {
@@ -516,17 +529,30 @@ pub fn apply(
     changes: &[(AgentConfig, bool)],
     project: Option<&Path>,
 ) -> Result<(String, Option<crate::history::Intent>)> {
+    let changes: Vec<_> = changes
+        .iter()
+        .map(|(a, on)| (a.clone(), *on, project.map(Path::to_path_buf)))
+        .collect();
+    apply_scoped(ws, keys, &changes)
+}
+
+/// Validate the whole mixed-scope selection before recording installation reasons.
+pub fn apply_scoped(
+    ws: &Workspace,
+    keys: &[String],
+    changes: &[(AgentConfig, bool, Option<PathBuf>)],
+) -> Result<(String, Option<crate::history::Intent>)> {
     let mut scoped = ws.clone();
-    scoped.config.agents = changes.iter().map(|(a, _)| a.clone()).collect();
-    for agent in &scoped.config.agents {
+    scoped.config.agents = changes.iter().map(|(a, _, _)| a.clone()).collect();
+    for (agent, _, project) in changes {
         if let Some(project) = project {
             paths::ensure_local_path(project, &agent.skills_path())?;
         }
     }
-    let snap = scoped.scan()?;
+    let snap = scoped.scan_for_links()?;
     let mut actions = Vec::new();
     let mut visited = std::collections::BTreeMap::new();
-    for (agent, on) in changes {
+    for (agent, on, _) in changes {
         if let Some(previous) = visited.insert(agent.skills_path(), *on) {
             ensure!(
                 previous == *on,
@@ -541,6 +567,27 @@ pub fn apply(
             super::deploy::plan_undeploy(&scoped, &snap, keys, &agents)?
         });
     }
+    let mut selections = Vec::new();
+    for (agent, on, project) in changes {
+        let before = selection_from_snapshot(ws, agent, &snap)?;
+        let mut after = before.clone();
+        if *on {
+            after.manual.extend(keys.iter().cloned());
+        } else {
+            for key in keys {
+                after.manual.remove(key);
+            }
+        }
+        selections.push(super::name_choices::Change {
+            agent: agent.clone(),
+            project: project.clone(),
+            before,
+            after,
+        });
+    }
+    if let Some(pending) = super::name_choices::Pending::from_plan(selections, &snap, &actions)? {
+        return Err(pending.into());
+    }
     let actions = super::deploy::resolve_names(&snap, &actions, None)?;
     // Validate the full batch before changing any destination.
     for action in &actions {
@@ -553,9 +600,9 @@ pub fn apply(
             );
         }
     }
-    for (agent, on) in changes {
+    for (agent, on, _) in changes {
         if !on {
-            let selection = selection(ws, agent)?;
+            let selection = selection_from_snapshot(ws, agent, &snap)?;
             for key in keys {
                 ensure!(
                     !selection
@@ -570,11 +617,12 @@ pub fn apply(
     let mut messages = Vec::new();
     let mut intents = Vec::new();
     let mut applied = std::collections::BTreeSet::new();
-    for (agent, on) in changes {
+    for (agent, on, project) in changes {
         if !applied.insert(agent.skills_path()) {
             continue;
         }
-        let (message, intent) = set_installed(ws, agent, project, keys, None, *on)?;
+        let (message, intent) =
+            set_installed_scanned(ws, agent, project.as_deref(), keys, None, *on, &snap)?;
         messages.push(message);
         if let Some(intent) = intent {
             intents.push(intent);
@@ -632,7 +680,7 @@ pub fn selection(ws: &Workspace, agent: &AgentConfig) -> Result<Selection> {
     }
     let mut scoped = ws.clone();
     scoped.config.agents = vec![agent.clone()];
-    Ok(inferred_selection(&scoped.scan()?, agent))
+    Ok(inferred_selection(&scoped.scan_for_links()?, agent))
 }
 
 /// UI callers already have a matching snapshot; never scan again just to infer
@@ -678,7 +726,20 @@ pub fn set_installed(
     on: bool,
 ) -> Result<(String, Option<crate::history::Intent>)> {
     let snap = scan_target(ws, agent)?;
-    let before = selection_from_snapshot(ws, agent, &snap)?;
+    set_installed_scanned(ws, agent, project, keys, preset, on, &snap)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_installed_scanned(
+    ws: &Workspace,
+    agent: &AgentConfig,
+    project: Option<&Path>,
+    keys: &[String],
+    preset: Option<&str>,
+    on: bool,
+    snap: &crate::reconcile::Snapshot,
+) -> Result<(String, Option<crate::history::Intent>)> {
+    let before = selection_from_snapshot(ws, agent, snap)?;
     let mut after = before.clone();
     if let Some(preset) = preset {
         if on {
@@ -699,7 +760,7 @@ pub fn set_installed(
             after.manual.remove(key);
         }
     }
-    let message = restore_scanned_selection(ws, agent, project, &before, &after, &snap)?;
+    let message = restore_scanned_selection(ws, agent, project, &before, &after, snap)?;
     let intent = (before != after).then(|| crate::history::Intent::TargetSelection {
         agent: agent.clone(),
         project: project.map(Path::to_path_buf),
@@ -723,7 +784,7 @@ pub fn restore_selection(
 fn scan_target(ws: &Workspace, agent: &AgentConfig) -> Result<crate::reconcile::Snapshot> {
     let mut scoped = ws.clone();
     scoped.config.agents = vec![agent.clone()];
-    scoped.scan()
+    scoped.scan_for_links()
 }
 
 /// Share one fresh scan across inference, validation, and planning. Filesystem
@@ -760,7 +821,21 @@ fn restore_scanned_selection(
         &removed,
         std::slice::from_ref(&agent.key),
     )?);
+    if let Some(pending) = super::name_choices::Pending::from_plan(
+        vec![super::name_choices::Change {
+            agent: agent.clone(),
+            project: project.map(Path::to_path_buf),
+            before: expected.clone(),
+            after: desired.clone(),
+        }],
+        snap,
+        &actions,
+    )? {
+        return Err(pending.into());
+    }
     let actions = super::deploy::resolve_names(snap, &actions, None)?;
+    let mut actions = actions;
+    actions.sort_by_key(|a| !matches!(a, super::deploy::Action::Unlink { .. }));
     for action in &actions {
         if let super::deploy::Action::Skip { reason, skill, .. } = action {
             let missing_removal = removed.contains(skill)
@@ -785,11 +860,36 @@ fn restore_scanned_selection(
     if save_shared_selection(&mut registry, agent, desired) {
         save(ws, &registry)?;
     }
-    Ok(format!(
+    let mut message = format!(
         "{} · {}",
         agent.display_name(),
         super::deploy::summarize(&actions)
-    ))
+    );
+    let names: std::collections::BTreeSet<_> = desired_keys
+        .iter()
+        .filter_map(|key| snap.get(key).and_then(|s| s.name.as_ref()))
+        .collect();
+    for other in &registry.agents {
+        if other.skills_path() == agent.skills_path()
+            || registry.projects.get(&other.key).map(PathBuf::as_path) == project
+        {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(other.skills_path()) {
+            for entry in entries.flatten() {
+                if let Ok(doc) = crate::skill::SkillDoc::load(&entry.path())
+                    && names.contains(&doc.name)
+                {
+                    message.push_str(&format!(
+                        "; warning: {} also exists in scope {} (unchanged)",
+                        doc.name,
+                        other.skills_path().display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(message)
 }
 
 /// Keep persisted installation references aligned with central library edits.
@@ -845,4 +945,82 @@ fn save_shared_selection(
         }
     }
     changed
+}
+
+/// Product identity stays separate from a destination's stable key.
+pub fn product_key(agent: &AgentConfig) -> &str {
+    crate::agents::BUILTINS
+        .iter()
+        .find(|d| {
+            agent.key == d.key
+                || agent.key.starts_with(&format!("{}-global-", d.key))
+                || agent.key.starts_with(&format!("{}-local-", d.key))
+        })
+        .map(|d| d.key)
+        .unwrap_or(&agent.key)
+}
+pub fn product_name(agent: &AgentConfig) -> &str {
+    crate::agents::BUILTINS
+        .iter()
+        .find(|d| d.key == product_key(agent))
+        .map(|d| d.name)
+        .unwrap_or(agent.display_name())
+}
+pub fn location_label(agent: &AgentConfig, project: &Path) -> String {
+    let path = agent.skills_path();
+    if path.starts_with(project) {
+        format!("Local   {}", path.display())
+    } else {
+        format!("Global  {}", paths::contract_tilde(&path))
+    }
+}
+
+/// Discover products, while keeping upstream per-product physical scope expansion.
+pub fn discover(ws: &mut Workspace, project: &Path) -> Result<()> {
+    let dirs = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    discover_with_paths(
+        ws,
+        project,
+        &paths::expand_tilde("~"),
+        &dirs,
+        &[PathBuf::from("/Applications")],
+    )
+}
+pub fn discover_in(ws: &mut Workspace, project: &Path, home: &Path) -> Result<()> {
+    discover_with_paths(ws, project, home, &[], &[])
+}
+fn discover_with_paths(
+    ws: &mut Workspace,
+    project: &Path,
+    home: &Path,
+    dirs: &[PathBuf],
+    applications: &[PathBuf],
+) -> Result<()> {
+    ws.inventory_project = Some(project.to_path_buf());
+    let products = crate::agents::detect_with_applications(home, project, dirs, applications);
+    for definition in crate::agents::BUILTINS {
+        if products.contains(definition.key) && ws.config.agent(definition.key).is_none() {
+            let mut agent = definition.config(ws.project.is_some());
+            agent.skills_dir = if let Some(project) = &ws.project {
+                project.join(definition.local_dir)
+            } else {
+                home.join(definition.global_dir.trim_start_matches("~/"))
+            }
+            .display()
+            .to_string();
+            ws.discovered_agents.insert(agent.key.clone());
+            ws.config.agents.push(agent);
+        }
+    }
+    ws.inventory_products = Some(products);
+    Ok(())
+}
+pub fn visible_agents(ws: &Workspace) -> impl Iterator<Item = &AgentConfig> {
+    ws.config.agents.iter().filter(|a| {
+        ws.inventory_products
+            .as_ref()
+            .is_none_or(|products| products.contains(product_key(a)))
+    })
 }

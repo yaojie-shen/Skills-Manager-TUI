@@ -55,7 +55,9 @@ pub struct SearchView {
     scope_agent: Option<String>,
     panel: Option<(BTreeSet<String>, String)>,
     panel_active: bool,
+    pub(super) hide_tags: bool,
     preset: Option<String>,
+    tag: Option<String>,
     target: Option<(
         skills::config::AgentConfig,
         Option<std::path::PathBuf>,
@@ -93,7 +95,9 @@ impl Default for SearchView {
             scope_agent: None,
             panel: None,
             panel_active: true,
+            hide_tags: false,
             preset: None,
+            tag: None,
             target: None,
             area: Rect::default(),
             scope: None,
@@ -106,13 +110,15 @@ impl Default for SearchView {
 
 impl SearchView {
     fn is_picker(&self) -> bool {
-        self.preset.is_some() || self.target.is_some()
+        self.preset.is_some() || self.tag.is_some() || self.target.is_some()
     }
 
     fn includes_record(&self, record: &skills::reconcile::SkillRecord) -> bool {
-        self.panel
-            .as_ref()
-            .is_none_or(|(keys, _)| keys.contains(&record.key))
+        (!self.is_picker() || (record.status.is_present() && record.name.is_some()))
+            && self
+                .panel
+                .as_ref()
+                .is_none_or(|(keys, _)| keys.contains(&record.key))
             && (self.is_picker()
                 || self.scope.is_some()
                 || self.panel.is_some()
@@ -215,7 +221,10 @@ impl SearchView {
                 agent.display_name(),
                 skills::paths::contract_tilde(&agent.skills_path())
             ),
-            None => " Preset skills ".into(),
+            None => self.tag.as_ref().map_or_else(
+                || " Preset skills ".into(),
+                |tag| format!(" Tag: {tag} · skills "),
+            ),
         }
     }
 
@@ -251,6 +260,25 @@ impl SearchView {
         view
     }
 
+    pub fn tag_members(tag: &str, ctx: &Ctx) -> Self {
+        let mut view = Self {
+            tag: Some(tag.into()),
+            multi: true,
+            hide_tags: true,
+            layout: Some(UiLayout::Grid),
+            ..Self::default()
+        };
+        view.refresh(ctx);
+        view.checked = ctx
+            .snap
+            .skills
+            .iter()
+            .filter(|r| r.tags.iter().any(|t| t == tag))
+            .map(|r| r.key.clone())
+            .collect();
+        view
+    }
+
     fn apply_preset(&self, ctx: &Ctx) -> Vec<Action> {
         if let Some((agent, project, on)) = self.target.clone() {
             let keys = self.visible_checked(ctx);
@@ -278,6 +306,29 @@ impl SearchView {
                     keys,
                 ),
             ];
+        }
+        if let Some(tag) = self.tag.clone() {
+            let visible: BTreeSet<String> = self
+                .hits
+                .iter()
+                .map(|h| ctx.snap.skills[h.index].key.clone())
+                .collect();
+            let desired = self.visible_checked(ctx);
+            let keys = visible.iter().cloned().collect();
+            return vec![Action::BatchMeta(
+                Box::new(move |ws| {
+                    skills::history::tag_edit(ws, |ws| {
+                        skills::config::Config::edit_tags(&ws.root, |tags| {
+                            if let Some(group) = tags.iter_mut().find(|t| t.name == tag) {
+                                group.skills.retain(|k| !visible.contains(k));
+                                group.skills.extend(desired);
+                            }
+                        })?;
+                        Ok(format!("updated members of {tag}"))
+                    })
+                }),
+                keys,
+            )];
         }
         let Some(preset) = self.preset.clone() else {
             return vec![];
@@ -484,10 +535,12 @@ impl SearchView {
             .into_iter()
             .filter(|hit| self.includes_record(&ctx.snap.skills[hit.index]))
             .collect();
-        // Keep relevance within each group; repository installs follow local skills.
-        self.hits.sort_by_key(|hit| {
-            skills::repository::alias_of(&ctx.snap.skills[hit.index].key).is_some()
-        });
+        // Browsing groups sources; text searches preserve relevance across panels.
+        if q.text.trim().is_empty() {
+            self.hits.sort_by_key(|hit| {
+                skills::repository::alias_of(&ctx.snap.skills[hit.index].key).is_some()
+            });
+        }
         if let Some((keys, _)) = self.panel.as_ref().or(self.scope.as_ref()) {
             self.hits
                 .retain(|hit| keys.contains(&ctx.snap.skills[hit.index].key));
@@ -586,6 +639,9 @@ impl SearchView {
     }
 
     fn act_tags(&self, ctx: &Ctx) -> Vec<Action> {
+        if !ctx.ws.config.tags_enabled {
+            return vec![];
+        }
         match self.need_present(ctx, "tag") {
             Ok(r) => vec![Action::OpenModal(Box::new(Modal::tags(&r.key, &r.tags)))],
             Err(a) => vec![a],
@@ -593,7 +649,8 @@ impl SearchView {
     }
     fn act_note(&self, ctx: &Ctx) -> Vec<Action> {
         match self.need_present(ctx, "annotate") {
-            Ok(r) => vec![Action::EditNote(r.key.clone())],
+            Ok(r) if r.source_kind() == "repository" => vec![Action::EditNote(r.key.clone())],
+            Ok(_) => vec![Action::Error("Local skills do not store notes".into())],
             Err(a) => vec![a],
         }
     }
@@ -627,7 +684,7 @@ impl SearchView {
         };
         if !matches!(
             r.status,
-            SkillStatus::Modified | SkillStatus::Managed { no_baseline: true }
+            SkillStatus::Modified | SkillStatus::MissingBaseline
         ) {
             return vec![Action::Error(
                 "accept applies to modified skills or skills without a baseline".into(),
@@ -647,7 +704,7 @@ impl SearchView {
         };
         let (old, new) = (r.key.clone(), to.clone());
         vec![Action::Write(Box::new(move |ws| {
-            edit::migrate_meta(ws, &old, &new).map(|_| format!("metadata moved {old} → {new}"))
+            edit::migrate_meta(ws, &old, &new).map(|_| format!("migrated {old} → {new}"))
         }))]
     }
     fn act_check(&self, ctx: &Ctx) -> Vec<Action> {
@@ -741,7 +798,11 @@ impl SearchView {
             f,
             field,
             self.panel_active && self.focus == Focus::Input,
-            "search skills…   repo:owner/repo  tag:x  agent:y  status:managed  untagged",
+            if ctx.ws.config.tags_enabled {
+                "search skills…   repo:owner/repo  tag:x  agent:y  source:local  untagged"
+            } else {
+                "search skills…   repo:owner/repo  agent:y  source:local"
+            },
             th,
         );
     }
@@ -847,7 +908,15 @@ impl SearchView {
                         .map(|s| s.kind().to_string())
                         .unwrap_or_default()
                 };
-                let mut lines = skill_card(r, ctx, ci.width as usize, body, &tail, &h.terms);
+                let mut lines = skill_card(
+                    r,
+                    ctx,
+                    ci.width as usize,
+                    body,
+                    &tail,
+                    &h.terms,
+                    !self.hide_tags,
+                );
                 self.decorate(&mut lines, r, ctx);
                 let style = if self.multi && self.checked.contains(&r.key) {
                     th.selected_unfocused()
@@ -884,6 +953,7 @@ impl SearchView {
                     body,
                     &tail,
                     &h.terms,
+                    !self.hide_tags,
                 );
                 self.decorate(&mut lines, r, ctx);
                 let lines: Vec<Line> = lines
@@ -1094,6 +1164,9 @@ impl View for SearchView {
                     return vec![];
                 }
                 KeyCode::Char(op @ ('t' | 'd' | 'p')) if k.modifiers.is_empty() => {
+                    if op == 't' && !ctx.ws.config.tags_enabled {
+                        return vec![];
+                    }
                     return self.batch_action(op, ctx);
                 }
                 KeyCode::Char('m') => {
@@ -1174,7 +1247,7 @@ impl View for SearchView {
                 KeyCode::Right | KeyCode::Char('l') if self.grid.cols() > 1 => self.move_sel(1),
                 KeyCode::Left | KeyCode::Char('h') if self.grid.cols() > 1 => self.move_sel(-1),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_preview(ctx),
-                KeyCode::Char('t') => {
+                KeyCode::Char('t') if ctx.ws.config.tags_enabled => {
                     acts = if self.multi {
                         self.batch_action('t', ctx)
                     } else {
@@ -1232,7 +1305,7 @@ impl View for SearchView {
                 }
                 KeyCode::Home | KeyCode::Char('g') => self.preview_scroll = 0,
                 KeyCode::End | KeyCode::Char('G') => self.scroll_preview(i32::MAX / 2),
-                KeyCode::Char('t') => {
+                KeyCode::Char('t') if ctx.ws.config.tags_enabled => {
                     acts = if self.multi {
                         self.batch_action('t', ctx)
                     } else {
@@ -1428,7 +1501,13 @@ impl View for SearchView {
             )
         } else {
             self.selected(ctx)
-                .map(|r| format!(" {} ", r.status.label()))
+                .map(|r| {
+                    if r.status.is_healthy() {
+                        format!(" {} ", r.source_kind())
+                    } else {
+                        format!(" {} · {} ", r.source_kind(), r.status.label())
+                    }
+                })
                 .unwrap_or_default()
         };
         let status = fit(&status, bar.width as usize / 2);
@@ -1488,6 +1567,36 @@ impl View for SearchView {
         if let Some(hints) = self.overlay.hints() {
             return hints;
         }
+        if self.focus == Focus::Input {
+            if self.completion.active() {
+                return &[
+                    ("↑↓", "suggestions"),
+                    ("Enter", "complete"),
+                    ("Esc", "close suggestions"),
+                ];
+            }
+            if self.is_picker() {
+                return &[
+                    ("Enter/↓", "results"),
+                    ("Ctrl+Enter", "apply"),
+                    ("Esc", "cancel"),
+                ];
+            }
+            if self.multi {
+                return &[("Enter/↓", "results"), ("Esc", "cancel selection")];
+            }
+            if self.panel.is_some() {
+                return &[("Enter/↓", "results"), ("Esc", "results")];
+            }
+        }
+        if self.is_picker() && self.focus == Focus::Preview {
+            return &[
+                ("↑↓/j/k", "scroll"),
+                ("e", "expand fields"),
+                ("Esc", "results"),
+                ("/", "filter"),
+            ];
+        }
         if self.is_picker() {
             return &[
                 ("Space", "select"),
@@ -1531,7 +1640,7 @@ impl View for SearchView {
                 ("d", "deploy"),
                 ("r", "rename"),
                 ("s", "source"),
-                ("a", "accept"),
+                ("a", "accept repo changes"),
                 ("u/U", "check/update"),
                 ("x", "remove"),
                 ("Enter", "preview"),
@@ -1642,6 +1751,26 @@ mod tests {
         .save(&root)
         .unwrap();
         let ws = skills::Workspace::open(&root).unwrap();
+        ws.meta
+            .save(
+                "missing",
+                &skills::meta::SkillMeta {
+                    source: Some(skills::meta::Source::Git {
+                        url: "https://example.com/repo".into(),
+                        branch: None,
+                        subpath: None,
+                        revision: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let text = std::fs::read_to_string(ws.meta.path("missing")).unwrap();
+        std::fs::write(
+            ws.meta.path("corrupt-missing"),
+            format!("{text}\n[skills.corrupt-missing]\nnote = 42\n"),
+        )
+        .unwrap();
         let snap = ws.scan().unwrap();
         let theme = crate::tui::theme::Theme::default();
         let ctx = Ctx {
@@ -1651,7 +1780,7 @@ mod tests {
         };
         let mut view = SearchView::default();
         view.refresh(&ctx);
-        assert_eq!(snap.skills.len(), 2);
+        assert_eq!(snap.skills.len(), 4);
         assert_eq!(view.hits.len(), 1);
         assert_eq!(view.selected(&ctx).unwrap().key, "valid");
         let mut terminal =
@@ -1670,8 +1799,14 @@ mod tests {
         view.set_query("", &ctx);
         view.select_scope(vec!["invalid".into()], "Repair".into(), None, &ctx);
         assert_eq!(view.selected(&ctx).unwrap().key, "invalid");
-        let picker = SearchView::preset_members("example", &ctx);
-        assert_eq!(picker.hits.len(), 2);
+        let mut picker = SearchView::preset_members("example", &ctx);
+        assert_eq!(picker.hits.len(), 1);
+        picker.focus_input();
+        assert!(!picker.hints().iter().any(|(k, _)| *k == "Space"));
+        picker.focus_list();
+        assert!(picker.hints().iter().any(|(k, _)| *k == "Space"));
+        picker.focus = Focus::Preview;
+        assert!(!picker.hints().iter().any(|(k, _)| *k == "Space"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1739,7 +1874,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_installs_follow_local_results_without_changing_filtering() {
+    fn text_search_preserves_relevance_across_local_and_repository_results() {
         let root =
             std::env::temp_dir().join(format!("skills-search-groups-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -1755,13 +1890,32 @@ mod tests {
             std::fs::write(
                 path.join("SKILL.md"),
                 format!(
-                    "---\nname: {}\ndescription: shared tools\n---\nBody",
+                    "---\nname: {}\ndescription: shared tools\n---\nBody mentions calendar",
                     name.rsplit('/').next().unwrap()
                 ),
             )
             .unwrap();
         }
         let ws = skills::Workspace::open(&root).unwrap();
+        let key = "repos/sampleorg--kit/calendar";
+        ws.meta
+            .save(
+                key,
+                &skills::meta::SkillMeta {
+                    source: Some(skills::meta::Source::Git {
+                        url: "https://github.com/sampleorg/kit".into(),
+                        branch: None,
+                        subpath: Some("calendar".into()),
+                        revision: None,
+                    }),
+                    baseline: Some(skills::meta::Baseline {
+                        hash: skills::hash::hash_directory(&root.join(key)).unwrap(),
+                        hash_algo: skills::hash::HASH_ALGO,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let snap = ws.scan().unwrap();
         let theme = crate::tui::theme::Theme::default();
         let ctx = Ctx {
@@ -1781,7 +1935,7 @@ mod tests {
             assert_eq!(keys, ["printer", "repos/sampleorg--kit/calendar"]);
         }
         view.set_query("calendar", &ctx);
-        assert_eq!(view.hits.len(), 1);
+        assert_eq!(view.hits.len(), 2);
         assert_eq!(
             view.selected(&ctx).unwrap().key,
             "repos/sampleorg--kit/calendar"
@@ -1869,7 +2023,7 @@ mod tests {
         view.handle_key(key(KeyCode::Char(' ')), &ctx);
         assert_eq!(view.visible_checked(&ctx), vec!["printer"]);
         let record = ctx.snap.get("printer").unwrap();
-        let mut lines = skill_card(record, &ctx, 40, None, "", &[]);
+        let mut lines = skill_card(record, &ctx, 40, None, "", &[], true);
         let before = lines[0].to_string();
         view.decorate(&mut lines, record, &ctx);
         assert!(lines[0].to_string().starts_with("[✓] printer"));
@@ -1954,18 +2108,18 @@ mod tests {
         };
         let mut view = SearchView::default();
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        for c in "status:mana".chars() {
+        for c in "status:repo".chars() {
             view.handle_key(key(KeyCode::Char(c)), &ctx);
         }
         assert!(view.completion.active());
         view.handle_key(key(KeyCode::Down), &ctx);
         assert_eq!(view.focus, Focus::Input);
         view.handle_key(key(KeyCode::Esc), &ctx);
-        assert_eq!(view.query(), "status:mana");
+        assert_eq!(view.query(), "status:repo");
         assert!(!view.completion.active());
-        view.handle_key(key(KeyCode::Char('g')), &ctx);
+        view.handle_key(key(KeyCode::Char('s')), &ctx);
         view.handle_key(key(KeyCode::Enter), &ctx);
-        assert_eq!(view.query(), "status:managed ");
+        assert_eq!(view.query(), "status:repository ");
         assert_eq!(view.focus, Focus::Input);
         assert!(!view.completion.active());
         view.handle_key(key(KeyCode::Enter), &ctx);
@@ -1975,13 +2129,13 @@ mod tests {
         view.handle_key(key(KeyCode::Enter), &ctx);
         assert_eq!(view.focus, Focus::List);
         view.focus_input();
-        view.set_query("status:mana 中文", &ctx);
+        view.set_query("status:repo 中文", &ctx);
         for _ in 0..3 {
             view.handle_key(key(KeyCode::Left), &ctx);
         }
         assert!(view.completion.active());
         view.handle_key(key(KeyCode::Enter), &ctx);
-        assert_eq!(view.query(), "status:managed 中文");
+        assert_eq!(view.query(), "status:repository 中文");
         assert!(!view.completion.active());
         view.focus_input();
         view.set_query("status:invalid", &ctx);

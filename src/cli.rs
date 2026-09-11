@@ -34,7 +34,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
     /// Resolve duplicate frontmatter names when deploying
-    #[arg(long, global = true, value_parser = ["coexist", "replace"])]
+    #[arg(long, global = true, value_parser = ["replace"])]
     pub same_name: Option<String>,
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -54,9 +54,9 @@ pub enum Command {
     Tag(TagArgs),
     /// Manage the free-text note of a skill
     Note(NoteArgs),
-    /// Record the current content as the new baseline (accept local changes)
+    /// Record repository skill content as the new baseline (accept changes)
     Accept { skill: String },
-    /// Move metadata of a missing skill onto its renamed directory
+    /// Repair an external move: migrate metadata, deployment links and references
     Migrate { old: String, new: String },
     /// Install a skill from a git repo, GitHub shorthand, or local path
     Install(InstallArgs),
@@ -229,8 +229,8 @@ pub struct UpdateArgs {
     /// Which side wins for a locally modified skill: local | upstream
     #[arg(long)]
     pub take: Option<Take>,
-    /// Per-file choice: path=local|upstream (repeatable)
-    #[arg(long = "take-file", value_name = "PATH=SIDE")]
+    /// Removed: updates now require one choice for the whole skill
+    #[arg(long = "take-file", value_name = "PATH=SIDE", hide = true)]
     pub take_file: Vec<String>,
     /// Alias for --take upstream
     #[arg(long)]
@@ -468,7 +468,7 @@ pub fn run(cli: Cli) -> Result<()> {
             edit::migrate_meta(&ctx.ws, &old, &new)?;
             ctx.out(
                 &serde_json::json!({"migrated": {"from": old, "to": new}}),
-                || println!("metadata moved {old} -> {new}"),
+                || println!("migrated {old} -> {new}"),
             )
         }
         Command::Install(a) => cmd_install(&ctx, a),
@@ -745,7 +745,7 @@ fn indent(s: &str) -> String {
 
 fn status_detail(s: &SkillStatus) -> String {
     match s {
-        SkillStatus::Managed { no_baseline: true } => "managed (no baseline)".into(),
+        SkillStatus::MissingBaseline => "repository (missing baseline)".into(),
         SkillStatus::Renamed { to } => format!("renamed? -> {to}"),
         SkillStatus::Invalid { reason } => format!("invalid: {reason}"),
         SkillStatus::CorruptMeta { error } => format!("corrupt-meta: {error}"),
@@ -803,8 +803,8 @@ fn print_agent(a: &skills::reconcile::AgentReport) {
         AgentDirMode::DirLinked => "dir-linked (whole directory -> root)".into(),
         AgentDirMode::DirForeign { target } => format!("dir-foreign -> {}", target.display()),
         AgentDirMode::Real => {
-            let d = a.count(|s| matches!(s, skills::reconcile::EntryState::Deployed));
-            let other = a.entries.len() - d;
+            let d = a.valid_count(|s| matches!(s, skills::reconcile::EntryState::Deployed));
+            let other = a.documents.len() - d;
             format!(
                 "real dir, {d} deployed{}",
                 if other > 0 {
@@ -842,22 +842,23 @@ fn entry_detail(s: &skills::reconcile::EntryState) -> String {
 }
 
 fn cmd_tag(ctx: &Ctx, c: TagCommand) -> Result<()> {
+    anyhow::ensure!(ctx.ws.config.tags_enabled, "Tags are disabled in settings");
     match c {
         TagCommand::Add { skill, tags } => {
             let m = edit::tag_add(&ctx.ws, &skill, &tags)?;
-            ctx.out(&m, || println!("{skill}: {}", m.tags.join(", ")))
+            ctx.out(&m, || println!("{skill}: {}", m.join(", ")))
         }
         TagCommand::Remove { skill, tags } => {
             let m = edit::tag_remove(&ctx.ws, &skill, &tags)?;
-            ctx.out(&m, || println!("{skill}: {}", m.tags.join(", ")))
+            ctx.out(&m, || println!("{skill}: {}", m.join(", ")))
         }
         TagCommand::Set { skill, tags } => {
             let m = edit::tag_set(&ctx.ws, &skill, &tags)?;
-            ctx.out(&m, || println!("{skill}: {}", m.tags.join(", ")))
+            ctx.out(&m, || println!("{skill}: {}", m.join(", ")))
         }
         TagCommand::List { skill: Some(skill) } => {
-            let m = ctx.ws.meta.load(&skill)?.unwrap_or_default();
-            ctx.out(&m.tags, || println!("{}", m.tags.join("\n")))
+            let m = skills::config::Config::load(&ctx.ws.root)?.skill_tags(&skill);
+            ctx.out(&m, || println!("{}", m.join("\n")))
         }
         TagCommand::List { skill: None } => {
             let snap = ctx.ws.scan()?;
@@ -1018,7 +1019,13 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
                 }
                 names.insert(paths[0].clone(), name.clone());
             }
-            let keys = fetched.install(&ctx.ws, &paths, &names)?;
+            let mut notices = Vec::new();
+            let keys = fetched.install_with_progress(&ctx.ws, &paths, &names, &mut |message| {
+                if message.starts_with("Warning:") || message.starts_with("Already installed:") {
+                    notices.push(message.to_string());
+                }
+            })?;
+
             let actions = if a.deploy_to.is_empty() {
                 vec![]
             } else {
@@ -1029,8 +1036,11 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
                 actions
             };
             ctx.out(
-                &serde_json::json!({"installed": keys, "actions": actions}),
+                &serde_json::json!({"installed": keys, "actions": actions, "notices": notices}),
                 || {
+                    for notice in &notices {
+                        println!("{notice}");
+                    }
                     for key in &keys {
                         println!("installed {key}");
                     }
@@ -1123,7 +1133,7 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
             .filter(|s| {
                 matches!(
                     s.status,
-                    SkillStatus::Managed { .. } | SkillStatus::Modified
+                    SkillStatus::Repository | SkillStatus::MissingBaseline | SkillStatus::Modified
                 )
             })
             .map(|s| s.key.clone())
@@ -1136,16 +1146,21 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
     } else {
         a.take
     };
-    let mut per_file: BTreeMap<String, Take> = BTreeMap::new();
-    for spec in &a.take_file {
-        let (p, side) = spec
-            .rsplit_once('=')
-            .with_context(|| format!("expected PATH=SIDE, got {spec:?}"))?;
-        per_file.insert(p.to_string(), side.parse()?);
-    }
+    anyhow::ensure!(
+        a.take_file.is_empty(),
+        "choose --take local or --take upstream for the whole skill; per-file merging is not supported"
+    );
+    let per_file = BTreeMap::new();
     let mut report = Vec::new();
     for k in keys {
-        let prepared = update::prepare(&ctx.ws, &snap, &k)?;
+        let prepared = match update::prepare(&ctx.ws, &snap, &k) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                report.push(serde_json::json!({"skill": k, "result": "skipped", "reason": format!("{error:#}")}));
+                continue;
+            }
+        };
+
         let up_to_date = prepared.from_revision.as_deref() == Some(prepared.to_revision.as_str());
         let mut entry = serde_json::to_value(&prepared)?;
         if up_to_date {
@@ -1159,12 +1174,31 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
             prepared.cleanup();
         } else {
             update::apply(&ctx.ws, &prepared, take.unwrap_or_default(), &per_file)?;
-            entry["result"] = "updated".into();
+            entry["result"] = if take == Some(Take::Local) {
+                "skipped-local"
+            } else {
+                "updated"
+            }
+            .into();
         }
         report.push(entry);
     }
     ctx.out(&report, || {
         for e in &report {
+            if let Some(reason) = e["reason"].as_str() {
+                println!("{}: {reason}", e["skill"].as_str().unwrap_or(""));
+            }
+            if let Some(new) = e["new_skills"].as_array()
+                && !new.is_empty()
+            {
+                println!(
+                    "New upstream skills (not installed): {}",
+                    new.iter()
+                        .filter_map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
             let skill = e["skill"].as_str().unwrap_or("");
             let result = e["result"].as_str().unwrap_or("");
             println!(

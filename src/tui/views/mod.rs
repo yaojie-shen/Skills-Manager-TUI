@@ -40,12 +40,10 @@ pub fn status_glyph(
     use ratatui::text::Span;
     use skills::reconcile::SkillStatus::*;
     match s {
-        Managed { no_baseline: false } => Span::styled("●", th.ok()),
-        // Same shape as managed, since it is managed; the colour carries the
-        // caveat. A half-filled circle here would read as a partial preset,
-        // which is what that glyph means everywhere else.
-        Managed { no_baseline: true } => Span::styled("●", th.warn()),
-        Unmanaged => Span::styled("○", th.dim()),
+        Local | Repository => Span::styled("●", th.ok()),
+        // Warn about missing update information without a second healthy category.
+        MissingBaseline => Span::styled("●", th.warn()),
+        MissingSource => Span::styled("!", th.warn()),
         Modified => Span::styled("✎", th.warn()),
         Missing => Span::styled("✗", th.err()),
         Renamed { .. } => Span::styled("↪", th.warn()),
@@ -56,7 +54,7 @@ pub fn status_glyph(
 pub fn status_text(s: &skills::reconcile::SkillStatus) -> String {
     use skills::reconcile::SkillStatus::*;
     match s {
-        Managed { no_baseline: true } => "managed, no baseline".into(),
+        MissingBaseline => "repository · missing baseline".into(),
         Renamed { to } => format!("renamed? → {to}"),
         Invalid { reason } => format!("invalid: {reason}"),
         CorruptMeta { error } => format!("corrupt metadata: {error}"),

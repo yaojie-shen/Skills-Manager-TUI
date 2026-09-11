@@ -299,7 +299,11 @@ impl View for ReposView {
                     ctx.snap
                         .get(key)
                         .map(|r| {
-                            format!("{}  [{}]", super::cards::display_name(r), r.status.label())
+                            if r.status.is_healthy() {
+                                super::cards::display_name(r).to_string()
+                            } else {
+                                format!("{}  [{}]", super::cards::display_name(r), r.status.label())
+                            }
                         })
                         .unwrap_or_else(|| key.clone())
                 })
@@ -406,7 +410,7 @@ mod tests {
         std::fs::create_dir_all(&skill).unwrap();
         std::fs::write(
             skill.join("SKILL.md"),
-            "---\nname: Example\ndescription: Sample skill\n---\n# Usage\nHello world",
+            "---\nname: example\ndescription: Sample skill\n---\n# Usage\nHello world",
         )
         .unwrap();
         skills::config::Config {

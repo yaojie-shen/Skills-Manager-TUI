@@ -23,6 +23,7 @@ impl Fixture {
         std::fs::create_dir_all(&root).unwrap();
         let root = std::fs::canonicalize(root).unwrap();
         let cfg = Config {
+            tags_enabled: true,
             schema: 1,
             agents: vec![AgentConfig {
                 key: "a".into(),
@@ -92,11 +93,7 @@ fn step(ws: &Workspace, log: &mut History, undo: bool) -> String {
 }
 
 fn tags(ws: &Workspace, key: &str) -> Vec<String> {
-    ws.meta
-        .load(key)
-        .unwrap()
-        .map(|m| m.tags)
-        .unwrap_or_default()
+    Config::load(&ws.root).unwrap().skill_tags(key)
 }
 
 fn note(ws: &Workspace, key: &str) -> Option<String> {
@@ -115,6 +112,22 @@ fn tag_set(ws: &Workspace, log: &mut History, key: &str, tags: &[&str]) {
 }
 
 fn note_set(ws: &Workspace, log: &mut History, key: &str, text: Option<&str>) {
+    if ws.meta.load(key).unwrap().is_none() {
+        ws.meta
+            .save(
+                key,
+                &skills::meta::SkillMeta {
+                    source: Some(Source::Git {
+                        url: "https://example.com/repo".into(),
+                        branch: None,
+                        subpath: Some(key.into()),
+                        revision: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
     let (_, intent) = history::note_edit(ws, key, text).unwrap();
     if let Some(intent) = intent {
         log.record(intent);
@@ -370,8 +383,8 @@ fn undoing_a_tag_rename_carries_the_colour_entry_back() {
     assert_eq!(tags(&ws, "printer"), ["stationery"]);
     assert_eq!(
         names(&ws),
-        ["office"],
-        "office kept its entry; stationery's is gone for good"
+        ["office", "stationery"],
+        "undo restores the source group membership without stealing the target color"
     );
 }
 
@@ -562,8 +575,8 @@ fn setting_a_source_goes_back_and_forth_with_its_revision() {
     step(&ws, &mut log, true);
     assert_eq!(source(&ws, "bicycle"), None);
     assert!(
-        ws.meta.exists("bicycle"),
-        "the file stays; only the source went"
+        !ws.meta.exists("bicycle"),
+        "removing the upstream returns to a local skill without metadata"
     );
 }
 
@@ -687,6 +700,72 @@ fn config_by_hand(fx: &Fixture) {
         ),
     )
     .unwrap();
+}
+
+#[test]
+fn preset_case_only_rename_preserves_contents_references_and_history() {
+    let fx = Fixture::new("preset-case-rename");
+    config_by_hand(&fx);
+    let ws = fx.ws();
+    let original = Preset {
+        name: "commute".into(),
+        description: Some("Daily tools".into()),
+        skills: vec!["bicycle".into()],
+        agents: vec!["a".into()],
+    };
+    ws.presets.save(&original).unwrap();
+    let (_, intent) = history::preset_rename(&ws, "commute", "Commute").unwrap();
+    let mut log = History::default();
+    log.record(intent.unwrap());
+    for (name, previous) in [
+        ("Commute", "commute"),
+        ("commute", "Commute"),
+        ("Commute", "commute"),
+    ] {
+        assert!(ws.presets.contains_name(name).unwrap());
+        assert!(!ws.presets.contains_name(previous).unwrap());
+        let expected = Preset {
+            name: name.into(),
+            ..original.clone()
+        };
+        assert_eq!(ws.presets.list().unwrap(), vec![expected]);
+        assert_eq!(Config::load(&fx.root).unwrap().deploy.presets, vec![name]);
+        if name == "commute" {
+            step(&ws, &mut log, false);
+        } else {
+            step(&ws, &mut log, true);
+        }
+    }
+}
+
+#[test]
+fn tag_case_only_rename_preserves_style_members_and_history() {
+    let fx = Fixture::new("tag-case-rename");
+    let ws = fx.ws();
+    Config::edit_tags(&ws.root, |tags| {
+        tags.push(skills::config::TagConfig {
+            name: "work".into(),
+            skills: vec!["bicycle".into()],
+            color: Some("cyan".into()),
+            description: Some("Daily tools".into()),
+        })
+    })
+    .unwrap();
+    let (_, intent) = history::tag_edit(&ws, |ws| {
+        edit::tag_rename(ws, "work", "Work").map(|n| n.to_string())
+    })
+    .unwrap();
+    let mut log = History::default();
+    log.record(intent.unwrap());
+    for (name, undo) in [("Work", true), ("work", false), ("Work", true)] {
+        let tags = Config::load(&ws.root).unwrap().tags;
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, name);
+        assert_eq!(tags[0].skills, vec!["bicycle"]);
+        assert_eq!(tags[0].color.as_deref(), Some("cyan"));
+        assert_eq!(tags[0].description.as_deref(), Some("Daily tools"));
+        step(&ws, &mut log, undo);
+    }
 }
 
 #[test]

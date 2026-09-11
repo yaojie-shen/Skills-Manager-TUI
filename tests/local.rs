@@ -182,6 +182,14 @@ fn shared_source_rename_preserves_directory_and_shared_alias_removal_cleans_link
     );
     let key = "repos/example/sample";
     skill(&ws.root.join(key));
+    let conflict =
+        deploy::plan_deploy(&ws, &ws.scan().unwrap(), &[key.into()], &["codex".into()]).unwrap();
+    assert!(deploy::apply(&conflict).is_err());
+    std::fs::write(
+        ws.root.join(key).join("SKILL.md"),
+        "---\nname: repo-sample\n---\nbody",
+    )
+    .unwrap();
     deploy::apply(
         &deploy::plan_deploy(&ws, &ws.scan().unwrap(), &[key.into()], &["codex".into()]).unwrap(),
     )
@@ -248,7 +256,10 @@ fn catalog_needs_no_root_and_agent_registration_preserves_global_config() {
     let f = Fixture::new("catalog");
     let catalog = success(f.cli(&["agents", "catalog", "--json"]));
     let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
-    assert_eq!(catalog.as_array().unwrap().len(), 19);
+    assert_eq!(
+        catalog.as_array().unwrap().len(),
+        skills::agents::BUILTINS.len()
+    );
     let root = f.0.join("global");
     std::fs::create_dir_all(root.join(".skills-meta")).unwrap();
     std::fs::write(

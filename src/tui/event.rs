@@ -26,6 +26,7 @@ pub enum Task {
     DiscoverRepository(String),
     InstallRepository(Box<super::repository_picker::InstallSelection>),
     Scan,
+    PollRoot,
     Check(Vec<String>),
     Prepare(String),
     /// Fetch a skill from a git repository or a local path into the root.
@@ -44,7 +45,8 @@ pub enum TaskOutput {
         Box<super::repository_picker::InstallSelection>,
         Result<Vec<String>>,
     ),
-    Scan(Result<Snapshot>),
+    Scan(Result<Snapshot>, Option<skills::reconcile::watch::Stamp>),
+    RootStamp(Result<skills::reconcile::watch::Stamp>),
     Check(Vec<(String, Result<CheckResult>)>),
     Prepared(String, Result<Prepared>),
     /// The reference asked for, and the key it landed under.
@@ -174,7 +176,15 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                     );
                     TaskOutput::RepositoryInstalled(selection, result)
                 }
-                Task::Scan => TaskOutput::Scan(ws.scan()),
+                Task::Scan => {
+                    // Capture before scanning: changes during the scan must still
+                    // invalidate the next poll, while our own writes need no second scan.
+                    let stamp = skills::reconcile::watch::stamp(&ws.root, &ws.config).ok();
+                    TaskOutput::Scan(ws.scan(), stamp)
+                }
+                Task::PollRoot => {
+                    TaskOutput::RootStamp(skills::reconcile::watch::stamp(&ws.root, &ws.config))
+                }
                 Task::Check(keys) => {
                     let total = keys.len();
                     TaskOutput::Check(
@@ -212,6 +222,7 @@ pub enum BatchWork {
     Links(Vec<skills::ops::deploy::Action>, Vec<String>),
 }
 pub struct BatchOutcome {
+    pub conflict: Option<skills::ops::name_choices::Pending>,
     pub message: String,
     pub intent: Option<skills::history::Intent>,
     pub failed: Vec<String>,
@@ -227,12 +238,28 @@ impl BatchWork {
         match self {
             Self::Metadata(write, keys) => match write(ws) {
                 Ok((message, intent)) => BatchOutcome {
+                    conflict: None,
                     message,
                     intent,
                     failed: vec![],
                     errors: vec![],
                 },
+                Err(e)
+                    if e.downcast_ref::<skills::ops::name_choices::Pending>()
+                        .is_some() =>
+                {
+                    BatchOutcome {
+                        conflict: e
+                            .downcast_ref::<skills::ops::name_choices::Pending>()
+                            .cloned(),
+                        message: "Choose conflicting skills".into(),
+                        intent: None,
+                        failed: vec![],
+                        errors: vec![],
+                    }
+                }
                 Err(e) => BatchOutcome {
+                    conflict: None,
                     message: "Batch metadata edit failed".into(),
                     intent: None,
                     failed: keys,
@@ -242,21 +269,26 @@ impl BatchWork {
             Self::Links(actions, keys) => {
                 use skills::{history, ops::deploy};
                 // Recheck names in the worker against the current filesystem.
-                match ws.scan() {
-                    Ok(snap) if deploy::name_conflicts(&snap, &actions).is_empty() => {}
-                    result => {
-                        let error = match result {
-                            Err(e) => format!("{e:#}"),
-                            Ok(_) => {
-                                "Conflicting skill names: resolve them before batch deployment"
-                                    .into()
-                            }
-                        };
+                match ws.scan_for_links().and_then(|snap| {
+                    skills::ops::name_choices::Pending::for_actions(ws, &snap, &actions)
+                }) {
+                    Ok(None) => {}
+                    Ok(Some(pending)) => {
                         return BatchOutcome {
+                            conflict: Some(pending),
+                            message: "Choose conflicting skills".into(),
+                            intent: None,
+                            failed: vec![],
+                            errors: vec![],
+                        };
+                    }
+                    Err(error) => {
+                        return BatchOutcome {
+                            conflict: None,
                             message: "Batch deployment failed".into(),
                             intent: None,
                             failed: keys,
-                            errors: vec![error],
+                            errors: vec![format!("{error:#}")],
                         };
                     }
                 }
@@ -296,6 +328,7 @@ impl BatchWork {
                     }
                 }
                 BatchOutcome {
+                    conflict: None,
                     message: deploy::summarize(&completed),
                     intent: history::Intent::from_actions(&completed),
                     failed: failed.into_iter().collect(),
@@ -315,7 +348,7 @@ pub fn spawn_batch(
         let keys = work.keys().to_vec();
         let mut progress = |text: &str| { let _ = tx.send(Msg::Progress(id, text.into())); };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.run(&ws, &mut progress)))
-            .unwrap_or_else(|_| BatchOutcome { message: "Batch worker failed".into(), intent: None, failed: keys, errors: vec!["The worker stopped unexpectedly. Refresh and inspect affected skills before retrying.".into()] });
+            .unwrap_or_else(|_| BatchOutcome { conflict: None, message: "Batch worker failed".into(), intent: None, failed: keys, errors: vec!["The worker stopped unexpectedly. Refresh and inspect affected skills before retrying.".into()] });
         let _ = tx.send(Msg::Task(id, Box::new(TaskOutput::Batch(outcome))));
     }).map(|_| ())
 }

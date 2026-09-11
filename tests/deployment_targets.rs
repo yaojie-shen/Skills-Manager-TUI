@@ -41,7 +41,7 @@ fn selecting_local_targets_does_not_write_until_apply_and_survives_reload() {
     let ws = f.ws();
     let project = f.0.join("project");
     let agents = targets::candidates(&ws, Some(&project)).unwrap();
-    assert_eq!(agents.len(), 19);
+    assert_eq!(agents.len(), skills::agents::BUILTINS.len());
     assert_eq!(std::fs::read_dir(&project).unwrap().count(), 0);
     let selected = agents
         .into_iter()
@@ -338,6 +338,31 @@ fn central_renames_and_removals_update_target_installation_references() {
 }
 
 #[test]
+fn external_moves_update_registered_target_references_and_links() {
+    let f = Fixture::new("external-move-references");
+    let project = f.0.join("project");
+    let agent = targets::candidates(&f.ws(), Some(&project))
+        .unwrap()
+        .remove(0);
+    let ws = f.ws();
+    skills::ops::edit::tag_add(&ws, "sample", &["keep".into()]).unwrap();
+    targets::set_installed(&ws, &agent, Some(&project), &["sample".into()], None, true).unwrap();
+    std::fs::rename(ws.root.join("sample"), ws.root.join("moved")).unwrap();
+    // The workspace predates registration: migration must reload destinations.
+    skills::ops::edit::migrate_meta(&ws, "sample", "moved").unwrap();
+    let selection = targets::selection(&ws, &agent).unwrap();
+    assert!(selection.manual.contains("moved"));
+    assert!(!selection.manual.contains("sample"));
+    assert_eq!(
+        std::fs::read_link(agent.skills_path().join("moved")).unwrap(),
+        ws.root.join("moved")
+    );
+    assert!(!skills::util::is_symlink(
+        &agent.skills_path().join("sample")
+    ));
+}
+
+#[test]
 fn moving_a_library_and_its_project_keeps_relative_target_identity() {
     let f = Fixture::new("portable");
     let project = f.0.join("project");
@@ -554,7 +579,7 @@ fn physical_scopes_keep_shared_private_and_current_directory_separate() {
     assert!(scopes.iter().any(|s| s.name() == "Global shared"));
     assert!(scopes.iter().any(|s| s.name() == "Global .codex"));
     let local: Vec<_> = scopes.iter().filter(|s| s.project.is_some()).collect();
-    assert_eq!(local.len(), 1);
+    assert_eq!(local.len(), 2);
     assert_eq!(
         local[0].directory.as_ref().unwrap(),
         &cwd.join(".agents/skills")
@@ -682,4 +707,593 @@ fn foreign_broken_and_cyclic_directory_links_are_not_merged() {
     let locals: Vec<_> = scopes.iter().filter(|s| s.project.is_some()).collect();
     assert_eq!(locals.len(), 4);
     assert!(locals.iter().all(|s| s.links.is_empty()));
+}
+
+#[test]
+fn inventory_hides_config_only_products_and_ignores_shared_directories() {
+    let f = Fixture::new("installed-only");
+    let project = f.0.join("project");
+    let home = f.0.join("fake-home");
+    std::fs::create_dir_all(home.join(".agents/skills")).unwrap();
+    std::fs::create_dir_all(project.join(".agents/skills")).unwrap();
+    let mut ws = f.ws();
+    ws.config.agents = skills::agents::defaults(false);
+    for key in ["shared", "legacy-storage"] {
+        ws.config.agents.push(AgentConfig {
+            key: key.into(),
+            name: key.into(),
+            skills_dir: home.join(".agents/skills").display().to_string(),
+        });
+    }
+    targets::discover_in(&mut ws, &project, &home).unwrap();
+    assert_eq!(targets::visible_agents(&ws).count(), 0);
+    assert_eq!(ws.config.agents.len(), 4, "saved destinations are retained");
+    for dir in [
+        ".codex",
+        ".cursor",
+        ".claude",
+        ".gemini",
+        ".config/opencode",
+    ] {
+        std::fs::create_dir_all(home.join(dir).join("skills")).unwrap();
+        std::fs::create_dir_all(project.join(dir).join("skills")).unwrap();
+    }
+    targets::discover_in(&mut ws, &project, &home).unwrap();
+    assert_eq!(
+        targets::visible_agents(&ws).count(),
+        0,
+        "leftover product directories are not installs"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    let binary = home.join(".local/bin/codex");
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::write(&binary, "not executed").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    targets::discover_in(&mut ws, &project, &home).unwrap();
+    assert!(targets::visible_agents(&ws).count() > 0);
+    assert!(targets::visible_agents(&ws).all(|a| targets::product_key(a) == "codex"));
+    std::fs::remove_file(binary).unwrap();
+    targets::discover_in(&mut ws, &project, &home).unwrap();
+    assert_eq!(
+        targets::visible_agents(&ws).count(),
+        0,
+        "discovery refreshes evidence"
+    );
+}
+
+#[test]
+fn executable_agent_is_detected_before_any_configuration_directory_exists() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("executable-detection");
+    let bin = f.0.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for (name, mode) in [("claude", 0o755), ("codex", 0o644)] {
+        let path = bin.join(name);
+        std::fs::write(&path, "must not execute").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    assert_eq!(
+        skills::agents::detect_in(&f.0.join("home"), &f.0.join("project"), &[bin]),
+        std::collections::BTreeSet::from(["claude".into()])
+    );
+}
+
+#[test]
+fn trae_cli_generations_follow_public_installer_links() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let f = Fixture::new("trae-cli-generations");
+    let home = f.0.join("home");
+    let project = f.0.join("project");
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for root in [".trae", ".trae-cn", ".traecli", ".agents"] {
+        std::fs::create_dir_all(home.join(root).join("skills")).unwrap();
+    }
+    let detect = || skills::agents::detect_in(&home, &project, &[]);
+    assert!(
+        detect().is_empty(),
+        "shared directories are not installed products"
+    );
+
+    let v1 = home.join(".local/share/trae-cli/trae-cli");
+    let v2 = home.join(".local/share/traecli/releases/0.204.1-tob/traex");
+    for binary in [&v1, &v2] {
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(binary, "fixture: must never execute").unwrap();
+        std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    symlink(&v1, bin.join("trae-cli")).unwrap();
+    assert!(
+        detect().is_empty(),
+        "standalone trae-cli is ambiguous with Trae Agent"
+    );
+    symlink(&v1, bin.join("traecli")).unwrap();
+    assert_eq!(
+        detect(),
+        std::collections::BTreeSet::from(["trae-cli-v1".into()])
+    );
+
+    std::fs::remove_file(bin.join("traecli")).unwrap();
+    symlink(&v2, bin.join("traex")).unwrap();
+    symlink("traex", bin.join("traecli")).unwrap();
+    assert_eq!(
+        detect(),
+        std::collections::BTreeSet::from(["trae-cli".into()])
+    );
+    std::fs::remove_file(bin.join("traex")).unwrap();
+    assert!(
+        detect().is_empty(),
+        "broken launchers are not installations"
+    );
+
+    symlink(&v2, bin.join("traex")).unwrap();
+    std::fs::remove_file(bin.join("traecli")).unwrap();
+    symlink(&v1, bin.join("traecli")).unwrap();
+    assert_eq!(
+        detect(),
+        std::collections::BTreeSet::from(["trae-cli".into(), "trae-cli-v1".into()])
+    );
+}
+
+#[test]
+fn trae_cli_roots_match_each_generation_and_share_existing_selections() {
+    let f = Fixture::new("trae-shared-roots");
+    let project = f.0.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let home = f.0.join("home");
+    for (key, globals, locals) in [
+        (
+            "trae-cli",
+            vec!["~/.trae/skills", "~/.agents/skills"],
+            vec![".agents/skills", ".trae/skills"],
+        ),
+        (
+            "trae-cli-v1",
+            vec!["~/.traecli/skills", "~/.trae-cn/skills"],
+            vec![".traecli/skills", ".trae/skills"],
+        ),
+    ] {
+        let definition = skills::agents::BUILTINS
+            .iter()
+            .find(|a| a.key == key)
+            .unwrap();
+        assert_eq!(definition.search_dirs(false), globals);
+        assert_eq!(definition.search_dirs(true), locals);
+    }
+    let candidates = targets::all_candidates_in(&f.ws(), Some(&project), &home).unwrap();
+    let readers: Vec<_> = candidates
+        .iter()
+        .filter(|a| a.skills_path() == project.join(".trae/skills"))
+        .collect();
+    assert_eq!(
+        readers.len(),
+        4,
+        "both IDE editions and both CLI generations share this project root"
+    );
+    targets::set_installed(
+        &f.ws(),
+        readers[0],
+        Some(&project),
+        &["sample".into()],
+        Some("shared-trae"),
+        true,
+    )
+    .unwrap();
+    for reader in &readers {
+        assert!(
+            targets::selection(&f.ws(), reader)
+                .unwrap()
+                .presets
+                .contains_key("shared-trae")
+        );
+    }
+    targets::set_installed(
+        &f.ws(),
+        readers[3],
+        Some(&project),
+        &["sample".into()],
+        Some("shared-trae"),
+        false,
+    )
+    .unwrap();
+    for reader in readers {
+        assert!(
+            targets::selection(&f.ws(), reader)
+                .unwrap()
+                .skills()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn standalone_solo_apps_do_not_imply_an_ide_installation() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("solo-not-ide");
+    let home = f.0.join("home");
+    for name in ["TRAE SOLO.app", "TRAE SOLO CN.app"] {
+        let bundle = home.join("Applications").join(name).join("Contents");
+        std::fs::create_dir_all(bundle.join("MacOS")).unwrap();
+        std::fs::write(bundle.join("Info.plist"), "fixture").unwrap();
+        let binary = bundle.join("MacOS/SOLO");
+        std::fs::write(&binary, "must not execute").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert!(skills::agents::detect_in(&home, &f.0.join("project"), &[]).is_empty());
+}
+
+#[test]
+fn mixed_scope_selection_registers_each_project_and_validates_before_writing() {
+    let f = Fixture::new("mixed");
+    let ws = f.ws();
+    let project = f.0.join("project");
+    let home = AgentConfig {
+        key: "home".into(),
+        name: "Home".into(),
+        skills_dir: f.0.join("fake-home/skills").display().to_string(),
+    };
+    let local = AgentConfig {
+        key: "local".into(),
+        name: "Local".into(),
+        skills_dir: project.join(".claude/skills").display().to_string(),
+    };
+    assert!(
+        targets::apply_scoped(
+            &ws,
+            &["sample".into()],
+            &[
+                (home.clone(), true, Some(project.clone())),
+                (local.clone(), true, Some(project.clone()))
+            ]
+        )
+        .is_err()
+    );
+    assert!(!home.skills_path().exists());
+    targets::apply_scoped(
+        &ws,
+        &["sample".into()],
+        &[
+            (home.clone(), true, None),
+            (local.clone(), true, Some(project.clone())),
+        ],
+    )
+    .unwrap();
+    let reopened = f.ws();
+    assert!(
+        targets::candidates(&reopened, None)
+            .unwrap()
+            .iter()
+            .any(|a| a.key == home.key)
+    );
+    assert!(
+        !targets::candidates(&reopened, None)
+            .unwrap()
+            .iter()
+            .any(|a| a.key == local.key)
+    );
+    assert!(
+        targets::candidates(&reopened, Some(&project))
+            .unwrap()
+            .iter()
+            .any(|a| a.key == local.key)
+    );
+}
+
+#[test]
+fn mixed_scope_changes_preserve_preset_ownership_and_undo_both_destinations() {
+    let f = Fixture::new("mixed-reasons-undo");
+    let ws = f.ws();
+    let home = AgentConfig {
+        key: "sample-home".into(),
+        name: "Home".into(),
+        skills_dir: f.0.join("home/skills").display().to_string(),
+    };
+    let project = f.0.join("project");
+    let local = AgentConfig {
+        key: "sample-local".into(),
+        name: "Local".into(),
+        skills_dir: project.join(".custom/skills").display().to_string(),
+    };
+    let keys = vec!["sample".into()];
+    targets::set_installed(&ws, &local, Some(&project), &keys, Some("keep"), true).unwrap();
+    assert!(
+        targets::apply_scoped(
+            &ws,
+            &keys,
+            &[
+                (home.clone(), true, None),
+                (local.clone(), false, Some(project.clone()))
+            ]
+        )
+        .is_err()
+    );
+    assert!(!home.skills_path().exists());
+    let (_, intent) = targets::apply_scoped(
+        &ws,
+        &keys,
+        &[
+            (home.clone(), true, None),
+            (local.clone(), true, Some(project.clone())),
+        ],
+    )
+    .unwrap();
+    assert!(
+        targets::selection(&ws, &home)
+            .unwrap()
+            .manual
+            .contains("sample")
+    );
+    assert!(
+        targets::selection(&ws, &local)
+            .unwrap()
+            .manual
+            .contains("sample")
+    );
+    let reopened = f.ws();
+    let skills::history::Plan::Write { apply, .. } =
+        skills::history::undo_plan(&reopened, &reopened.scan().unwrap(), &intent.unwrap()).unwrap()
+    else {
+        panic!("expected grouped selection undo")
+    };
+    apply.apply(&reopened).unwrap();
+    assert!(!home.skills_path().join("sample").exists());
+    assert!(local.skills_path().join("sample").exists());
+    let selection = targets::selection(&reopened, &local).unwrap();
+    assert!(selection.manual.is_empty());
+    assert!(selection.presets.contains_key("keep"));
+}
+
+#[test]
+fn detection_requires_valid_app_bundle_or_registered_extension_payload() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("installed-evidence");
+    let home = f.0.join("home");
+    let project = f.0.join("project");
+    let bundle = home.join("Applications/Trae.app/Contents");
+    std::fs::create_dir_all(bundle.join("MacOS")).unwrap();
+    std::fs::write(bundle.join("Info.plist"), "fixture").unwrap();
+    assert!(skills::agents::detect_in(&home, &project, &[]).is_empty());
+    let binary = bundle.join("MacOS/Trae");
+    std::fs::write(&binary, "not executed").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let extensions = home.join(".vscode/extensions");
+    let extension = extensions.join("anthropic.claude-code-1.0.0");
+    std::fs::create_dir_all(&extension).unwrap();
+    std::fs::write(
+        extension.join("package.json"),
+        r#"{"publisher":"anthropic","name":"claude-code","main":"extension.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(extension.join("extension.js"), "fixture").unwrap();
+    assert_eq!(
+        skills::agents::detect_in(&home, &project, &[]),
+        std::collections::BTreeSet::from(["trae".into()])
+    );
+    std::fs::write(extensions.join("extensions.json"), r#"[{"identifier":{"id":"anthropic.claude-code"},"relativeLocation":"anthropic.claude-code-1.0.0"}]"#).unwrap();
+    assert_eq!(
+        skills::agents::detect_in(&home, &project, &[]),
+        std::collections::BTreeSet::from(["claude".into(), "trae".into()])
+    );
+    std::fs::remove_file(extension.join("extension.js")).unwrap();
+    assert!(!skills::agents::detect_in(&home, &project, &[]).contains("claude"));
+}
+
+#[test]
+fn detection_combines_cli_aliases_system_apps_and_browser_extensions() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("combined-installations");
+    let home = f.0.join("home");
+    let project = f.0.join("project");
+    let bin = f.0.join("bin");
+    let apps = f.0.join("Applications");
+    for directory in [&bin, &home.join(".local/bin")] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    for path in [bin.join("copilot"), home.join(".local/bin/opencode")] {
+        std::fs::write(&path, "fixture, never executed").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let bundle = apps.join("Cursor.app/Contents");
+    std::fs::create_dir_all(bundle.join("MacOS")).unwrap();
+    std::fs::write(bundle.join("Info.plist"), "fixture").unwrap();
+    let binary = bundle.join("MacOS/Cursor");
+    std::fs::write(&binary, "fixture, never executed").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let extensions = home.join(".vscode/extensions");
+    let extension = extensions.join("codex-fixture");
+    std::fs::create_dir_all(&extension).unwrap();
+    std::fs::write(
+        extension.join("package.json"),
+        r#"{"publisher":"OpenAI","name":"ChatGPT","browser":"browser.js"}"#,
+    )
+    .unwrap();
+    std::fs::write(extension.join("browser.js"), "fixture").unwrap();
+    std::fs::write(
+        extensions.join("extensions.json"),
+        serde_json::json!([
+            {"identifier": {"id": "OPENAI.CHATGPT"}, "location": {"path": extension}}
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let expected = std::collections::BTreeSet::from([
+        "github-copilot".into(),
+        "opencode".into(),
+        "cursor".into(),
+        "codex".into(),
+    ]);
+    assert_eq!(
+        skills::agents::detect_with_applications(
+            &home,
+            &project,
+            std::slice::from_ref(&bin),
+            std::slice::from_ref(&apps)
+        ),
+        expected
+    );
+    // A registered extension with a different package identity is not evidence.
+    std::fs::write(
+        extension.join("package.json"),
+        r#"{"publisher":"different","name":"ChatGPT","browser":"browser.js"}"#,
+    )
+    .unwrap();
+    assert!(
+        !skills::agents::detect_with_applications(&home, &project, &[bin], &[apps])
+            .contains("codex")
+    );
+}
+
+#[test]
+fn shared_directory_links_have_identical_base_scan_and_scope_reports() {
+    for reverse in [false, true] {
+        let f = Fixture::new(if reverse {
+            "base-shared-reverse"
+        } else {
+            "base-shared-forward"
+        });
+        let mut ws = f.ws();
+        let project = f.0.join("project");
+        let claude = project.join(".claude/skills");
+        let shared = project.join(".agents/skills");
+        let (source, target) = if reverse {
+            (&shared, &claude)
+        } else {
+            (&claude, &shared)
+        };
+        std::fs::create_dir_all(target.join("invalid")).unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(target, source).unwrap();
+        std::os::unix::fs::symlink(ws.root.join("sample"), target.join("sample")).unwrap();
+        std::os::unix::fs::symlink(project.join("absent"), target.join("broken")).unwrap();
+        ws.config.agents = vec![
+            AgentConfig {
+                key: "claude".into(),
+                name: "Claude".into(),
+                skills_dir: claude.display().to_string(),
+            },
+            AgentConfig {
+                key: "codex".into(),
+                name: "Codex".into(),
+                skills_dir: shared.display().to_string(),
+            },
+        ];
+        let snap = ws.scan().unwrap();
+        for report in &snap.agents {
+            assert_eq!(report.mode, skills::reconcile::AgentDirMode::Real);
+            assert_eq!(report.documents.len(), 1);
+            assert_eq!(
+                report.entries.len(),
+                3,
+                "health still sees invalid and broken entries"
+            );
+            assert_eq!(
+                report.valid_count(|s| matches!(s, skills::reconcile::EntryState::Deployed)),
+                1
+            );
+        }
+        assert_eq!(snap.agents[0].entries, snap.agents[1].entries);
+        let scoped = skills::reconcile::rescope(&snap, &ws.config.agents).unwrap();
+        assert_eq!(scoped.agents[0].entries, snap.agents[0].entries);
+    }
+}
+
+#[test]
+fn name_choices_keep_one_or_none_without_deleting_library_sources() {
+    for keep in [Some("first"), Some("second"), None] {
+        let f = Fixture::new(&format!("choices-{}", keep.unwrap_or("none")));
+        for key in ["first", "second"] {
+            std::fs::create_dir_all(f.0.join("source").join(key)).unwrap();
+            std::fs::write(
+                f.0.join("source").join(key).join("SKILL.md"),
+                "---\nname: duplicate\ndescription: example\n---\nbody",
+            )
+            .unwrap();
+        }
+        let ws = f.ws();
+        let agent = AgentConfig {
+            key: "test".into(),
+            name: "Test".into(),
+            skills_dir: f.0.join("project/.agents/skills").display().to_string(),
+        };
+        let error = targets::set_installed(
+            &ws,
+            &agent,
+            None,
+            &["first".into(), "second".into(), "sample".into()],
+            None,
+            true,
+        )
+        .unwrap_err();
+        let pending = error
+            .downcast_ref::<skills::ops::name_choices::Pending>()
+            .unwrap();
+        assert!(!agent.skills_path().exists(), "review never writes");
+        assert_eq!(pending.groups.len(), 1);
+        let choice = keep.map(|key| {
+            pending.groups[0]
+                .candidates
+                .iter()
+                .position(|c| c.key.as_deref() == Some(key))
+                .unwrap()
+        });
+        pending.apply(&ws, &[choice]).unwrap();
+        for key in ["first", "second"] {
+            assert_eq!(agent.skills_path().join(key).exists(), keep == Some(key));
+            assert!(ws.root.join(key).join("SKILL.md").exists());
+        }
+        assert!(
+            agent.skills_path().join("sample").exists(),
+            "unrelated selection survives"
+        );
+        let selection = targets::selection(&ws, &agent).unwrap();
+        assert_eq!(selection.skills().len(), 1 + usize::from(keep.is_some()));
+    }
+}
+
+#[test]
+fn name_choices_archive_only_excluded_owned_entries_and_reject_stale_content() {
+    for keep_owned in [true, false] {
+        let f = Fixture::new(&format!("owned-choice-{keep_owned}"));
+        let ws = f.ws();
+        let agent = AgentConfig {
+            key: "test".into(),
+            name: "Test".into(),
+            skills_dir: f.0.join("project/.agents/skills").display().to_string(),
+        };
+        let owned = agent.skills_path().join("own-folder");
+        std::fs::create_dir_all(&owned).unwrap();
+        let content = "---\nname: sample\ndescription: owned\n---\nprecious content";
+        std::fs::write(owned.join("SKILL.md"), content).unwrap();
+        let get_pending = || {
+            targets::set_installed(&ws, &agent, None, &["sample".into()], None, true)
+                .unwrap_err()
+                .downcast::<skills::ops::name_choices::Pending>()
+                .unwrap()
+        };
+        let stale = get_pending();
+        std::fs::write(owned.join("extra"), "changed").unwrap();
+        assert!(stale.apply(&ws, &[None]).is_err());
+        assert!(owned.join("SKILL.md").exists());
+        let pending = get_pending();
+        let choice = pending.groups[0]
+            .candidates
+            .iter()
+            .position(|c| c.key.is_none() == keep_owned)
+            .unwrap();
+        let (message, _) = pending.apply(&ws, &[Some(choice)]).unwrap();
+        assert_eq!(owned.exists(), keep_owned);
+        assert_eq!(agent.skills_path().join("sample").exists(), !keep_owned);
+        if !keep_owned {
+            let backup = message
+                .split("Archived agent-owned entry to ")
+                .last()
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(PathBuf::from(backup).join("SKILL.md")).unwrap(),
+                content
+            );
+        }
+    }
 }

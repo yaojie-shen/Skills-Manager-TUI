@@ -209,7 +209,10 @@ impl RepositoryPicker {
             &paths,
             &self.selection.names,
             &occupied,
-            &self.selection.fetched.local_name(""),
+            &paths
+                .iter()
+                .map(|p| (p.clone(), self.selection.fetched.local_name(p)))
+                .collect(),
         )
         .ok()
         .and_then(|names| names.get(path).cloned())
@@ -233,14 +236,8 @@ impl RepositoryPicker {
             return Some("ancestor or descendant selected".into());
         }
         if ctx.snap.skills.iter().any(|s| match &s.source {
-            Some(skills::meta::Source::Git {
-                url,
-                branch,
-                subpath,
-                ..
-            }) => {
+            Some(skills::meta::Source::Git { url, subpath, .. }) => {
                 *url == self.selection.fetched.repository.url
-                    && branch.as_deref() == Some(&self.selection.fetched.repository.branch)
                     && subpath.as_deref().unwrap_or("") == path
             }
             _ => false,
@@ -665,7 +662,7 @@ fn candidate_snapshot(fetched: &FetchedRepository) -> Snapshot {
                     .map(|reason| SkillStatus::Invalid {
                         reason: reason.clone(),
                     })
-                    .unwrap_or(SkillStatus::Unmanaged),
+                    .unwrap_or(SkillStatus::Repository),
                 name: doc.as_ref().map(|doc| doc.name.clone()),
                 description: doc.as_ref().map(|doc| doc.description.clone()),
                 body: doc.map(|doc| doc.body),
@@ -762,7 +759,7 @@ mod tests {
             "observability",
             "skills/ prnter",
             "repo:sample/tools skills/",
-            "status:unmanaged skills/",
+            "status:repository skills/",
         ] {
             picker.search = Input::with_value(query);
             picker.refilter();
@@ -886,6 +883,15 @@ mod tests {
                 "other/printer".into(),
             ],
         };
+        for path in &fetched.choices {
+            let dir = fetched.workdir.join(path);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {}\n---\nbody", path.rsplit('/').next().unwrap()),
+            )
+            .unwrap();
+        }
         let mut picker = RepositoryPicker::new(fetched, &ctx);
         assert_eq!(picker.selection.paths, vec!["tools", "other/printer"]);
         assert!(!picker.toggle("tools/reader", &ctx).is_empty());

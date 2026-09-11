@@ -95,6 +95,80 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn repository_root_skill_uses_declared_name_instead_of_project_name() {
+    let f = Fixture::new();
+    f.put("", "review-article-architecture", "review");
+    f.commit();
+    let fetched = f.fetch("Boom5426--Nature-Paper-Skills");
+    assert_eq!(fetched.local_name(""), "review-article-architecture");
+    let keys = fetched
+        .install(&f.ws, &[String::new()], &BTreeMap::new())
+        .unwrap();
+    fetched.cleanup();
+    assert_eq!(
+        keys,
+        ["repos/Boom5426--Nature-Paper-Skills/review-article-architecture"]
+    );
+}
+
+#[test]
+fn repository_deployment_preserves_skill_name_without_source_prefix() {
+    let f = Fixture::new();
+    let name = "review-article-architecture";
+    f.put(&format!("skills/{name}"), name, "review");
+    f.commit();
+    let fetched = f.fetch("Boom5426--Nature-Paper-Skills");
+    let keys = fetched
+        .install(&f.ws, &[format!("skills/{name}")], &BTreeMap::new())
+        .unwrap();
+    fetched.cleanup();
+    let snap = f.ws.scan().unwrap();
+    assert_eq!(snap.get(&keys[0]).unwrap().deployment_name(), name);
+    let plan = deploy::plan_deploy(&f.ws, &snap, &keys, &["sample".into()]).unwrap();
+    deploy::apply(&plan).unwrap();
+    assert_eq!(
+        std::fs::read_link(f.dir.join("agent").join(name)).unwrap(),
+        f.ws.skill_path(&keys[0])
+    );
+    assert!(
+        !f.dir
+            .join("agent/Boom5426--Nature-Paper-Skills--review-article-architecture")
+            .exists()
+    );
+    let snap = f.ws.scan().unwrap();
+    assert_eq!(
+        snap.get(&keys[0]).unwrap().deploy["sample"],
+        DeployState::Deployed
+    );
+    edit::remove(&f.ws, &snap, &keys[0], false).unwrap();
+    assert!(!f.dir.join("agent").join(name).is_symlink());
+}
+
+#[test]
+fn reinstall_same_source_is_a_noop_even_with_another_alias() {
+    let f = Fixture::new();
+    f.put("some/folder", "review", "review");
+    f.commit();
+    let first = f.fetch("first");
+    let keys = first
+        .install(&f.ws, &["some/folder".into()], &BTreeMap::new())
+        .unwrap();
+    assert_eq!(keys, ["repos/first/review"]);
+    let before = f.ws.meta.load(&keys[0]).unwrap();
+    let second = f.fetch("second");
+    assert!(
+        second
+            .install(&f.ws, &["some/folder".into()], &BTreeMap::new())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(f.ws.meta.load(&keys[0]).unwrap(), before);
+    assert!(!f.ws.root.join("repos/second").exists());
+    first.cleanup();
+    second.cleanup();
+}
+
+#[test]
 fn repositories_preserve_sources_and_aliases_through_update_deployment_and_undo() {
     let f = Fixture::new();
     f.put("frontend/review", "review", "first");
@@ -132,10 +206,7 @@ fn repositories_preserve_sources_and_aliases_through_update_deployment_and_undo(
     );
     let plan = deploy::plan_deploy(&f.ws, &snap, std::slice::from_ref(second), &agent).unwrap();
     assert!(deploy::resolve_names(&snap, &plan, None).is_err());
-    assert_eq!(
-        deploy::resolve_names(&snap, &plan, Some("coexist")).unwrap(),
-        plan
-    );
+    assert!(deploy::resolve_names(&snap, &plan, Some("coexist")).is_err());
     let replace = deploy::resolve_names(&snap, &plan, Some("replace")).unwrap();
     let intent = skills::history::Intent::from_actions(&replace).unwrap();
     deploy::apply(&replace).unwrap();
@@ -227,7 +298,8 @@ fn nested_choices_are_rejected_and_basename_installs_keep_nested_contents() {
     assert!(
         fetched
             .install(&f.ws, &["a/b".into()], &BTreeMap::new())
-            .is_err()
+            .unwrap()
+            .is_empty()
     );
     fetched.cleanup();
 }
@@ -313,7 +385,7 @@ fn replace_never_deletes_an_agents_own_same_named_directory() {
     let snap = f.ws.scan().unwrap();
     let plan = deploy::plan_deploy(&f.ws, &snap, &keys, &["sample".into()]).unwrap();
     assert!(deploy::resolve_names(&snap, &plan, Some("replace")).is_err());
-    deploy::apply(&deploy::resolve_names(&snap, &plan, Some("coexist")).unwrap()).unwrap();
+    assert!(deploy::resolve_names(&snap, &plan, Some("coexist")).is_err());
     assert!(own.is_dir());
 }
 
@@ -334,7 +406,7 @@ fn repository_work_reports_clone_scan_and_install_stages() {
     assert!(!fetched.workdir.starts_with(&f.ws.root));
     assert!(
         !f.ws.root.join(".skills-meta/.staging").exists(),
-        "discovery should not write staging in the managed root"
+        "discovery should not write staging in the tracked root"
     );
     assert!(messages.iter().any(|s| s.starts_with("Clone:")));
     assert!(
@@ -412,7 +484,11 @@ fn invalid_skill_fixtures_are_reported_with_paths_before_installation() {
     );
 
     fetched
-        .install(&f.ws, &["skills/good".into()], &BTreeMap::new())
+        .install(
+            &f.ws,
+            &["skills/good".into()],
+            &BTreeMap::from([("skills/good".into(), "validation-good".into())]),
+        )
         .unwrap();
     fetched.cleanup();
 }
@@ -422,24 +498,30 @@ fn local_names_resolve_basename_collisions_deterministically() {
     use skills::repository::resolve_local_names;
     use std::collections::BTreeSet;
     let paths = vec!["z/review".into(), "a/review".into(), "solo/printer".into()];
-    let names = resolve_local_names(&paths, &BTreeMap::new(), &BTreeSet::new(), "root").unwrap();
+    let declared = BTreeMap::from([
+        ("a/review".into(), "review".into()),
+        ("z/review".into(), "review".into()),
+        ("solo/printer".into(), "printer".into()),
+        ("".into(), "root".into()),
+    ]);
+    let names = resolve_local_names(&paths, &BTreeMap::new(), &BTreeSet::new(), &declared).unwrap();
     assert_eq!(names["a/review"], "review");
     assert_eq!(names["z/review"], "z--review");
     assert_eq!(names["solo/printer"], "printer");
     let reversed: Vec<_> = paths.iter().rev().cloned().collect();
     assert_eq!(
         names,
-        resolve_local_names(&reversed, &BTreeMap::new(), &BTreeSet::new(), "root").unwrap()
+        resolve_local_names(&reversed, &BTreeMap::new(), &BTreeSet::new(), &declared).unwrap()
     );
     let occupied = BTreeSet::from(["review".into(), "a--review".into(), "a--review--2".into()]);
-    let names = resolve_local_names(&paths, &BTreeMap::new(), &occupied, "root").unwrap();
+    let names = resolve_local_names(&paths, &BTreeMap::new(), &occupied, &declared).unwrap();
     assert_eq!(names["a/review"], "a--review--3");
     assert_eq!(names["z/review"], "z--review");
     let roots = resolve_local_names(
         &["".into()],
         &BTreeMap::new(),
         &BTreeSet::from(["root".into()]),
-        "root",
+        &declared,
     )
     .unwrap();
     assert_eq!(roots[""], "root--2");
@@ -450,11 +532,15 @@ fn explicit_local_names_are_reserved_and_never_silently_changed() {
     use skills::repository::resolve_local_names;
     use std::collections::BTreeSet;
     let paths = vec!["a/review".into(), "z/custom".into()];
+    let declared = BTreeMap::from([
+        ("a/review".into(), "review".into()),
+        ("z/custom".into(), "custom".into()),
+    ]);
     let overrides = BTreeMap::from([
         ("z/custom".into(), "review".into()),
         ("not-selected".into(), "../ignored".into()),
     ]);
-    let names = resolve_local_names(&paths, &overrides, &BTreeSet::new(), "root").unwrap();
+    let names = resolve_local_names(&paths, &overrides, &BTreeSet::new(), &declared).unwrap();
     assert_eq!(names["z/custom"], "review");
     assert_eq!(names["a/review"], "a--review");
     assert!(
@@ -462,7 +548,7 @@ fn explicit_local_names_are_reserved_and_never_silently_changed() {
             &paths,
             &overrides,
             &BTreeSet::from(["review".into()]),
-            "root"
+            &declared
         )
         .is_err()
     );
@@ -470,9 +556,9 @@ fn explicit_local_names_are_reserved_and_never_silently_changed() {
         ("a/review".into(), "chosen".into()),
         ("z/custom".into(), "chosen".into()),
     ]);
-    assert!(resolve_local_names(&paths, &duplicate, &BTreeSet::new(), "root").is_err());
+    assert!(resolve_local_names(&paths, &duplicate, &BTreeSet::new(), &declared).is_err());
     let invalid = BTreeMap::from([("a/review".into(), "../escape".into())]);
-    assert!(resolve_local_names(&paths, &invalid, &BTreeSet::new(), "root").is_err());
+    assert!(resolve_local_names(&paths, &invalid, &BTreeSet::new(), &declared).is_err());
 }
 
 #[test]
@@ -513,4 +599,264 @@ fn later_installs_reserve_existing_files_symlinks_and_metadata_names() {
             .is_err()
     );
     fetched.cleanup();
+}
+
+#[test]
+fn updates_preserve_local_skill_and_deployment_when_upstream_identity_breaks() {
+    for case in ["rename", "move", "delete", "invalid", "illegal-name"] {
+        let f = Fixture::new();
+        f.put("tools/review", "review", "original");
+        f.commit();
+        let fetched = f.fetch("fixed-source");
+        let keys = fetched
+            .install(&f.ws, &["tools/review".into()], &BTreeMap::new())
+            .unwrap();
+        fetched.cleanup();
+        let key = &keys[0];
+        let snap = f.ws.scan().unwrap();
+        deploy::apply(&deploy::plan_deploy(&f.ws, &snap, &keys, &["sample".into()]).unwrap())
+            .unwrap();
+        let original = std::fs::read(f.ws.skill_path(key).join("SKILL.md")).unwrap();
+        let metadata = std::fs::read(f.ws.meta.path(key)).unwrap();
+        let link = f.ws.config.agents[0].skills_path().join("review");
+        let target = std::fs::read_link(&link).unwrap();
+        match case {
+            "rename" => f.put("tools/review", "audit", "new"),
+            "move" => {
+                std::fs::rename(f.repo.join("tools/review"), f.repo.join("tools/moved")).unwrap()
+            }
+            "delete" => std::fs::remove_dir_all(f.repo.join("tools/review")).unwrap(),
+            "invalid" => {
+                std::fs::write(f.repo.join("tools/review/SKILL.md"), "not a skill").unwrap()
+            }
+            "illegal-name" => f.put("tools/review", "bad/name", "new"),
+            _ => unreachable!(),
+        }
+        f.commit();
+        let error = update::prepare(&f.ws, &f.ws.scan().unwrap(), key).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("keeping local"),
+            "{case}: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(f.ws.skill_path(key).join("SKILL.md")).unwrap(),
+            original
+        );
+        assert_eq!(std::fs::read(f.ws.meta.path(key)).unwrap(), metadata);
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert!(link.join("SKILL.md").is_file());
+    }
+}
+
+#[test]
+fn update_rechecks_local_state_and_prepared_name_before_writing() {
+    let f = Fixture::new();
+    f.put("tools/review", "review", "original");
+    f.commit();
+    let fetched = f.fetch("fixed-source");
+    let keys = fetched
+        .install(&f.ws, &["tools/review".into()], &BTreeMap::new())
+        .unwrap();
+    fetched.cleanup();
+    let key = &keys[0];
+    f.put("tools/review", "review", "new");
+    f.commit();
+    let prepared = update::prepare(&f.ws, &f.ws.scan().unwrap(), key).unwrap();
+    let document = f.ws.skill_path(key).join("SKILL.md");
+    let original = std::fs::read(&document).unwrap();
+    std::fs::write(&document, "---\nname: review\n---\nuser edit").unwrap();
+    assert!(update::apply(&f.ws, &prepared, update::Take::Upstream, &BTreeMap::new()).is_err());
+    assert!(
+        std::fs::read_to_string(&document)
+            .unwrap()
+            .contains("user edit")
+    );
+    std::fs::write(&document, &original).unwrap();
+    std::fs::write(
+        prepared.upstream_dir.join("SKILL.md"),
+        "---\nname: renamed\n---\nchanged",
+    )
+    .unwrap();
+    assert!(update::apply(&f.ws, &prepared, update::Take::Upstream, &BTreeMap::new()).is_err());
+    assert_eq!(std::fs::read(&document).unwrap(), original);
+    prepared.cleanup();
+}
+
+#[test]
+fn declared_names_aliases_and_invalid_names_are_handled_before_install() {
+    let f = Fixture::new();
+    f.put("z/unrelated-folder", "review", "second");
+    f.put("a/another-folder", "review", "first");
+    for (path, name) in [
+        ("invalid-space", "Bad Name"),
+        ("invalid-path", "../escape"),
+        ("invalid-empty", ""),
+        ("invalid-hyphen", "bad--name"),
+    ] {
+        f.put(path, name, "invalid");
+    }
+    f.commit();
+    let fetched = f.fetch("names");
+    assert_eq!(fetched.invalid.len(), 4);
+    let paths = vec!["z/unrelated-folder".into(), "a/another-folder".into()];
+    let preview = fetched
+        .resolved_names(&f.ws, &paths, &BTreeMap::new())
+        .unwrap();
+    assert_eq!(preview["a/another-folder"], "review");
+    let mut notices = Vec::new();
+    let keys = fetched
+        .install_with_progress(&f.ws, &paths, &BTreeMap::new(), &mut |s| {
+            notices.push(s.to_string())
+        })
+        .unwrap();
+    assert!(notices.iter().any(|s| s.starts_with("Warning:")));
+    for (path, key) in paths.iter().zip(&keys) {
+        let doc = skills::skill::SkillDoc::load(&f.ws.skill_path(key)).unwrap();
+        assert_eq!(doc.name, "review");
+        let meta = f.ws.meta.load(key).unwrap().unwrap();
+        assert_eq!(meta.installed_name.as_deref(), Some("review"));
+        assert!(
+            matches!(meta.source, Some(skills::meta::Source::Git { subpath: Some(p), .. }) if &p == path)
+        );
+    }
+    assert!(
+        fetched
+            .install(&f.ws, &["invalid-path".into()], &BTreeMap::new())
+            .is_err()
+    );
+    fetched.cleanup();
+}
+
+#[test]
+fn same_folder_different_sources_require_choice_and_track_actual_link() {
+    let f = Fixture::new();
+    f.put("first", "review", "first");
+    f.put("second", "audit", "second");
+    f.commit();
+    let first = f.fetch("one");
+    let a = first
+        .install(&f.ws, &["first".into()], &BTreeMap::new())
+        .unwrap()
+        .remove(0);
+    let second = f.fetch("two");
+    let b = second
+        .install(
+            &f.ws,
+            &["second".into()],
+            &BTreeMap::from([("second".into(), "review".into())]),
+        )
+        .unwrap()
+        .remove(0);
+    let snap = f.ws.scan().unwrap();
+    let both =
+        deploy::plan_deploy(&f.ws, &snap, &[a.clone(), b.clone()], &["sample".into()]).unwrap();
+    assert!(deploy::apply(&both).is_err());
+    assert!(!f.dir.join("agent").exists());
+    let only_a =
+        deploy::plan_deploy(&f.ws, &snap, std::slice::from_ref(&a), &["sample".into()]).unwrap();
+    deploy::apply(&only_a).unwrap();
+    let snap = f.ws.scan().unwrap();
+    assert_eq!(
+        snap.get(&a).unwrap().deploy["sample"],
+        DeployState::Deployed
+    );
+    assert_eq!(
+        snap.get(&b).unwrap().deploy["sample"],
+        DeployState::NotDeployed
+    );
+    let plan =
+        deploy::plan_deploy(&f.ws, &snap, std::slice::from_ref(&b), &["sample".into()]).unwrap();
+    let pending = skills::ops::name_choices::Pending::for_actions(&f.ws, &snap, &plan)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.groups.len(), 1);
+    assert_eq!(pending.groups[0].candidates.len(), 2);
+    let choice = pending.groups[0]
+        .candidates
+        .iter()
+        .position(|c| c.key.as_ref() == Some(&b))
+        .unwrap();
+    pending.apply(&f.ws, &[Some(choice)]).unwrap();
+    assert_eq!(
+        std::fs::read_link(f.dir.join("agent/review")).unwrap(),
+        f.ws.skill_path(&b)
+    );
+    let snap = f.ws.scan().unwrap();
+    let remove_a =
+        deploy::plan_undeploy(&f.ws, &snap, std::slice::from_ref(&a), &["sample".into()]).unwrap();
+    deploy::apply(&remove_a).unwrap();
+    assert_eq!(
+        std::fs::read_link(f.dir.join("agent/review")).unwrap(),
+        f.ws.skill_path(&b)
+    );
+    assert!(f.ws.skill_path(&a).is_dir());
+    first.cleanup();
+    second.cleanup();
+}
+
+#[test]
+fn local_name_changes_cannot_redefine_the_update_identity() {
+    let f = Fixture::new();
+    f.put("folder", "original", "v1");
+    f.commit();
+    let fetched = f.fetch("identity");
+    let key = fetched
+        .install(&f.ws, &["folder".into()], &BTreeMap::new())
+        .unwrap()
+        .remove(0);
+    fetched.cleanup();
+    std::fs::write(
+        f.ws.skill_path(&key).join("SKILL.md"),
+        "---\nname: renamed\n---\nlocal",
+    )
+    .unwrap();
+    f.put("folder", "renamed", "v2");
+    f.commit();
+    let before = f.ws.meta.load(&key).unwrap();
+    assert!(update::prepare(&f.ws, &f.ws.scan().unwrap(), &key).is_err());
+    assert_eq!(f.ws.meta.load(&key).unwrap(), before);
+}
+
+#[test]
+fn cross_scope_duplicate_is_a_warning_and_new_upstream_skills_are_not_installed() {
+    let f = Fixture::new();
+    f.put("original-folder", "review", "v1");
+    f.commit();
+    let fetched = f.fetch("scopes");
+    let keys = fetched
+        .install(&f.ws, &["original-folder".into()], &BTreeMap::new())
+        .unwrap();
+    fetched.cleanup();
+    skills::ops::targets::set_installed(&f.ws, &f.ws.config.agents[0], None, &keys, None, true)
+        .unwrap();
+    let project = f.dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let local = AgentConfig {
+        key: "sample-local".into(),
+        name: "Sample local".into(),
+        skills_dir: project.join(".agents/skills").display().to_string(),
+    };
+    let (message, _) =
+        skills::ops::targets::set_installed(&f.ws, &local, Some(&project), &keys, None, true)
+            .unwrap();
+    assert!(message.contains("warning:"), "{message}");
+    assert!(local.skills_path().join("review").is_symlink());
+    assert!(f.dir.join("agent/review").is_symlink());
+    f.put("original-folder", "review", "v2");
+    f.put("new-folder", "new-skill", "new");
+    f.commit();
+    let prepared = update::prepare(&f.ws, &f.ws.scan().unwrap(), &keys[0]).unwrap();
+    assert_eq!(prepared.new_skills, ["new-folder"]);
+    update::apply(&f.ws, &prepared, update::Take::Upstream, &BTreeMap::new()).unwrap();
+    assert_eq!(f.ws.scan().unwrap().skills.len(), 1);
+    for path in [
+        local.skills_path().join("review"),
+        f.dir.join("agent/review"),
+    ] {
+        assert_eq!(
+            skills::skill::SkillDoc::load(&path).unwrap().body.trim(),
+            "v2"
+        );
+    }
 }

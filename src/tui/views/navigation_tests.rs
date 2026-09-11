@@ -40,6 +40,74 @@ fn fixture(label: &str) -> Workspace {
 }
 
 #[test]
+fn create_empty_tag_then_add_members_with_shared_picker() {
+    let mut ws = fixture("tag-create");
+    let snap = ws.scan().unwrap();
+    let theme = Theme::default();
+    let ctx = Ctx {
+        ws: &ws,
+        snap: &snap,
+        theme: &theme,
+    };
+    let mut view = TagsView::default();
+    view.refresh(&ctx);
+    let Action::OpenModal(mut modal) = view.handle_key(key(KeyCode::Char('c')), &ctx).remove(0)
+    else {
+        panic!("create tag dialog")
+    };
+    modal.paste("empty", &ctx);
+    let Action::SubmitInput(actions) = modal.handle_key(key(KeyCode::Enter), &ctx).remove(0) else {
+        panic!("submit tag name")
+    };
+    for action in actions {
+        if let Action::WriteMeta(write) = action {
+            write(&ws).unwrap();
+        }
+    }
+    ws.config = Config::load(&ws.root).unwrap();
+    assert!(
+        ws.config
+            .tags
+            .iter()
+            .any(|t| t.name == "empty" && t.skills.is_empty())
+    );
+    let ctx = Ctx {
+        ws: &ws,
+        snap: &snap,
+        theme: &theme,
+    };
+    view.refresh(&ctx);
+    view.select("empty", &snap);
+    let Action::OpenModal(mut modal) = view.handle_key(key(KeyCode::Char('a')), &ctx).remove(0)
+    else {
+        panic!("member picker")
+    };
+    modal.paste("alpha", &ctx);
+    modal.handle_key(key(KeyCode::Down), &ctx);
+    modal.handle_key(key(KeyCode::Char(' ')), &ctx);
+    let Action::BatchMeta(write, _) = modal
+        .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctx)
+        .remove(0)
+    else {
+        panic!("apply member selection")
+    };
+    write(&ws).unwrap();
+    let config = Config::load(&ws.root).unwrap();
+    assert_eq!(
+        config
+            .tags
+            .iter()
+            .find(|t| t.name == "empty")
+            .unwrap()
+            .skills,
+        vec!["alpha"]
+    );
+    assert!(config.skill_tags("alpha").contains(&"team".into()));
+    assert!(config.skill_tags("beta").contains(&"other".into()));
+    std::fs::remove_dir_all(ws.root).unwrap();
+}
+
+#[test]
 fn tag_panel_filters_locally_and_batch_writes_exclude_hidden_selections() {
     let ws = fixture("tags");
     let snap = ws.scan().unwrap();
@@ -68,12 +136,10 @@ fn tag_panel_filters_locally_and_batch_writes_exclude_hidden_selections() {
         panic!("batch dialog")
     };
     modal.paste("reviewed", &ctx);
-    modal.handle_key(key(KeyCode::Enter), &ctx);
-    let actions = modal.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctx);
-    let Action::BatchMeta(write, keys) = actions.into_iter().next().unwrap() else {
+    let actions = modal.handle_key(key(KeyCode::Enter), &ctx);
+    let Action::WriteMeta(write) = actions.into_iter().next().unwrap() else {
         panic!("batch write")
     };
-    assert_eq!(keys, ["alpha"]);
     write(&ws).unwrap();
     let next = ws.scan().unwrap();
     assert!(next.get("alpha").unwrap().tags.contains(&"reviewed".into()));
@@ -109,6 +175,7 @@ fn filtered_preset_removal_preserves_other_members_and_central_skills() {
     view.paste("bndl", &ctx);
     view.handle_key(key(KeyCode::Enter), &ctx);
     view.handle_key(key(KeyCode::Right), &ctx);
+    view.handle_key(key(KeyCode::Right), &ctx); // Select team after other.
     view.handle_key(key(KeyCode::Char('/')), &ctx);
     view.paste("alpha", &ctx);
     view.handle_key(key(KeyCode::Enter), &ctx);

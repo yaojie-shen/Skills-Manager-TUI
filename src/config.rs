@@ -23,6 +23,8 @@ pub struct Config {
     pub deploy: DeployConfig,
     #[serde(default)]
     pub tags: Vec<TagConfig>,
+    #[serde(default = "default_true")]
+    pub tags_enabled: bool,
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
@@ -263,6 +265,8 @@ impl Default for DeployConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TagConfig {
+    #[serde(default)]
+    pub skills: Vec<String>,
     pub name: String,
     #[serde(default)]
     pub color: Option<String>,
@@ -288,6 +292,7 @@ impl Default for Config {
             agents: default_agents(),
             deploy: DeployConfig::default(),
             tags: Vec::new(),
+            tags_enabled: true,
             search: SearchConfig::default(),
             ui: UiConfig::default(),
         }
@@ -470,6 +475,49 @@ impl Config {
                 tables.get_mut(i).context("tag entry vanished")?["name"] = value(new);
             }
             Ok(true)
+        })
+    }
+
+    pub fn skill_tags(&self, key: &str) -> Vec<String> {
+        self.tags
+            .iter()
+            .filter(|t| t.skills.iter().any(|s| s == key))
+            .map(|t| t.name.clone())
+            .collect()
+    }
+
+    pub fn edit_tags(root: &Path, edit: impl FnOnce(&mut Vec<TagConfig>)) -> Result<()> {
+        let _lock = crate::meta::MetaStore::new(root).lock()?;
+        Self::edit_document(root, |doc| {
+            let mut config: Self = toml::from_str(&doc.to_string())?;
+            edit(&mut config.tags);
+            for tag in &mut config.tags {
+                tag.skills.sort();
+                tag.skills.dedup();
+            }
+            let updated = toml::to_string(&config)?.parse::<DocumentMut>()?;
+            doc["tags"] = updated["tags"].clone();
+            Ok(true)
+        })
+    }
+
+    pub fn set_tags_enabled(root: &Path, enabled: bool) -> Result<()> {
+        Self::edit_document(root, |doc| {
+            doc["tags_enabled"] = value(enabled);
+            Ok(true)
+        })
+    }
+
+    pub fn rename_tag_skill(root: &Path, old: &str, new: Option<&str>) -> Result<()> {
+        Self::edit_tags(root, |tags| {
+            for tag in tags {
+                if tag.skills.iter().any(|s| s == old) {
+                    tag.skills.retain(|s| s != old);
+                    if let Some(new) = new {
+                        tag.skills.push(new.to_string());
+                    }
+                }
+            }
         })
     }
 

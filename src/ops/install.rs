@@ -189,25 +189,9 @@ pub fn default_name(r: &InstallRef, fetched: &Fetched) -> String {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        InstallRef::Git { url, subpath, .. } => match subpath {
-            Some(s) if !s.is_empty() => Path::new(s)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            _ => {
-                let doc = SkillDoc::load(&fetched.skill_dir).ok();
-                doc.map(|d| d.name)
-                    .filter(|n| crate::util::valid_skill_key(n))
-                    .unwrap_or_else(|| {
-                        url.trim_end_matches('/')
-                            .trim_end_matches(".git")
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or("skill")
-                            .to_string()
-                    })
-            }
-        },
+        InstallRef::Git { .. } => SkillDoc::load(&fetched.skill_dir)
+            .map(|doc| doc.name)
+            .unwrap_or_default(),
     }
 }
 
@@ -275,14 +259,17 @@ pub fn install(ws: &Workspace, r: &InstallRef, name: Option<&str>) -> Result<Str
                 .with_context(|| format!("placing {}", dest.display()))?;
         }
         let meta = SkillMeta {
-            schema: crate::meta::SCHEMA,
-            tags: Vec::new(),
             note: None,
+            installed_name: Some(SkillDoc::load(&dest)?.name),
             source: Some(fetched.source.clone()),
-            baseline: Some(Baseline {
-                hash: hash_directory(&dest)?,
-                hash_algo: HASH_ALGO,
-            }),
+            baseline: if matches!(fetched.source, Source::Git { .. }) {
+                Some(Baseline {
+                    hash: hash_directory(&dest)?,
+                    hash_algo: HASH_ALGO,
+                })
+            } else {
+                None
+            },
         };
         ws.meta.save(&key, &meta)?;
         Ok(key.clone())
@@ -311,12 +298,7 @@ pub fn adopt(ws: &Workspace, path: &Path, name: Option<&str>) -> Result<String> 
             bail!("{key} already has metadata");
         }
         let meta = SkillMeta {
-            schema: crate::meta::SCHEMA,
             source: Some(Source::Local { path: None }),
-            baseline: Some(Baseline {
-                hash: hash_directory(&dest)?,
-                hash_algo: HASH_ALGO,
-            }),
             ..Default::default()
         };
         ws.meta.save(&key, &meta)?;
@@ -340,13 +322,8 @@ pub fn adopt(ws: &Workspace, path: &Path, name: Option<&str>) -> Result<String> 
         std::os::unix::fs::symlink(&dest, &path)?;
     }
     let meta = SkillMeta {
-        schema: crate::meta::SCHEMA,
         source: Some(Source::Local {
             path: Some(crate::paths::contract_tilde(&path)),
-        }),
-        baseline: Some(Baseline {
-            hash: hash_directory(&dest)?,
-            hash_algo: HASH_ALGO,
         }),
         ..Default::default()
     };
@@ -356,6 +333,10 @@ pub fn adopt(ws: &Workspace, path: &Path, name: Option<&str>) -> Result<String> 
 
 /// Change the recorded source of a skill without touching its content.
 pub fn set_source(ws: &Workspace, key: &str, r: &InstallRef) -> Result<SkillMeta> {
+    anyhow::ensure!(
+        matches!(r, InstallRef::Git { .. }),
+        "Only repository upstream sources are recorded"
+    );
     let mut meta = crate::ops::edit::load_or_init(ws, key)?;
     meta.source = Some(match r {
         InstallRef::Local(p) => Source::Local {

@@ -10,8 +10,11 @@ mod batch;
 mod deploy_picker;
 mod event;
 mod icons;
+#[cfg(test)]
+mod latency_bench;
 mod markdown;
 mod modal;
+mod name_choices;
 mod repository_picker;
 mod theme;
 mod toast;
@@ -32,10 +35,7 @@ type Term = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout
 
 pub fn run(ws: skills::Workspace, launch_dir: Option<&std::path::Path>) -> Result<()> {
     let (tx, rx) = mpsc::channel();
-    let mut app = app::App::new(ws, tx.clone())?;
-    if let Some(start) = launch_dir {
-        app.set_launch_directory(start)?;
-    }
+    let mut app = app::App::new_with_launch_directory(ws, tx.clone(), launch_dir)?;
 
     install_panic_hook();
     let mut terminal = enter()?;

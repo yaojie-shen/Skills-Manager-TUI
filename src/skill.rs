@@ -39,6 +39,16 @@ impl SkillDoc {
         if name.is_empty() {
             bail!("frontmatter has no `name`");
         }
+        if name.len() > 64
+            || !name
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+            || name.starts_with('-')
+            || name.ends_with('-')
+            || name.contains("--")
+        {
+            bail!("invalid skill name: use 1–64 lowercase letters, digits and single hyphens");
+        }
         Ok(Self {
             key,
             path: dir.to_path_buf(),

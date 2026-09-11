@@ -63,8 +63,11 @@ pub fn frame_styled(f: &mut Frame, cell: Rect, border: Style) -> Rect {
 /// Text colour that stays legible on a filled pill.
 pub fn ink(fill: Color) -> Color {
     match fill {
-        Color::DarkGray | Color::Black | Color::Blue | Color::Red | Color::Magenta => Color::White,
-        _ => Color::Black,
+        Color::Rgb(r, g, b) if 299 * r as u32 + 587 * g as u32 + 114 * (b as u32) < 128_000 => {
+            Color::Rgb(255, 255, 255)
+        }
+        Color::DarkGray | Color::Black | Color::Blue | Color::Red => Color::Rgb(255, 255, 255),
+        _ => Color::Rgb(20, 20, 20),
     }
 }
 
@@ -79,6 +82,16 @@ pub fn tag_fill(name: &str, ctx: &Ctx) -> Color {
         .and_then(|t| t.color.as_deref())
         .and_then(|c| c.parse::<Color>().ok())
         .unwrap_or(ctx.theme.tag)
+}
+
+/// Shared capsule rendering, including configured end caps and readable text.
+pub fn pill(body: String, fill: Color, ctx: &Ctx) -> Vec<Span<'static>> {
+    let (left, right) = ctx.ws.config.ui.pill_caps.glyphs();
+    vec![
+        Span::styled(left, Style::default().fg(fill)),
+        Span::styled(body, Style::default().bg(fill).fg(ink(fill))),
+        Span::styled(right, Style::default().fg(fill)),
+    ]
 }
 
 /// Tags as capsules, as many as fit in `max_w`, then a count for the rest. A
@@ -111,9 +124,7 @@ pub fn tag_pills(tags: &[String], ctx: &Ctx, max_w: usize) -> Vec<Span<'static>>
         if i > 0 {
             out.push(Span::raw(" "));
         }
-        out.push(Span::styled(lcap.to_string(), Style::default().fg(fill)));
-        out.push(Span::styled(body, Style::default().bg(fill).fg(ink(fill))));
-        out.push(Span::styled(rcap.to_string(), Style::default().fg(fill)));
+        out.extend(pill(body, fill, ctx));
         used += w;
     }
     out
@@ -153,9 +164,9 @@ pub fn checkbox_marker(checked: bool, th: &Theme) -> Span<'static> {
 pub fn health_marker(r: &SkillRecord, th: &Theme) -> Span<'static> {
     use skills::reconcile::SkillStatus::*;
     let (glyph, style) = match &r.status {
-        Managed { no_baseline: false } => ("●   ", th.ok()),
-        Managed { no_baseline: true } => ("●   ", th.warn()),
-        Unmanaged => ("○   ", th.dim()),
+        Local | Repository => ("●   ", th.ok()),
+        MissingBaseline => ("●   ", th.warn()),
+        MissingSource => ("!   ", th.warn()),
         Modified => ("~   ", th.warn()),
         Missing | Invalid { .. } | CorruptMeta { .. } => ("!   ", th.err()),
         Renamed { .. } => ("!   ", th.warn()),
@@ -229,6 +240,7 @@ pub fn skill_card(
     body: Option<&str>,
     tail: &str,
     terms: &[String],
+    show_tags: bool,
 ) -> Vec<Line<'static>> {
     let th = ctx.theme;
     let source = repository_badge(r, ctx.ws.config.ui.icons)
@@ -254,7 +266,7 @@ pub fn skill_card(
             .unwrap_or("No description"),
         inner_w,
     );
-    let tags_budget = if r.tags.is_empty() { 0 } else { inner_w / 2 };
+    let tags_budget = if show_tags { inner_w / 2 } else { 0 };
     let pills = tag_pills(&r.tags, ctx, tags_budget);
     let pills_w: usize = pills.iter().map(|s| width(&s.content)).sum();
     let source_budget = inner_w.saturating_sub(pills_w + usize::from(pills_w > 0));
@@ -333,8 +345,8 @@ mod tests {
         };
         let mut record = snap.get(key).unwrap().clone();
         for status in [
-            skills::reconcile::SkillStatus::Managed { no_baseline: false },
-            skills::reconcile::SkillStatus::Unmanaged,
+            skills::reconcile::SkillStatus::Repository,
+            skills::reconcile::SkillStatus::MissingSource,
             skills::reconcile::SkillStatus::Modified,
             skills::reconcile::SkillStatus::Missing,
         ] {
@@ -349,7 +361,7 @@ mod tests {
             assert_eq!(marker.width(), MARKER_W);
             assert!(marker.content.ends_with("] "));
         }
-        let lines = skill_card(&record, &ctx, 60, None, "name", &[]);
+        let lines = skill_card(&record, &ctx, 60, None, "name", &[], true);
         assert!(lines[0].to_string().contains("mock-calendar"));
         assert!(!lines[0].to_string().contains("skills--"));
         assert!(lines[3].to_string().contains("󰊤 sampleorg/kit"));
@@ -380,14 +392,11 @@ mod tests {
                 .any(|line| line.to_string().contains("≠ directory name"))
         );
         assert_eq!(record.key, key);
-        assert_eq!(
-            record.deployment_name(),
-            "sampleorg--kit--skills--mock-calendar"
-        );
+        assert_eq!(record.deployment_name(), "skills--mock-calendar");
         record.name = Some("中文日历".into());
         record.tags = vec!["A very long tag".into(), "中文标签".into(), "third".into()];
         for width in [0, 1, 2, 3, 8, 16, 24, 40, 80] {
-            for line in skill_card(&record, &ctx, width, None, "git", &[]) {
+            for line in skill_card(&record, &ctx, width, None, "git", &[], true) {
                 assert!(line.width() <= width);
             }
         }

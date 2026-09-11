@@ -37,6 +37,22 @@ impl PresetStore {
         self.dir.join(format!("{name}.toml"))
     }
 
+    /// Check the stored spelling, even on a case-insensitive filesystem.
+    pub fn contains_name(&self, name: &str) -> Result<bool> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let filename = format!("{name}.toml");
+        for entry in entries {
+            if entry?.file_name() == filename.as_str() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn load(&self, name: &str) -> Result<Option<Preset>> {
         let path = self.path(name);
         match std::fs::read_to_string(&path) {
@@ -101,14 +117,24 @@ impl PresetStore {
         let mut p = self
             .load(old)?
             .with_context(|| format!("no such preset: {old}"))?;
-        if self.path(new).exists() {
+        let aliases_old = old != new
+            && old.eq_ignore_ascii_case(new)
+            && self.path(new).exists()
+            && !self.contains_name(new)?;
+        if self.path(new).exists() && !aliases_old {
             bail!("preset {new} already exists");
         }
         p.name = new.to_string();
         // `save` refuses an invalid name, and does so before the old file
         // goes, so a bad name loses nothing.
         self.save(&p)?;
-        self.remove(old)?;
+        // Atomic replacement can retain the existing filename's spelling.
+        // Rename that entry explicitly; removing `old` would delete the result.
+        if aliases_old {
+            std::fs::rename(self.path(old), self.path(new))?;
+        } else {
+            self.remove(old)?;
+        }
         Ok(p)
     }
 }
