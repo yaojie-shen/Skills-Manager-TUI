@@ -1,12 +1,12 @@
 //! Tags tab: the tags themselves, and a look at what carries each one.
 //!
 //! Each pane filters its own collection. A tag can be edited directly: renamed, merged into another,
-//! deleted, given a colour. The left column is one row per tag, drawn as the
-//! same capsule the cards use so a colour is seen where it is set; the right
+//! deleted, given a colour. The left column uses spaced text rows with colour
+//! markers; the right
 //! pane is the skills under the selected tag, as the cards the search and
 //! presets pages use, so a skill reads the same wherever it turns up.
 
-use super::cards::{self, CARD_H, cols_for, frame, skill_card, tag_fill, tag_pills};
+use super::cards::{self, CARD_H, cols_for, frame, skill_card, tag_fill};
 use super::preview::Overlay;
 use super::{View, split_panes, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
@@ -448,7 +448,7 @@ impl TagsView {
             width: inner.width.saturating_sub(1),
             ..inner
         };
-        self.list.layout(content, 1, 1, 0, self.rows.len());
+        self.list.layout(content, 1, 2, 0, self.rows.len());
         let selected = self.list.selected();
         let w = content.width as usize;
         for i in self.list.visible() {
@@ -460,18 +460,24 @@ impl TagsView {
             let count = count.to_string();
             let count_w = width(&count).max(3);
             // The count sits at the right edge; whatever is left after the
-            // marker and the count goes to the pill and the description.
+            // marker and the count goes to the name and the description.
             let body_w = w.saturating_sub(2 + count_w + 1);
             let mut spans = vec![Span::styled(if on { "▸ " } else { "  " }, th.accent())];
             let mut used = 0;
             if tag == UNTAGGED {
                 let s = fit(UNTAGGED, body_w);
                 used += width(&s);
-                spans.push(Span::styled(s, th.dim()));
+                spans.push(Span::raw(s));
             } else {
-                let pills = tag_pills(std::slice::from_ref(tag), ctx, body_w);
-                used += pills.iter().map(|s| width(&s.content)).sum::<usize>();
-                spans.extend(pills);
+                let marker = fit("● ", body_w);
+                used += width(&marker);
+                spans.push(Span::styled(
+                    marker,
+                    Style::default().fg(tag_fill(tag, ctx)),
+                ));
+                let name = fit(tag, body_w.saturating_sub(used));
+                used += width(&name);
+                spans.push(Span::raw(name));
                 let desc = ctx
                     .ws
                     .config
@@ -488,7 +494,7 @@ impl TagsView {
                 }
             }
             spans.push(Span::raw(" ".repeat(body_w.saturating_sub(used) + 1)));
-            spans.push(Span::styled(pad(&count, count_w), th.dim()));
+            spans.push(Span::raw(pad(&count, count_w)));
             let style = if on && focused {
                 th.selected()
             } else if on {
@@ -496,7 +502,10 @@ impl TagsView {
             } else {
                 Style::default()
             };
-            f.render_widget(Paragraph::new(Line::from(spans)).style(style), cell);
+            f.render_widget(
+                Paragraph::new(Line::from(spans)).style(style),
+                Rect { height: 1, ..cell },
+            );
         }
         draw_track(f, inner, &self.list, selected, &mut self.list_track, th);
     }

@@ -63,8 +63,11 @@ pub fn frame_styled(f: &mut Frame, cell: Rect, border: Style) -> Rect {
 /// Text colour that stays legible on a filled pill.
 pub fn ink(fill: Color) -> Color {
     match fill {
-        Color::DarkGray | Color::Black | Color::Blue | Color::Red | Color::Magenta => Color::White,
-        _ => Color::Black,
+        Color::Rgb(r, g, b) if 299 * r as u32 + 587 * g as u32 + 114 * (b as u32) < 128_000 => {
+            Color::Rgb(255, 255, 255)
+        }
+        Color::DarkGray | Color::Black | Color::Blue | Color::Red => Color::Rgb(255, 255, 255),
+        _ => Color::Rgb(20, 20, 20),
     }
 }
 
