@@ -23,6 +23,7 @@ impl Fixture {
         std::fs::create_dir_all(&root).unwrap();
         let root = std::fs::canonicalize(root).unwrap();
         let cfg = Config {
+            tags_enabled: true,
             schema: 1,
             agents: vec![AgentConfig {
                 key: "a".into(),
@@ -92,11 +93,7 @@ fn step(ws: &Workspace, log: &mut History, undo: bool) -> String {
 }
 
 fn tags(ws: &Workspace, key: &str) -> Vec<String> {
-    ws.meta
-        .load(key)
-        .unwrap()
-        .map(|m| m.tags)
-        .unwrap_or_default()
+    Config::load(&ws.root).unwrap().skill_tags(key)
 }
 
 fn note(ws: &Workspace, key: &str) -> Option<String> {
@@ -115,6 +112,22 @@ fn tag_set(ws: &Workspace, log: &mut History, key: &str, tags: &[&str]) {
 }
 
 fn note_set(ws: &Workspace, log: &mut History, key: &str, text: Option<&str>) {
+    if ws.meta.load(key).unwrap().is_none() {
+        ws.meta
+            .save(
+                key,
+                &skills::meta::SkillMeta {
+                    source: Some(Source::Git {
+                        url: "https://example.com/repo".into(),
+                        branch: None,
+                        subpath: Some(key.into()),
+                        revision: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
     let (_, intent) = history::note_edit(ws, key, text).unwrap();
     if let Some(intent) = intent {
         log.record(intent);
@@ -370,8 +383,8 @@ fn undoing_a_tag_rename_carries_the_colour_entry_back() {
     assert_eq!(tags(&ws, "printer"), ["stationery"]);
     assert_eq!(
         names(&ws),
-        ["office"],
-        "office kept its entry; stationery's is gone for good"
+        ["office", "stationery"],
+        "undo restores the source group membership without stealing the target color"
     );
 }
 
@@ -562,8 +575,8 @@ fn setting_a_source_goes_back_and_forth_with_its_revision() {
     step(&ws, &mut log, true);
     assert_eq!(source(&ws, "bicycle"), None);
     assert!(
-        ws.meta.exists("bicycle"),
-        "the file stays; only the source went"
+        !ws.meta.exists("bicycle"),
+        "removing the upstream returns to a local skill without metadata"
     );
 }
 

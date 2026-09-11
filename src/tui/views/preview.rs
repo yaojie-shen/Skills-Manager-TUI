@@ -266,19 +266,21 @@ fn record_lines<'a>(
         Span::raw(" "),
         Span::styled(status_text(&r.status), th.dim()),
     ])];
-    let mut tag_line = vec![Span::styled(format!("{:<9}", "tags"), th.dim())];
-    if r.tags.is_empty() {
-        tag_line.push(Span::styled("none", th.dim()));
-    } else {
-        for t in &r.tags {
-            tag_line.push(Span::styled(
-                format!(" {t} "),
-                th.tag().bg(ctx.theme.selection_bg),
-            ));
-            tag_line.push(Span::raw(" "));
+    if ctx.ws.config.tags_enabled {
+        let mut tag_line = vec![Span::styled(format!("{:<9}", "tags"), th.dim())];
+        if r.tags.is_empty() {
+            tag_line.push(Span::styled("none", th.dim()));
+        } else {
+            for t in &r.tags {
+                tag_line.push(Span::styled(
+                    format!(" {t} "),
+                    th.tag().bg(ctx.theme.selection_bg),
+                ));
+                tag_line.push(Span::raw(" "));
+            }
         }
+        lines.push(Line::from(tag_line));
     }
-    lines.push(Line::from(tag_line));
     let mut dep = vec![Span::styled(format!("{:<9}", "deploy"), th.dim())];
     for a in &ctx.snap.agents {
         let (txt, style) = match r.deploy.get(&a.key) {
@@ -301,7 +303,7 @@ fn record_lines<'a>(
         r.source
             .as_ref()
             .map(|s| crate::tui::icons::source(ctx.ws.config.ui.icons, s))
-            .unwrap_or_else(|| "none".into()),
+            .unwrap_or_else(|| r.source_kind().into()),
         th,
     ));
     if r.external {

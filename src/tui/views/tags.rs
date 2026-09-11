@@ -1,6 +1,6 @@
 //! Tags tab: the tags themselves, and a look at what carries each one.
 //!
-//! Each pane filters its own collection. A tag can be managed directly: renamed, merged into another,
+//! Each pane filters its own collection. A tag can be edited directly: renamed, merged into another,
 //! deleted, given a colour. The left column is one row per tag, drawn as the
 //! same capsule the cards use so a colour is seen where it is set; the right
 //! pane is the skills under the selected tag, as the cards the search and

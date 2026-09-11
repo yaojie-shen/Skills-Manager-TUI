@@ -440,22 +440,11 @@ impl MetaChange {
                 added,
                 removed,
             } => {
-                let mut meta = edit::load_or_init(ws, skill)?;
-                meta.tags.retain(|t| !removed.contains(t));
-                for t in added {
-                    if !meta.tags.contains(t) {
-                        meta.tags.push(t.clone());
-                    }
-                }
-                ws.meta.save(skill, &meta)?;
-                Ok(format!(
-                    "{skill}: {}",
-                    if meta.tags.is_empty() {
-                        "no tags".to_string()
-                    } else {
-                        meta.tags.join(", ")
-                    }
-                ))
+                let mut tags = Config::load(&ws.root)?.skill_tags(skill);
+                tags.retain(|t| !removed.contains(t));
+                tags.extend(added.iter().filter(|t| !removed.contains(t)).cloned());
+                let tags = edit::tag_set(ws, skill, &tags)?;
+                Ok(format!("{skill}: {}", tags.join(", ")))
             }
             MetaChange::TagEntry { from, to } => {
                 Config::rename_tag_entry(&ws.root, from, to)?;
@@ -533,10 +522,8 @@ impl MetaChange {
 /// The tags a skill carries now, or `None` if neither its metadata nor its
 /// directory is there any more.
 fn current_tags(ws: &Workspace, skill: &str) -> Result<Option<Vec<String>>> {
-    match ws.meta.load(skill).ok().flatten() {
-        Some(m) => Ok(Some(m.tags)),
-        None => Ok(ws.skill_path(skill).is_dir().then(Vec::new)),
-    }
+    let tags = Config::load(&ws.root)?.skill_tags(skill);
+    Ok((ws.skill_path(skill).is_dir() || !tags.is_empty()).then_some(tags))
 }
 
 /// The note a skill carries now. The outer `None` is "no such skill", the inner
@@ -642,12 +629,10 @@ fn tag_entry_names(ws: &Workspace) -> Result<Vec<String>> {
 }
 
 fn all_tags(ws: &Workspace) -> Result<BTreeMap<String, Vec<String>>> {
-    let mut out = BTreeMap::new();
-    for key in ws.meta.list_keys()? {
-        // A metadata file too broken to read is also one this tool must never
-        // rewrite, so keep it out of the comparison entirely.
-        if let Some(m) = ws.meta.load(&key).ok().flatten() {
-            out.insert(key, m.tags);
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for tag in Config::load(&ws.root)?.tags {
+        for key in tag.skills {
+            out.entry(key).or_default().push(tag.name.clone());
         }
     }
     Ok(out)

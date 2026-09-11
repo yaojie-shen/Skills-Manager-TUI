@@ -259,7 +259,6 @@ pub fn install(ws: &Workspace, r: &InstallRef, name: Option<&str>) -> Result<Str
                 .with_context(|| format!("placing {}", dest.display()))?;
         }
         let meta = SkillMeta {
-            tags: Vec::new(),
             note: None,
             installed_name: Some(SkillDoc::load(&dest)?.name),
             source: Some(fetched.source.clone()),
@@ -334,6 +333,10 @@ pub fn adopt(ws: &Workspace, path: &Path, name: Option<&str>) -> Result<String> 
 
 /// Change the recorded source of a skill without touching its content.
 pub fn set_source(ws: &Workspace, key: &str, r: &InstallRef) -> Result<SkillMeta> {
+    anyhow::ensure!(
+        matches!(r, InstallRef::Git { .. }),
+        "Only repository upstream sources are recorded"
+    );
     let mut meta = crate::ops::edit::load_or_init(ws, key)?;
     meta.source = Some(match r {
         InstallRef::Local(p) => Source::Local {

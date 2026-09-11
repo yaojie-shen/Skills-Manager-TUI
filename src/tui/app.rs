@@ -44,6 +44,12 @@ impl Tab {
         Tab::Health,
         Tab::Repos,
     ];
+    pub fn visible(tags_enabled: bool) -> Vec<Tab> {
+        Self::ALL
+            .into_iter()
+            .filter(|t| tags_enabled || *t != Tab::Tags)
+            .collect()
+    }
     pub fn title(self) -> &'static str {
         match self {
             Tab::Search => "Library",
@@ -53,9 +59,6 @@ impl Tab {
             Tab::Health => "Health",
             Tab::Repos => "Repos",
         }
-    }
-    pub fn index(self) -> usize {
-        Tab::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
 }
 
@@ -720,14 +723,14 @@ impl App {
             if self.modal.is_some() || (self.tab == Tab::Tags && self.tags.dialog_open()) {
                 return vec![];
             }
+            let tabs = Tab::visible(self.ws.config.tags_enabled);
+            let index = tabs.iter().position(|t| *t == self.tab).unwrap_or(0);
             let delta = if k.code == KeyCode::Tab {
                 1
             } else {
-                Tab::ALL.len() - 1
+                tabs.len() - 1
             };
-            return vec![Action::SwitchTab(
-                Tab::ALL[(self.tab.index() + delta) % Tab::ALL.len()],
-            )];
+            return vec![Action::SwitchTab(tabs[(index + delta) % tabs.len()])];
         }
         if let Some(m) = self.modal.as_mut() {
             return m.handle_key(k, &ctx);
@@ -767,12 +770,23 @@ impl App {
             (KeyCode::Char('R'), _) if !in_search_input => {
                 return vec![Action::OpenModal(Box::new(Modal::repositories(&ctx)))];
             }
+            (KeyCode::F(2), _) => {
+                let enabled = !self.ws.config.tags_enabled;
+                return vec![Action::OpenModal(Box::new(Modal::confirm_write(
+                    "Settings · Tags".into(),
+                    vec![format!("Tags: {} → {}", !enabled, enabled), "Hide or show tag classification throughout the interface. Existing data and preset membership are preserved.".into()],
+                    Box::new(move |ws| { skills::config::Config::set_tags_enabled(&ws.root, enabled)?; Ok(format!("Tags {}", if enabled { "enabled" } else { "disabled" })) })
+                )))];
+            }
             (KeyCode::F(1), _) => return vec![Action::OpenModal(Box::new(Modal::help()))],
             (KeyCode::Char('?'), _) if !in_search_input => {
                 return vec![Action::OpenModal(Box::new(Modal::help()))];
             }
             (KeyCode::Char(c @ '1'..='6'), KeyModifiers::NONE) if !in_search_input => {
-                return vec![Action::SwitchTab(Tab::ALL[(c as u8 - b'1') as usize])];
+                return Tab::visible(self.ws.config.tags_enabled)
+                    .get((c as u8 - b'1') as usize)
+                    .map(|t| vec![Action::SwitchTab(*t)])
+                    .unwrap_or_default();
             }
             _ => {}
         }
@@ -1061,6 +1075,11 @@ impl App {
     /// changes: a key for the tab already showing is not a return to it, and
     /// must not throw away a focus the user has just set.
     fn switch_tab(&mut self, t: Tab) {
+        let t = if t == Tab::Tags && !self.ws.config.tags_enabled {
+            Tab::Search
+        } else {
+            t
+        };
         if t == self.tab {
             return;
         }
@@ -1208,6 +1227,9 @@ impl App {
         match self.ws.load_config() {
             Ok(config) => {
                 self.ws.config = config;
+                if !self.ws.config.tags_enabled && self.tab == Tab::Tags {
+                    self.tab = Tab::Search;
+                }
                 if let Err(e) = Self::discover_local_agents(&mut self.ws) {
                     self.toast(format!("{e:#}"), Level::Error);
                 }
@@ -1265,7 +1287,7 @@ impl App {
         let mut spans: Vec<Span> = vec![Span::styled(" skills ", th.bold().fg(th.accent))];
         self.tab_rects.clear();
         let mut x = area.x + width(" skills ") as u16;
-        for (i, t) in Tab::ALL.iter().enumerate() {
+        for (i, t) in Tab::visible(self.ws.config.tags_enabled).iter().enumerate() {
             let label = format!(" {} {} ", i + 1, t.title());
             let style = if *t == self.tab {
                 th.selected().fg(th.accent)
@@ -1321,6 +1343,9 @@ impl App {
         let mut spans: Vec<Span> = Vec::new();
         let mut hint_w = 0usize;
         for (key, desc) in hints {
+            if !self.ws.config.tags_enabled && *key == "t" {
+                continue;
+            }
             let piece_w = width(key) + width(desc) + 3;
             if hint_w + piece_w + 1 > area.width as usize {
                 break;
@@ -1467,7 +1492,12 @@ mod matrix_key_tests {
             app.snap.get("old").unwrap().status,
             skills::reconcile::SkillStatus::Missing
         );
-        assert_eq!(app.ws.meta.load("old").unwrap().unwrap().tags, vec!["keep"]);
+        assert_eq!(
+            skills::config::Config::load(&app.ws.root)
+                .unwrap()
+                .skill_tags("old"),
+            vec!["keep"]
+        );
         app.last_root_poll = std::time::Instant::now() - std::time::Duration::from_secs(3);
         app.handle(Msg::Tick);
         let id = app.next_task_id;

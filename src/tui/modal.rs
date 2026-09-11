@@ -1058,7 +1058,14 @@ impl Modal {
             Modal::Repository(p) => p.draw(f, area, ctx),
             Modal::DeployTargets(p) => p.draw(f, area, ctx),
             Modal::Help { scroll } => {
-                let lines: Vec<Line> = HELP.lines().map(|l| help_line(l, th)).collect();
+                let lines: Vec<Line> = HELP
+                    .lines()
+                    .filter(|l| {
+                        ctx.ws.config.tags_enabled
+                            || (!l.to_lowercase().contains("tag") && !l.starts_with("  t "))
+                    })
+                    .map(|l| help_line(l, th))
+                    .collect();
                 let r = centered(area, 78, lines.len() as u16 + 2);
                 f.render_widget(Clear, r);
                 f.render_widget(
@@ -1487,10 +1494,10 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
                     edit::tag_set(ws, &skill, &tags).map(|m| {
                         format!(
                             "{skill}: {}",
-                            if m.tags.is_empty() {
+                            if m.is_empty() {
                                 "no tags".into()
                             } else {
-                                m.tags.join(", ")
+                                m.join(", ")
                             }
                         )
                     })
@@ -1657,8 +1664,9 @@ fn help_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
 }
 
 const HELP: &str = "Library
+  F2                settings
   type              fuzzy search over name, tags, description, note
-  tag:x agent:y     filters; also status:managed  source:git  untagged
+  tag:x agent:y     filters; also status:modified  source:repository  untagged
   Enter             accept a suggestion / open results / preview
   arrows            navigate panels and lists (Esc goes back)
   i                 install a skill from a repo or a local path

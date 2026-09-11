@@ -1,4 +1,4 @@
-//! Local metadata in local.toml; repository identity and skills in repos/<alias>.toml.
+//! Repository metadata only; local skills do not have metadata records.
 //!
 //! Reading uses serde; writing goes through `toml_edit` so that comments and
 //! key order written by hand survive round trips.
@@ -12,8 +12,6 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SkillMeta {
-    #[serde(default)]
-    pub tags: Vec<String>,
     #[serde(default)]
     pub note: Option<String>,
     /// Declared name captured at installation; directory aliases are independent.
@@ -109,7 +107,7 @@ impl MetaStore {
     pub fn path(&self, key: &str) -> PathBuf {
         match crate::repository::alias_of(key) {
             Some(alias) => self.dir.join("repos").join(format!("{alias}.toml")),
-            None => self.dir.join("local.toml"),
+            None => self.dir.join("repos/.root.toml"),
         }
     }
     fn entry(key: &str) -> &str {
@@ -170,16 +168,25 @@ impl MetaStore {
         if !matches!(meta.source, Some(Source::Git { .. })) {
             meta.baseline = None;
         }
+        if crate::repository::alias_of(key).is_none()
+            && !matches!(meta.source, Some(Source::Git { .. }))
+        {
+            return Ok(None);
+        }
         Ok(Some(meta))
     }
     pub fn list_keys(&self) -> Result<Vec<String>> {
-        let mut files = vec![(self.dir.join("local.toml"), String::new())];
+        let mut files = Vec::new();
         let repos = self.dir.join("repos");
         if repos.is_dir() {
             for entry in std::fs::read_dir(repos)? {
                 let path = entry?.path();
                 if path.is_file() && path.extension().is_some_and(|e| e == "toml") {
                     let alias = path.file_stem().unwrap().to_string_lossy();
+                    if alias == ".root" {
+                        files.push((path.clone(), String::new()));
+                        continue;
+                    }
                     anyhow::ensure!(
                         crate::util::valid_skill_key(&alias),
                         "invalid repository alias"
@@ -262,6 +269,11 @@ impl MetaStore {
     }
     pub fn save(&self, key: &str, meta: &SkillMeta) -> Result<()> {
         crate::ops::require_key(key)?;
+        if crate::repository::alias_of(key).is_none()
+            && !matches!(meta.source, Some(Source::Git { .. }))
+        {
+            return self.remove(key);
+        }
         let _lock = self.lock()?;
         let path = self.path(key);
         let mut doc = Self::read(&path)?;
@@ -341,6 +353,12 @@ mod tests {
                             &format!("skill-{i}"),
                             &SkillMeta {
                                 note: Some(format!("note-{i}")),
+                                source: Some(Source::Git {
+                                    url: "https://example.com/repo".into(),
+                                    branch: None,
+                                    subpath: None,
+                                    revision: None,
+                                }),
                                 ..Default::default()
                             },
                         )
@@ -420,11 +438,13 @@ mod tests {
     #[test]
     fn deployment_registry_is_not_a_skill() {
         let tmp = std::env::temp_dir().join(format!("skills-meta-registry-{}", std::process::id()));
-        std::fs::create_dir_all(tmp.join(".skills-meta")).unwrap();
+        std::fs::create_dir_all(tmp.join(".skills-meta/repos")).unwrap();
         let store = MetaStore::new(&tmp);
         std::fs::write(store.dir.join("deployment-targets.toml"), "agents = []\n").unwrap();
-        store.save("example", &SkillMeta::default()).unwrap();
-        assert_eq!(store.list_keys().unwrap(), vec!["example"]);
+        store
+            .save("repos/demo/example", &SkillMeta::default())
+            .unwrap();
+        assert_eq!(store.list_keys().unwrap(), vec!["repos/demo/example"]);
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
@@ -432,21 +452,29 @@ mod tests {
     fn roundtrip_preserves_comments() {
         let tmp = std::env::temp_dir().join(format!("skills-meta-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join(".skills-meta")).unwrap();
+        std::fs::create_dir_all(tmp.join(".skills-meta/repos")).unwrap();
         let store = MetaStore::new(&tmp);
         std::fs::write(
             store.path("foo"),
-            "# hand written comment\n[skills.foo]\ntags = [\"a\"]\nnote = \"hi\"\n",
+            "# hand written comment\n[skills.foo]\nnote = \"hi\"\n",
         )
         .unwrap();
+        let mut doc = MetaStore::read(&store.path("foo")).unwrap();
+        doc["skills"]["foo"]["source"] = toml_edit::Item::Table({
+            let mut t = Table::new();
+            t["type"] = value("git");
+            t["url"] = value("https://example.com/repo");
+            t
+        });
+        std::fs::write(store.path("foo"), doc.to_string()).unwrap();
         let mut meta = store.load("foo").unwrap().unwrap();
-        meta.tags.push("b".into());
+        meta.note = Some("updated".into());
         store.save("foo", &meta).unwrap();
         let text = std::fs::read_to_string(store.path("foo")).unwrap();
         assert!(text.contains("# hand written comment"));
-        assert!(text.contains("\"b\""));
+        assert!(text.contains("updated"));
         let again = store.load("foo").unwrap().unwrap();
-        assert_eq!(again.tags, vec!["a", "b"]);
+        assert_eq!(again.note.as_deref(), Some("updated"));
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 }

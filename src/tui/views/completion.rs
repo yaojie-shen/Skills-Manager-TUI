@@ -50,11 +50,16 @@ impl Completion {
                 .chain(ctx.ws.config.tags.iter().map(|t| t.name.clone()))
                 .collect(),
             Some(("agent", _)) => ctx.snap.agents.iter().map(|a| a.key.clone()).collect(),
+            Some(("source", _)) => ["local", "repository"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
             Some(("status", _)) => [
                 "local",
-                "managed",
+                "repository",
                 "modified",
-                "unmanaged",
+                "missing-baseline",
+                "missing-source",
                 "missing",
                 "renamed",
                 "invalid",
@@ -66,6 +71,10 @@ impl Completion {
             _ => BTreeSet::new(),
         };
         self.choices = candidates(token, values);
+        if !ctx.ws.config.tags_enabled {
+            self.choices
+                .retain(|s| !s.starts_with("tag:") && s != "untagged");
+        }
         self.token = range;
         self.selected = 0;
         self.offset = 0;
@@ -92,7 +101,7 @@ impl Completion {
             !choice.starts_with("status:")
                 || matches!(
                     choice.as_str(),
-                    "status:" | "status:managed" | "status:unmanaged"
+                    "status:" | "status:local" | "status:repository"
                 )
         });
         self.selected = self.selected.min(self.choices.len().saturating_sub(1));

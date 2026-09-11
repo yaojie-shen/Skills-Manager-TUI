@@ -23,7 +23,7 @@ fn local_namespace_install_metadata_scan_and_removal() {
         Some("local/project--example"),
     )
     .unwrap();
-    assert!(ws.meta.list_keys().unwrap().contains(&key));
+    assert!(ws.meta.list_keys().unwrap().is_empty());
     let snap = ws.scan().unwrap();
     assert_eq!(snap.skills.len(), 1);
     assert!(snap.get(&key).is_some());
@@ -49,7 +49,7 @@ fn local_namespace_install_metadata_scan_and_removal() {
         std::fs::read_link(base.join("agent/project--example")).unwrap(),
         ws.skill_path(new)
     );
-    assert_eq!(ws.meta.list_keys().unwrap(), vec![new]);
+    assert!(ws.meta.list_keys().unwrap().is_empty());
     let snap = ws.scan().unwrap();
     assert_eq!(snap.skills.len(), 1);
     assert!(snap.get(new).is_some());

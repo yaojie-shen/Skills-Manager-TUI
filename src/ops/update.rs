@@ -148,7 +148,7 @@ pub fn prepare(_ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> 
         _ => bail!("{key} is not a git-sourced skill"),
     };
     match rec.status {
-        SkillStatus::Managed { .. } | SkillStatus::Modified => {}
+        SkillStatus::Repository | SkillStatus::MissingBaseline | SkillStatus::Modified => {}
         ref s => bail!("cannot update a skill in state {}", s.label()),
     }
     let local = crate::skill::SkillDoc::load(&rec.path)?;

@@ -11,7 +11,7 @@ pub mod update;
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
-/// Download and inspection workspace outside the managed root. Keep final
+/// Download and inspection workspace outside the tracked root. Keep final
 /// installation staging on the root filesystem so publication stays atomic.
 pub struct DownloadDir {
     path: Option<std::path::PathBuf>,

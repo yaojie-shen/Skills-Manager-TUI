@@ -406,7 +406,7 @@ fn repository_work_reports_clone_scan_and_install_stages() {
     assert!(!fetched.workdir.starts_with(&f.ws.root));
     assert!(
         !f.ws.root.join(".skills-meta/.staging").exists(),
-        "discovery should not write staging in the managed root"
+        "discovery should not write staging in the tracked root"
     );
     assert!(messages.iter().any(|s| s.starts_with("Clone:")));
     assert!(

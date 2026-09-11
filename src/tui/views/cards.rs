@@ -153,9 +153,9 @@ pub fn checkbox_marker(checked: bool, th: &Theme) -> Span<'static> {
 pub fn health_marker(r: &SkillRecord, th: &Theme) -> Span<'static> {
     use skills::reconcile::SkillStatus::*;
     let (glyph, style) = match &r.status {
-        Local | Managed { no_baseline: false } => ("●   ", th.ok()),
-        Managed { no_baseline: true } => ("●   ", th.warn()),
-        Unmanaged => ("○   ", th.dim()),
+        Local | Repository => ("●   ", th.ok()),
+        MissingBaseline => ("●   ", th.warn()),
+        MissingSource => ("!   ", th.warn()),
         Modified => ("~   ", th.warn()),
         Missing | Invalid { .. } | CorruptMeta { .. } => ("!   ", th.err()),
         Renamed { .. } => ("!   ", th.warn()),
@@ -333,8 +333,8 @@ mod tests {
         };
         let mut record = snap.get(key).unwrap().clone();
         for status in [
-            skills::reconcile::SkillStatus::Managed { no_baseline: false },
-            skills::reconcile::SkillStatus::Unmanaged,
+            skills::reconcile::SkillStatus::Repository,
+            skills::reconcile::SkillStatus::MissingSource,
             skills::reconcile::SkillStatus::Modified,
             skills::reconcile::SkillStatus::Missing,
         ] {

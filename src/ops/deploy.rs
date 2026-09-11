@@ -1191,7 +1191,7 @@ pub fn name_conflicts(snap: &Snapshot, actions: &[Action]) -> Vec<NameConflict> 
     conflicts
 }
 
-/// None requires an explicit decision; replace only unlinks managed entries.
+/// None requires an explicit decision; replace only unlinks tracked entries.
 pub fn resolve_names(
     snap: &Snapshot,
     actions: &[Action],

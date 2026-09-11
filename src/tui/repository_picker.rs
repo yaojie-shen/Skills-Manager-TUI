@@ -662,7 +662,7 @@ fn candidate_snapshot(fetched: &FetchedRepository) -> Snapshot {
                     .map(|reason| SkillStatus::Invalid {
                         reason: reason.clone(),
                     })
-                    .unwrap_or(SkillStatus::Unmanaged),
+                    .unwrap_or(SkillStatus::Repository),
                 name: doc.as_ref().map(|doc| doc.name.clone()),
                 description: doc.as_ref().map(|doc| doc.description.clone()),
                 body: doc.map(|doc| doc.body),
@@ -759,7 +759,7 @@ mod tests {
             "observability",
             "skills/ prnter",
             "repo:sample/tools skills/",
-            "status:unmanaged skills/",
+            "status:repository skills/",
         ] {
             picker.search = Input::with_value(query);
             picker.refilter();

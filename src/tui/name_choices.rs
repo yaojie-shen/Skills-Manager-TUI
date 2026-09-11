@@ -63,7 +63,7 @@ impl NameChoices {
             .collect();
         let summary = pending.groups.iter().zip(&choices).map(|(group, choice)| {
             format!("{}: {}", group.name, choice.map(|i| format!("keep {}", group.candidates[i].path.display())).unwrap_or_else(|| "keep none".into()))
-        }).chain(std::iter::once("Excluded agent-owned folders are archived in .skills-manager-backups beside the skills directory; managed source skills are kept. Archive operations are not undoable in this session.".into())).collect();
+        }).chain(std::iter::once("Excluded agent-owned folders are archived in .skills-manager-backups beside the skills directory; Library source skills are kept. Archive operations are not undoable in this session.".into())).collect();
         let keys = pending.keys();
         vec![
             Action::OpenModal(Box::new(

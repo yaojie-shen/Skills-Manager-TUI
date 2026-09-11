@@ -745,7 +745,7 @@ fn indent(s: &str) -> String {
 
 fn status_detail(s: &SkillStatus) -> String {
     match s {
-        SkillStatus::Managed { no_baseline: true } => "managed (no baseline)".into(),
+        SkillStatus::MissingBaseline => "repository (missing baseline)".into(),
         SkillStatus::Renamed { to } => format!("renamed? -> {to}"),
         SkillStatus::Invalid { reason } => format!("invalid: {reason}"),
         SkillStatus::CorruptMeta { error } => format!("corrupt-meta: {error}"),
@@ -842,22 +842,23 @@ fn entry_detail(s: &skills::reconcile::EntryState) -> String {
 }
 
 fn cmd_tag(ctx: &Ctx, c: TagCommand) -> Result<()> {
+    anyhow::ensure!(ctx.ws.config.tags_enabled, "Tags are disabled in settings");
     match c {
         TagCommand::Add { skill, tags } => {
             let m = edit::tag_add(&ctx.ws, &skill, &tags)?;
-            ctx.out(&m, || println!("{skill}: {}", m.tags.join(", ")))
+            ctx.out(&m, || println!("{skill}: {}", m.join(", ")))
         }
         TagCommand::Remove { skill, tags } => {
             let m = edit::tag_remove(&ctx.ws, &skill, &tags)?;
-            ctx.out(&m, || println!("{skill}: {}", m.tags.join(", ")))
+            ctx.out(&m, || println!("{skill}: {}", m.join(", ")))
         }
         TagCommand::Set { skill, tags } => {
             let m = edit::tag_set(&ctx.ws, &skill, &tags)?;
-            ctx.out(&m, || println!("{skill}: {}", m.tags.join(", ")))
+            ctx.out(&m, || println!("{skill}: {}", m.join(", ")))
         }
         TagCommand::List { skill: Some(skill) } => {
-            let m = ctx.ws.meta.load(&skill)?.unwrap_or_default();
-            ctx.out(&m.tags, || println!("{}", m.tags.join("\n")))
+            let m = skills::config::Config::load(&ctx.ws.root)?.skill_tags(&skill);
+            ctx.out(&m, || println!("{}", m.join("\n")))
         }
         TagCommand::List { skill: None } => {
             let snap = ctx.ws.scan()?;
@@ -1132,7 +1133,7 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
             .filter(|s| {
                 matches!(
                     s.status,
-                    SkillStatus::Managed { .. } | SkillStatus::Modified
+                    SkillStatus::Repository | SkillStatus::MissingBaseline | SkillStatus::Modified
                 )
             })
             .map(|s| s.key.clone())

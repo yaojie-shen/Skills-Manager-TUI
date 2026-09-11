@@ -45,7 +45,7 @@ enum Focus {
 struct Row<'a> {
     name: &'a str,
     state: Option<&'a EntryState>,
-    managed: bool,
+    linked: bool,
 }
 
 /// Which repairs an entry admits. Kept one per row from the last refresh so
@@ -56,7 +56,7 @@ struct Row<'a> {
 struct Caps {
     /// A link with nothing behind it; removing it loses nothing.
     clean: bool,
-    managed: bool,
+    linked: bool,
     /// The agent's own copy, byte for byte what the root has.
     relink: bool,
     adopt: bool,
@@ -66,7 +66,7 @@ impl Caps {
     fn of(state: Option<&EntryState>) -> Caps {
         Caps {
             adopt: matches!(state, Some(EntryState::AgentOnly)),
-            managed: matches!(state, Some(EntryState::Deployed)),
+            linked: matches!(state, Some(EntryState::Deployed)),
             clean: matches!(state, Some(EntryState::Broken { .. })),
             relink: matches!(state, Some(EntryState::Shadow { same_content: true })),
         }
@@ -474,22 +474,22 @@ impl AgentsView {
         };
         let mut names: Vec<&str> = report.entries.keys().map(String::as_str).collect();
         names.sort_unstable();
-        let (mut managed, mut local): (Vec<Row>, Vec<Row>) = (Vec::new(), Vec::new());
+        let (mut linked, mut local): (Vec<Row>, Vec<Row>) = (Vec::new(), Vec::new());
         for name in names {
             let state = report.entries.get(name);
-            let is_managed = matches!(state, Some(EntryState::Deployed));
+            let is_linked = matches!(state, Some(EntryState::Deployed));
             let row = Row {
                 name,
                 state,
-                managed: is_managed,
+                linked: is_linked,
             };
-            if is_managed {
-                managed.push(row)
+            if is_linked {
+                linked.push(row)
             } else {
                 local.push(row)
             }
         }
-        managed.append(&mut local);
+        linked.append(&mut local);
         if !self.destinations.is_empty() && !self.content_filter.value().trim().is_empty() {
             let mut records = ctx.snap.skills.clone();
             records.retain(|record| {
@@ -506,7 +506,7 @@ impl AgentsView {
                 records.push(skills::reconcile::SkillRecord {
                     key: alias.clone(),
                     path: doc.path.clone(),
-                    status: skills::reconcile::SkillStatus::Unmanaged,
+                    status: skills::reconcile::SkillStatus::Local,
                     name: Some(doc.name.clone()),
                     description: Some(doc.description.clone()),
                     body: Some(doc.body.clone()),
@@ -534,28 +534,28 @@ impl AgentsView {
                 .map(|(i, h)| (records[h.index].deployment_name(), i))
                 .collect();
             let query = self.content_filter.value().to_lowercase();
-            managed.retain(|row| {
+            linked.retain(|row| {
                 order.contains_key(row.name)
                     || (!report.documents.contains_key(row.name)
                         && row.name.to_lowercase().contains(&query))
             });
-            managed.sort_by_key(|row| {
+            linked.sort_by_key(|row| {
                 let rank = order.get(row.name).copied().unwrap_or(usize::MAX);
                 if query.is_empty() {
-                    (usize::from(!row.managed), rank)
+                    (usize::from(!row.linked), rank)
                 } else {
-                    (rank, usize::from(!row.managed))
+                    (rank, usize::from(!row.linked))
                 }
             });
         }
-        managed
+        linked
     }
 
     fn select_skills(&self, ctx: &Ctx, checked: Option<String>) -> Vec<Action> {
         let keys: Vec<_> = self
             .rows(ctx)
             .into_iter()
-            .filter(|row| row.managed)
+            .filter(|row| row.linked)
             .filter_map(|row| {
                 ctx.snap
                     .skills
@@ -587,8 +587,8 @@ impl AgentsView {
             row.name.to_string(),
             agent.name.clone(),
             agent.skills_dir.join(row.name),
-            if row.managed {
-                "managed link to central skill".into()
+            if row.linked {
+                "linked from Library".into()
             } else {
                 row.state
                     .map(entry_note)
@@ -872,7 +872,7 @@ impl AgentsView {
         if !self.destinations.is_empty() {
             if self.focus() == Focus::Entries
                 && (k.code == KeyCode::Char('i')
-                    || (k.code == KeyCode::Char('m') && self.selected_caps().managed))
+                    || (k.code == KeyCode::Char('m') && self.selected_caps().linked))
             {
                 let Some(agent) = ctx.ws.config.agent(&self.scope).cloned() else {
                     return vec![];
@@ -881,7 +881,7 @@ impl AgentsView {
                 let keys = (!on).then(|| {
                     self.rows(ctx)
                         .into_iter()
-                        .filter(|r| r.managed)
+                        .filter(|r| r.linked)
                         .filter_map(|r| {
                             ctx.snap
                                 .skills
@@ -897,7 +897,7 @@ impl AgentsView {
             }
             if k.code == KeyCode::Char('x')
                 && self.focus() == Focus::Entries
-                && self.selected_caps().managed
+                && self.selected_caps().linked
             {
                 let rows = self.rows(ctx);
                 let Some(row) = self.entries.selected().and_then(|i| rows.get(i)) else {
@@ -1054,7 +1054,7 @@ impl AgentsView {
                 let rows = self.rows(ctx);
                 let n = rows.len();
                 match k.code {
-                    KeyCode::Char('m') if self.selected_caps().managed => {
+                    KeyCode::Char('m') if self.selected_caps().linked => {
                         return self.select_skills(ctx, None);
                     }
                     // Down and up cross a whole row of cards; left and right
@@ -1209,7 +1209,7 @@ impl AgentsView {
                         })
                     {
                         let rows = self.rows(ctx);
-                        if let Some(row) = rows.get(index).filter(|row| row.managed)
+                        if let Some(row) = rows.get(index).filter(|row| row.linked)
                             && let Some(skill) = ctx
                                 .snap
                                 .skills
@@ -1708,12 +1708,8 @@ impl AgentsView {
             .collect();
         let valid = |row: &&Row<'_>| report.is_some_and(|r| r.documents.contains_key(row.name));
         let mut counts = match (
-            rows_data.iter().filter(valid).filter(|r| r.managed).count(),
-            rows_data
-                .iter()
-                .filter(valid)
-                .filter(|r| !r.managed)
-                .count(),
+            rows_data.iter().filter(valid).filter(|r| r.linked).count(),
+            rows_data.iter().filter(valid).filter(|r| !r.linked).count(),
         ) {
             (0, 0) => "nothing here yet".to_string(),
             (n, 0) => format!("{n} linked"),
@@ -1799,8 +1795,8 @@ impl AgentsView {
                 {
                     // A skill the root knows is drawn the way every page draws
                     // it. Being in this grid already says it is linked, so the
-                    // tail says where it came from rather than "managed" again.
-                    Some(r) if row.managed => {
+                    // tail says where it came from rather than "linked" again.
+                    Some(r) if row.linked => {
                         let tail = r
                             .source
                             .as_ref()
@@ -1849,8 +1845,8 @@ impl AgentsView {
                     Style::default()
                 };
                 let (glyph, gs) = glyph_for(row.state, th);
-                let managed = row
-                    .managed
+                let linked = row
+                    .linked
                     .then(|| {
                         ctx.snap
                             .skills
@@ -1860,11 +1856,11 @@ impl AgentsView {
                     .flatten();
                 let mut spans = vec![
                     Span::styled(if on { "▸ " } else { "  " }, th.accent()),
-                    managed
+                    linked
                         .map(|r| cards::health_marker(r, th))
                         .unwrap_or_else(|| Span::styled(format!("{glyph}   "), gs)),
                 ];
-                if let Some(r) = managed {
+                if let Some(r) = linked {
                     let available = (cell.width as usize).saturating_sub(2 + cards::MARKER_W);
                     let badge = cards::repository_badge(r, ctx.ws.config.ui.icons);
                     let badge_w = badge
@@ -1888,7 +1884,7 @@ impl AgentsView {
                 } else {
                     spans.push(Span::styled(
                         pad(row.name, 26),
-                        if row.managed {
+                        if row.linked {
                             Style::default()
                         } else {
                             th.dim()
@@ -1983,7 +1979,7 @@ impl AgentsView {
         }
         if !self.destinations.is_empty() && self.focus() == Focus::Entries {
             return match self.selected_caps() {
-                Caps { managed: true, .. } => &[
+                Caps { linked: true, .. } => &[
                     ("↑↓←→", "skill · ↑ first row: presets"),
                     ("/", "filter skills"),
                     ("i", "install"),
@@ -2072,7 +2068,7 @@ impl AgentsView {
                     ("[ ]", "agent"),
                     ("v", "layout"),
                 ],
-                Caps { managed: true, .. } => &[
+                Caps { linked: true, .. } => &[
                     ("j/k", "move"),
                     ("↑", "back to presets"),
                     ("Enter", "preview"),
@@ -2473,7 +2469,7 @@ fn state_label(state: Option<&EntryState>) -> &'static str {
 }
 
 /// Fit whole pills, moving the start only when selection leaves the viewport.
-fn pill_window(
+pub(super) fn pill_window(
     widths: &[usize],
     selected: usize,
     offset: &mut usize,
@@ -2544,7 +2540,7 @@ mod overflow_tests {
         assert!(
             view.rows(&ctx)
                 .iter()
-                .any(|row| row.name == "printer" && row.managed)
+                .any(|row| row.name == "printer" && row.linked)
         );
         for compact in [false, true] {
             view.compact = compact;

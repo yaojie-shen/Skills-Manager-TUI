@@ -23,91 +23,97 @@ pub fn load_or_init(ws: &Workspace, key: &str) -> Result<SkillMeta> {
     })
 }
 
-fn normalize_tag(t: &str) -> String {
-    t.trim().to_string()
+pub fn tag_add(ws: &Workspace, key: &str, tags: &[String]) -> Result<Vec<String>> {
+    let mut current = Config::load(&ws.root)?.skill_tags(key);
+    current.extend_from_slice(tags);
+    tag_set(ws, key, &current)
 }
 
-pub fn tag_add(ws: &Workspace, key: &str, tags: &[String]) -> Result<SkillMeta> {
-    let mut meta = load_or_init(ws, key)?;
-    for t in tags {
-        let t = normalize_tag(t);
-        if t.is_empty() {
-            continue;
+pub fn tag_remove(ws: &Workspace, key: &str, tags: &[String]) -> Result<Vec<String>> {
+    let mut current = Config::load(&ws.root)?.skill_tags(key);
+    current.retain(|t| !tags.iter().any(|remove| remove.trim() == t));
+    tag_set(ws, key, &current)
+}
+
+pub fn tag_set(ws: &Workspace, key: &str, tags: &[String]) -> Result<Vec<String>> {
+    require_key(key)?;
+    let config = Config::load(&ws.root)?;
+    anyhow::ensure!(config.tags_enabled, "Tags are disabled in settings");
+    anyhow::ensure!(
+        ws.skill_path(key).is_dir() || !config.skill_tags(key).is_empty(),
+        "no such skill: {key}"
+    );
+    let names: std::collections::BTreeSet<_> = tags
+        .iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    Config::edit_tags(&ws.root, |groups| {
+        for tag in groups.iter_mut() {
+            tag.skills.retain(|s| s != key);
         }
-        if !meta.tags.iter().any(|x| x == &t) {
-            meta.tags.push(t);
+        for name in &names {
+            if let Some(tag) = groups.iter_mut().find(|t| &t.name == name) {
+                tag.skills.push(key.into());
+            } else {
+                groups.push(crate::config::TagConfig {
+                    name: name.clone(),
+                    skills: vec![key.into()],
+                    color: None,
+                    description: None,
+                });
+            }
         }
-    }
-    ws.meta.save(key, &meta)?;
-    Ok(meta)
+    })?;
+    Ok(names.into_iter().collect())
 }
 
-pub fn tag_remove(ws: &Workspace, key: &str, tags: &[String]) -> Result<SkillMeta> {
-    let mut meta = load_or_init(ws, key)?;
-    let drop: Vec<String> = tags.iter().map(|t| normalize_tag(t)).collect();
-    meta.tags.retain(|t| !drop.contains(t));
-    ws.meta.save(key, &meta)?;
-    Ok(meta)
-}
-
-pub fn tag_set(ws: &Workspace, key: &str, tags: &[String]) -> Result<SkillMeta> {
-    let mut meta = load_or_init(ws, key)?;
-    meta.tags.clear();
-    for t in tags {
-        let t = normalize_tag(t);
-        if !t.is_empty() && !meta.tags.contains(&t) {
-            meta.tags.push(t);
-        }
-    }
-    ws.meta.save(key, &meta)?;
-    Ok(meta)
-}
-
-/// Rename a tag across every skill. Returns the number of skills touched.
-///
-/// Renaming onto a tag that already exists is a merge: a skill carrying both
-/// ends up with one copy of the new name. The tag's `[[tags]]` entry in the
-/// config follows it, so a rename does not cost the tag its colour.
 pub fn tag_rename(ws: &Workspace, old: &str, new: &str) -> Result<usize> {
-    let new = normalize_tag(new);
-    if new.is_empty() {
-        bail!("new tag name is empty");
-    }
-    if new == old {
-        return Ok(0);
-    }
-    let mut n = 0;
-    for key in ws.meta.list_keys()? {
-        if let Some(mut meta) = ws.meta.load(&key)?
-            && meta.tags.iter().any(|t| t == old)
-        {
-            meta.tags.retain(|t| t != old && t != &new);
-            meta.tags.push(new.clone());
-            ws.meta.save(&key, &meta)?;
-            n += 1;
+    let new = new.trim();
+    anyhow::ensure!(!new.is_empty(), "new tag name is empty");
+    let mut count = 0;
+    Config::edit_tags(&ws.root, |tags| {
+        if let Some(i) = tags.iter().position(|t| t.name == old) {
+            let mut tag = tags.remove(i);
+            count = tag.skills.len();
+            if let Some(target) = tags.iter_mut().find(|t| t.name == new) {
+                target.skills.extend(tag.skills);
+                if target.color.is_none() {
+                    target.color = tag.color;
+                }
+                if target.description.is_none() {
+                    target.description = tag.description;
+                }
+            } else {
+                tag.name = new.into();
+                tags.push(tag);
+            }
         }
-    }
-    Config::rename_tag_entry(&ws.root, old, &new)?;
-    Ok(n)
+    })?;
+    Ok(count)
 }
 
-/// Delete a tag from every skill. Returns the number of skills touched.
 pub fn tag_delete(ws: &Workspace, tag: &str) -> Result<usize> {
-    let mut n = 0;
-    for key in ws.meta.list_keys()? {
-        if let Some(mut meta) = ws.meta.load(&key)?
-            && meta.tags.iter().any(|t| t == tag)
-        {
-            meta.tags.retain(|t| t != tag);
-            ws.meta.save(&key, &meta)?;
-            n += 1;
-        }
-    }
-    Ok(n)
+    let mut count = 0;
+    Config::edit_tags(&ws.root, |tags| {
+        tags.retain(|t| {
+            if t.name == tag {
+                count = t.skills.len();
+                false
+            } else {
+                true
+            }
+        });
+    })?;
+    Ok(count)
 }
 
 pub fn note_set(ws: &Workspace, key: &str, note: Option<&str>) -> Result<SkillMeta> {
     let mut meta = load_or_init(ws, key)?;
+    anyhow::ensure!(
+        matches!(meta.source, Some(crate::meta::Source::Git { .. })),
+        "Local skills do not store notes"
+    );
     meta.note = note
         .map(|s| s.trim_end().to_string())
         .filter(|s| !s.is_empty());
@@ -154,9 +160,7 @@ pub fn migrate_meta(ws: &Workspace, old: &str, new: &str) -> Result<()> {
     if !resolved.starts_with(&ws.root) || crate::util::is_symlink(&to) {
         bail!("migration destination must be a skill directory inside the root");
     }
-    ws.meta
-        .load(old)?
-        .context("old skill has no metadata to migrate")?;
+
     if ws.meta.exists(new) {
         bail!("metadata for {new} already exists");
     }
@@ -233,6 +237,7 @@ pub fn migrate_meta(ws: &Workspace, old: &str, new: &str) -> Result<()> {
         }
     }
     super::targets::rename_skill_reference(ws, old, Some(new))?;
+    Config::rename_tag_skill(&ws.root, old, Some(new))?;
     ws.meta.rename(old, new)
 }
 
@@ -268,6 +273,7 @@ pub fn rename(ws: &Workspace, snap: &Snapshot, old: &str, new: &str) -> Result<V
     std::fs::create_dir_all(to.parent().context("missing parent")?)?;
     std::fs::rename(&from, &to).with_context(|| format!("renaming {old} -> {new}"))?;
     log.push(format!("renamed directory {old} -> {new}"));
+    Config::rename_tag_skill(&ws.root, old, Some(new))?;
     ws.meta.rename(old, new)?;
     let mut linked = std::collections::BTreeSet::new();
     for a in &agents {
@@ -335,6 +341,7 @@ pub fn remove(ws: &Workspace, snap: &Snapshot, key: &str, keep_meta: bool) -> Re
         ws.meta.remove(key)?;
         log.push("removed metadata".into());
     }
+    Config::rename_tag_skill(&ws.root, key, None)?;
     super::targets::rename_skill_reference(ws, key, None)?;
     Ok(log)
 }

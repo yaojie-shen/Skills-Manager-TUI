@@ -18,9 +18,10 @@ pub mod watch;
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum SkillStatus {
     Local,
-    Managed { no_baseline: bool },
+    Repository,
+    MissingBaseline,
     Modified,
-    Unmanaged,
+    MissingSource,
     Missing,
     Renamed { to: String },
     Invalid { reason: String },
@@ -31,9 +32,10 @@ impl SkillStatus {
     pub fn label(&self) -> &'static str {
         match self {
             SkillStatus::Local => "local",
-            SkillStatus::Managed { .. } => "managed",
+            SkillStatus::Repository => "repository",
+            SkillStatus::MissingBaseline => "missing-baseline",
             SkillStatus::Modified => "modified",
-            SkillStatus::Unmanaged => "unmanaged",
+            SkillStatus::MissingSource => "missing-source",
             SkillStatus::Missing => "missing",
             SkillStatus::Renamed { .. } => "renamed?",
             SkillStatus::Invalid { .. } => "invalid",
@@ -41,19 +43,17 @@ impl SkillStatus {
         }
     }
     pub fn is_healthy(&self) -> bool {
-        matches!(
-            self,
-            SkillStatus::Local | SkillStatus::Managed { .. } | SkillStatus::Unmanaged
-        )
+        matches!(self, SkillStatus::Local | SkillStatus::Repository)
     }
     /// Skill directory exists with a readable SKILL.md.
     pub fn is_present(&self) -> bool {
         matches!(
             self,
             SkillStatus::Local
-                | SkillStatus::Managed { .. }
+                | SkillStatus::Repository
+                | SkillStatus::MissingBaseline
                 | SkillStatus::Modified
-                | SkillStatus::Unmanaged
+                | SkillStatus::MissingSource
                 | SkillStatus::CorruptMeta { .. }
         )
     }
@@ -102,6 +102,16 @@ pub struct SkillRecord {
 }
 
 impl SkillRecord {
+    pub fn source_kind(&self) -> &'static str {
+        if matches!(self.source, Some(crate::meta::Source::Git { .. }))
+            || crate::repository::alias_of(&self.key).is_some()
+        {
+            "repository"
+        } else {
+            "local"
+        }
+    }
+
     pub fn deployment_name(&self) -> String {
         crate::repository::default_deploy_name(&self.key)
     }
@@ -209,7 +219,7 @@ pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
 }
 
 /// Refresh deployment reports against an existing library snapshot. Scope browsing
-/// does not need to reread every SKILL.md or hash every managed source. Shadow
+/// does not need to reread every SKILL.md or hash every tracked source. Shadow
 /// copies still get fresh comparisons; hashes are shared only within this call.
 pub fn rescope(snapshot: &Snapshot, destinations: &[AgentConfig]) -> Result<Snapshot> {
     let mut records: BTreeMap<_, _> = snapshot
@@ -386,7 +396,7 @@ fn scan_inventory(
         }
         let external = is_symlink(&path);
         let (status, doc) = match SkillDoc::load(&path) {
-            Ok(doc) => (SkillStatus::Unmanaged, Some(doc)),
+            Ok(doc) => (SkillStatus::MissingSource, Some(doc)),
             Err(e) => (
                 SkillStatus::Invalid {
                     reason: e.to_string(),
@@ -440,7 +450,7 @@ fn scan_inventory(
                     deploy: BTreeMap::new(),
                     meta: None,
                 });
-                rec.tags = meta.tags.clone();
+
                 rec.note = meta.note.clone();
                 rec.source = meta.source.clone();
                 rec.baseline_hash = meta.baseline.as_ref().map(|b| b.hash.clone());
@@ -472,13 +482,57 @@ fn scan_inventory(
         }
     }
 
+    let tag_config = Config::load(root)?;
+    let mut references: Vec<String> = tag_config
+        .tags
+        .iter()
+        .filter(|_| config.tags_enabled)
+        .flat_map(|tag| tag.skills.clone())
+        .collect();
+    references.extend(
+        crate::preset::PresetStore::new(root)
+            .list()?
+            .into_iter()
+            .flat_map(|p| p.skills),
+    );
+    for key in references {
+        if !crate::repository::valid_id(&key) {
+            continue;
+        }
+        records.entry(key.clone()).or_insert_with(|| SkillRecord {
+            key: key.clone(),
+            path: root.join(&key),
+            status: SkillStatus::Missing,
+            name: None,
+            description: None,
+            body: None,
+            external: false,
+            name_mismatch: false,
+            tags: Vec::new(),
+            note: None,
+            source: None,
+            current_hash: None,
+            baseline_hash: None,
+            deploy: BTreeMap::new(),
+            meta: None,
+        });
+    }
+
     for rec in records.values_mut() {
-        if rec.status == SkillStatus::Unmanaged
+        if rec.status == SkillStatus::MissingSource
             && crate::repository::alias_of(&rec.key).is_none()
             && !matches!(rec.source, Some(crate::meta::Source::Git { .. }))
         {
             rec.status = SkillStatus::Local;
         }
+    }
+
+    for rec in records.values_mut() {
+        rec.tags = if config.tags_enabled {
+            tag_config.skill_tags(&rec.key)
+        } else {
+            Vec::new()
+        };
     }
 
     // Collect baseline work once, then share completed hashes with agent/shadow
@@ -487,29 +541,30 @@ fn scan_inventory(
         let paths: Vec<_> = records
             .values()
             .filter(|r| {
-                r.status == SkillStatus::Unmanaged && r.meta.is_some() && r.baseline_hash.is_some()
+                r.status == SkillStatus::MissingSource
+                    && matches!(r.source, Some(crate::meta::Source::Git { .. }))
+                    && r.baseline_hash.is_some()
             })
             .map(|r| r.path.clone())
             .collect();
         hashes.extend(parallel_hashes(&paths));
     }
-    for rec in records
-        .values_mut()
-        .filter(|r| r.status == SkillStatus::Unmanaged && r.meta.is_some())
-    {
+    for rec in records.values_mut().filter(|r| {
+        r.status == SkillStatus::MissingSource
+            && matches!(r.source, Some(crate::meta::Source::Git { .. }))
+    }) {
         if verify_content && rec.baseline_hash.is_some() {
             rec.current_hash = cached_hash(&rec.path, &mut hashes, hash);
         }
         rec.status = match (&rec.current_hash, &rec.baseline_hash) {
-            (Some(cur), Some(base)) if cur == base => SkillStatus::Managed { no_baseline: false },
+            (Some(cur), Some(base)) if cur == base => SkillStatus::Repository,
             (Some(_), Some(_)) => SkillStatus::Modified,
-            _ => SkillStatus::Managed {
-                no_baseline: verify_content || rec.baseline_hash.is_none(),
-            },
+            _ if rec.baseline_hash.is_some() => SkillStatus::Repository,
+            _ => SkillStatus::MissingBaseline,
         };
     }
 
-    // 3. Only hash unmanaged directories when a missing baseline needs rename candidates.
+    // 3. Only hash unidentified directories when a missing baseline needs rename candidates.
     // The candidates still have to be unique in both directions.
     if verify_content
         && records
@@ -518,17 +573,17 @@ fn scan_inventory(
     {
         for rec in records
             .values_mut()
-            .filter(|r| r.status == SkillStatus::Unmanaged)
+            .filter(|r| r.status == SkillStatus::MissingSource)
         {
             rec.current_hash = cached_hash(&rec.path, &mut hashes, hash);
         }
     }
-    let mut by_hash_unmanaged: HashMap<String, Vec<String>> = HashMap::new();
+    let mut by_hash_candidates: HashMap<String, Vec<String>> = HashMap::new();
     for r in records.values() {
-        if r.status == SkillStatus::Unmanaged
+        if r.status == SkillStatus::MissingSource
             && let Some(h) = &r.current_hash
         {
-            by_hash_unmanaged
+            by_hash_candidates
                 .entry(h.clone())
                 .or_default()
                 .push(r.key.clone());
@@ -547,7 +602,7 @@ fn scan_inventory(
     }
     let mut renames: Vec<(String, String)> = Vec::new();
     for (h, missing) in &by_hash_missing {
-        if let Some(cands) = by_hash_unmanaged.get(h)
+        if let Some(cands) = by_hash_candidates.get(h)
             && missing.len() == 1
             && cands.len() == 1
         {
@@ -863,7 +918,7 @@ mod scan_cost_tests {
         .unwrap();
         assert_eq!(
             snap.get("repos/demo/one").unwrap().status,
-            SkillStatus::Unmanaged
+            SkillStatus::MissingSource
         );
         assert_eq!(snap.get("two").unwrap().status, SkillStatus::Local);
         assert!(snap.skills.iter().all(|r| r.current_hash.is_none()));
@@ -902,7 +957,7 @@ mod scan_cost_tests {
         assert_eq!(reads, vec![path.canonicalize().unwrap()]);
         assert_eq!(
             snap.get("repos/demo/one").unwrap().status,
-            SkillStatus::Managed { no_baseline: false }
+            SkillStatus::Repository
         );
         std::fs::write(path.join("script.py"), "print('changed')").unwrap();
         assert_eq!(
@@ -915,7 +970,7 @@ mod scan_cost_tests {
         );
         std::fs::remove_file(path.join("script.py")).unwrap();
         std::fs::rename(&path, root.join("repos/demo/renamed")).unwrap();
-        // Both unmanaged directories have the same content, so no unique rename.
+        // Both unidentified directories have the same content, so no unique rename.
         assert_eq!(
             scan(root, &config)
                 .unwrap()

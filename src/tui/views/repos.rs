@@ -299,7 +299,11 @@ impl View for ReposView {
                     ctx.snap
                         .get(key)
                         .map(|r| {
-                            format!("{}  [{}]", super::cards::display_name(r), r.status.label())
+                            if r.status.is_healthy() {
+                                super::cards::display_name(r).to_string()
+                            } else {
+                                format!("{}  [{}]", super::cards::display_name(r), r.status.label())
+                            }
                         })
                         .unwrap_or_else(|| key.clone())
                 })

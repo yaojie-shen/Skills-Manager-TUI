@@ -20,6 +20,7 @@ impl Fixture {
         let root = base.join("skills");
         std::fs::create_dir_all(&root).unwrap();
         Config {
+            tags_enabled: true,
             schema: 1,
             agents: vec![AgentConfig {
                 key: "a".into(),
@@ -31,6 +32,7 @@ impl Fixture {
                 presets: vec![],
             },
             tags: vec![TagConfig {
+                skills: vec![],
                 name: "storage".into(),
                 color: Some("blue".into()),
                 description: Some("keeps bytes".into()),
@@ -58,12 +60,7 @@ impl Fixture {
     }
 
     fn tags(&self, key: &str) -> Vec<String> {
-        self.ws()
-            .meta
-            .load(key)
-            .unwrap()
-            .map(|m| m.tags)
-            .unwrap_or_default()
+        Config::load(&self.root).unwrap().skill_tags(key)
     }
 
     fn config_text(&self) -> String {

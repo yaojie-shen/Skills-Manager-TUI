@@ -25,6 +25,7 @@ impl Fixture {
         let root = base.join("skills");
         std::fs::create_dir_all(&root).unwrap();
         let cfg = Config {
+            tags_enabled: true,
             schema: 1,
             agents: vec![],
             deploy: DeployConfig {
@@ -142,7 +143,7 @@ fn install_from_repo_subdirectory() {
 
     let snap = ws.scan().unwrap();
     let rec = snap.get("writer").unwrap();
-    assert_eq!(rec.status, SkillStatus::Managed { no_baseline: false });
+    assert_eq!(rec.status, SkillStatus::Repository);
     match &rec.source {
         Some(Source::Git {
             url,
@@ -264,7 +265,7 @@ fn duplicate_name_fails_and_keeps_the_first() {
     );
     let snap = ws.scan().unwrap();
     let rec = snap.get("dup").unwrap();
-    assert_eq!(rec.status, SkillStatus::Managed { no_baseline: false });
+    assert_eq!(rec.status, SkillStatus::Repository);
     match &rec.source {
         Some(Source::Git { url, revision, .. }) => {
             assert_eq!(url, &url_of(&up));
@@ -346,7 +347,7 @@ fn check_and_update_without_local_changes() {
     let rec = snap.get("up").unwrap();
     assert_eq!(
         rec.status,
-        SkillStatus::Managed { no_baseline: false },
+        SkillStatus::Repository,
         "the update is not a local modification"
     );
     assert_eq!(
@@ -396,13 +397,7 @@ fn install_from_local_directory_copies() {
     let snap = ws.scan().unwrap();
     let rec = snap.get("handy").unwrap();
     assert_eq!(rec.status, SkillStatus::Local);
-    match &rec.source {
-        Some(Source::Local { path }) => assert_eq!(
-            path.as_deref(),
-            Some(skills::paths::contract_tilde(&std::fs::canonicalize(&src).unwrap()).as_str())
-        ),
-        other => panic!("unexpected source {other:?}"),
-    }
+    assert!(rec.source.is_none());
     assert_eq!(rec.baseline_hash.as_deref(), None);
     assert!(f.staging_empty(), "staging cleaned");
 }

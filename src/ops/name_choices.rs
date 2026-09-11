@@ -197,7 +197,7 @@ impl Pending {
         self.changes.iter().flat_map(|c| c.after.skills()).collect()
     }
     /// `None` explicitly means keep none. An agent-owned copy is archived,
-    /// never deleted. Managed source directories always remain in the library.
+    /// never deleted. Library source directories always remain in the library.
     pub fn apply(
         &self,
         ws: &Workspace,

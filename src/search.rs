@@ -106,7 +106,7 @@ impl Query {
             return false;
         }
         if !self.sources.is_empty() {
-            let kind = r.source.as_ref().map(|s| s.kind()).unwrap_or("none");
+            let kind = r.source_kind();
             if !self.sources.iter().any(|s| s == kind) {
                 return false;
             }
@@ -1007,7 +1007,7 @@ mod tests {
         SkillRecord {
             key: key.into(),
             path: key.into(),
-            status: SkillStatus::Unmanaged,
+            status: SkillStatus::MissingSource,
             name: Some(key.into()),
             description: Some(desc.into()),
             body: Some(body.into()),
@@ -1105,6 +1105,28 @@ mod tests {
         }
         r.key = "old-flat-install".into();
         assert!(Query::parse("repo:sampleorg/kit").filter(&r));
+    }
+
+    #[test]
+    fn source_filters_classify_local_and_repository_independently_of_problems() {
+        let mut r = rec("review", "", "", &[]);
+        assert!(Query::parse("source:local").filter(&r));
+        assert!(!Query::parse("source:repository").filter(&r));
+        r.source = Some(crate::meta::Source::Git {
+            url: "https://github.com/example/repo".into(),
+            branch: None,
+            subpath: None,
+            revision: None,
+        });
+        for status in [
+            SkillStatus::Repository,
+            SkillStatus::Modified,
+            SkillStatus::MissingBaseline,
+        ] {
+            r.status = status;
+            assert!(Query::parse("source:repository").filter(&r));
+            assert!(!Query::parse("source:local").filter(&r));
+        }
     }
 
     /// One technical table at full weight, for tests that only need a mapping.

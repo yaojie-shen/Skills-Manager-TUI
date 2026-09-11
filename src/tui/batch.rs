@@ -9,10 +9,7 @@ use ratatui::{
     text::Line,
     widgets::{List, ListItem, Paragraph},
 };
-use skills::{
-    history,
-    ops::{deploy, edit},
-};
+use skills::{history, ops::deploy};
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -331,34 +328,33 @@ impl Batch {
                 let targets = keys.clone();
                 vec![Action::BatchMeta(
                     Box::new(move |ws| {
-                        // Validate and prepare every file before any write. Roll back a failed batch.
-                        let mut prepared = Vec::new();
+                        anyhow::ensure!(
+                            skills::config::Config::load(&ws.root)?.tags_enabled,
+                            "Tags are disabled"
+                        );
                         for key in &targets {
-                            let original = ws.meta.load(key)?;
-                            let mut meta = edit::load_or_init(ws, key)?;
-                            for (tag, on) in &changes {
-                                if *on {
-                                    if !meta.tags.contains(tag) {
-                                        meta.tags.push(tag.clone());
-                                    }
-                                } else {
-                                    meta.tags.retain(|t| t != tag);
-                                }
-                            }
-                            prepared.push((key.clone(), original, meta));
+                            anyhow::ensure!(ws.skill_path(key).is_dir(), "no such skill: {key}");
                         }
                         history::tag_edit(ws, |ws| {
-                            for (i, (key, _, meta)) in prepared.iter().enumerate() {
-                                if let Err(e) = ws.meta.save(key, meta) {
-                                    for (key, original, _) in prepared[..i].iter().rev() {
-                                        match original {
-                                            Some(m) => ws.meta.save(key, m)?,
-                                            None => ws.meta.remove(key)?,
+                            skills::config::Config::edit_tags(&ws.root, |tags| {
+                                for (name, on) in &changes {
+                                    if *on && !tags.iter().any(|tag| &tag.name == name) {
+                                        tags.push(skills::config::TagConfig {
+                                            name: name.clone(),
+                                            skills: Vec::new(),
+                                            color: None,
+                                            description: None,
+                                        });
+                                    }
+                                    if let Some(tag) = tags.iter_mut().find(|tag| &tag.name == name)
+                                    {
+                                        tag.skills.retain(|key| !targets.contains(key));
+                                        if *on {
+                                            tag.skills.extend(targets.clone());
                                         }
                                     }
-                                    return Err(e);
                                 }
-                            }
+                            })?;
                             Ok(format!("Updated tags for {} skills", targets.len()))
                         })
                     }),
@@ -587,6 +583,7 @@ impl Batch {
 mod tests {
     use super::*;
     use skills::Workspace;
+    use skills::ops::edit;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     struct Fixture(std::path::PathBuf);
@@ -639,14 +636,17 @@ mod tests {
         assert_eq!(keys.len(), 2);
         let (_, intent) = write(&ws).unwrap();
         assert!(
-            ws.meta
-                .load("alpha")
+            skills::config::Config::load(&ws.root)
                 .unwrap()
-                .unwrap()
-                .tags
+                .skill_tags("alpha")
                 .contains(&"existing".into())
         );
-        assert_eq!(ws.meta.load("beta").unwrap().unwrap().tags, vec!["new"]);
+        assert_eq!(
+            skills::config::Config::load(&ws.root)
+                .unwrap()
+                .skill_tags("beta"),
+            vec!["new"]
+        );
         let Some(history::Intent::Meta(changes)) = intent else {
             panic!("expected one metadata intent")
         };
@@ -661,14 +661,10 @@ mod tests {
         let fixture = Fixture::new();
         let ws = Workspace::open(&fixture.0).unwrap();
         edit::tag_add(&ws, "alpha", &["existing".into()]).unwrap();
-        let text = std::fs::read_to_string(ws.meta.path("alpha")).unwrap();
-        std::fs::write(
-            ws.meta.path("beta"),
-            format!("{text}\n[skills.beta]\ntags = 42\n"),
-        )
-        .unwrap();
-        let before = std::fs::read(ws.meta.path("alpha")).unwrap();
         let snap = ws.scan().unwrap();
+        let path = skills::config::Config::path(&ws.root);
+        std::fs::write(&path, "tags = 42").unwrap();
+        let before = std::fs::read(&path).unwrap();
         let theme = super::super::theme::Theme::default();
         let ctx = Ctx {
             ws: &ws,
@@ -681,7 +677,7 @@ mod tests {
             panic!("expected metadata edit")
         };
         assert!(write(&ws).is_err());
-        assert_eq!(std::fs::read(ws.meta.path("alpha")).unwrap(), before);
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
     #[test]
     fn adding_to_several_presets_preserves_members_and_groups_history() {
