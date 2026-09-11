@@ -1105,15 +1105,14 @@ fn rename(ws: &Workspace, snap: &Snapshot, from: &str, to: &str) -> Result<Plan>
 /// taken, whether or not it parses: a preset this tool cannot read is still
 /// not one it may write over.
 fn preset_rename_plan(ws: &Workspace, from: &str, to: &str) -> Result<Plan> {
-    let present = |name: &str| ws.presets.path(name).exists();
-    if !present(from) {
-        return Ok(Plan::Nothing(if present(to) {
+    if !ws.presets.contains_name(from)? {
+        return Ok(Plan::Nothing(if ws.presets.contains_name(to)? {
             format!("already done: renamed preset {from} to {to}")
         } else {
             format!("preset {from} is gone")
         }));
     }
-    if present(to) {
+    if ws.presets.contains_name(to)? {
         return Ok(Plan::Nothing(format!(
             "preset {to} is taken; {from} left as it is"
         )));
