@@ -84,6 +84,16 @@ pub fn tag_fill(name: &str, ctx: &Ctx) -> Color {
         .unwrap_or(ctx.theme.tag)
 }
 
+/// Shared capsule rendering, including configured end caps and readable text.
+pub fn pill(body: String, fill: Color, ctx: &Ctx) -> Vec<Span<'static>> {
+    let (left, right) = ctx.ws.config.ui.pill_caps.glyphs();
+    vec![
+        Span::styled(left, Style::default().fg(fill)),
+        Span::styled(body, Style::default().bg(fill).fg(ink(fill))),
+        Span::styled(right, Style::default().fg(fill)),
+    ]
+}
+
 /// Tags as capsules, as many as fit in `max_w`, then a count for the rest. A
 /// filled shape with round ends is told apart from the text around it at a
 /// glance, which a coloured word is not.
@@ -114,9 +124,7 @@ pub fn tag_pills(tags: &[String], ctx: &Ctx, max_w: usize) -> Vec<Span<'static>>
         if i > 0 {
             out.push(Span::raw(" "));
         }
-        out.push(Span::styled(lcap.to_string(), Style::default().fg(fill)));
-        out.push(Span::styled(body, Style::default().bg(fill).fg(ink(fill))));
-        out.push(Span::styled(rcap.to_string(), Style::default().fg(fill)));
+        out.extend(pill(body, fill, ctx));
         used += w;
     }
     out

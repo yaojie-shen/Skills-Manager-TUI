@@ -1663,20 +1663,15 @@ impl AgentsView {
                 // remembers the place, which marks it without competing with the
                 // list for attention.
                 let fill = if selected && focused { lit(base) } else { base };
-                let mut body_style = Style::default().bg(fill).fg(cards::ink(fill));
+                let mut pill = cards::pill(body, fill, ctx);
                 if selected {
-                    body_style = body_style.add_modifier(if focused {
+                    pill[1].style = pill[1].style.add_modifier(if focused {
                         Modifier::BOLD | Modifier::UNDERLINED
                     } else {
                         Modifier::BOLD
                     });
                 }
-                // The caps carry the fill as foreground against the page, which is
-                // what rounds the ends off; reversing them would square the pill.
-                let cap = Style::default().fg(fill);
-                pills.push(Span::styled(lcap, cap));
-                pills.push(Span::styled(body, body_style));
-                pills.push(Span::styled(rcap, cap));
+                pills.extend(pill);
                 pills.push(Span::raw(" "));
                 x += w + 1;
             }

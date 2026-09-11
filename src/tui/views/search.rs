@@ -57,6 +57,7 @@ pub struct SearchView {
     panel_active: bool,
     pub(super) hide_tags: bool,
     preset: Option<String>,
+    tag: Option<String>,
     target: Option<(
         skills::config::AgentConfig,
         Option<std::path::PathBuf>,
@@ -96,6 +97,7 @@ impl Default for SearchView {
             panel_active: true,
             hide_tags: false,
             preset: None,
+            tag: None,
             target: None,
             area: Rect::default(),
             scope: None,
@@ -108,7 +110,7 @@ impl Default for SearchView {
 
 impl SearchView {
     fn is_picker(&self) -> bool {
-        self.preset.is_some() || self.target.is_some()
+        self.preset.is_some() || self.tag.is_some() || self.target.is_some()
     }
 
     fn includes_record(&self, record: &skills::reconcile::SkillRecord) -> bool {
@@ -219,7 +221,10 @@ impl SearchView {
                 agent.display_name(),
                 skills::paths::contract_tilde(&agent.skills_path())
             ),
-            None => " Preset skills ".into(),
+            None => self.tag.as_ref().map_or_else(
+                || " Preset skills ".into(),
+                |tag| format!(" Tag: {tag} · skills "),
+            ),
         }
     }
 
@@ -255,6 +260,25 @@ impl SearchView {
         view
     }
 
+    pub fn tag_members(tag: &str, ctx: &Ctx) -> Self {
+        let mut view = Self {
+            tag: Some(tag.into()),
+            multi: true,
+            hide_tags: true,
+            layout: Some(UiLayout::Grid),
+            ..Self::default()
+        };
+        view.refresh(ctx);
+        view.checked = ctx
+            .snap
+            .skills
+            .iter()
+            .filter(|r| r.tags.iter().any(|t| t == tag))
+            .map(|r| r.key.clone())
+            .collect();
+        view
+    }
+
     fn apply_preset(&self, ctx: &Ctx) -> Vec<Action> {
         if let Some((agent, project, on)) = self.target.clone() {
             let keys = self.visible_checked(ctx);
@@ -282,6 +306,29 @@ impl SearchView {
                     keys,
                 ),
             ];
+        }
+        if let Some(tag) = self.tag.clone() {
+            let visible: BTreeSet<String> = self
+                .hits
+                .iter()
+                .map(|h| ctx.snap.skills[h.index].key.clone())
+                .collect();
+            let desired = self.visible_checked(ctx);
+            let keys = visible.iter().cloned().collect();
+            return vec![Action::BatchMeta(
+                Box::new(move |ws| {
+                    skills::history::tag_edit(ws, |ws| {
+                        skills::config::Config::edit_tags(&ws.root, |tags| {
+                            if let Some(group) = tags.iter_mut().find(|t| t.name == tag) {
+                                group.skills.retain(|k| !visible.contains(k));
+                                group.skills.extend(desired);
+                            }
+                        })?;
+                        Ok(format!("updated members of {tag}"))
+                    })
+                }),
+                keys,
+            )];
         }
         let Some(preset) = self.preset.clone() else {
             return vec![];

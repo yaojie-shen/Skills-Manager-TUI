@@ -31,6 +31,8 @@ pub struct PickItem {
 pub enum InputKind {
     Tags { skill: String },
     PresetName,
+    TagName,
+    TagDescription { name: String },
     PresetDescription { name: String },
     RenamePreset { old: String },
     RenameTag { old: String },
@@ -252,6 +254,26 @@ impl Modal {
             input: Input::default(),
             kind: InputKind::Install,
             hint: "owner/repo[/path] · git URL · local path\nEnter install · Esc cancel".into(),
+            rect: Rect::default(),
+        }
+    }
+
+    pub fn new_tag() -> Self {
+        Self::Input {
+            title: " create tag ".into(),
+            input: Input::default(),
+            kind: InputKind::TagName,
+            hint: "name · Enter create · Esc cancel".into(),
+            rect: Rect::default(),
+        }
+    }
+
+    pub fn tag_description(name: &str, current: Option<&str>) -> Self {
+        Self::Input {
+            title: format!(" description of {name} "),
+            input: Input::with_value(current.unwrap_or_default()),
+            kind: InputKind::TagDescription { name: name.into() },
+            hint: "one sentence · Enter save · empty clears · Esc cancel".into(),
             rect: Rect::default(),
         }
     }
@@ -1571,6 +1593,52 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
                 Err(e) => vec![Action::Error(format!("{e:#}"))],
             }
         }
+        InputKind::TagName => {
+            let name = value.trim().to_string();
+            if name.is_empty() {
+                return vec![];
+            }
+            let selected = name.clone();
+            vec![
+                Action::WriteMeta(Box::new(move |ws| {
+                    anyhow::ensure!(
+                        name != "(untagged)" && !name.contains(','),
+                        "invalid tag name"
+                    );
+                    history::tag_edit(ws, |ws| {
+                        let mut exists = false;
+                        skills::config::Config::edit_tags(&ws.root, |tags| {
+                            exists = tags.iter().any(|t| t.name == name);
+                            if !exists {
+                                tags.push(skills::config::TagConfig {
+                                    name: name.clone(),
+                                    skills: vec![],
+                                    color: None,
+                                    description: None,
+                                });
+                            }
+                        })?;
+                        anyhow::ensure!(!exists, "tag {name} already exists");
+                        Ok(format!("created {name} — press a to add skills"))
+                    })
+                })),
+                Action::SelectTag(selected),
+            ]
+        }
+        InputKind::TagDescription { name } => {
+            let name = name.clone();
+            let description = value.trim().to_string();
+            vec![Action::WriteMeta(Box::new(move |ws| {
+                history::tag_edit(ws, |ws| {
+                    skills::config::Config::edit_tags(&ws.root, |tags| {
+                        if let Some(tag) = tags.iter_mut().find(|t| t.name == name) {
+                            tag.description = (!description.is_empty()).then_some(description);
+                        }
+                    })?;
+                    Ok(format!("updated description of {name}"))
+                })
+            }))]
+        }
         InputKind::RenameTag { old } => {
             let old = old.clone();
             let new = value.trim().to_string();
@@ -1679,12 +1747,16 @@ const HELP: &str = "Library
   Esc               cancel multi-select; hidden selections never participate
   u  U              check upstream / update from upstream (git sources)
 Tags / Presets
+  c / a             create a group / add skills
+  e / r / D         description / rename / delete group
+  C / m             Tags: color / merge (left panel)
   /                 filter names on the left or skills on the right
   arrows            navigate lists and move between panels
   m                 multi-select skills in the current panel
   Ctrl-A            select current skill results; hidden selections are excluded
   t / d / p         batch tags / deploy / add to preset
-  x                 in Presets: remove selected skills from that preset
+  x                 remove selected skills from the current tag or preset
+  Enter / click     toggle or create a tag immediately; Esc closes the picker
 Agents
   /                 filter preset pills or skills, according to focus
   a                 adopt an entry the agent has but the root does not

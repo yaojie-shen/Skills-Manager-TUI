@@ -14,7 +14,7 @@ use crate::tui::widgets::{CardGrid, ScrollTrack, fit, pad, width};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use skills::history;
@@ -250,17 +250,15 @@ impl PresetsView {
             } else {
                 ctx.theme.dim
             };
-            let mut style = Style::default().bg(fill).fg(cards::ink(fill));
+            let mut pill = cards::pill(bodies[i].clone(), fill, ctx);
             if i == self.tag_cursor {
-                style = style.add_modifier(if self.focus_tags {
+                pill[1].style = pill[1].style.add_modifier(if self.focus_tags {
                     Modifier::BOLD | Modifier::UNDERLINED
                 } else {
                     Modifier::BOLD
                 });
             }
-            spans.push(Span::styled(left, Style::default().fg(fill)));
-            spans.push(Span::styled(bodies[i].clone(), style));
-            spans.push(Span::styled(right, Style::default().fg(fill)));
+            spans.extend(pill);
             spans.push(Span::raw(" "));
             self.tag_rects
                 .push((i, Rect::new(x, area.y, (widths[i] - 1) as u16, 1)));

@@ -97,6 +97,7 @@ pub enum Action {
     /// Land on a preset by name once the list next reloads: after creating
     /// or renaming one, the card to look at is the one that has just changed.
     SelectPreset(String),
+    SelectTag(String),
     /// Jump to the search tab with this query; `focus_list` selects the list pane.
     Search {
         query: String,
@@ -946,6 +947,7 @@ impl App {
                 }
             }
             Action::SelectPreset(name) => self.presets.select(&name),
+            Action::SelectTag(name) => self.tags.select(&name, &self.snap),
             Action::Search { query, focus_list } => {
                 self.switch_tab(Tab::Search);
                 let ctx = Ctx {

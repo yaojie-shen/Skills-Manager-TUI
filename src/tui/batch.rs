@@ -6,7 +6,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::{
     Frame,
     layout::Rect,
-    text::Line,
+    style::Style,
+    text::{Line, Span},
     widgets::{List, ListItem, Paragraph},
 };
 use skills::{history, ops::deploy};
@@ -155,6 +156,14 @@ impl Batch {
         if self.busy {
             return &[("…", "applying changes")];
         }
+        if self.kind == Kind::Tags {
+            return &[
+                ("↑↓", "choose"),
+                ("Enter", "toggle / create"),
+                ("Tab", "complete"),
+                ("Esc", "done"),
+            ];
+        }
         if self.focus == 0 {
             &[
                 ("type", "filter"),
@@ -182,6 +191,12 @@ impl Batch {
             .filter(|(_, r)| r.label.to_lowercase().contains(&query))
             .map(|(i, _)| i)
             .collect();
+        if self.kind == Kind::Tags
+            && !query.is_empty()
+            && !self.rows.iter().any(|r| r.id.to_lowercase() == query)
+        {
+            self.shown.push(self.rows.len()); // Inline create option.
+        }
         self.list.first(self.shown.len());
     }
     fn toggle(&mut self) {
@@ -216,6 +231,27 @@ impl Batch {
         if k.code == KeyCode::Esc {
             return vec![Action::CloseModal];
         }
+        if self.kind == Kind::Tags {
+            match k.code {
+                KeyCode::Down => self.list.move_by(1, self.shown.len()),
+                KeyCode::Up => self.list.move_by(-1, self.shown.len()),
+                KeyCode::Enter => return self.edit_selected_tag(),
+                KeyCode::Tab => {
+                    if let Some(row) = self
+                        .list
+                        .selected()
+                        .and_then(|i| self.shown.get(i))
+                        .and_then(|i| self.rows.get(*i))
+                    {
+                        self.input = Input::with_value(&row.id);
+                        self.filter();
+                    }
+                }
+                _ if self.input.handle_key(k) => self.filter(),
+                _ => {}
+            }
+            return vec![];
+        }
         if k.code == KeyCode::Enter && k.modifiers.contains(KeyModifiers::CONTROL) {
             return self.apply(ctx);
         }
@@ -240,19 +276,6 @@ impl Batch {
             KeyCode::Enter if self.focus == 3 => return vec![Action::CloseModal],
             KeyCode::Enter if self.focus == 1 => self.toggle(),
             KeyCode::Enter if self.focus == 0 => {
-                let name = self.input.value().trim().to_string();
-                if self.kind == Kind::Tags
-                    && !name.is_empty()
-                    && !self.rows.iter().any(|r| r.id == name)
-                {
-                    self.rows.push(Row {
-                        label: name.clone(),
-                        id: name,
-                        count: 0,
-                        desired: Some(true),
-                    });
-                    self.filter();
-                }
                 self.focus = 1;
                 self.list.clamp(self.shown.len());
             }
@@ -297,6 +320,55 @@ impl Batch {
         });
         Ok(actions)
     }
+    fn edit_selected_tag(&mut self) -> Vec<Action> {
+        let Some(i) = self
+            .list
+            .selected()
+            .and_then(|i| self.shown.get(i))
+            .copied()
+        else {
+            return vec![];
+        };
+        let name = self
+            .rows
+            .get(i)
+            .map(|r| r.id.clone())
+            .unwrap_or_else(|| self.input.value().trim().to_string());
+        let keys = self.keys.clone();
+        self.input = Input::default();
+        self.filter();
+        vec![Action::WriteMeta(Box::new(move |ws| {
+            let config = skills::config::Config::load(&ws.root)?;
+            anyhow::ensure!(config.tags_enabled, "Tags are disabled");
+            anyhow::ensure!(!keys.is_empty(), "No skills selected");
+            anyhow::ensure!(
+                !name.is_empty() && name != "(untagged)" && !name.contains(','),
+                "Invalid tag name"
+            );
+            for key in &keys {
+                anyhow::ensure!(ws.skill_path(key).is_dir(), "no such skill: {key}");
+            }
+            history::tag_edit(ws, |ws| {
+                skills::config::Config::edit_tags(&ws.root, |tags| {
+                    if !tags.iter().any(|t| t.name == name) {
+                        tags.push(skills::config::TagConfig {
+                            name: name.clone(),
+                            skills: vec![],
+                            color: None,
+                            description: None,
+                        });
+                    }
+                    let tag = tags.iter_mut().find(|t| t.name == name).unwrap();
+                    let remove = keys.iter().all(|k| tag.skills.contains(k));
+                    tag.skills.retain(|k| !keys.contains(k));
+                    if !remove {
+                        tag.skills.extend(keys.clone());
+                    }
+                })?;
+                Ok(format!("Updated tag {name}"))
+            })
+        }))]
+    }
     fn apply(&mut self, ctx: &Ctx) -> Vec<Action> {
         if self.keys.is_empty() {
             self.error = Some("No skills selected.".into());
@@ -307,7 +379,7 @@ impl Batch {
             .iter()
             .filter_map(|r| r.desired.map(|on| (r.id.clone(), on)))
             .collect();
-        if changes.is_empty() {
+        if changes.is_empty() && self.kind != Kind::Tags {
             self.error = Some("No changes selected.".into());
             return vec![];
         }
@@ -324,43 +396,7 @@ impl Batch {
                     vec![]
                 }
             },
-            Kind::Tags => {
-                let targets = keys.clone();
-                vec![Action::BatchMeta(
-                    Box::new(move |ws| {
-                        anyhow::ensure!(
-                            skills::config::Config::load(&ws.root)?.tags_enabled,
-                            "Tags are disabled"
-                        );
-                        for key in &targets {
-                            anyhow::ensure!(ws.skill_path(key).is_dir(), "no such skill: {key}");
-                        }
-                        history::tag_edit(ws, |ws| {
-                            skills::config::Config::edit_tags(&ws.root, |tags| {
-                                for (name, on) in &changes {
-                                    if *on && !tags.iter().any(|tag| &tag.name == name) {
-                                        tags.push(skills::config::TagConfig {
-                                            name: name.clone(),
-                                            skills: Vec::new(),
-                                            color: None,
-                                            description: None,
-                                        });
-                                    }
-                                    if let Some(tag) = tags.iter_mut().find(|tag| &tag.name == name)
-                                    {
-                                        tag.skills.retain(|key| !targets.contains(key));
-                                        if *on {
-                                            tag.skills.extend(targets.clone());
-                                        }
-                                    }
-                                }
-                            })?;
-                            Ok(format!("Updated tags for {} skills", targets.len()))
-                        })
-                    }),
-                    keys,
-                )]
-            }
+            Kind::Tags => self.edit_selected_tag(),
             Kind::Presets => {
                 let targets = keys.clone();
                 vec![Action::BatchMeta(
@@ -414,6 +450,28 @@ impl Batch {
     }
     pub fn mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
         let at = ratatui::layout::Position::new(m.column, m.row);
+        if self.kind == Kind::Tags {
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if !self.rect.contains(at) {
+                        return vec![Action::CloseModal];
+                    }
+                    if self.input_rect.contains(at) {
+                        self.input.click(m.column);
+                    }
+                    if self.list.rows.contains(at)
+                        && let Some(i) = self.list.row_at(m.row, self.shown.len())
+                    {
+                        self.list.select(Some(i));
+                        return self.edit_selected_tag();
+                    }
+                }
+                MouseEventKind::ScrollDown => self.list.move_by(1, self.shown.len()),
+                MouseEventKind::ScrollUp => self.list.move_by(-1, self.shown.len()),
+                _ => {}
+            }
+            return vec![];
+        }
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if !self.rect.contains(at) || self.buttons[1].contains(at) {
@@ -451,6 +509,151 @@ impl Batch {
         vec![]
     }
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        if self.kind == Kind::Tags {
+            let selected = self
+                .list
+                .selected()
+                .and_then(|i| self.shown.get(i))
+                .map(|i| {
+                    self.rows
+                        .get(*i)
+                        .map(|r| r.id.clone())
+                        .unwrap_or_else(|| self.input.value().trim().to_string())
+                });
+            let fresh = Self::tags(self.keys.clone(), ctx);
+            if self
+                .rows
+                .iter()
+                .map(|r| &r.id)
+                .ne(fresh.rows.iter().map(|r| &r.id))
+            {
+                self.rows = fresh.rows;
+                self.filter();
+                if let Some(name) = selected {
+                    let index = self
+                        .shown
+                        .iter()
+                        .position(|i| self.rows.get(*i).is_some_and(|r| r.id == name));
+                    if index.is_some() {
+                        self.list.select(index);
+                    }
+                }
+            } else {
+                self.rows = fresh.rows;
+            }
+            let w = area.width.saturating_sub(2).min(50);
+            let h = area
+                .height
+                .saturating_sub(2)
+                .min(self.shown.len().clamp(1, 7) as u16 + 6);
+            self.rect = Rect::new(
+                area.x + (area.width - w) / 2,
+                area.y + (area.height - h) / 2,
+                w,
+                h,
+            );
+            f.render_widget(OverlayClear, self.rect);
+            let block = ctx
+                .theme
+                .block("", false)
+                .title(Line::from(Span::styled(" Tags ", ctx.theme.accent())));
+            let inner = block.inner(self.rect);
+            f.render_widget(block, self.rect);
+            if inner.height < 4 || inner.width < 6 {
+                return;
+            }
+            f.render_widget(
+                Paragraph::new("›").style(ctx.theme.accent()),
+                Rect::new(inner.x + 1, inner.y, 1, 1),
+            );
+            self.input_rect = Rect::new(inner.x + 3, inner.y, inner.width.saturating_sub(4), 1);
+            self.input
+                .render(f, self.input_rect, true, "Search or create…", ctx.theme);
+            f.render_widget(
+                Paragraph::new("─".repeat(inner.width as usize)).style(ctx.theme.dim()),
+                Rect::new(inner.x, inner.y + 1, inner.width, 1),
+            );
+            self.list.rows = Rect::new(
+                inner.x + 1,
+                inner.y + 2,
+                inner.width.saturating_sub(2),
+                inner.height.saturating_sub(4),
+            );
+            self.list.clamp(self.shown.len());
+            let items: Vec<ListItem> = self
+                .shown
+                .iter()
+                .enumerate()
+                .map(|(index, i)| {
+                    ListItem::new(if let Some(row) = self.rows.get(*i) {
+                        let fill = super::views::cards::tag_fill(&row.id, ctx);
+                        let (left, right) = ctx.ws.config.ui.pill_caps.glyphs();
+                        let caps_width = super::widgets::width(left) + super::widgets::width(right);
+                        let label = fit(
+                            &row.label,
+                            (self.list.rows.width as usize).saturating_sub(7 + caps_width),
+                        );
+                        let chip = format!(" {label} ");
+                        let gap =
+                            self.list.rows.width.saturating_sub(
+                                (super::widgets::width(&chip) + caps_width) as u16 + 3,
+                            );
+                        let mut spans = vec![Span::raw(" ")];
+                        spans.extend(super::views::cards::pill(chip, fill, ctx));
+                        spans.extend([
+                            Span::raw(" ".repeat(gap as usize)),
+                            Span::styled(
+                                if row.count == self.keys.len() {
+                                    "✓"
+                                } else if row.count > 0 {
+                                    "−"
+                                } else {
+                                    " "
+                                },
+                                ctx.theme.ok(),
+                            ),
+                            Span::raw(" "),
+                        ]);
+                        Line::from(spans)
+                    } else {
+                        Line::from(vec![
+                            Span::styled(" + ", ctx.theme.accent()),
+                            Span::styled("Create ", ctx.theme.dim()),
+                            Span::styled(
+                                fit(
+                                    self.input.value().trim(),
+                                    self.list.rows.width.saturating_sub(10) as usize,
+                                ),
+                                ctx.theme.accent(),
+                            ),
+                        ])
+                    })
+                    .style(if self.list.selected() == Some(index) {
+                        ctx.theme.selected_unfocused()
+                    } else {
+                        Style::default()
+                    })
+                })
+                .collect();
+            if items.is_empty() {
+                f.render_widget(
+                    Paragraph::new("Type to create your first tag").style(ctx.theme.dim()),
+                    self.list.rows,
+                );
+            } else {
+                f.render_stateful_widget(List::new(items), self.list.rows, &mut self.list.state);
+            }
+            f.render_widget(
+                Paragraph::new("↵ select                 esc close").style(ctx.theme.dim()),
+                Rect::new(
+                    inner.x + 2,
+                    inner.bottom() - 1,
+                    inner.width.saturating_sub(4),
+                    1,
+                ),
+            );
+            return;
+        }
         let w = area.width.saturating_sub(2).min(76);
         let h = area.height.saturating_sub(2).min(20);
         self.rect = Rect::new(
@@ -475,17 +678,8 @@ impl Batch {
             return;
         }
         self.input_rect = Rect::new(inner.x, inner.y, inner.width, 1);
-        self.input.render(
-            f,
-            self.input_rect,
-            self.focus == 0,
-            if self.kind == Kind::Tags {
-                "Filter or create a tag…"
-            } else {
-                "Filter…"
-            },
-            ctx.theme,
-        );
+        self.input
+            .render(f, self.input_rect, self.focus == 0, "Filter…", ctx.theme);
         self.list.rows = Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 5);
         self.list.clamp(self.shown.len());
         let items: Vec<ListItem> = self
@@ -514,12 +708,7 @@ impl Batch {
             .collect();
         if items.is_empty() {
             f.render_widget(
-                Paragraph::new(if self.kind == Kind::Tags && !self.input.is_empty() {
-                    "Enter creates this tag"
-                } else {
-                    "No matching entries"
-                })
-                .style(ctx.theme.dim()),
+                Paragraph::new("No matching entries").style(ctx.theme.dim()),
                 self.list.rows,
             );
         } else {
@@ -546,10 +735,8 @@ impl Batch {
                         ),
                         Err(e) => e.to_string(),
                     }
-                } else if self.kind == Kind::Presets {
-                    "Selected presets receive all selected skills.".into()
                 } else {
-                    "Untouched tags keep their existing membership.".into()
+                    "Selected presets receive all selected skills.".into()
                 }
             })
         };
@@ -611,6 +798,122 @@ mod tests {
         }
     }
     #[test]
+    fn tag_picker_saves_each_choice_and_stays_open() {
+        let fixture = Fixture::new();
+        let ws = Workspace::open(&fixture.0).unwrap();
+        edit::tag_add(&ws, "beta", &["merlin".into(), "meta".into()]).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = super::super::theme::Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut batch = Batch::tags(vec!["alpha".into()], &ctx);
+        batch.paste("mer");
+        assert_eq!(batch.shown.len(), 2); // Existing merlin and Create mer.
+        batch.key(key(KeyCode::Tab), &ctx);
+        assert_eq!(batch.input.value(), "merlin");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 25)).unwrap();
+        for name in ["merlin", "meta", "new-tag"] {
+            batch.input = Input::default();
+            batch.paste(name);
+            let actions = batch.key(key(KeyCode::Enter), &ctx);
+            assert_eq!(actions.len(), 1);
+            let Action::WriteMeta(write) = actions.into_iter().next().unwrap() else {
+                panic!("immediate write")
+            };
+            write(&ws).unwrap();
+            assert!(
+                skills::config::Config::load(&ws.root)
+                    .unwrap()
+                    .skill_tags("alpha")
+                    .contains(&name.to_string())
+            );
+            let snap = ws.scan().unwrap();
+            terminal
+                .draw(|f| batch.draw(f, f.area(), &Ctx { snap: &snap, ..ctx }))
+                .unwrap();
+        }
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!screen.contains("Apply"));
+        assert!(!screen.contains("pending"));
+        assert!(screen.contains(" new-tag "));
+        assert!(screen.contains('✓'));
+        let mut styled_ws = Workspace::open(&ws.root).unwrap();
+        for caps in [
+            skills::config::PillCaps::Round,
+            skills::config::PillCaps::Block,
+            skills::config::PillCaps::None,
+        ] {
+            styled_ws.config.ui.pill_caps = caps;
+            terminal
+                .draw(|f| {
+                    batch.draw(
+                        f,
+                        f.area(),
+                        &Ctx {
+                            ws: &styled_ws,
+                            ..ctx
+                        },
+                    )
+                })
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            let (left, right) = caps.glyphs();
+            assert!(text.contains(&format!("{left} new-tag {right}")));
+        }
+        // Clicking the checked tag removes it immediately.
+        let actions = batch.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: batch.list.rows.x,
+                row: batch.list.rows.y
+                    + batch
+                        .shown
+                        .iter()
+                        .position(|i| batch.rows[*i].id == "new-tag")
+                        .unwrap() as u16,
+                modifiers: KeyModifiers::NONE,
+            },
+            &ctx,
+        );
+        let Action::WriteMeta(write) = actions.into_iter().next().unwrap() else {
+            panic!("click toggles")
+        };
+        write(&ws).unwrap();
+        assert_eq!(
+            skills::config::Config::load(&ws.root)
+                .unwrap()
+                .skill_tags("alpha"),
+            vec!["merlin", "meta"]
+        );
+        assert!(matches!(
+            batch.key(key(KeyCode::Esc), &ctx).as_slice(),
+            [Action::CloseModal]
+        ));
+        assert_eq!(
+            skills::config::Config::load(&ws.root)
+                .unwrap()
+                .skill_tags("alpha"),
+            vec!["merlin", "meta"]
+        );
+    }
+    #[test]
     fn partial_tags_are_preserved_until_toggled_and_batch_has_one_undo() {
         let fixture = Fixture::new();
         let ws = Workspace::open(&fixture.0).unwrap();
@@ -624,16 +927,13 @@ mod tests {
         };
         let mut batch = Batch::tags(vec!["alpha".into(), "beta".into()], &ctx);
         assert_eq!(batch.rows[0].marker(2), "[−]");
-        batch.rows.push(Row {
-            id: "new".into(),
-            label: "new".into(),
-            count: 0,
-            desired: Some(true),
-        });
-        let Action::BatchMeta(write, keys) = batch.apply(&ctx).remove(0) else {
+        batch.paste("new");
+        let Action::WriteMeta(write) = batch
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx)
+            .remove(0)
+        else {
             panic!("expected metadata edit")
         };
-        assert_eq!(keys.len(), 2);
         let (_, intent) = write(&ws).unwrap();
         assert!(
             skills::config::Config::load(&ws.root)
@@ -672,8 +972,11 @@ mod tests {
             theme: &theme,
         };
         let mut batch = Batch::tags(vec!["alpha".into(), "beta".into()], &ctx);
-        batch.rows[0].desired = Some(false);
-        let Action::BatchMeta(write, _) = batch.apply(&ctx).remove(0) else {
+        batch.filter();
+        let Action::WriteMeta(write) = batch
+            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx)
+            .remove(0)
+        else {
             panic!("expected metadata edit")
         };
         assert!(write(&ws).is_err());
