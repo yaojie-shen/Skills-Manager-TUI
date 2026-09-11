@@ -449,7 +449,7 @@ impl TagsView {
             width: inner.width.saturating_sub(1),
             ..inner
         };
-        self.list.layout(content, 1, 2, 0, self.rows.len());
+        self.list.layout(content, 1, 1, 0, self.rows.len());
         let selected = self.list.selected();
         let w = content.width as usize;
         for i in self.list.visible() {
@@ -503,10 +503,7 @@ impl TagsView {
             } else {
                 Style::default()
             };
-            f.render_widget(
-                Paragraph::new(Line::from(spans)).style(style),
-                Rect { height: 1, ..cell },
-            );
+            f.render_widget(Paragraph::new(Line::from(spans)).style(style), cell);
         }
         draw_track(f, inner, &self.list, selected, &mut self.list_track, th);
     }
