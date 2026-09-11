@@ -395,6 +395,7 @@ fn install_from_local_directory_copies() {
 
     let snap = ws.scan().unwrap();
     let rec = snap.get("handy").unwrap();
+    assert_eq!(rec.status, SkillStatus::Local);
     match &rec.source {
         Some(Source::Local { path }) => assert_eq!(
             path.as_deref(),
@@ -402,10 +403,7 @@ fn install_from_local_directory_copies() {
         ),
         other => panic!("unexpected source {other:?}"),
     }
-    assert_eq!(
-        rec.baseline_hash.as_deref(),
-        Some(hash_directory(&dir).unwrap().as_str())
-    );
+    assert_eq!(rec.baseline_hash.as_deref(), None);
     assert!(f.staging_empty(), "staging cleaned");
 }
 

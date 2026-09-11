@@ -153,7 +153,7 @@ pub fn checkbox_marker(checked: bool, th: &Theme) -> Span<'static> {
 pub fn health_marker(r: &SkillRecord, th: &Theme) -> Span<'static> {
     use skills::reconcile::SkillStatus::*;
     let (glyph, style) = match &r.status {
-        Managed { no_baseline: false } => ("●   ", th.ok()),
+        Local | Managed { no_baseline: false } => ("●   ", th.ok()),
         Managed { no_baseline: true } => ("●   ", th.warn()),
         Unmanaged => ("○   ", th.dim()),
         Modified => ("~   ", th.warn()),

@@ -17,6 +17,7 @@ pub mod watch;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum SkillStatus {
+    Local,
     Managed { no_baseline: bool },
     Modified,
     Unmanaged,
@@ -29,6 +30,7 @@ pub enum SkillStatus {
 impl SkillStatus {
     pub fn label(&self) -> &'static str {
         match self {
+            SkillStatus::Local => "local",
             SkillStatus::Managed { .. } => "managed",
             SkillStatus::Modified => "modified",
             SkillStatus::Unmanaged => "unmanaged",
@@ -39,13 +41,17 @@ impl SkillStatus {
         }
     }
     pub fn is_healthy(&self) -> bool {
-        matches!(self, SkillStatus::Managed { .. } | SkillStatus::Unmanaged)
+        matches!(
+            self,
+            SkillStatus::Local | SkillStatus::Managed { .. } | SkillStatus::Unmanaged
+        )
     }
     /// Skill directory exists with a readable SKILL.md.
     pub fn is_present(&self) -> bool {
         matches!(
             self,
-            SkillStatus::Managed { .. }
+            SkillStatus::Local
+                | SkillStatus::Managed { .. }
                 | SkillStatus::Modified
                 | SkillStatus::Unmanaged
                 | SkillStatus::CorruptMeta { .. }
@@ -466,6 +472,15 @@ fn scan_inventory(
         }
     }
 
+    for rec in records.values_mut() {
+        if rec.status == SkillStatus::Unmanaged
+            && crate::repository::alias_of(&rec.key).is_none()
+            && !matches!(rec.source, Some(crate::meta::Source::Git { .. }))
+        {
+            rec.status = SkillStatus::Local;
+        }
+    }
+
     // Collect baseline work once, then share completed hashes with agent/shadow
     // comparisons. Limit concurrency to avoid an unbounded disk/FD fan-out.
     if verify_content && parallel {
@@ -786,7 +801,7 @@ mod scan_cost_tests {
         );
         assert_eq!(
             scan(&root, &config).unwrap().get("one").unwrap().status,
-            SkillStatus::Modified
+            SkillStatus::Local
         );
     }
 
@@ -825,10 +840,7 @@ mod scan_cost_tests {
                 serde_json::to_value(&parallel).unwrap(),
                 serde_json::to_value(&serial).unwrap()
             );
-            assert_eq!(
-                parallel.get("skill-2").unwrap().status,
-                SkillStatus::Modified
-            );
+            assert_eq!(parallel.get("skill-2").unwrap().status, SkillStatus::Local);
         }
     }
 
@@ -853,10 +865,7 @@ mod scan_cost_tests {
             snap.get("repos/demo/one").unwrap().status,
             SkillStatus::Unmanaged
         );
-        assert_eq!(
-            snap.get("two").unwrap().status,
-            SkillStatus::Managed { no_baseline: true }
-        );
+        assert_eq!(snap.get("two").unwrap().status, SkillStatus::Local);
         assert!(snap.skills.iter().all(|r| r.current_hash.is_none()));
     }
 
@@ -864,16 +873,22 @@ mod scan_cost_tests {
     fn baseline_changes_and_rename_ambiguity_are_still_detected() {
         let tmp = crate::ops::DownloadDir::new("scan-required-hash").unwrap();
         let root = tmp.path();
-        let path = skill(root, "one");
+        let path = skill(root, "repos/demo/one");
         let meta = SkillMeta {
+            source: Some(crate::meta::Source::Git {
+                url: "https://example.com/demo".into(),
+                branch: None,
+                subpath: Some("one".into()),
+                revision: None,
+            }),
             baseline: Some(Baseline {
                 hash: hash_directory(&path).unwrap(),
                 hash_algo: crate::hash::HASH_ALGO,
             }),
             ..Default::default()
         };
-        MetaStore::new(root).save("one", &meta).unwrap();
-        skill(root, "unrelated");
+        MetaStore::new(root).save("repos/demo/one", &meta).unwrap();
+        skill(root, "repos/demo/unrelated");
         let config = Config {
             agents: vec![],
             ..Default::default()
@@ -886,26 +901,38 @@ mod scan_cost_tests {
         .unwrap();
         assert_eq!(reads, vec![path.canonicalize().unwrap()]);
         assert_eq!(
-            snap.get("one").unwrap().status,
+            snap.get("repos/demo/one").unwrap().status,
             SkillStatus::Managed { no_baseline: false }
         );
         std::fs::write(path.join("script.py"), "print('changed')").unwrap();
         assert_eq!(
-            scan(root, &config).unwrap().get("one").unwrap().status,
+            scan(root, &config)
+                .unwrap()
+                .get("repos/demo/one")
+                .unwrap()
+                .status,
             SkillStatus::Modified
         );
         std::fs::remove_file(path.join("script.py")).unwrap();
-        std::fs::rename(&path, root.join("renamed")).unwrap();
+        std::fs::rename(&path, root.join("repos/demo/renamed")).unwrap();
         // Both unmanaged directories have the same content, so no unique rename.
         assert_eq!(
-            scan(root, &config).unwrap().get("one").unwrap().status,
+            scan(root, &config)
+                .unwrap()
+                .get("repos/demo/one")
+                .unwrap()
+                .status,
             SkillStatus::Missing
         );
-        std::fs::write(root.join("unrelated/extra.txt"), "different").unwrap();
+        std::fs::write(root.join("repos/demo/unrelated/extra.txt"), "different").unwrap();
         assert_eq!(
-            scan(root, &config).unwrap().get("one").unwrap().status,
+            scan(root, &config)
+                .unwrap()
+                .get("repos/demo/one")
+                .unwrap()
+                .status,
             SkillStatus::Renamed {
-                to: "renamed".into()
+                to: "repos/demo/renamed".into()
             }
         );
     }

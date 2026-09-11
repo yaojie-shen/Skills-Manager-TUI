@@ -166,7 +166,11 @@ impl MetaStore {
                 source.insert("branch".into(), branch.into());
             }
         }
-        Ok(Some(value.try_into()?))
+        let mut meta: SkillMeta = value.try_into()?;
+        if !matches!(meta.source, Some(Source::Git { .. })) {
+            meta.baseline = None;
+        }
+        Ok(Some(meta))
     }
     pub fn list_keys(&self) -> Result<Vec<String>> {
         let mut files = vec![(self.dir.join("local.toml"), String::new())];
@@ -207,6 +211,9 @@ impl MetaStore {
             .parse::<DocumentMut>()?
             .as_table()
             .clone();
+        if !matches!(meta.source, Some(Source::Git { .. })) {
+            item.remove("baseline");
+        }
         if let Some(alias) = crate::repository::alias_of(key)
             && let Some(Source::Git { url, branch, .. }) = &meta.source
         {

@@ -2505,7 +2505,7 @@ mod overflow_tests {
     use skills::{Workspace, config::AgentConfig};
 
     #[test]
-    fn linked_unmanaged_skill_keeps_its_health_marker_across_layouts() {
+    fn linked_local_skill_keeps_its_health_marker_across_layouts() {
         let root =
             std::env::temp_dir().join(format!("skills-agent-markers-{}", std::process::id()));
         let central = root.join("central");
@@ -2539,7 +2539,7 @@ mod overflow_tests {
         let record = snap.get("printer").unwrap();
         assert!(matches!(
             record.status,
-            skills::reconcile::SkillStatus::Unmanaged
+            skills::reconcile::SkillStatus::Local
         ));
         assert!(
             view.rows(&ctx)
@@ -2556,8 +2556,8 @@ mod overflow_tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             let line = text.lines().find(|line| line.contains("printer")).unwrap();
-            assert!(line.contains("○"), "compact={compact}: {line}");
-            assert!(!line.contains("●"), "compact={compact}: {line}");
+            assert!(line.contains("●"), "compact={compact}: {line}");
+            assert!(!line.contains("○"), "compact={compact}: {line}");
         }
         assert_eq!(glyph_for(Some(&EntryState::Deployed), &theme).0, "✓");
         assert_eq!(glyph_for(None, &theme).0, "—");

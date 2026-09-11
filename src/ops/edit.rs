@@ -8,28 +8,19 @@ use crate::ops::{deploy, require_key};
 use crate::reconcile::{AgentDirMode, EntryState, Snapshot};
 use anyhow::{Context, Result, bail};
 
-/// Load metadata for `key`, creating an in-memory default with a fresh baseline
-/// when none exists yet (first write records the current hash, §7.2).
+/// Load metadata without registering a content baseline for local skills.
 pub fn load_or_init(ws: &Workspace, key: &str) -> Result<SkillMeta> {
     require_key(key)?;
     if let Some(m) = ws.meta.load(key)? {
         return Ok(m);
     }
-    let path = ws.skill_path(key);
-    if !path.is_dir() {
+    if !ws.skill_path(key).is_dir() {
         bail!("no such skill: {key}");
     }
-    let mut meta = SkillMeta::default();
-    if let Ok(h) = hash_directory(&path) {
-        meta.baseline = Some(Baseline {
-            hash: h,
-            hash_algo: HASH_ALGO,
-        });
-    }
-    if meta.source.is_none() {
-        meta.source = Some(crate::meta::Source::Local { path: None });
-    }
-    Ok(meta)
+    Ok(SkillMeta {
+        source: Some(crate::meta::Source::Local { path: None }),
+        ..Default::default()
+    })
 }
 
 fn normalize_tag(t: &str) -> String {
@@ -127,6 +118,9 @@ pub fn note_set(ws: &Workspace, key: &str, note: Option<&str>) -> Result<SkillMe
 /// Record the current content hash as the new baseline ("accept local changes").
 pub fn accept(ws: &Workspace, key: &str) -> Result<SkillMeta> {
     let mut meta = load_or_init(ws, key)?;
+    if !matches!(meta.source, Some(crate::meta::Source::Git { .. })) {
+        bail!("local skills do not track a baseline");
+    }
     let path = ws.skill_path(key);
     if !path.is_dir() {
         bail!("no such skill: {key}");

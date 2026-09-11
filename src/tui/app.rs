@@ -1454,7 +1454,7 @@ mod matrix_key_tests {
         assert!(app.snap.get("new").is_some());
         assert!(matches!(
             app.snap.get("old").unwrap().status,
-            skills::reconcile::SkillStatus::Renamed { .. }
+            skills::reconcile::SkillStatus::Missing
         ));
         std::fs::remove_dir_all(root.join("new")).unwrap();
         app.last_root_poll = std::time::Instant::now() - std::time::Duration::from_secs(3);

@@ -745,7 +745,7 @@ impl SearchView {
             f,
             field,
             self.panel_active && self.focus == Focus::Input,
-            "search skills…   repo:owner/repo  tag:x  agent:y  status:managed  untagged",
+            "search skills…   repo:owner/repo  tag:x  agent:y  status:local  untagged",
             th,
         );
     }
@@ -1565,7 +1565,7 @@ impl View for SearchView {
                 ("d", "deploy"),
                 ("r", "rename"),
                 ("s", "source"),
-                ("a", "accept"),
+                ("a", "accept repo changes"),
                 ("u/U", "check/update"),
                 ("x", "remove"),
                 ("Enter", "preview"),

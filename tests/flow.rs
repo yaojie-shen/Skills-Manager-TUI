@@ -91,11 +91,7 @@ fn scan_tags_notes_and_baseline() {
 
     let snap = ws.scan().unwrap();
     assert_eq!(snap.skills.len(), 2);
-    assert!(
-        snap.skills
-            .iter()
-            .all(|s| s.status == SkillStatus::Unmanaged)
-    );
+    assert!(snap.skills.iter().all(|s| s.status == SkillStatus::Local));
     assert!(!ws.meta.exists("alpha"), "scan must not write");
 
     edit::tag_add(&ws, "alpha", &["ops".into(), "ml".into()]).unwrap();
@@ -106,20 +102,23 @@ fn scan_tags_notes_and_baseline() {
     assert_eq!(a.note.as_deref(), Some("hello\nworld"));
     assert_eq!(
         a.status,
-        SkillStatus::Managed { no_baseline: false },
-        "first write records a baseline"
+        SkillStatus::Local,
+        "metadata edits do not change local status"
     );
 
-    // Local edit -> modified; accept -> managed again.
+    // Local edits remain healthy without tracking a baseline.
     std::fs::write(f.root.join("alpha/extra.md"), "more").unwrap();
     let snap = ws.scan().unwrap();
-    assert_eq!(snap.get("alpha").unwrap().status, SkillStatus::Modified);
-    edit::accept(&ws, "alpha").unwrap();
-    let snap = ws.scan().unwrap();
-    assert_eq!(
-        snap.get("alpha").unwrap().status,
-        SkillStatus::Managed { no_baseline: false }
+    assert_eq!(snap.get("alpha").unwrap().status, SkillStatus::Local);
+    assert!(edit::accept(&ws, "alpha").is_err());
+    assert!(ws.meta.load("alpha").unwrap().unwrap().baseline.is_none());
+    assert!(
+        !std::fs::read_to_string(ws.meta.path("alpha"))
+            .unwrap()
+            .contains("baseline")
     );
+    let snap = ws.scan().unwrap();
+    assert_eq!(snap.get("alpha").unwrap().status, SkillStatus::Local);
 
     // Tag rename/delete across skills.
     edit::tag_add(&ws, "beta", &["ops".into()]).unwrap();
@@ -143,13 +142,8 @@ fn missing_and_rename_detection() {
 
     std::fs::rename(f.root.join("gamma"), f.root.join("gamma2")).unwrap();
     let snap = ws.scan().unwrap();
-    assert_eq!(
-        snap.get("gamma").unwrap().status,
-        SkillStatus::Renamed {
-            to: "gamma2".into()
-        }
-    );
-    assert_eq!(snap.get("gamma2").unwrap().status, SkillStatus::Unmanaged);
+    assert_eq!(snap.get("gamma").unwrap().status, SkillStatus::Missing);
+    assert_eq!(snap.get("gamma2").unwrap().status, SkillStatus::Local);
     assert_eq!(
         snap.get("gamma").unwrap().deploy["a"],
         DeployState::NotDeployed
@@ -369,7 +363,7 @@ fn install_local_rename_remove() {
     assert_eq!(key, "srcskill");
     let snap = ws.scan().unwrap();
     let rec = snap.get("srcskill").unwrap();
-    assert_eq!(rec.status, SkillStatus::Managed { no_baseline: false });
+    assert_eq!(rec.status, SkillStatus::Local);
     assert!(matches!(
         rec.source,
         Some(skills::meta::Source::Local { .. })
@@ -1081,4 +1075,26 @@ fn note_editor_only_saves_successful_content_changes() {
         ws.meta.load("printer").unwrap().unwrap().note.as_deref(),
         Some("updated")
     );
+}
+
+#[test]
+fn local_baselines_are_ignored_and_removed_on_metadata_edit() {
+    let f = Fixture::new("local-baseline");
+    f.add_skill("alpha", "first skill");
+    let ws = f.ws();
+    edit::tag_add(&ws, "alpha", &["keep".into()]).unwrap();
+    let path = ws.meta.path("alpha");
+    let mut contents = std::fs::read_to_string(&path).unwrap();
+    contents.push_str("\n[skills.alpha.baseline]\nhash = \"obsolete\"\nhash_algo = 1\n");
+    std::fs::write(&path, contents).unwrap();
+    let snap = ws.scan().unwrap();
+    let rec = snap.get("alpha").unwrap();
+    assert_eq!(rec.status, SkillStatus::Local);
+    assert!(rec.baseline_hash.is_none());
+    assert!(rec.current_hash.is_none());
+    assert!(rec.status.is_healthy());
+    edit::note_set(&ws, "alpha", Some("keep note")).unwrap();
+    let stored = std::fs::read_to_string(path).unwrap();
+    assert!(!stored.contains("baseline"));
+    assert_eq!(ws.meta.load("alpha").unwrap().unwrap().tags, vec!["keep"]);
 }

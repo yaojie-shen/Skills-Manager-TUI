@@ -51,6 +51,7 @@ impl Completion {
                 .collect(),
             Some(("agent", _)) => ctx.snap.agents.iter().map(|a| a.key.clone()).collect(),
             Some(("status", _)) => [
+                "local",
                 "managed",
                 "modified",
                 "unmanaged",

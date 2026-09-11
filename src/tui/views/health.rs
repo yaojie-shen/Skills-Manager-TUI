@@ -452,7 +452,9 @@ impl HealthView {
                     "record the current content hash as the baseline".into(),
                 ));
             }
-            SkillStatus::Managed { no_baseline: false } | SkillStatus::Unmanaged => {
+            SkillStatus::Local
+            | SkillStatus::Managed { no_baseline: false }
+            | SkillStatus::Unmanaged => {
                 lines.push(text(
                     "The skill itself is fine; it is listed because of the last update check."
                         .into(),

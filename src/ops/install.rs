@@ -263,10 +263,14 @@ pub fn install(ws: &Workspace, r: &InstallRef, name: Option<&str>) -> Result<Str
             note: None,
             installed_name: Some(SkillDoc::load(&dest)?.name),
             source: Some(fetched.source.clone()),
-            baseline: Some(Baseline {
-                hash: hash_directory(&dest)?,
-                hash_algo: HASH_ALGO,
-            }),
+            baseline: if matches!(fetched.source, Source::Git { .. }) {
+                Some(Baseline {
+                    hash: hash_directory(&dest)?,
+                    hash_algo: HASH_ALGO,
+                })
+            } else {
+                None
+            },
         };
         ws.meta.save(&key, &meta)?;
         Ok(key.clone())
@@ -296,10 +300,6 @@ pub fn adopt(ws: &Workspace, path: &Path, name: Option<&str>) -> Result<String> 
         }
         let meta = SkillMeta {
             source: Some(Source::Local { path: None }),
-            baseline: Some(Baseline {
-                hash: hash_directory(&dest)?,
-                hash_algo: HASH_ALGO,
-            }),
             ..Default::default()
         };
         ws.meta.save(&key, &meta)?;
@@ -325,10 +325,6 @@ pub fn adopt(ws: &Workspace, path: &Path, name: Option<&str>) -> Result<String> 
     let meta = SkillMeta {
         source: Some(Source::Local {
             path: Some(crate::paths::contract_tilde(&path)),
-        }),
-        baseline: Some(Baseline {
-            hash: hash_directory(&dest)?,
-            hash_algo: HASH_ALGO,
         }),
         ..Default::default()
     };

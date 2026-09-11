@@ -54,7 +54,7 @@ pub enum Command {
     Tag(TagArgs),
     /// Manage the free-text note of a skill
     Note(NoteArgs),
-    /// Record the current content as the new baseline (accept local changes)
+    /// Record repository skill content as the new baseline (accept changes)
     Accept { skill: String },
     /// Repair an external move: migrate metadata, deployment links and references
     Migrate { old: String, new: String },

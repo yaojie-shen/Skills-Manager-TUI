@@ -40,7 +40,7 @@ pub fn status_glyph(
     use ratatui::text::Span;
     use skills::reconcile::SkillStatus::*;
     match s {
-        Managed { no_baseline: false } => Span::styled("●", th.ok()),
+        Local | Managed { no_baseline: false } => Span::styled("●", th.ok()),
         // Same shape as managed, since it is managed; the colour carries the
         // caveat. A half-filled circle here would read as a partial preset,
         // which is what that glyph means everywhere else.
