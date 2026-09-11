@@ -141,9 +141,6 @@ impl PresetsView {
     fn refresh_groups(&mut self, ctx: &Ctx) {
         self.tags_enabled = ctx.ws.config.tags_enabled;
         let selected = self.tag_groups.get(self.tag_cursor).map(|g| g.0.clone());
-        let selected_all = self.tag_cursor == 0;
-        let selected_untagged =
-            self.tag_groups.len() > 1 && self.tag_cursor == self.tag_groups.len() - 1;
         let mut all: Vec<String> = ctx
             .snap
             .skills
@@ -156,7 +153,7 @@ impl PresetsView {
         }
         all.sort();
         all.dedup();
-        self.tag_groups = vec![("All".into(), all.clone())];
+        self.tag_groups.clear();
         if self.tags_enabled {
             let mut names: std::collections::BTreeSet<String> =
                 ctx.ws.config.tags.iter().map(|t| t.name.clone()).collect();
@@ -171,30 +168,27 @@ impl PresetsView {
                     .collect();
                 self.tag_groups.push((name, keys));
             }
-            self.tag_groups.push((
-                "Untagged".into(),
-                all.into_iter()
-                    .filter(|key| ctx.snap.get(key).is_some_and(|r| r.tags.is_empty()))
-                    .collect(),
-            ));
-        } else {
+        }
+        self.tags_enabled = !self.tag_groups.is_empty();
+        if !self.tags_enabled {
             self.focus_tags = false;
         }
-        self.tag_cursor = if !self.tags_enabled || selected_all {
-            0
-        } else if selected_untagged {
-            self.tag_groups.len() - 1
-        } else {
-            selected
-                .and_then(|name| {
-                    self.tag_groups[1..self.tag_groups.len() - 1]
-                        .iter()
-                        .position(|g| g.0 == name)
-                        .map(|i| i + 1)
-                })
-                .unwrap_or(0)
-        };
-        self.visible_members = self.tag_groups[self.tag_cursor].1.clone();
+        self.tag_cursor = selected
+            .and_then(|name| self.tag_groups.iter().position(|g| g.0 == name))
+            .unwrap_or(0);
+        self.visible_members = self
+            .tag_groups
+            .get(self.tag_cursor)
+            .map(|g| g.1.clone())
+            .unwrap_or_else(|| {
+                if ctx.ws.config.tags_enabled {
+                    self.selected()
+                        .map(|p| p.skills.clone())
+                        .unwrap_or_default()
+                } else {
+                    all
+                }
+            });
         self.members.clamp(self.member_count());
     }
 
@@ -827,7 +821,7 @@ impl View for PresetsView {
                 vec![]
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if m > 0 {
+                if m > 0 || self.tags_enabled {
                     self.focus_members = true;
                     self.focus_tags = self.tags_enabled;
                     self.members.clamp(m);
@@ -1256,7 +1250,9 @@ mod tag_group_tests {
             .collect();
         assert!(screen.contains("python 1/2"));
         assert!(screen.contains("testing 1/1"));
-        assert!(screen.contains("Untagged 0/1"));
+        assert!(!screen.contains("Untagged"));
+        assert!(!screen.contains("All 1/"));
+        assert_eq!(view.tag_groups.len(), 2);
         let (index, rect) = view
             .tag_rects
             .iter()
@@ -1322,5 +1318,20 @@ mod tag_group_tests {
             ["python", "testing"]
         );
         assert!(!root.join(".skills-meta/local.toml").exists());
+        skills::config::Config::edit_tags(root, |tags| tags.clear()).unwrap();
+        skills::config::Config::set_tags_enabled(root, true).unwrap();
+        ws.config = ws.load_config().unwrap();
+        let snap = ws.scan().unwrap();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            theme: &theme,
+        };
+        view.refresh(&ctx);
+        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        assert!(view.tag_rects.is_empty());
+        assert_eq!(view.visible_members, ["gamma"]);
+        view.handle_key(keys(KeyCode::Right), &ctx);
+        assert!(!view.focus_tags);
     }
 }

@@ -109,6 +109,7 @@ fn filtered_preset_removal_preserves_other_members_and_central_skills() {
     view.paste("bndl", &ctx);
     view.handle_key(key(KeyCode::Enter), &ctx);
     view.handle_key(key(KeyCode::Right), &ctx);
+    view.handle_key(key(KeyCode::Right), &ctx); // Select team after other.
     view.handle_key(key(KeyCode::Char('/')), &ctx);
     view.paste("alpha", &ctx);
     view.handle_key(key(KeyCode::Enter), &ctx);
