@@ -256,7 +256,10 @@ fn catalog_needs_no_root_and_agent_registration_preserves_global_config() {
     let f = Fixture::new("catalog");
     let catalog = success(f.cli(&["agents", "catalog", "--json"]));
     let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
-    assert_eq!(catalog.as_array().unwrap().len(), 19);
+    assert_eq!(
+        catalog.as_array().unwrap().len(),
+        skills::agents::BUILTINS.len()
+    );
     let root = f.0.join("global");
     std::fs::create_dir_all(root.join(".skills-meta")).unwrap();
     std::fs::write(

@@ -53,13 +53,13 @@ const IDENTITIES: &[ProductIdentity] = &[
     ProductIdentity {
         key: "trae",
         command: "trae",
-        applications: &["Trae.app", "TRAE.app", "TRAE SOLO.app"],
+        applications: &["Trae.app", "TRAE.app"],
         extension: None,
     },
     ProductIdentity {
         key: "trae-cn",
         command: "trae-cn",
-        applications: &["Trae CN.app", "TRAE CN.app", "TRAE SOLO CN.app"],
+        applications: &["Trae CN.app", "TRAE CN.app"],
         extension: None,
     },
     ProductIdentity {
@@ -132,6 +132,10 @@ pub fn detect_with_applications(
     let user_apps = home.join("Applications");
     let mut found = BTreeSet::new();
     for definition in BUILTINS {
+        // These generations share a launcher but read different skill roots.
+        if matches!(definition.key, "trae-cli" | "trae-cli-v1") {
+            continue;
+        }
         let identity = IDENTITIES.iter().find(|rule| rule.key == definition.key);
         let command = identity.map_or(definition.key, |rule| rule.command);
         let applications = identity.map_or(&[][..], |rule| rule.applications);
@@ -139,6 +143,30 @@ pub fn detect_with_applications(
             || detect_macos_applications(applications, application_dirs, &user_apps)
         {
             found.insert(definition.key.to_string());
+        }
+    }
+    // Public installers use traecli -> trae-cli (1.x) or traecli -> traex (2.0).
+    // The standalone trae-cli command also belongs to the unrelated open-source
+    // Trae Agent, so it is not evidence without the public traecli launcher.
+    // Inspect paths only; discovery never executes an installed program.
+    for dir in executable_dirs.iter().chain(std::iter::once(&user_bin)) {
+        for command in ["traecli", "traex"] {
+            let path = dir.join(command);
+            if !is_executable(&path) {
+                continue;
+            }
+            let Ok(resolved) = path.canonicalize() else {
+                continue;
+            };
+            match resolved.file_name().and_then(|name| name.to_str()) {
+                Some("traex") => {
+                    found.insert("trae-cli".into());
+                }
+                Some("trae-cli") if command == "traecli" => {
+                    found.insert("trae-cli-v1".into());
+                }
+                _ => {}
+            }
         }
     }
     found.extend(detect_editor_extensions(home));

@@ -53,6 +53,18 @@ agents![
     ),
     ("trae", "Trae", "~/.trae/skills", ".trae/skills"),
     ("trae-cn", "Trae CN", "~/.trae-cn/skills", ".trae/skills"),
+    (
+        "trae-cli",
+        "TraeCode CLI",
+        "~/.trae/skills",
+        ".agents/skills"
+    ),
+    (
+        "trae-cli-v1",
+        "TraeCode CLI 1.x",
+        "~/.traecli/skills",
+        ".traecli/skills"
+    ),
     ("cline", "Cline", "~/.cline/skills", ".cline/skills"),
     ("roo", "Roo Code", "~/.roo/skills", ".roo/skills"),
     (
@@ -85,6 +97,12 @@ impl AgentDefinition {
             self.global_dir
         }];
         let extra: &[&str] = match (self.key, local) {
+            // Verified with public CLI 2.0 (0.204.1-tob) offline discovery.
+            ("trae-cli", false) => &["~/.agents/skills"],
+            ("trae-cli", true) => &[".trae/skills"],
+            // https://docs.trae.cn/cli_skills (CLI 1.x)
+            ("trae-cli-v1", false) => &["~/.trae-cn/skills"],
+            ("trae-cli-v1", true) => &[".trae/skills"],
             // https://learn.chatgpt.com/docs/build-skills (legacy user root retained)
             ("codex", false) => &["~/.agents/skills"],
             ("codex", true) => &[".codex/skills"],

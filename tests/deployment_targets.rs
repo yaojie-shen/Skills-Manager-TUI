@@ -41,7 +41,7 @@ fn selecting_local_targets_does_not_write_until_apply_and_survives_reload() {
     let ws = f.ws();
     let project = f.0.join("project");
     let agents = targets::candidates(&ws, Some(&project)).unwrap();
-    assert_eq!(agents.len(), 19);
+    assert_eq!(agents.len(), skills::agents::BUILTINS.len());
     assert_eq!(std::fs::read_dir(&project).unwrap().count(), 0);
     let selected = agents
         .into_iter()
@@ -776,6 +776,150 @@ fn executable_agent_is_detected_before_any_configuration_directory_exists() {
         skills::agents::detect_in(&f.0.join("home"), &f.0.join("project"), &[bin]),
         std::collections::BTreeSet::from(["claude".into()])
     );
+}
+
+#[test]
+fn trae_cli_generations_follow_public_installer_links() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let f = Fixture::new("trae-cli-generations");
+    let home = f.0.join("home");
+    let project = f.0.join("project");
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for root in [".trae", ".trae-cn", ".traecli", ".agents"] {
+        std::fs::create_dir_all(home.join(root).join("skills")).unwrap();
+    }
+    let detect = || skills::agents::detect_in(&home, &project, &[]);
+    assert!(
+        detect().is_empty(),
+        "shared directories are not installed products"
+    );
+
+    let v1 = home.join(".local/share/trae-cli/trae-cli");
+    let v2 = home.join(".local/share/traecli/releases/0.204.1-tob/traex");
+    for binary in [&v1, &v2] {
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(binary, "fixture: must never execute").unwrap();
+        std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    symlink(&v1, bin.join("trae-cli")).unwrap();
+    assert!(
+        detect().is_empty(),
+        "standalone trae-cli is ambiguous with Trae Agent"
+    );
+    symlink(&v1, bin.join("traecli")).unwrap();
+    assert_eq!(
+        detect(),
+        std::collections::BTreeSet::from(["trae-cli-v1".into()])
+    );
+
+    std::fs::remove_file(bin.join("traecli")).unwrap();
+    symlink(&v2, bin.join("traex")).unwrap();
+    symlink("traex", bin.join("traecli")).unwrap();
+    assert_eq!(
+        detect(),
+        std::collections::BTreeSet::from(["trae-cli".into()])
+    );
+    std::fs::remove_file(bin.join("traex")).unwrap();
+    assert!(
+        detect().is_empty(),
+        "broken launchers are not installations"
+    );
+
+    symlink(&v2, bin.join("traex")).unwrap();
+    std::fs::remove_file(bin.join("traecli")).unwrap();
+    symlink(&v1, bin.join("traecli")).unwrap();
+    assert_eq!(
+        detect(),
+        std::collections::BTreeSet::from(["trae-cli".into(), "trae-cli-v1".into()])
+    );
+}
+
+#[test]
+fn trae_cli_roots_match_each_generation_and_share_existing_selections() {
+    let f = Fixture::new("trae-shared-roots");
+    let project = f.0.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let home = f.0.join("home");
+    for (key, globals, locals) in [
+        (
+            "trae-cli",
+            vec!["~/.trae/skills", "~/.agents/skills"],
+            vec![".agents/skills", ".trae/skills"],
+        ),
+        (
+            "trae-cli-v1",
+            vec!["~/.traecli/skills", "~/.trae-cn/skills"],
+            vec![".traecli/skills", ".trae/skills"],
+        ),
+    ] {
+        let definition = skills::agents::BUILTINS
+            .iter()
+            .find(|a| a.key == key)
+            .unwrap();
+        assert_eq!(definition.search_dirs(false), globals);
+        assert_eq!(definition.search_dirs(true), locals);
+    }
+    let candidates = targets::all_candidates_in(&f.ws(), Some(&project), &home).unwrap();
+    let readers: Vec<_> = candidates
+        .iter()
+        .filter(|a| a.skills_path() == project.join(".trae/skills"))
+        .collect();
+    assert_eq!(
+        readers.len(),
+        4,
+        "both IDE editions and both CLI generations share this project root"
+    );
+    targets::set_installed(
+        &f.ws(),
+        readers[0],
+        Some(&project),
+        &["sample".into()],
+        Some("shared-trae"),
+        true,
+    )
+    .unwrap();
+    for reader in &readers {
+        assert!(
+            targets::selection(&f.ws(), reader)
+                .unwrap()
+                .presets
+                .contains_key("shared-trae")
+        );
+    }
+    targets::set_installed(
+        &f.ws(),
+        readers[3],
+        Some(&project),
+        &["sample".into()],
+        Some("shared-trae"),
+        false,
+    )
+    .unwrap();
+    for reader in readers {
+        assert!(
+            targets::selection(&f.ws(), reader)
+                .unwrap()
+                .skills()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn standalone_solo_apps_do_not_imply_an_ide_installation() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new("solo-not-ide");
+    let home = f.0.join("home");
+    for name in ["TRAE SOLO.app", "TRAE SOLO CN.app"] {
+        let bundle = home.join("Applications").join(name).join("Contents");
+        std::fs::create_dir_all(bundle.join("MacOS")).unwrap();
+        std::fs::write(bundle.join("Info.plist"), "fixture").unwrap();
+        let binary = bundle.join("MacOS/SOLO");
+        std::fs::write(&binary, "must not execute").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert!(skills::agents::detect_in(&home, &f.0.join("project"), &[]).is_empty());
 }
 
 #[test]
