@@ -999,16 +999,7 @@ fn discover_with_paths(
     applications: &[PathBuf],
 ) -> Result<()> {
     ws.inventory_project = Some(project.to_path_buf());
-    let mut products = crate::agents::detect_with_applications(home, project, dirs, applications);
-    for agent in &ws.config.agents {
-        if !crate::agents::BUILTINS
-            .iter()
-            .any(|d| d.key == product_key(agent))
-            && agent.skills_path().is_dir()
-        {
-            products.insert(product_key(agent).to_string());
-        }
-    }
+    let products = crate::agents::detect_with_applications(home, project, dirs, applications);
     for definition in crate::agents::BUILTINS {
         if products.contains(definition.key) && ws.config.agent(definition.key).is_none() {
             let mut agent = definition.config(ws.project.is_some());

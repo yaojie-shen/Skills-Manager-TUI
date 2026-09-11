@@ -718,9 +718,16 @@ fn inventory_hides_config_only_products_and_ignores_shared_directories() {
     std::fs::create_dir_all(project.join(".agents/skills")).unwrap();
     let mut ws = f.ws();
     ws.config.agents = skills::agents::defaults(false);
+    for key in ["shared", "legacy-storage"] {
+        ws.config.agents.push(AgentConfig {
+            key: key.into(),
+            name: key.into(),
+            skills_dir: home.join(".agents/skills").display().to_string(),
+        });
+    }
     targets::discover_in(&mut ws, &project, &home).unwrap();
     assert_eq!(targets::visible_agents(&ws).count(), 0);
-    assert_eq!(ws.config.agents.len(), 2, "saved destinations are retained");
+    assert_eq!(ws.config.agents.len(), 4, "saved destinations are retained");
     for dir in [
         ".codex",
         ".cursor",
