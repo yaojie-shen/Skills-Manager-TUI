@@ -512,7 +512,7 @@ impl PresetsView {
                         .as_ref()
                         .map(|s| s.kind().to_string())
                         .unwrap_or_default();
-                    let lines = skill_card(r, ctx, ci.width as usize, None, &tail, &[]);
+                    let lines = skill_card(r, ctx, ci.width as usize, None, &tail, &[], true);
                     lines.into_iter().map(|l| (ci, l)).collect::<Vec<_>>()
                 }
                 // A member with no directory behind it is the one thing on

@@ -241,6 +241,7 @@ impl TagsView {
             format!("Tag: {}", self.selected_tag().unwrap_or("none")),
             ctx,
         ));
+        self.skill_search.as_mut().unwrap().hide_tags = true;
         self.focus_grid = true;
     }
 
@@ -574,7 +575,7 @@ impl TagsView {
                 .as_ref()
                 .map(|s| s.kind().to_string())
                 .unwrap_or_default();
-            let lines = skill_card(r, ctx, ci.width as usize, None, &tail, &[]);
+            let lines = skill_card(r, ctx, ci.width as usize, None, &tail, &[], false);
             f.render_widget(Paragraph::new(lines), ci);
         }
         draw_track(f, inner, &self.grid, selected, &mut self.grid_track, th);

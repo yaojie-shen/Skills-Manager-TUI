@@ -1802,7 +1802,7 @@ impl AgentsView {
                             .as_ref()
                             .map(|s| s.kind().to_string())
                             .unwrap_or_default();
-                        skill_card(r, ctx, ci.width as usize, None, &tail, &[])
+                        skill_card(r, ctx, ci.width as usize, None, &tail, &[], true)
                     }
                     // The agent's own: there may be no record behind it, and
                     // even when there is, what matters is the shape it is in.

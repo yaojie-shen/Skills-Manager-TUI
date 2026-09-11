@@ -55,6 +55,7 @@ pub struct SearchView {
     scope_agent: Option<String>,
     panel: Option<(BTreeSet<String>, String)>,
     panel_active: bool,
+    pub(super) hide_tags: bool,
     preset: Option<String>,
     target: Option<(
         skills::config::AgentConfig,
@@ -93,6 +94,7 @@ impl Default for SearchView {
             scope_agent: None,
             panel: None,
             panel_active: true,
+            hide_tags: false,
             preset: None,
             target: None,
             area: Rect::default(),
@@ -859,7 +861,15 @@ impl SearchView {
                         .map(|s| s.kind().to_string())
                         .unwrap_or_default()
                 };
-                let mut lines = skill_card(r, ctx, ci.width as usize, body, &tail, &h.terms);
+                let mut lines = skill_card(
+                    r,
+                    ctx,
+                    ci.width as usize,
+                    body,
+                    &tail,
+                    &h.terms,
+                    !self.hide_tags,
+                );
                 self.decorate(&mut lines, r, ctx);
                 let style = if self.multi && self.checked.contains(&r.key) {
                     th.selected_unfocused()
@@ -896,6 +906,7 @@ impl SearchView {
                     body,
                     &tail,
                     &h.terms,
+                    !self.hide_tags,
                 );
                 self.decorate(&mut lines, r, ctx);
                 let lines: Vec<Line> = lines
@@ -1965,7 +1976,7 @@ mod tests {
         view.handle_key(key(KeyCode::Char(' ')), &ctx);
         assert_eq!(view.visible_checked(&ctx), vec!["printer"]);
         let record = ctx.snap.get("printer").unwrap();
-        let mut lines = skill_card(record, &ctx, 40, None, "", &[]);
+        let mut lines = skill_card(record, &ctx, 40, None, "", &[], true);
         let before = lines[0].to_string();
         view.decorate(&mut lines, record, &ctx);
         assert!(lines[0].to_string().starts_with("[✓] printer"));

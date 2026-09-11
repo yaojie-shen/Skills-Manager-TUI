@@ -232,6 +232,7 @@ pub fn skill_card(
     body: Option<&str>,
     tail: &str,
     terms: &[String],
+    show_tags: bool,
 ) -> Vec<Line<'static>> {
     let th = ctx.theme;
     let source = repository_badge(r, ctx.ws.config.ui.icons)
@@ -257,7 +258,7 @@ pub fn skill_card(
             .unwrap_or("No description"),
         inner_w,
     );
-    let tags_budget = if r.tags.is_empty() { 0 } else { inner_w / 2 };
+    let tags_budget = if show_tags { inner_w / 2 } else { 0 };
     let pills = tag_pills(&r.tags, ctx, tags_budget);
     let pills_w: usize = pills.iter().map(|s| width(&s.content)).sum();
     let source_budget = inner_w.saturating_sub(pills_w + usize::from(pills_w > 0));
@@ -352,7 +353,7 @@ mod tests {
             assert_eq!(marker.width(), MARKER_W);
             assert!(marker.content.ends_with("] "));
         }
-        let lines = skill_card(&record, &ctx, 60, None, "name", &[]);
+        let lines = skill_card(&record, &ctx, 60, None, "name", &[], true);
         assert!(lines[0].to_string().contains("mock-calendar"));
         assert!(!lines[0].to_string().contains("skills--"));
         assert!(lines[3].to_string().contains("󰊤 sampleorg/kit"));
@@ -387,7 +388,7 @@ mod tests {
         record.name = Some("中文日历".into());
         record.tags = vec!["A very long tag".into(), "中文标签".into(), "third".into()];
         for width in [0, 1, 2, 3, 8, 16, 24, 40, 80] {
-            for line in skill_card(&record, &ctx, width, None, "git", &[]) {
+            for line in skill_card(&record, &ctx, width, None, "git", &[], true) {
                 assert!(line.width() <= width);
             }
         }
