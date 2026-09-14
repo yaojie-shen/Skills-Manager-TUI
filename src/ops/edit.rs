@@ -149,6 +149,18 @@ pub fn accept(ws: &Workspace, key: &str) -> Result<SkillMeta> {
 /// pointed exactly at the old path, and update tag and preset references.
 /// Content matching is only a suggestion; the caller explicitly chooses the pair.
 pub fn migrate_meta(ws: &Workspace, old: &str, new: &str) -> Result<()> {
+    migrate_meta_checked(ws, old, new, true, &ws.scan()?)
+}
+
+/// Use a caller's fresh scan for layout validation; filesystem preconditions
+/// are still checked below in both preview and apply mode.
+pub(crate) fn migrate_meta_checked(
+    ws: &Workspace,
+    old: &str,
+    new: &str,
+    apply: bool,
+    snap: &Snapshot,
+) -> Result<()> {
     require_key(old)?;
     require_key(new)?;
     let from = ws.skill_path(old);
@@ -159,7 +171,7 @@ pub fn migrate_meta(ws: &Workspace, old: &str, new: &str) -> Result<()> {
         Ok(_) => bail!("{old} still exists; use rename to move an existing skill"),
     }
     crate::skill::SkillDoc::load(&to).context("migration destination is not a readable skill")?;
-    if ws.scan()?.get(new).is_none_or(|r| r.name.is_none()) {
+    if snap.get(new).is_none_or(|r| r.name.is_none()) {
         bail!("migration destination is outside the supported library layout");
     }
     let resolved = std::fs::canonicalize(&to)?;
@@ -211,6 +223,9 @@ pub fn migrate_meta(ws: &Workspace, old: &str, new: &str) -> Result<()> {
             let mut seen = std::collections::BTreeSet::new();
             p.skills.retain(|key| seen.insert(key.clone()));
         }
+    }
+    if !apply {
+        return Ok(());
     }
     // Metadata is moved last so a failed reference write can be retried with the
     // same old/new pair. Already repaired links are left intact on retry.

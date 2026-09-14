@@ -301,6 +301,12 @@ impl App {
             ws.inventory_project = Some(start.to_path_buf());
         }
         Self::discover_local_agents(&mut ws)?;
+        let startup_repair = skills::ops::repair::startup(&ws);
+        // Repairs can migrate or remove tag membership; display the persisted result.
+        if !matches!(&startup_repair, Ok(report) if report.repaired == 0 && report.failed == 0) {
+            ws.config = ws.load_config()?;
+            Self::discover_local_agents(&mut ws)?;
+        }
         let local_project = ws
             .inventory_project
             .clone()
@@ -343,6 +349,26 @@ impl App {
             body: Rect::default(),
         };
         app.on_snapshot();
+        match startup_repair {
+            Ok(report) if report.repaired > 0 || report.failed > 0 => {
+                app.toast(
+                    format!(
+                        "Startup repair: {} repaired, {} failed",
+                        report.repaired, report.failed
+                    ),
+                    if report.failed > 0 {
+                        Level::Error
+                    } else {
+                        Level::Ok
+                    },
+                );
+            }
+            Err(error) => app.toast(
+                format!("Startup repair: {error:#}; review Health"),
+                Level::Error,
+            ),
+            _ => {}
+        }
         Ok(app)
     }
 
@@ -488,6 +514,52 @@ impl App {
 
     fn on_task(&mut self, out: TaskOutput) -> Vec<Action> {
         match out {
+            TaskOutput::RepairPlan(result) => match result {
+                Ok(report) => vec![Action::OpenModal(Box::new(Modal::HealthRepair(Box::new(
+                    super::views::health::RepairDialog::preview(report),
+                ))))],
+                Err(e) => vec![Action::Error(format!("Repair preview: {e:#}"))],
+            },
+            TaskOutput::RepairApplied(result) => {
+                self.batch_running = false;
+                match result {
+                    Ok(report) => vec![
+                        Action::Rescan,
+                        Action::OpenModal(Box::new(Modal::message(
+                            "Repair results",
+                            report.lines(),
+                        ))),
+                    ],
+                    Err(e) => vec![
+                        Action::Rescan,
+                        Action::Error(format!(
+                            "Repair: {e:#}; inspect status; earlier actions may have completed"
+                        )),
+                    ],
+                }
+            }
+            TaskOutput::Sync(request, result) => match result {
+                Err(e) => vec![Action::Error(format!("Sync {}: {e:#}", request.remote))],
+                Ok(changes) if request.dry_run => {
+                    let ctx = Ctx {
+                        ws: &self.ws,
+                        snap: &self.snap,
+                        settings: &self.settings,
+                    };
+                    match super::sync_picker::SyncPicker::preview(&ctx, request, changes) {
+                        Ok(p) => vec![Action::OpenModal(Box::new(Modal::Sync(Box::new(p))))],
+                        Err(e) => vec![Action::Error(format!("{e:#}"))],
+                    }
+                }
+                Ok(changes) => vec![
+                    Action::Toast(format!(
+                        "Synced {} skills with {}",
+                        changes.len(),
+                        request.remote
+                    )),
+                    Action::Rescan,
+                ],
+            },
             TaskOutput::Batch(outcome) => {
                 self.batch_running = false;
                 let return_to = if self.batch_modal_owned
@@ -805,6 +877,15 @@ impl App {
                     vec![format!("Tags: {} → {}", !enabled, enabled), "Hide or show tag classification throughout the interface. Existing data and preset membership are preserved.".into()],
                     Box::new(move |ws| { skills::config::Config::set_tags_enabled(&ws.root, enabled)?; Ok(format!("Tags {}", if enabled { "enabled" } else { "disabled" })) })
                 )))];
+            }
+            (KeyCode::F(5), _) => return vec![Action::Rescan, Action::Toast("rescanning".into())],
+            (KeyCode::F(6), _) => {
+                return vec![Action::OpenModal(Box::new(Modal::HealthRepair(
+                    Box::default(),
+                )))];
+            }
+            (KeyCode::F(7), _) => {
+                return vec![Action::OpenModal(Box::new(super::sync_picker::open(&ctx)))];
             }
             (KeyCode::F(1), _) => return vec![Action::OpenModal(Box::new(Modal::help()))],
             (KeyCode::Char('?'), _) if !in_search_input => {
@@ -1244,10 +1325,15 @@ impl App {
     }
 
     fn spawn(&mut self, task: Task) {
+        if matches!(task, Task::RepairApply(_)) {
+            self.batch_running = true;
+        }
         self.tasks_running += 1;
         self.next_task_id += 1;
         let id = self.next_task_id;
         let label = match &task {
+            Task::RepairPlan(_) => Some("Scan and preview health repairs".into()),
+            Task::RepairApply(_) => Some("Apply health repairs".into()),
             Task::Scan | Task::PollRoot => None,
             Task::DiscoverRepository(reference) => Some(format!("Fetch {reference}")),
             Task::InstallRepository(selection) => {
@@ -1255,6 +1341,11 @@ impl App {
             }
             Task::Install { reference, .. } => Some(format!("Install {reference}")),
             Task::Check(keys) => Some(format!("Check upstream: {} skills", keys.len())),
+            Task::Sync(r) => Some(format!(
+                "Sync {}{}",
+                r.remote,
+                if r.dry_run { " (preview)" } else { "" }
+            )),
             Task::Prepare(key) => Some(format!("Prepare update: {key}")),
         };
         if let Some(label) = label {
@@ -2414,5 +2505,42 @@ mod panel_navigation_tests {
         assert!(app.on_key(key(KeyCode::Tab)).is_empty());
         assert!(app.modal.is_some());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod startup_repair_tests {
+    use super::*;
+
+    #[test]
+    fn startup_removes_absent_metadata_before_building_the_first_snapshot() {
+        let temp = skills::ops::DownloadDir::new("tui-startup-repair").unwrap();
+        let root = temp.path().join("root");
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        ws.meta
+            .save(
+                "gone",
+                &skills::meta::SkillMeta {
+                    source: Some(skills::meta::Source::Git {
+                        url: "https://example.invalid/source.git".into(),
+                        branch: None,
+                        subpath: None,
+                        revision: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let app = App::new_with_launch_directory(ws, tx, Some(temp.path())).unwrap();
+        assert!(!app.ws.meta.exists("gone"));
+        assert!(app.snap.get("gone").is_none());
+        assert!(app.ws.meta.dir.join(".repair-backups").is_dir());
     }
 }

@@ -13,6 +13,43 @@ use std::path::{Path, PathBuf};
 
 pub mod watch;
 
+/// Shared health categories for CLI reports and the Health screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HealthClass {
+    Fault,
+    Review,
+    Independent,
+}
+impl SkillStatus {
+    pub fn health_class(&self) -> Option<HealthClass> {
+        match self {
+            Self::Repository | Self::Local => None,
+            Self::Modified | Self::Renamed { .. } => Some(HealthClass::Review),
+            _ => Some(HealthClass::Fault),
+        }
+    }
+}
+impl EntryState {
+    pub fn health_class(&self) -> Option<HealthClass> {
+        match self {
+            Self::Deployed => None,
+            Self::Broken { .. } => Some(HealthClass::Fault),
+            Self::Shadow { .. } => Some(HealthClass::Review),
+            Self::Foreign { .. } | Self::AgentOnly => Some(HealthClass::Independent),
+        }
+    }
+}
+impl AgentDirMode {
+    pub fn health_class(&self) -> Option<HealthClass> {
+        match self {
+            Self::Missing => Some(HealthClass::Review),
+            Self::DirForeign { .. } => Some(HealthClass::Independent),
+            _ => None,
+        }
+    }
+}
+
 /// State of a skill relative to its metadata (§7.2).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -334,21 +371,34 @@ fn scan_inventory(
         }
         if name == "local" && !entry.path().join("SKILL.md").exists() && !is_symlink(&entry.path())
         {
-            for skill in std::fs::read_dir(entry.path())? {
-                let skill = skill?;
-                let leaf = skill.file_name().to_string_lossy().into_owned();
-                if skill.file_type()?.is_dir() && valid_skill_key(&leaf) {
-                    if skill.path().join("SKILL.md").is_file() {
-                        discovered.push((format!("local/{leaf}"), skill.path()));
-                    } else {
-                        for member in std::fs::read_dir(skill.path())? {
-                            let member = member?;
-                            let name = member.file_name().to_string_lossy().into_owned();
-                            if member.file_type()?.is_dir() && valid_skill_key(&name) {
-                                discovered.push((format!("local/{leaf}/{name}"), member.path()));
-                            }
-                        }
-                    }
+            // Arbitrarily nested local categories; stop at each skill boundary.
+            for node in walkdir::WalkDir::new(entry.path())
+                .min_depth(1)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|e| {
+                    e.depth() == 0
+                        || (valid_skill_key(&e.file_name().to_string_lossy())
+                            && !e
+                                .path()
+                                .parent()
+                                .is_some_and(|p| p.join("SKILL.md").is_file()))
+                })
+            {
+                let node = node?;
+                if !node.file_type().is_dir() {
+                    continue;
+                }
+                let has_children = std::fs::read_dir(node.path())?
+                    .any(|e| e.is_ok_and(|e| e.file_type().is_ok_and(|t| t.is_dir())));
+                if node.path().join("SKILL.md").exists() || !has_children {
+                    discovered.push((
+                        node.path()
+                            .strip_prefix(root)?
+                            .to_string_lossy()
+                            .into_owned(),
+                        node.path().to_path_buf(),
+                    ));
                 }
             }
             continue;

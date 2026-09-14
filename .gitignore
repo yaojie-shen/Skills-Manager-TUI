@@ -17,3 +17,9 @@
 # Local agent state
 .claude/
 .codex/
+AGENTS.md
+
+# One-off development artifacts previously removed from the repository
+/code_optimization/
+/docs/external-changes.md
+/.github/images/deployment-picker.png

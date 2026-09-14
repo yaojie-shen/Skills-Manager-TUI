@@ -19,7 +19,7 @@ pub fn stamp(root: &Path, config: &Config) -> Result<Stamp> {
         for entry in walkdir::WalkDir::new(&meta)
             .follow_links(false)
             .into_iter()
-            .filter_entry(|e| e.file_name() != ".staging")
+            .filter_entry(|e| e.file_name() != ".staging" && e.file_name() != ".repair-backups")
         {
             let entry = entry?;
             record(entry.path(), &mut out)?;
@@ -58,8 +58,7 @@ fn record(path: &Path, out: &mut Stamp) -> Result<()> {
 fn containers(path: &Path, depth: usize, out: &mut Stamp) -> Result<()> {
     record(path, out)?;
     record(&path.join("SKILL.md"), out)?;
-    if depth > 0 && (path.join("SKILL.md").is_file() || crate::util::is_symlink(path) || depth == 3)
-    {
+    if depth > 0 && (path.join("SKILL.md").is_file() || crate::util::is_symlink(path)) {
         return Ok(());
     }
     for entry in std::fs::read_dir(path)? {
