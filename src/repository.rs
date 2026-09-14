@@ -231,7 +231,7 @@ pub fn valid_id(key: &str) -> bool {
     }
     key.split('/').all(valid_skill_key)
         && ((key.starts_with("repos/") && key.split('/').count() == 3)
-            || (key.starts_with("local/") && matches!(key.split('/').count(), 2 | 3)))
+            || (key.starts_with("local/") && key.split('/').count() >= 2))
 }
 pub fn alias_of(key: &str) -> Option<&str> {
     key.strip_prefix("repos/")?.split('/').next()

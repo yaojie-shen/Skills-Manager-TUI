@@ -20,6 +20,7 @@ mod modal;
 mod name_choices;
 mod repository_picker;
 mod settings;
+mod sync_picker;
 mod text;
 mod theme;
 mod toast;

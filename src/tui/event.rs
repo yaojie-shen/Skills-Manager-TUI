@@ -23,6 +23,9 @@ pub enum Msg {
 /// Long-running work executed off the UI thread.
 #[derive(Debug, Clone)]
 pub enum Task {
+    RepairPlan(skills::ops::repair::Options),
+    RepairApply(skills::ops::repair::Report),
+    Sync(super::sync_picker::Request),
     DiscoverRepository(String),
     InstallRepository(Box<super::repository_picker::InstallSelection>),
     Scan,
@@ -38,6 +41,12 @@ pub enum Task {
 }
 
 pub enum TaskOutput {
+    RepairPlan(Result<skills::ops::repair::Report>),
+    RepairApplied(Result<skills::ops::repair::Report>),
+    Sync(
+        super::sync_picker::Request,
+        Result<Vec<skills::ops::sync::Change>>,
+    ),
     Batch(BatchOutcome),
     RepositoryFetched(String, Result<skills::repository::FetchedRepository>),
     RepositoryInstalled(
@@ -154,6 +163,23 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                 let _ = tx.send(Msg::Progress(id, text.into()));
             };
             let out = match task {
+                Task::RepairPlan(options) => {
+                    TaskOutput::RepairPlan(skills::ops::repair::plan(&ws, &options))
+                }
+                Task::RepairApply(plan) => {
+                    TaskOutput::RepairApplied(skills::ops::repair::apply(&ws, &plan))
+                }
+                Task::Sync(request) => {
+                    let result = skills::ops::sync::run(
+                        &ws,
+                        &request.remote,
+                        request.push,
+                        &request.keys,
+                        request.dry_run,
+                        &mut progress,
+                    );
+                    TaskOutput::Sync(request, result)
+                }
                 Task::DiscoverRepository(reference) => {
                     let result =
                         skills::ops::install::parse_ref(&reference, None, None).and_then(|r| {
@@ -185,13 +211,14 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                     TaskOutput::RootStamp(skills::reconcile::watch::stamp(&ws.root, &ws.config))
                 }
                 Task::Check(keys) => {
+                    let mut session = update::UpdateSession::default();
                     let total = keys.len();
                     TaskOutput::Check(
                         keys.into_iter()
                             .enumerate()
                             .map(|(done, k)| {
                                 progress(&format!("{done}/{total} complete · querying {k}…"));
-                                let r = update::check(&ws, &k);
+                                let r = session.check(&ws, &k, &mut progress);
                                 progress(&format!("{}/{total} complete", done + 1));
                                 (k, r)
                             })
@@ -206,7 +233,9 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                 }
                 Task::Prepare(key) => {
                     progress("Update: inspecting local files and fetching upstream…");
-                    let r = ws.scan().and_then(|snap| update::prepare(&ws, &snap, &key));
+                    let r = ws.scan().and_then(|snap| {
+                        update::UpdateSession::default().prepare(&snap, &key, &mut progress)
+                    });
                     TaskOutput::Prepared(key, r)
                 }
             };

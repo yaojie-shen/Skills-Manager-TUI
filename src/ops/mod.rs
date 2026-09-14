@@ -5,7 +5,9 @@ pub mod deploy;
 pub mod edit;
 pub mod install;
 pub mod name_choices;
+pub mod repair;
 pub mod source;
+pub mod sync;
 pub mod targets;
 pub mod update;
 

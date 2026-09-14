@@ -407,7 +407,7 @@ fn health_filter_with_no_matches_never_claims_the_library_is_healthy() {
         .iter()
         .map(|c| c.symbol())
         .collect();
-    assert!(text.contains("No matching issues"));
+    assert!(text.contains("No matching entries"));
     assert!(!text.contains("everything is healthy"));
     assert_eq!(snap.skills.len(), 3);
     std::fs::remove_dir_all(&ws.root).unwrap();
