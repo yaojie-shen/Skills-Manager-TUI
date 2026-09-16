@@ -77,7 +77,6 @@ jobs:
     timeout-minutes: 40
     env:
       TARGET: ${{ matrix.target }}
-      RELEASE_TAG: ${{ needs.version.outputs.tag }}
       MACOSX_DEPLOYMENT_TARGET: '11.0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -125,7 +124,7 @@ jobs:
       - name: Package binary and licenses
         shell: bash
         run: |
-          package="skills-$RELEASE_TAG-$TARGET"
+          package="skills-$TARGET"
           mkdir -p "dist/$package/licenses"
           cp "target/$TARGET/release/skills" "dist/$package/skills"
           cp LICENSE "dist/$package/LICENSE"

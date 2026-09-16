@@ -37,6 +37,8 @@ jobs:
           rustup default "$RUST_TOOLCHAIN"
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check installer script
+        run: sh -n install.sh
       - name: Lint
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test
