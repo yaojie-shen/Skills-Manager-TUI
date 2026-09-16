@@ -49,6 +49,7 @@ pub enum Command {
     /// Show one skill in detail
     Show { skill: String },
     /// Full reconciliation report of skills and agents
+    #[command(visible_alias = "rescan")]
     Status,
     /// Manage tags
     Tag(TagArgs),
@@ -58,6 +59,29 @@ pub enum Command {
     Accept { skill: String },
     /// Repair an external move: migrate metadata, deployment links and references
     Migrate { old: String, new: String },
+    /// Preview repairs after directory reorganization; --apply executes the plan
+    Repair {
+        /// Execute repairs (default is a read-only preview)
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+        /// Explicitly request a read-only preview
+        #[arg(long)]
+        dry_run: bool,
+        /// Restore missing skills only from a baseline-matching local source
+        #[arg(long, conflicts_with = "forget_missing")]
+        restore_missing: bool,
+        /// Back up and forget obsolete missing records (never delete skill files)
+        #[arg(long)]
+        forget_missing: bool,
+        /// Remove remaining broken deployment links after repairs
+        #[arg(long)]
+        clean_links: bool,
+        /// Explicit old-to-new mapping, including moves with edited content
+        #[arg(long = "move", value_name = "OLD=NEW")]
+        moves: Vec<String>,
+        /// Restrict skill repairs to these keys
+        skills: Vec<String>,
+    },
     /// Install skills from a Git repository, archive URL, or local path
     #[command(
         long_about = "Install skills from a Git repository, archive URL, or local path.\n\nArchive URLs use curl to download and follow HTTP(S) redirects. ZIP, TAR, TAR.GZ, TAR.BZ2, and TAR.XZ are detected from the downloaded content. Paths inside the archive are preserved, including any top-level directory: use --list to discover paths, then --select or --subpath to choose skills.\n\nUse --source-name NAME to name a URL package before installing. Git sources default to owner/repo. Source names are independent of --repo-alias (storage directory) and --name (one skill's local name)."
@@ -100,15 +124,40 @@ pub enum Command {
     Deploy(DeployArgs),
     /// Remove links from agent directories
     Undeploy(DeployArgs),
-    /// Removed: use deploy/undeploy or apply a preset to an explicit target
+    /// Synchronize the entire root with its Git remote
+    #[command(
+        long_about = "Synchronize the root as a Git working tree. Configure URL [--branch main] explicitly enables automatic backup at TUI startup and around modifying CLI commands, and after TUI changes. Read-only CLI commands and previews do not sync. Skills, metadata, notes, presets and configuration are shared, including machine-specific paths; deletions propagate. Runtime files stay local and normal Git ignore rules apply. Sync saves local changes, merges remote updates, then pushes without force. Conflicts stop synchronization and retain the local backup commit. Use an empty remote or clone an existing root repository first. Legacy per-skill backup repositories are not automatically converted."
+    )]
     Sync {
-        #[arg(long)]
+        #[arg(long, global = true)]
         dry_run: bool,
+        #[command(subcommand)]
+        command: Option<SyncCommand>,
     },
     /// Agent directories
     Agents(AgentsArgs),
     /// Preset packages with fixed skill members
     Preset(PresetArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SyncCommand {
+    /// Make root a Git working tree and enable automatic commit/pull/push
+    Configure {
+        url: String,
+        #[arg(long, default_value = "main")]
+        branch: String,
+    },
+    /// Disable automatic sync without deleting Git history
+    Disable,
+    /// Show root sync configuration
+    Status,
+    /// Save local changes and push without pulling
+    Push,
+    /// Save local changes and merge remote updates without pushing
+    Pull,
+    /// Save local changes, merge remote updates and push
+    Run,
 }
 
 #[derive(Args, Debug)]
@@ -439,6 +488,73 @@ impl Cli {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    let auto = match &cli.command {
+        Some(
+            Command::Init
+            | Command::Accept { .. }
+            | Command::Migrate { .. }
+            | Command::Adopt { .. }
+            | Command::Rename { .. }
+            | Command::SetSource(_),
+        ) => true,
+        Some(Command::Tag(a)) => !matches!(a.command, TagCommand::List { .. }),
+        Some(Command::Note(a)) => !matches!(a.command, NoteCommand::Get { .. }),
+        Some(Command::Remove { yes, .. }) => *yes,
+        Some(Command::Install(a)) => !a.list,
+        Some(Command::Update(a)) => !a.dry_run,
+        Some(Command::Deploy(a) | Command::Undeploy(a)) => !a.dry_run,
+        Some(Command::Repair { apply, .. }) => *apply,
+        Some(Command::Repos { command: Some(_) }) => true,
+        Some(Command::Preset(a)) => match &a.command {
+            PresetCommand::List | PresetCommand::Show { .. } => false,
+            PresetCommand::Deploy { dry_run, .. } | PresetCommand::Undeploy { dry_run, .. } => {
+                !dry_run
+            }
+            _ => true,
+        },
+        Some(Command::Agents(a)) => match &a.command {
+            Some(AgentsCommand::Add { .. }) => true,
+            Some(
+                AgentsCommand::Convert { dry_run, yes, .. }
+                | AgentsCommand::Clean { dry_run, yes, .. }
+                | AgentsCommand::RemoveLink { dry_run, yes, .. }
+                | AgentsCommand::AdoptLink { dry_run, yes, .. }
+                | AgentsCommand::Relink { dry_run, yes, .. },
+            ) => !dry_run && *yes,
+            _ => false,
+        },
+        _ => false,
+    };
+    let create = matches!(
+        &cli.command,
+        Some(
+            Command::Init
+                | Command::Install(_)
+                | Command::Agents(AgentsArgs {
+                    command: Some(AgentsCommand::Add { .. })
+                })
+        )
+    );
+    let ws = if auto {
+        Some(cli.workspace(create)?)
+    } else {
+        None
+    };
+    if let Some(ws) = &ws
+        && let Err(e) = skills::ops::sync::automatic(ws)
+    {
+        eprintln!("Root sync: {e:#}; continuing with local data");
+    }
+    let result = run_command(cli);
+    if let Some(ws) = &ws
+        && let Err(e) = skills::ops::sync::automatic(ws)
+    {
+        eprintln!("Root backup pending: {e:#}; local changes retained");
+    }
+    result
+}
+
+fn run_command(cli: Cli) -> Result<()> {
     if matches!(
         &cli.command,
         Some(Command::Agents(AgentsArgs {
@@ -491,6 +607,50 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::List(a) => cmd_list(&ctx, a),
         Command::Show { skill } => cmd_show(&ctx, &skill),
         Command::Status => cmd_status(&ctx),
+        Command::Repair {
+            apply,
+            restore_missing,
+            forget_missing,
+            clean_links,
+            moves,
+            skills,
+            ..
+        } => {
+            let mut ws = ctx.ws.clone();
+            if ws.project.is_none() {
+                skills::ops::targets::discover(&mut ws, &std::env::current_dir()?)?;
+            }
+            let mut options = skills::ops::repair::Options {
+                restore_missing,
+                forget_missing,
+                clean_links,
+                keys: skills,
+                ..Default::default()
+            };
+            for mapping in moves {
+                let (old, new) = mapping.split_once('=').context("expected --move OLD=NEW")?;
+                anyhow::ensure!(
+                    options.moves.insert(old.into(), new.into()).is_none(),
+                    "duplicate move for {old}"
+                );
+            }
+            let report = skills::ops::repair::run_with_options(&ws, apply, &options)?;
+            ctx.out(&report, || {
+                for line in report.lines() {
+                    println!("{line}");
+                }
+                if !apply && report.planned > 0 {
+                    println!("Preview only. Add --apply to execute these changes.");
+                }
+            })?;
+            if report.failed > 0 {
+                bail!(
+                    "{} repair(s) failed; successful repairs were retained; inspect status before retrying",
+                    report.failed
+                );
+            }
+            Ok(())
+        }
         Command::Tag(a) => cmd_tag(&ctx, a.command),
         Command::Note(a) => cmd_note(&ctx, a.command),
         Command::Accept { skill } => {
@@ -553,11 +713,12 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Check { skill, all, repo } => {
             if let Some(alias) = repo {
                 let snap = ctx.ws.scan()?;
+                let mut session = update::UpdateSession::default();
                 let results: Vec<_> = snap
                     .skills
                     .iter()
                     .filter(|s| skills::repository::alias_of(&s.key) == Some(alias.as_str()))
-                    .map(|s| update::check(&ctx.ws, &s.key))
+                    .map(|s| session.check(&ctx.ws, &s.key, &mut |message| eprintln!("{message}")))
                     .collect::<Result<_>>()?;
                 ctx.out(&results, || {
                     for result in &results {
@@ -600,11 +761,52 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Update(a) => cmd_update(&ctx, a),
         Command::Deploy(a) => cmd_deploy(&ctx, a, true),
         Command::Undeploy(a) => cmd_deploy(&ctx, a, false),
-        Command::Sync { .. } => anyhow::bail!(
-            "sync has been removed. Refresh to inspect current state; use deploy/undeploy or apply a preset to an explicit Global/Local target. No links were changed."
-        ),
+        Command::Sync { dry_run, command } => {
+            let command = command.unwrap_or(SyncCommand::Run);
+            cmd_sync(&ctx, command, dry_run)
+        }
         Command::Agents(a) => cmd_agents(&ctx, a.command),
         Command::Preset(a) => cmd_preset(&ctx, a.command),
+    }
+}
+
+fn cmd_sync(ctx: &Ctx, command: SyncCommand, dry_run: bool) -> Result<()> {
+    use skills::ops::sync::{self, Mode, Settings};
+    anyhow::ensure!(
+        !dry_run
+            || !matches!(
+                command,
+                SyncCommand::Configure { .. } | SyncCommand::Disable
+            ),
+        "configuration commands do not support --dry-run"
+    );
+    match command {
+        SyncCommand::Configure { url, branch } => {
+            sync::configure(&ctx.ws, &url, &branch)?;
+            let report = sync::run(&ctx.ws, Mode::Sync, false, &mut |s| eprintln!("{s}"))?;
+            ctx.out(&report, || println!("Root auto-sync enabled: {report:?}"))
+        }
+        SyncCommand::Disable => {
+            sync::disable(&ctx.ws)?;
+            ctx.out(&serde_json::json!({"enabled": false}), || {
+                println!("Automatic root sync disabled")
+            })
+        }
+        SyncCommand::Status => {
+            let settings = Settings::load(&ctx.ws)?;
+            ctx.out(&settings, || {
+                println!("{}", serde_json::to_string_pretty(&settings).unwrap())
+            })
+        }
+        command => {
+            let mode = match command {
+                SyncCommand::Push => Mode::Push,
+                SyncCommand::Pull => Mode::Pull,
+                _ => Mode::Sync,
+            };
+            let report = sync::run(&ctx.ws, mode, dry_run, &mut |s| eprintln!("{s}"))?;
+            ctx.out(&report, || println!("{report:?}"))
+        }
     }
 }
 
@@ -819,7 +1021,11 @@ fn deploy_label(s: &DeployState) -> &'static str {
 }
 
 fn cmd_status(ctx: &Ctx) -> Result<()> {
-    let snap = ctx.ws.scan()?;
+    let mut ws = ctx.ws.clone();
+    if ws.project.is_none() {
+        skills::ops::targets::discover(&mut ws, &std::env::current_dir()?)?;
+    }
+    let snap = ws.scan()?;
     ctx.out(&snap, || print_status(&snap))
 }
 
@@ -1158,8 +1364,9 @@ fn cmd_check(ctx: &Ctx, skill: Option<String>, all: bool) -> Result<()> {
     };
     let mut results = Vec::new();
     let mut errors = Vec::new();
+    let mut session = update::UpdateSession::default();
     for k in keys {
-        match update::check(&ctx.ws, &k) {
+        match session.check(&ctx.ws, &k, &mut |message| eprintln!("{message}")) {
             Ok(r) => results.push(r),
             Err(e) => errors.push(serde_json::json!({"skill": k, "error": format!("{e:#}")})),
         }
@@ -1195,6 +1402,7 @@ fn cmd_check(ctx: &Ctx, skill: Option<String>, all: bool) -> Result<()> {
 }
 
 fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
+    eprintln!("Scanning installed skills …");
     let snap = ctx.ws.scan()?;
     let keys: Vec<String> = if let Some(alias) = &a.repo {
         snap.skills
@@ -1232,15 +1440,19 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
     );
     let per_file = BTreeMap::new();
     let mut report = Vec::new();
-    for k in keys {
-        let prepared = match update::prepare(&ctx.ws, &snap, &k) {
+    let mut session = update::UpdateSession::default();
+    let mut failed = 0;
+    for (index, k) in keys.iter().enumerate() {
+        eprintln!("[{}/{}] Updating {k} …", index + 1, keys.len());
+        let prepared = match session.prepare(&snap, k, &mut |message| eprintln!("  {message}")) {
             Ok(prepared) => prepared,
             Err(error) => {
-                report.push(serde_json::json!({"skill": k, "result": "skipped", "reason": format!("{error:#}")}));
+                eprintln!("  {k}: {error:#}");
+                report.push(serde_json::json!({"skill": k, "result": "error", "error": format!("{error:#}")}));
+                failed += 1;
                 continue;
             }
         };
-
         let up_to_date = prepared.from_revision.as_deref() == Some(prepared.to_revision.as_str());
         let mut entry = serde_json::to_value(&prepared)?;
         if up_to_date {
@@ -1253,14 +1465,24 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
             entry["result"] = "needs-resolution".into();
             prepared.cleanup();
         } else {
-            update::apply(&ctx.ws, &prepared, take.unwrap_or_default(), &per_file)?;
-            entry["result"] = if take == Some(Take::Local) {
-                "skipped-local"
-            } else {
-                "updated"
+            match update::apply(&ctx.ws, &prepared, take.unwrap_or_default(), &per_file) {
+                Ok(()) => {
+                    entry["result"] = if take == Some(Take::Local) {
+                        "skipped-local"
+                    } else {
+                        "updated"
+                    }
+                    .into()
+                }
+                Err(error) => {
+                    prepared.cleanup();
+                    entry["result"] = "error".into();
+                    entry["error"] = format!("{error:#}").into();
+                    failed += 1;
+                }
             }
-            .into();
         }
+        eprintln!("  {k}: {}", entry["result"].as_str().unwrap_or(""));
         report.push(entry);
     }
     ctx.out(&report, || {
@@ -1305,7 +1527,9 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
                 }
             }
         }
-    })
+    })?;
+    anyhow::ensure!(failed == 0, "{failed} skill update(s) failed");
+    Ok(())
 }
 
 fn resolve_agents(ctx: &Ctx, agents: &[String], all: bool) -> Result<Vec<String>> {

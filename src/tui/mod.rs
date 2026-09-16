@@ -20,6 +20,7 @@ mod modal;
 mod name_choices;
 mod repository_picker;
 mod settings;
+mod sync_picker;
 mod text;
 mod theme;
 mod toast;
@@ -39,11 +40,18 @@ use std::sync::mpsc;
 type Term = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
 pub fn run(ws: skills::Workspace, launch_dir: Option<&std::path::Path>) -> Result<()> {
+    let mut ws = ws;
+    match skills::ops::sync::automatic(&ws) {
+        Ok(Some(_)) => ws.config = ws.load_config()?,
+        Err(e) => eprintln!("Root sync: {e:#}; continuing with local data"),
+        _ => {}
+    }
     let (tx, rx) = mpsc::channel();
     let mut app = app::App::new_with_launch_directory(ws, tx.clone(), launch_dir)?;
 
     install_panic_hook();
     let mut terminal = enter()?;
+    app.sync_if_ready();
     let gate = std::sync::Arc::new(event::InputGate::default());
     event::spawn_input(tx.clone(), gate.clone());
     event::spawn_ticker(tx, app.settings.interaction.tick_interval);

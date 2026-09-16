@@ -1710,7 +1710,7 @@ impl View for SearchView {
                 ("↓", "list"),
                 ("Enter", "list"),
                 ("Esc", "clear/results"),
-                ("F1", "help"),
+                ("Ctrl-G", "help"),
             ],
             Focus::List => &[
                 ("Enter", "preview"),

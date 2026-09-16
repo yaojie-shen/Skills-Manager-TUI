@@ -23,26 +23,7 @@ pub struct CheckResult {
 
 /// Compare the tracked Git revision or archive content hash with the installed version.
 pub fn check(ws: &Workspace, key: &str) -> Result<CheckResult> {
-    let meta = ws
-        .meta
-        .load(key)?
-        .with_context(|| format!("{key} has no metadata"))?;
-    let source = meta
-        .source
-        .filter(Source::is_remote)
-        .with_context(|| format!("{key} is not a remote-sourced skill"))?;
-    let url = source.url().unwrap().to_owned();
-    let branch = source.branch().map(str::to_owned);
-    let revision = source.revision().map(str::to_owned);
-    let remote = crate::ops::source::latest_revision(&source)?;
-    Ok(CheckResult {
-        skill: key.to_string(),
-        url,
-        branch,
-        update_available: revision.as_deref() != Some(remote.as_str()),
-        installed: revision,
-        remote,
-    })
+    UpdateSession::default().check(ws, key, &mut |_| {})
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -111,136 +92,252 @@ impl Prepared {
 /// Fetch the upstream (and, when the skill is modified, the baseline revision)
 /// into staging and classify differences. Nothing in the root is touched.
 pub fn prepare(_ws: &Workspace, snap: &Snapshot, key: &str) -> Result<Prepared> {
-    let rec = snap
-        .get(key)
-        .with_context(|| format!("no such skill: {key}"))?;
-    let meta = rec
-        .meta
-        .clone()
-        .with_context(|| format!("{key} has no metadata"))?;
-    let source = meta
-        .source
-        .clone()
-        .filter(Source::is_remote)
-        .with_context(|| format!("{key} is not a remote-sourced skill"))?;
-    let revision = source.revision().map(str::to_owned);
-    match rec.status {
-        SkillStatus::Repository | SkillStatus::MissingBaseline | SkillStatus::Modified => {}
-        ref s => bail!("cannot update a skill in state {}", s.label()),
-    }
-    let local = crate::skill::SkillDoc::load(&rec.path)?;
-    let expected_name = meta
-        .installed_name
-        .clone()
-        .unwrap_or_else(|| local.name.clone());
-    anyhow::ensure!(
-        local.name == expected_name,
-        "local skill name changed; keeping local copy and deployments"
-    );
-    let expected_hash = hash_directory(&rec.path)?;
+    UpdateSession::default().prepare(snap, key, &mut |_| {})
+}
 
-    let download = DownloadDir::new("update")?;
-    let work = download.path().to_path_buf();
-    let source_tree = work.join("source");
-    let reference = crate::ops::install::InstallRef::from_source(&source)?;
-    let acquired = crate::ops::source::acquire(&reference, &source_tree, &mut |_| {})?;
-    let to_revision = acquired.revision;
-    let sub = source.subpath().unwrap_or("");
-    let upstream_src = if sub.is_empty() {
-        source_tree.clone()
-    } else {
-        source_tree.join(sub)
-    };
-    if !upstream_src.join(crate::skill::SKILL_FILE).is_file() {
-        bail!("upstream no longer has a skill at {sub:?}; keeping local copy");
-    }
-    let upstream = crate::skill::SkillDoc::load(&upstream_src)
-        .context("upstream skill is invalid; keeping local copy and deployments")?;
-    anyhow::ensure!(
-        upstream.name == local.name,
-        "upstream skill name changed from {:?} to {:?}; keeping local copy and deployments",
-        local.name,
-        upstream.name
-    );
-    let installed_paths: Vec<_> = snap
-        .skills
-        .iter()
-        .filter_map(|s| match &s.source {
-            Some(installed)
-                if installed.kind() == source.kind()
-                    && installed.url() == source.url()
-                    && installed.branch() == source.branch() =>
-            {
-                Some(installed.subpath().unwrap_or(""))
-            }
-            _ => None,
+/// Share source downloads and Git head checks within one update run.
+#[derive(Default)]
+pub struct UpdateSession {
+    trees: BTreeMap<(String, String, Option<String>), (DownloadDir, String)>,
+    heads: BTreeMap<(String, String, Option<String>), String>,
+}
+impl UpdateSession {
+    /// Check each provider/URL/branch once per batch, using the same provider as updates.
+    pub fn check(
+        &mut self,
+        ws: &Workspace,
+        key: &str,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<CheckResult> {
+        let meta = ws
+            .meta
+            .load(key)?
+            .with_context(|| format!("{key} has no metadata"))?;
+        let source = meta
+            .source
+            .filter(Source::is_remote)
+            .with_context(|| format!("{key} is not a remote-sourced skill"))?;
+        let url = source.url().unwrap().to_owned();
+        let branch = source.branch().map(str::to_owned);
+        let revision = source.revision().map(str::to_owned);
+        let remote = self.latest(&source, progress)?;
+        Ok(CheckResult {
+            skill: key.to_string(),
+            url,
+            branch,
+            update_available: revision.as_deref() != Some(remote.as_str()),
+            installed: revision,
+            remote,
         })
-        .collect();
-    let mut new_skills = Vec::new();
-    for entry in walkdir::WalkDir::new(&source_tree)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
-    {
-        let entry = entry?;
-        if entry.file_type().is_file() && entry.file_name() == crate::skill::SKILL_FILE {
-            let directory = entry.path().parent().context("missing skill parent")?;
-            let path = directory.strip_prefix(&source_tree)?.to_string_lossy();
-            if !installed_paths
-                .iter()
-                .any(|p| *p == path || crate::repository::overlaps(p, &path))
-                && crate::skill::SkillDoc::load(directory).is_ok()
-            {
-                new_skills.push(path.into_owned());
-            }
-        }
     }
-    new_skills.sort();
-    let upstream_dir = work.join("upstream");
-    copy_dir(&upstream_src, &upstream_dir)?;
-    let _ = std::fs::remove_dir_all(upstream_dir.join(".git"));
 
-    let mut prepared = Prepared {
-        skill: key.to_string(),
-        from_revision: revision.clone(),
-        to_revision,
-        status: rec.status.label().to_string(),
-        new_skills,
-        files: BTreeMap::new(),
-        upstream_dir,
-        workdir: work.clone(),
-        baseline_dir: None,
-        expected_name,
-        expected_meta: Box::new(meta),
-        expected_hash,
-    };
+    fn identity(source: &Source) -> (String, String, Option<String>) {
+        (
+            source.kind().into(),
+            source.url().unwrap().into(),
+            source.branch().map(str::to_owned),
+        )
+    }
 
-    if rec.status == SkillStatus::Modified {
-        // Providers with version history can recover a three-way baseline;
-        // otherwise differences remain unclassified.
-        if let Some(rev) = &revision
-            && crate::ops::source::checkout_revision(&reference, &source_tree, rev)?
-        {
-            let base_src = if sub.is_empty() {
-                source_tree.clone()
+    fn acquire(&mut self, source: &Source, progress: &mut dyn FnMut(&str)) -> Result<()> {
+        let identity = Self::identity(source);
+        if !self.trees.contains_key(&identity) {
+            progress(&format!("Downloading {} …", identity.1));
+            let reference = crate::ops::install::InstallRef::from_source(source)?;
+            let tree = DownloadDir::new("update-source")?;
+            let acquired =
+                crate::ops::source::acquire(&reference, &tree.path().join("source"), progress)?;
+            // The fetched revision is authoritative if the remote moved after checking.
+            self.heads
+                .insert(identity.clone(), acquired.revision.clone());
+            self.trees.insert(identity, (tree, acquired.revision));
+        }
+        Ok(())
+    }
+
+    fn latest(&mut self, source: &Source, progress: &mut dyn FnMut(&str)) -> Result<String> {
+        let identity = Self::identity(source);
+        if !self.heads.contains_key(&identity) {
+            progress(&format!("Checking {} …", identity.1));
+            if matches!(source, Source::Git { .. }) {
+                self.heads.insert(
+                    identity.clone(),
+                    crate::ops::source::latest_revision(source)?,
+                );
             } else {
-                source_tree.join(sub)
-            };
-            if base_src.is_dir() {
-                let base_dir = work.join("baseline");
-                copy_dir(&base_src, &base_dir)?;
-                let _ = std::fs::remove_dir_all(base_dir.join(".git"));
-                prepared.baseline_dir = Some(base_dir);
+                self.acquire(source, progress)?;
             }
         }
-        prepared.files = classify(
-            &rec.path,
-            &prepared.upstream_dir,
-            prepared.baseline_dir.as_deref(),
-        )?;
+        Ok(self.heads[&identity].clone())
     }
-    prepared.workdir = download.keep();
-    Ok(prepared)
+
+    pub fn prepare(
+        &mut self,
+        snap: &Snapshot,
+        key: &str,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Prepared> {
+        let rec = snap
+            .get(key)
+            .with_context(|| format!("no such skill: {key}"))?;
+        let meta = rec
+            .meta
+            .clone()
+            .with_context(|| format!("{key} has no metadata"))?;
+        let source = meta
+            .source
+            .clone()
+            .filter(Source::is_remote)
+            .with_context(|| format!("{key} is not a remote-sourced skill"))?;
+        let revision = source.revision().map(str::to_owned);
+        match rec.status {
+            SkillStatus::Repository | SkillStatus::MissingBaseline | SkillStatus::Modified => {}
+            ref s => bail!("cannot update a skill in state {}", s.label()),
+        }
+        let local = crate::skill::SkillDoc::load(&rec.path)?;
+        let expected_name = meta
+            .installed_name
+            .clone()
+            .unwrap_or_else(|| local.name.clone());
+        anyhow::ensure!(
+            local.name == expected_name,
+            "local skill name changed; keeping local copy and deployments"
+        );
+        let expected_hash = hash_directory(&rec.path)?;
+
+        let download = DownloadDir::new("update")?;
+        let work = download.path().to_path_buf();
+        let reference = crate::ops::install::InstallRef::from_source(&source)?;
+        let identity = Self::identity(&source);
+        if matches!(source, Source::Git { .. }) {
+            self.latest(&source, progress)?;
+        }
+        if matches!(source, Source::Git { .. })
+            && let Some(head) = self.heads.get(&identity)
+            && revision.as_ref() == Some(head)
+        {
+            return Ok(Prepared {
+                skill: key.into(),
+                from_revision: revision,
+                to_revision: head.clone(),
+                status: rec.status.label().into(),
+                new_skills: Vec::new(),
+                files: BTreeMap::new(),
+                upstream_dir: work.join("upstream"),
+                workdir: download.keep(),
+                baseline_dir: None,
+                expected_name,
+                expected_meta: Box::new(meta),
+                expected_hash,
+            });
+        }
+        self.acquire(&source, progress)?;
+        let (tree, to_revision) = &self.trees[&identity];
+        let to_revision = to_revision.clone();
+        let source_tree = tree.path().join("source");
+        if matches!(source, Source::Git { .. }) {
+            crate::ops::git(
+                &["checkout", "--quiet", "--detach", &to_revision],
+                Some(&source_tree),
+            )?;
+        }
+        let sub = source.subpath().unwrap_or("");
+        let upstream_src = if sub.is_empty() {
+            source_tree.clone()
+        } else {
+            source_tree.join(sub)
+        };
+        if !upstream_src.join(crate::skill::SKILL_FILE).is_file() {
+            bail!("upstream no longer has a skill at {sub:?}; keeping local copy");
+        }
+        let upstream = crate::skill::SkillDoc::load(&upstream_src)
+            .context("upstream skill is invalid; keeping local copy and deployments")?;
+        anyhow::ensure!(
+            upstream.name == local.name,
+            "upstream skill name changed from {:?} to {:?}; keeping local copy and deployments",
+            local.name,
+            upstream.name
+        );
+        let installed_paths: Vec<_> = snap
+            .skills
+            .iter()
+            .filter_map(|s| match &s.source {
+                Some(installed)
+                    if installed.kind() == source.kind()
+                        && installed.url() == source.url()
+                        && installed.branch() == source.branch() =>
+                {
+                    Some(installed.subpath().unwrap_or(""))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut new_skills = Vec::new();
+        for entry in walkdir::WalkDir::new(&source_tree)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| e.depth() == 0 || !e.file_name().to_string_lossy().starts_with('.'))
+        {
+            let entry = entry?;
+            if entry.file_type().is_file() && entry.file_name() == crate::skill::SKILL_FILE {
+                let directory = entry.path().parent().context("missing skill parent")?;
+                let path = directory.strip_prefix(&source_tree)?.to_string_lossy();
+                if !installed_paths
+                    .iter()
+                    .any(|p| *p == path || crate::repository::overlaps(p, &path))
+                    && crate::skill::SkillDoc::load(directory).is_ok()
+                {
+                    new_skills.push(path.into_owned());
+                }
+            }
+        }
+        new_skills.sort();
+        let upstream_dir = work.join("upstream");
+        copy_dir(&upstream_src, &upstream_dir)?;
+        let _ = std::fs::remove_dir_all(upstream_dir.join(".git"));
+
+        let mut prepared = Prepared {
+            skill: key.to_string(),
+            from_revision: revision.clone(),
+            to_revision,
+            status: rec.status.label().to_string(),
+            new_skills,
+            files: BTreeMap::new(),
+            upstream_dir,
+            workdir: work.clone(),
+            baseline_dir: None,
+            expected_name,
+            expected_meta: Box::new(meta),
+            expected_hash,
+        };
+
+        if rec.status == SkillStatus::Modified {
+            // Providers with version history can recover a three-way baseline;
+            // otherwise differences remain unclassified.
+            if let Some(rev) = &revision
+                && crate::ops::source::checkout_revision(&reference, &source_tree, rev)?
+            {
+                let base_src = if sub.is_empty() {
+                    source_tree.clone()
+                } else {
+                    source_tree.join(sub)
+                };
+                if base_src.is_dir() {
+                    let base_dir = work.join("baseline");
+                    copy_dir(&base_src, &base_dir)?;
+                    let _ = std::fs::remove_dir_all(base_dir.join(".git"));
+                    prepared.baseline_dir = Some(base_dir);
+                }
+            }
+            prepared.files = classify(
+                &rec.path,
+                &prepared.upstream_dir,
+                prepared.baseline_dir.as_deref(),
+            )?;
+        }
+        prepared.workdir = download.keep();
+        Ok(prepared)
+    }
 }
 
 fn list_files(dir: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
@@ -312,7 +409,9 @@ pub fn apply(
         per_file.is_empty(),
         "per-file merging is not supported; choose local or upstream for the whole skill"
     );
-    if take == Take::Local {
+    if take == Take::Local
+        || prepared.from_revision.as_deref() == Some(prepared.to_revision.as_str())
+    {
         prepared.cleanup();
         return Ok(());
     }

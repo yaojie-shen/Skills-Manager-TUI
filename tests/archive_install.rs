@@ -445,7 +445,7 @@ fn ambiguous_git_url_keeps_git_configuration_and_inline_branch_syntax() {
             "compat",
             "--all",
         ])
-        .env("GIT_CONFIG_GLOBAL", config)
+        .env("GIT_CONFIG_GLOBAL", &config)
         .output()
         .unwrap();
     assert!(
@@ -464,6 +464,33 @@ fn ambiguous_git_url_keeps_git_configuration_and_inline_branch_syntax() {
     assert_eq!(source.kind(), "git");
     assert_eq!(source.url(), Some(url));
     assert_eq!(source.branch(), Some("develop"));
+    std::fs::write(upstream.join("SKILL.md"), skill("toolkit", "v2")).unwrap();
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "new version"]);
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_skills"))
+            .args(["--json", "--root"])
+            .arg(&fixture.ws.root)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let checked = run(&["check", "--all"]);
+    assert_eq!(checked["results"][0]["update_available"], true);
+    let updated = run(&["update", "--all"]);
+    assert_eq!(updated[0]["result"], "updated");
+    assert_eq!(updated[0]["to_revision"], checked["results"][0]["remote"]);
+    assert_eq!(
+        run(&["check", "--all"])["results"][0]["update_available"],
+        false
+    );
 }
 
 #[test]
@@ -602,4 +629,172 @@ fn archive_cli_rejects_git_branch_without_installing() {
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("branch"), "{error}");
     assert!(fixture.ws.scan().unwrap().skills.is_empty());
+}
+
+#[test]
+fn mixed_git_and_redirected_archive_checks_match_batch_updates() {
+    let fixture = Fixture::new();
+    let server = HttpArchive::new(zip_archive("v1"));
+    let url = server.url("/redirect");
+    let mut keys = Vec::new();
+    for name in ["review", "writer"] {
+        keys.push(
+            install::install(
+                &fixture.ws,
+                &install::InstallRef::Url {
+                    url: url.clone(),
+                    branch: None,
+                    subpath: Some(format!("bundle/skills/{name}")),
+                },
+                Some(name),
+            )
+            .unwrap(),
+        );
+    }
+    let repository = fixture.temp.path().join("git-source");
+    std::fs::create_dir(&repository).unwrap();
+    let git = |args: &[&str]| skills::ops::git(args, Some(&repository)).unwrap();
+    git(&["init", "--initial-branch=main"]);
+    let commit = || {
+        git(&["add", "SKILL.md"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "version",
+        ]);
+    };
+    std::fs::write(repository.join("SKILL.md"), skill("git-tool", "v1")).unwrap();
+    commit();
+    keys.push(
+        install::install(
+            &fixture.ws,
+            &install::InstallRef::Git {
+                url: format!("file://{}", repository.display()),
+                branch: Some("main".into()),
+                subpath: None,
+            },
+            Some("git-tool"),
+        )
+        .unwrap(),
+    );
+    let downloads = || {
+        server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|path| path.as_str() == "/download?token=user@secret")
+            .count()
+    };
+
+    let before = downloads();
+    let unchanged = fixture.json(&["check", "--all"]);
+    assert_eq!(unchanged["results"].as_array().unwrap().len(), 3);
+    assert_eq!(unchanged["errors"], serde_json::json!([]));
+    assert!(
+        unchanged["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["update_available"] == false)
+    );
+    assert_eq!(
+        downloads() - before,
+        1,
+        "one archive download per check batch"
+    );
+
+    server.replace(zip_archive("v2"));
+    std::fs::write(repository.join("SKILL.md"), skill("git-tool", "v2")).unwrap();
+    commit();
+    let checked = fixture.json(&["check", "--all"]);
+    assert!(
+        checked["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["update_available"] == true)
+    );
+    let before = downloads();
+    let updated = fixture.json(&["update", "--all"]);
+    assert_eq!(
+        downloads() - before,
+        1,
+        "one archive download per update batch"
+    );
+    for result in updated.as_array().unwrap() {
+        assert_eq!(result["result"], "updated");
+        let check = checked["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["skill"] == result["skill"])
+            .unwrap();
+        assert_eq!(result["to_revision"], check["remote"]);
+    }
+    for key in &keys {
+        assert!(
+            std::fs::read_to_string(fixture.ws.skill_path(key).join("SKILL.md"))
+                .unwrap()
+                .contains("v2")
+        );
+    }
+    let current = fixture.json(&["check", "--all"]);
+    assert!(
+        current["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["update_available"] == false)
+    );
+
+    // A combined library session also reuses the checked archive for preparation.
+    server.requests.lock().unwrap().clear();
+    let mut session = update::UpdateSession::default();
+    let snap = fixture.ws.scan().unwrap();
+    for key in &keys[..2] {
+        let checked = session.check(&fixture.ws, key, &mut |_| {}).unwrap();
+        let prepared = session.prepare(&snap, key, &mut |_| {}).unwrap();
+        assert_eq!(checked.remote, prepared.to_revision);
+        prepared.cleanup();
+    }
+    assert_eq!(downloads(), 1);
+
+    // Changing only the URL query must invalidate the source identity.
+    server.replace(zip_archive("v3"));
+    let mut meta = fixture.ws.meta.load(&keys[0]).unwrap().unwrap();
+    let previous = meta
+        .source
+        .as_ref()
+        .unwrap()
+        .revision()
+        .unwrap()
+        .to_string();
+    let Source::Archive { url, .. } = meta.source.as_mut().unwrap() else {
+        panic!("expected archive source")
+    };
+    *url = server.url("/download?token=changed@query");
+    fixture.ws.meta.save(&keys[0], &meta).unwrap();
+    let changed = session.check(&fixture.ws, &keys[0], &mut |_| {}).unwrap();
+    assert!(changed.update_available);
+    assert_ne!(changed.remote, previous);
+    let prepared = session
+        .prepare(&fixture.ws.scan().unwrap(), &keys[0], &mut |_| {})
+        .unwrap();
+    assert_eq!(prepared.to_revision, changed.remote);
+    prepared.cleanup();
+    assert!(
+        server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path == "/download?token=changed@query")
+    );
 }

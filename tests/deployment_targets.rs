@@ -191,7 +191,7 @@ fn old_registry_and_sync_config_have_no_effect() {
         .output()
         .unwrap();
     assert!(!result.status.success());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("sync has been removed"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("root sync is not configured"));
     assert!(target.skills_path().join("sample").is_symlink());
     assert_eq!(std::fs::read_to_string(config_path).unwrap(), config_text);
 }

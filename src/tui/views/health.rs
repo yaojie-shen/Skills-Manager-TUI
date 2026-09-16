@@ -23,7 +23,7 @@ use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 use skills::meta::{Source, short_rev};
 use skills::ops::update::CheckResult;
 use skills::ops::{deploy, edit};
-use skills::reconcile::{AgentDirMode, EntryState, SkillRecord, SkillStatus};
+use skills::reconcile::{AgentDirMode, EntryState, HealthClass, SkillRecord, SkillStatus};
 use std::collections::BTreeMap;
 
 /// Which of the page's actions apply to one row. Decided once per rebuild
@@ -62,6 +62,8 @@ impl Caps {
 }
 
 struct Row {
+    class: Option<HealthClass>,
+    archive: bool,
     key: String,
     caps: Caps,
     agent: Option<String>,
@@ -200,6 +202,8 @@ impl HealthView {
                         .unwrap_or(false)
             })
             .map(|s| Row {
+                class: s.status.health_class().or(Some(HealthClass::Review)),
+                archive: s.status == SkillStatus::Missing,
                 key: s.key.clone(),
                 caps: Caps::of(s, self.checks.get(&s.key)),
                 agent: None,
@@ -219,10 +223,11 @@ impl HealthView {
                 .collect();
             let mode_issue = match &agent.mode {
                 AgentDirMode::Missing => Some(
-                    "Agent directory does not exist. Deploy from Agents to create it.".to_string(),
+                    "Review: agent directory does not exist. Deploy from Agents if needed; unused agents do not need a directory."
+                        .to_string(),
                 ),
                 AgentDirMode::DirForeign { target } => Some(format!(
-                    "Agent directory links outside the root → {}. Review this path before changing it.",
+                    "Independent: agent directory links outside the root → {}. No repair required unless central management is intended.",
                     target.display()
                 )),
                 _ => None,
@@ -239,6 +244,8 @@ impl HealthView {
             )));
             if let Some(explanation) = mode_issue {
                 self.rows.push(Row {
+                    class: agent.mode.health_class(),
+                    archive: false,
                     key: "directory".into(),
                     caps: Caps::default(),
                     agent: Some(agent.key.clone()),
@@ -249,6 +256,8 @@ impl HealthView {
             }
             for (name, state) in issues {
                 self.rows.push(Row {
+                    class: state.health_class(),
+                    archive: false,
                     key: name.clone(),
                     caps: Caps::default(),
                     agent: Some(agent.key.clone()),
@@ -258,7 +267,7 @@ impl HealthView {
                 });
             }
         }
-        self.total_issues = self.issue_count();
+        self.total_issues = self.rows.iter().filter(|r| r.heading.is_none()).count();
         let documents = self
             .rows
             .iter()
@@ -327,7 +336,10 @@ impl HealthView {
     }
 
     fn issue_count(&self) -> usize {
-        self.rows.iter().filter(|r| r.heading.is_none()).count()
+        self.rows
+            .iter()
+            .filter(|r| r.class == Some(HealthClass::Fault))
+            .count()
     }
 
     fn agent_command(&self, code: Command, ctx: &Ctx) -> Option<Vec<Action>> {
@@ -519,7 +531,8 @@ impl HealthView {
                 meta_lines(&mut lines);
                 actions.push(action(
                     "x",
-                    "forget it: delete the metadata file, tags and note included".into(),
+                    "Ctrl-P: restore or archive missing records in bulk; m: locate a moved skill"
+                        .into(),
                 ));
                 match &r.source {
                     Some(Source::Git { .. } | Source::Archive { .. }) => actions.push(action(
@@ -747,6 +760,22 @@ impl View for HealthView {
             self.rebuild(ctx);
             return vec![];
         }
+        if k.code == KeyCode::Char('m')
+            && self
+                .selected(ctx)
+                .is_some_and(|r| matches!(r.status, SkillStatus::Missing))
+        {
+            let r = self.selected(ctx).unwrap();
+            return vec![Action::OpenModal(Box::new(Modal::Input {
+                title: format!("Locate moved skill: {}", r.key),
+                input: crate::tui::widgets::Input::default(),
+                kind: crate::tui::modal::InputKind::Migrate {
+                    skill: r.key.clone(),
+                },
+                hint: "New library key (e.g. local/design/pdf); Enter previews changes".into(),
+                rect: Rect::default(),
+            }))];
+        }
         if let Some(actions) = self.agent_action(k.code, ctx) {
             return actions;
         }
@@ -849,8 +878,19 @@ impl View for HealthView {
         let area = self.filter.draw(
             f,
             area,
-            "Filter health issues",
-            &format!("health · {} issues", self.issue_count()),
+            "Ctrl-R rescan · Ctrl-P batch repair · Filter health entries",
+            &format!(
+                "health · {} faults · {} review · {} independent",
+                self.issue_count(),
+                self.rows
+                    .iter()
+                    .filter(|r| r.class == Some(HealthClass::Review))
+                    .count(),
+                self.rows
+                    .iter()
+                    .filter(|r| r.class == Some(HealthClass::Independent))
+                    .count()
+            ),
             true,
             ctx,
         );
@@ -858,12 +898,15 @@ impl View for HealthView {
         // With nothing to show there is nothing to explain either, so the
         // message gets the whole width instead of being squeezed beside an
         // empty pane.
-        if self.issue_count() == 0 {
+        if !self.rows.iter().any(|r| r.heading.is_none()) {
             self.left = area;
             self.right = Rect::default();
             let inner = area;
             let msg = if self.total_issues > 0 {
-                format!("No matching issues · {} issues in total", self.total_issues)
+                format!(
+                    "No matching entries · {} entries in total",
+                    self.total_issues
+                )
             } else {
                 format!(
                     "everything is healthy\n{} skills · {} agents checked\nPress c to check remote sources for updates.",
@@ -903,10 +946,23 @@ impl View for HealthView {
                     let (description, _) = agent_description(row);
                     return ListItem::new(Line::from(Span::styled(
                         fit(
-                            &format!("{} {}  {description}", agent_marker(row), row.key),
+                            &format!(
+                                "[{}] {} {}  {description}",
+                                match row.class {
+                                    Some(HealthClass::Independent) => "independent",
+                                    Some(HealthClass::Review) => "review",
+                                    _ => "fault",
+                                },
+                                agent_marker(row),
+                                row.key
+                            ),
                             left.width.saturating_sub(4) as usize,
                         ),
-                        th.warn(),
+                        if row.class == Some(HealthClass::Independent) {
+                            th.dim()
+                        } else {
+                            th.warn()
+                        },
                     )));
                 }
                 let r = ctx
@@ -1003,6 +1059,23 @@ impl View for HealthView {
                 ("q", "clear/back"),
             ];
         };
+        if caps.clean {
+            return if self.selected_row().is_some_and(|r| r.archive) {
+                &[
+                    ("x", "archive record"),
+                    ("m", "locate move"),
+                    ("Ctrl-P", "batch repair"),
+                    ("Esc", "clear/back"),
+                ]
+            } else {
+                &[
+                    ("x", "delete folder"),
+                    ("Enter", "details"),
+                    ("Ctrl-P", "batch repair"),
+                    ("Esc", "clear/back"),
+                ]
+            };
+        }
         match (caps.update, caps.accept, caps.migrate, caps.clean) {
             (true, true, _, _) => &[
                 ("c", "check updates"),
@@ -1025,7 +1098,7 @@ impl View for HealthView {
             (true, false, false, true) => &[
                 ("c", "check updates"),
                 ("U", "update"),
-                ("x", "clean up"),
+                ("x", "archive/delete"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
                 ("Esc", "clear/back"),
@@ -1057,7 +1130,7 @@ impl View for HealthView {
             ],
             (false, false, false, true) => &[
                 ("c", "check updates"),
-                ("x", "clean up"),
+                ("x", "archive/delete"),
                 ("Enter", "open"),
                 ("M", "multi-select"),
                 ("Esc", "clear/back"),
@@ -1077,6 +1150,8 @@ impl View for HealthView {
 impl Row {
     fn heading(text: String) -> Self {
         Self {
+            class: None,
+            archive: false,
             key: String::new(),
             caps: Caps::default(),
             agent: None,
@@ -1184,7 +1259,7 @@ mod tests {
             snap.get("repos").is_none(),
             "repos is a storage container, not an invalid skill"
         );
-        assert_eq!(view.issue_count(), 4);
+        assert_eq!(view.issue_count(), 2);
         assert_eq!(view.rows.iter().filter(|r| r.heading.is_some()).count(), 2);
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
@@ -1195,7 +1270,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(text.contains("health · 4 issues"));
+        assert!(text.contains("health · 2 faults"));
         for name in ["invalid-item", "broken-item", "foreign-item", "printer"] {
             assert!(text.contains(name), "missing {name}");
         }
@@ -1353,6 +1428,214 @@ mod tests {
             .collect();
         assert!(text.contains("everything is healthy"));
         assert!(text.contains("0 skills · 1 agents checked"));
+        std::fs::create_dir_all(root.join("agent/own-skill")).unwrap();
+        let independent_snap = ws.scan().unwrap();
+        let independent_ctx = Ctx {
+            ws: &ws,
+            snap: &independent_snap,
+            settings: ctx.settings,
+        };
+        view.refresh(&independent_ctx);
+        assert_eq!(view.issue_count(), 0);
+        terminal
+            .draw(|f| view.draw(f, f.area(), &independent_ctx))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("[independent]"));
+        assert!(!text.contains("everything is healthy"));
+
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Shared CLI repair policies with a scrollable, explicit preview before writes.
+#[derive(Default)]
+pub struct RepairDialog {
+    options: skills::ops::repair::Options,
+    preview: Option<skills::ops::repair::Report>,
+    scroll: u16,
+}
+impl RepairDialog {
+    pub fn forget(key: &str) -> Self {
+        Self {
+            options: skills::ops::repair::Options {
+                forget_missing: true,
+                keys: vec![key.into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    pub fn preview(report: skills::ops::repair::Report) -> Self {
+        Self {
+            preview: Some(report),
+            ..Default::default()
+        }
+    }
+    pub fn hints(&self) -> Hints {
+        if self.preview.is_some() {
+            &[("y", "apply preview"), ("↑↓", "scroll"), ("Esc", "cancel")]
+        } else {
+            &[
+                ("r", "restore missing"),
+                ("f", "archive missing"),
+                ("c", "clean links"),
+                ("Enter", "preview"),
+                ("Esc", "cancel"),
+            ]
+        }
+    }
+    pub fn key(&mut self, key: KeyEvent) -> Vec<Action> {
+        match key.code {
+            KeyCode::Esc => return vec![Action::CloseModal],
+            KeyCode::Down => self.scroll = self.scroll.saturating_add(1),
+            KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
+            KeyCode::Char('y') if self.preview.as_ref().is_some_and(|p| p.planned > 0) => {
+                return vec![
+                    Action::CloseModal,
+                    Action::Spawn(Task::RepairApply(self.preview.take().unwrap())),
+                ];
+            }
+            KeyCode::Char('r') if self.preview.is_none() => {
+                self.options.restore_missing = !self.options.restore_missing;
+                self.options.forget_missing = false;
+            }
+            KeyCode::Char('f') if self.preview.is_none() => {
+                self.options.forget_missing = !self.options.forget_missing;
+                self.options.restore_missing = false;
+            }
+            KeyCode::Char('c') if self.preview.is_none() => {
+                self.options.clean_links = !self.options.clean_links
+            }
+            KeyCode::Enter if self.preview.is_none() => {
+                return vec![
+                    Action::CloseModal,
+                    Action::Spawn(Task::RepairPlan(self.options.clone())),
+                ];
+            }
+            _ => {}
+        }
+        vec![]
+    }
+    pub fn mouse(&mut self, m: MouseEvent) -> Vec<Action> {
+        match m.kind {
+            MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_add(3),
+            MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_sub(3),
+            _ => {}
+        }
+        vec![]
+    }
+    pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        let area = Rect::new(
+            area.x + 1,
+            area.y + 1,
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        );
+        f.render_widget(crate::tui::widgets::OverlayClear, area);
+        let block = ctx
+            .settings
+            .theme
+            .block(" Health repair · Esc cancel ", true);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let mut lines = if let Some(report) = &self.preview {
+            let mut lines = vec!["Preview only. y: apply listed actions; Esc: cancel.".into(), "Each item is checked again. Metadata is backed up; failures do not roll back earlier items.".into()];
+            lines.extend(report.lines());
+            lines
+        } else {
+            vec![
+                "Moved, deleted or edited folders: scan first, then review repairs.".into(),
+                "[x] Migrate unique content-matched moves and repair references".into(),
+                format!("[{}] r: Restore missing skills from baseline-matching local sources", if self.options.restore_missing { "x" } else { " " }),
+                format!("[{}] f: Archive obsolete missing records, then remove their references", if self.options.forget_missing { "x" } else { " " }),
+                format!("[{}] c: Remove links still broken after migration/restoration", if self.options.clean_links { "x" } else { " " }),
+                "Restore and archive are alternatives. Existing skill files are never deleted.".into(),
+                "Edited moves: close this dialog, select the missing skill and press m to specify its new library key.".into(),
+                "Different managed replacements: compare copies first; archive the obsolete record if no longer needed.".into(),
+                "Enter: scan and preview. Nothing is written yet.".into(),
+            ]
+        };
+        if !self.options.keys.is_empty() && self.preview.is_none() {
+            lines.insert(
+                0,
+                format!("Selected records: {}", self.options.keys.join(", ")),
+            );
+        }
+        lines.push("↑↓ / PgUp PgDn / wheel: scroll".into());
+        let text = lines.join("\n\n");
+        let rows = text
+            .lines()
+            .map(|l| {
+                (crate::tui::widgets::width(l) as u16)
+                    .div_ceil(inner.width.max(1))
+                    .max(1)
+            })
+            .fold(0u16, |a, b| a.saturating_add(b));
+        self.scroll = self.scroll.min(rows.saturating_sub(inner.height));
+        f.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .scroll((self.scroll, 0)),
+            inner,
+        );
+    }
+}
+
+#[cfg(test)]
+mod repair_dialog_tests {
+    use super::*;
+    #[test]
+    fn repair_dialog_requires_preview_and_explicit_apply_and_renders_small_terminals() {
+        let tmp = skills::ops::DownloadDir::new("repair-dialog").unwrap();
+        let ws = skills::Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut dialog = RepairDialog::default();
+        assert!(dialog.key(KeyCode::Char('y').into()).is_empty());
+        dialog.key(KeyCode::Char('r').into());
+        assert!(dialog.options.restore_missing);
+        dialog.key(KeyCode::Char('f').into());
+        assert!(dialog.options.forget_missing && !dialog.options.restore_missing);
+        assert!(matches!(
+            dialog.key(KeyCode::Enter.into()).as_slice(),
+            [Action::CloseModal, Action::Spawn(Task::RepairPlan(_))]
+        ));
+        for (w, h) in [(80, 24), (48, 12)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| dialog.draw(f, f.area(), &ctx)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(text.contains("Health repair"));
+        }
+        let mut dialog = RepairDialog::preview(skills::ops::repair::Report {
+            planned: 1,
+            ..Default::default()
+        });
+        assert!(dialog.key(KeyCode::Enter.into()).is_empty());
+        assert!(matches!(
+            dialog.key(KeyCode::Char('y').into()).as_slice(),
+            [Action::CloseModal, Action::Spawn(Task::RepairApply(_))]
+        ));
     }
 }

@@ -198,6 +198,8 @@ pub struct App {
     pub toasts: Toasts,
     pub history: History,
     tasks_running: usize,
+    root_sync_pending: bool,
+    root_sync_running: bool,
     next_task_id: u64,
     spinner: usize,
     last_root_poll: std::time::Instant,
@@ -311,6 +313,12 @@ impl App {
             ws.inventory_project = Some(start.to_path_buf());
         }
         Self::discover_local_agents(&mut ws)?;
+        let startup_repair = skills::ops::repair::startup(&ws);
+        // Repairs can migrate or remove tag membership; display the persisted result.
+        if !matches!(&startup_repair, Ok(report) if report.repaired == 0 && report.failed == 0) {
+            ws.config = ws.load_config()?;
+            Self::discover_local_agents(&mut ws)?;
+        }
         let local_project = ws
             .inventory_project
             .clone()
@@ -342,6 +350,8 @@ impl App {
             batch_modal_owned: false,
             history: History::default(),
             tasks_running: 0,
+            root_sync_pending: true,
+            root_sync_running: false,
             next_task_id: 0,
             spinner: 0,
             last_root_poll: std::time::Instant::now(),
@@ -364,6 +374,26 @@ impl App {
                 ),
                 Level::Info,
             );
+        }
+        match startup_repair {
+            Ok(report) if report.repaired > 0 || report.failed > 0 => {
+                app.toast(
+                    format!(
+                        "Startup repair: {} repaired, {} failed",
+                        report.repaired, report.failed
+                    ),
+                    if report.failed > 0 {
+                        Level::Error
+                    } else {
+                        Level::Ok
+                    },
+                );
+            }
+            Err(error) => app.toast(
+                format!("Startup repair: {error:#}; review Health"),
+                Level::Error,
+            ),
+            _ => {}
         }
         Ok(app)
     }
@@ -504,6 +534,31 @@ impl App {
             };
             self.apply(action);
         }
+        if !self.quit {
+            self.sync_if_ready();
+        }
+    }
+
+    pub fn sync_if_ready(&mut self) {
+        if self.root_sync_pending
+            && self.tasks_running == 0
+            && !self.batch_running
+            && !self.task_ui_blocked()
+            && self.context_menu.is_none()
+            && self.external.is_none()
+        {
+            self.root_sync_pending = false;
+            match skills::ops::sync::Settings::load(&self.ws) {
+                Ok(settings) if settings.enabled => {
+                    self.spawn(Task::Sync(super::sync_picker::Request {
+                        mode: skills::ops::sync::Mode::Sync,
+                        dry_run: false,
+                    }))
+                }
+                Err(e) => self.toast(format!("Root sync: {e:#}"), Level::Error),
+                _ => {}
+            }
+        }
     }
 
     fn task_ui_blocked(&self) -> bool {
@@ -514,6 +569,65 @@ impl App {
 
     fn on_task(&mut self, out: TaskOutput) -> Vec<Action> {
         match out {
+            TaskOutput::RepairPlan(result) => match result {
+                Ok(report) => vec![Action::OpenModal(Box::new(Modal::HealthRepair(Box::new(
+                    super::views::health::RepairDialog::preview(report),
+                ))))],
+                Err(e) => vec![Action::Error(format!("Repair preview: {e:#}"))],
+            },
+            TaskOutput::RepairApplied(result) => {
+                self.batch_running = false;
+                match result {
+                    Ok(report) => vec![
+                        Action::Rescan,
+                        Action::OpenModal(Box::new(Modal::message(
+                            "Repair results",
+                            report.lines(),
+                        ))),
+                    ],
+                    Err(e) => vec![
+                        Action::Rescan,
+                        Action::Error(format!(
+                            "Repair: {e:#}; inspect status; earlier actions may have completed"
+                        )),
+                    ],
+                }
+            }
+            TaskOutput::Sync(request, result) => {
+                self.root_sync_running = false;
+                self.batch_running = false;
+                match result {
+                    Ok(report) if request.dry_run => {
+                        let ctx = Ctx {
+                            ws: &self.ws,
+                            snap: &self.snap,
+                            settings: &self.settings,
+                        };
+                        match super::sync_picker::SyncPicker::preview(&ctx, request, report) {
+                            Ok(p) => vec![Action::OpenModal(Box::new(Modal::Sync(Box::new(p))))],
+                            Err(e) => vec![Action::Error(format!("{e:#}"))],
+                        }
+                    }
+                    result => {
+                        self.rescan();
+                        self.root_sync_pending = false;
+                        match result {
+                            Ok(report) => {
+                                if report.pulled {
+                                    self.history = History::default();
+                                }
+                                vec![Action::Toast(format!(
+                                    "Root synced: backup {}, pull {}, push {}",
+                                    report.committed, report.pulled, report.pushed
+                                ))]
+                            }
+                            Err(e) => vec![Action::Error(format!(
+                                "Root sync pending: {e:#}; local changes retained"
+                            ))],
+                        }
+                    }
+                }
+            }
             TaskOutput::Batch(outcome) => {
                 self.batch_running = false;
                 let return_to = if self.batch_modal_owned
@@ -719,6 +833,9 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) -> Vec<Action> {
+        if self.root_sync_running {
+            return vec![];
+        }
         if self.context_menu.is_some() {
             return vec![];
         }
@@ -768,6 +885,9 @@ impl App {
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return vec![Action::Quit];
         }
+        if self.root_sync_running {
+            return vec![];
+        }
         if let Some(menu) = self.context_menu.as_mut() {
             let event = menu.key(k);
             return self.context_event(event);
@@ -784,6 +904,31 @@ impl App {
         };
         if let Some(m) = self.modal.as_mut() {
             return m.handle_key(k, &ctx);
+        }
+        match (k.code, k.modifiers) {
+            (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                return vec![Action::Rescan, Action::Toast("rescanning".into())];
+            }
+            (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+                let enabled = !self.settings.tags_enabled;
+                return vec![Action::OpenModal(Box::new(Modal::confirm_write(
+                    "Settings · Tags".into(),
+                    vec![format!("Tags: {} → {}", !enabled, enabled), "Hide or show tag classification throughout the interface. Existing data and preset membership are preserved.".into()],
+                    Box::new(move |ws| { skills::config::Config::set_tags_enabled(&ws.root, enabled)?; Ok(format!("Tags {}", if enabled { "enabled" } else { "disabled" })) })
+                )))];
+            }
+            (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                return vec![Action::OpenModal(Box::new(Modal::HealthRepair(
+                    Box::default(),
+                )))];
+            }
+            (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
+                return vec![Action::OpenModal(Box::new(super::sync_picker::open(&ctx)))];
+            }
+            (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
+                return vec![Action::OpenModal(Box::new(Modal::help()))];
+            }
+            _ => {}
         }
         if self.focus == AppFocus::Tabs {
             let tabs = Tab::visible(self.settings.tags_enabled);
@@ -818,7 +963,7 @@ impl App {
                         .map(|t| vec![Action::SwitchTab(*t)])
                         .unwrap_or_default();
                 }
-                KeyCode::F(1) | KeyCode::Char('?') => {
+                KeyCode::Char('?') => {
                     return vec![Action::OpenModal(Box::new(Modal::help()))];
                 }
                 _ => return vec![],
@@ -869,21 +1014,9 @@ impl App {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return vec![Action::Quit],
             (KeyCode::Char('z'), KeyModifiers::CONTROL) => return self.step(Step::Undo),
             (KeyCode::Char('y'), KeyModifiers::CONTROL) => return self.step(Step::Redo),
-            (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
-                return vec![Action::Rescan, Action::Toast("rescanning".into())];
-            }
             (KeyCode::Char('R'), _) if !in_search_input => {
                 return vec![Action::OpenModal(Box::new(Modal::repositories(&ctx)))];
             }
-            (KeyCode::F(2), _) => {
-                let enabled = !self.settings.tags_enabled;
-                return vec![Action::OpenModal(Box::new(Modal::confirm_write(
-                    "Settings · Tags".into(),
-                    vec![format!("Tags: {} → {}", !enabled, enabled), "Hide or show tag classification throughout the interface. Existing data and preset membership are preserved.".into()],
-                    Box::new(move |ws| { skills::config::Config::set_tags_enabled(&ws.root, enabled)?; Ok(format!("Tags {}", if enabled { "enabled" } else { "disabled" })) })
-                )))];
-            }
-            (KeyCode::F(1), _) => return vec![Action::OpenModal(Box::new(Modal::help()))],
             (KeyCode::Char('?'), _) if !in_search_input => {
                 return vec![Action::OpenModal(Box::new(Modal::help()))];
             }
@@ -935,6 +1068,9 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) -> Vec<Action> {
+        if self.root_sync_running {
+            return vec![];
+        }
         if let Some(prompt) = self.quit_prompt.as_ref() {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
                 let point = (m.column, m.row).into();
@@ -1053,6 +1189,7 @@ impl App {
                 self.search.restrict_agent(agent);
             }
             Action::Quit => {
+                self.sync_if_ready();
                 if self.tasks_running == 0 {
                     self.quit = true;
                 } else {
@@ -1397,10 +1534,27 @@ impl App {
     }
 
     fn spawn(&mut self, task: Task) {
+        if matches!(task, Task::Sync(_)) {
+            if self.tasks_running > 0 {
+                self.toast(
+                    "Wait for the current operation before syncing the root",
+                    Level::Info,
+                );
+                return;
+            }
+            self.root_sync_pending = false;
+            self.root_sync_running = true;
+            self.batch_running = true;
+        }
+        if matches!(task, Task::RepairApply(_)) {
+            self.batch_running = true;
+        }
         self.tasks_running += 1;
         self.next_task_id += 1;
         let id = self.next_task_id;
         let label = match &task {
+            Task::RepairPlan(_) => Some("Scan and preview health repairs".into()),
+            Task::RepairApply(_) => Some("Apply health repairs".into()),
             Task::Scan | Task::PollRoot => None,
             Task::DiscoverRepository(reference) => Some(format!("Fetch {reference}")),
             Task::InstallRepository(selection) => Some(format!(
@@ -1409,6 +1563,11 @@ impl App {
             )),
             Task::Install { reference, .. } => Some(format!("Install {reference}")),
             Task::Check(keys) => Some(format!("Check upstream: {} skills", keys.len())),
+            Task::Sync(r) => Some(format!(
+                "Root sync {:?}{}",
+                r.mode,
+                if r.dry_run { " (preview)" } else { "" }
+            )),
             Task::Prepare(key) => Some(format!("Prepare update: {key}")),
         };
         if let Some(label) = label {
@@ -1418,6 +1577,7 @@ impl App {
     }
 
     pub fn rescan(&mut self) {
+        self.root_sync_pending = true;
         // Refresh one configuration snapshot for every view. Invalid edits keep
         // the last valid settings and report the error without disrupting input.
         match self.ws.load_config() {
@@ -1612,14 +1772,14 @@ impl App {
         let escape = hints.iter().find(|(key, _)| key.contains("Esc"));
         let reserve = escape.map_or(0, |(key, desc)| width(key) + width(desc) + 3)
             + if self.modal.is_none() && self.quit_prompt.is_none() {
-                9
+                13
             } else {
                 0
             };
         for (key, desc) in hints {
             if (!self.settings.tags_enabled && *key == "t")
                 || key.contains("Esc")
-                || (*key == "F1" && self.modal.is_none() && self.quit_prompt.is_none())
+                || (*key == "Ctrl-G" && self.modal.is_none() && self.quit_prompt.is_none())
             {
                 continue;
             }
@@ -1645,10 +1805,10 @@ impl App {
                 hint_w += piece_w;
             }
         }
-        if self.modal.is_none() && self.quit_prompt.is_none() && hint_w + 9 <= budget {
-            spans.push(Span::styled("F1", th.key_hint()));
+        if self.modal.is_none() && self.quit_prompt.is_none() && hint_w + 13 <= budget {
+            spans.push(Span::styled("Ctrl-G", th.key_hint()));
             spans.push(Span::styled(" help  ", Style::default().fg(th.placeholder)));
-            hint_w += 9;
+            hint_w += 13;
         }
         let pad = budget.saturating_sub(hint_w);
         let mut line = vec![
@@ -2515,7 +2675,10 @@ mod scope_tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
-        app.handle(Msg::Key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)));
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        )));
         assert_eq!(app.ws.root, root);
         assert!(!app.history.is_empty());
         assert!(!base.join("project/.agents").exists());
@@ -2626,6 +2789,46 @@ mod panel_navigation_tests {
 #[cfg(test)]
 mod escape_hierarchy_tests {
     use super::*;
+
+    #[test]
+    fn control_shortcuts_work_in_tabs_and_text_input_without_function_keys() {
+        let (_root, mut app) = app();
+        for focus in [AppFocus::Tabs, AppFocus::Page] {
+            app.focus = focus;
+            let query = app.search.query().to_owned();
+            for key in ['g', 'o', 'p', 'b'] {
+                let actions = app.on_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL));
+                assert!(
+                    matches!(actions.as_slice(), [Action::OpenModal(_)]),
+                    "{key}"
+                );
+                if key == 'p' {
+                    assert!(
+                        matches!(&actions[0], Action::OpenModal(modal) if matches!(modal.as_ref(), Modal::HealthRepair(_)))
+                    );
+                }
+            }
+            assert!(matches!(
+                app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+                    .as_slice(),
+                [Action::Rescan, Action::Toast(_)]
+            ));
+            for number in 1..=12 {
+                assert!(
+                    app.on_key(KeyEvent::new(KeyCode::F(number), KeyModifiers::NONE))
+                        .is_empty()
+                );
+            }
+            assert_eq!(app.search.query(), query);
+        }
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(app.search.query(), "g");
+        app.modal = Some(Modal::help());
+        assert!(
+            app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+                .is_empty()
+        );
+    }
 
     #[test]
     fn mouse_tab_selection_keeps_the_page_active() {
@@ -3061,7 +3264,7 @@ mod context_menu_tests {
         for (key, desc) in hints {
             if (!app.settings.tags_enabled && *key == "t")
                 || key.contains("Esc")
-                || (*key == "F1" && app.modal.is_none() && app.quit_prompt.is_none())
+                || (*key == "Ctrl-G" && app.modal.is_none() && app.quit_prompt.is_none())
             {
                 continue;
             }
@@ -3071,7 +3274,7 @@ mod context_menu_tests {
             expected.push(((*key).to_owned(), (*desc).to_owned()));
         }
         if app.modal.is_none() && app.quit_prompt.is_none() {
-            expected.push(("F1".into(), "help".into()));
+            expected.push(("Ctrl-G".into(), "help".into()));
         }
         expected
     }
@@ -3222,7 +3425,7 @@ mod context_menu_tests {
                 ("↓", "list"),
                 ("Enter", "list"),
                 ("Esc", "clear/results"),
-                ("F1", "help"),
+                ("Ctrl-G", "help"),
             ],
         );
         key(&mut app, KeyCode::Esc);
@@ -3812,7 +4015,7 @@ mod context_menu_tests {
         );
         let footer = footer_line(&mut app, 400, 40);
         assert!(
-            !footer.contains("F1 help"),
+            !footer.contains("Ctrl-G help"),
             "quit popup must not expose help: {footer:?}"
         );
         assert!(
@@ -3833,7 +4036,7 @@ mod context_menu_tests {
             "",
             "context menu must clear the global page footer"
         );
-        assert!(!global_footer.contains("F1") && !global_footer.contains("preview"));
+        assert!(!global_footer.contains("Ctrl-G") && !global_footer.contains("preview"));
 
         draw_app(&mut app, 140, 35);
         let request = app.context_menu.as_ref().unwrap().request.clone();
@@ -3876,7 +4079,7 @@ mod context_menu_tests {
         }));
         let enabled_footer = draw_app(&mut app, 140, 35);
         assert!(enabled_footer.contains("Left click to run"));
-        assert!(!enabled_footer.contains("F1 help"));
+        assert!(!enabled_footer.contains("Ctrl-G help"));
     }
 
     #[test]
@@ -4234,5 +4437,112 @@ mod context_menu_tests {
                 .as_slice(),
             [Action::Quit]
         ));
+    }
+}
+
+#[cfg(test)]
+mod startup_repair_tests {
+    use super::*;
+
+    #[test]
+    fn startup_removes_absent_metadata_before_building_the_first_snapshot() {
+        let temp = skills::ops::DownloadDir::new("tui-startup-repair").unwrap();
+        let root = temp.path().join("root");
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        ws.meta
+            .save(
+                "gone",
+                &skills::meta::SkillMeta {
+                    source: Some(skills::meta::Source::Git {
+                        url: "https://example.invalid/source.git".into(),
+                        branch: None,
+                        subpath: None,
+                        revision: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let app = App::new_with_launch_directory(ws, tx, Some(temp.path())).unwrap();
+        assert!(!app.ws.meta.exists("gone"));
+        assert!(app.snap.get("gone").is_none());
+        assert!(app.ws.meta.dir.join(".repair-backups").is_dir());
+    }
+}
+
+#[cfg(test)]
+mod root_sync_tests {
+    use super::*;
+    #[test]
+    fn metadata_write_schedules_one_root_backup_and_blocks_overlapping_writes() {
+        let temp = skills::ops::DownloadDir::new("tui-root-sync").unwrap();
+        let root = temp.path().join("root");
+        let remote = temp.path().join("remote.git");
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        skills::ops::git(
+            &[
+                "init",
+                "--bare",
+                "--initial-branch=main",
+                remote.to_str().unwrap(),
+            ],
+            None,
+        )
+        .unwrap();
+        skills::ops::sync::configure(&ws, remote.to_str().unwrap(), "main").unwrap();
+        skills::ops::sync::automatic(&ws).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new_with_launch_directory(ws, tx, Some(temp.path())).unwrap();
+        app.root_sync_running = true;
+        app.batch_running = true;
+        app.apply(Action::Write(Box::new(|_| {
+            panic!("must not write during checkout")
+        })));
+        assert!(
+            app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+                .is_empty()
+        );
+        app.root_sync_running = false;
+        app.batch_running = false;
+        app.apply(Action::Write(Box::new(|ws| {
+            std::fs::write(ws.root.join("saved.txt"), "automatically backed up")?;
+            Ok("saved".into())
+        })));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app.tasks_running > 0 || app.root_sync_pending {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "auto-sync did not settle"
+            );
+            app.sync_if_ready();
+            if app.tasks_running > 0 {
+                app.handle(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+            }
+        }
+        assert_eq!(
+            skills::ops::git(&["show", "HEAD:saved.txt"], Some(&remote)).unwrap(),
+            "automatically backed up"
+        );
+        let before = skills::ops::git(&["rev-parse", "HEAD"], Some(&root)).unwrap();
+        app.sync_if_ready();
+        assert_eq!(app.tasks_running, 0);
+        assert_eq!(
+            before,
+            skills::ops::git(&["rev-parse", "HEAD"], Some(&root)).unwrap()
+        );
     }
 }

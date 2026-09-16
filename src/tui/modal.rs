@@ -29,6 +29,7 @@ pub struct PickItem {
 }
 
 pub enum InputKind {
+    Migrate { skill: String },
     PresetName,
     TagName,
     TagDescription { name: String },
@@ -43,6 +44,8 @@ pub enum InputKind {
 
 pub enum Modal {
     DeploymentChoices(Box<super::name_choices::NameChoices>),
+    HealthRepair(Box<super::views::health::RepairDialog>),
+    Sync(Box<super::sync_picker::SyncPicker>),
     DeployTargets(Box<super::deploy_picker::DeployPicker>),
     PresetSkills(Box<SearchView>),
     Batch(Box<super::batch::Batch>),
@@ -439,19 +442,9 @@ impl Modal {
         .in_background(vec![skill.to_string()])
     }
 
-    /// Forget the tags and notes of a skill whose directory is gone.
+    /// Archive a missing record using the same preview/revalidation as batch repair.
     pub fn forget_missing(skill: &str) -> Self {
-        let k = skill.to_string();
-        Self::confirm_write(
-            format!(" forget {skill} "),
-            vec![
-                format!("Forget the metadata of \"{skill}\"?"),
-                "Its directory is already gone; this discards the tags and note you wrote \
-                 for it. Keep it instead if you intend to reinstall the skill."
-                    .into(),
-            ],
-            Box::new(move |ws| ws.meta.remove(&k).map(|_| format!("forgot {k}"))),
-        )
+        Self::HealthRepair(Box::new(super::views::health::RepairDialog::forget(skill)))
     }
 
     /// Edit the preset's fixed membership using the shared skill selector.
@@ -572,6 +565,8 @@ impl Modal {
         match self {
             Modal::DeploymentChoices(picker) => picker.hints(),
             Modal::PresetSkills(view) => view.hints(),
+            Modal::HealthRepair(p) => p.hints(),
+            Modal::Sync(p) => p.hints(),
             Modal::Batch(p) => p.hints(),
             Modal::Repository(p) => p.hints(),
             Modal::DeployTargets(p) => p.hints(),
@@ -626,6 +621,8 @@ impl Modal {
     pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
         match self {
             Modal::PresetSkills(view) => view.paste(text, ctx),
+            Modal::HealthRepair(_) => vec![],
+            Modal::Sync(p) => p.paste(text),
             Modal::Batch(picker) => picker.paste(text),
             Modal::Repository(picker) => picker.paste(text, ctx),
             Modal::DeployTargets(p) => p.paste(text),
@@ -663,6 +660,8 @@ impl Modal {
         }
         match self {
             Modal::DeploymentChoices(picker) => picker.key(k),
+            Modal::HealthRepair(p) => p.key(k),
+            Modal::Sync(p) => p.key(k, ctx),
             Modal::PresetSkills(view) => view.handle_key(k, ctx),
             Modal::Batch(p) => p.key(k, ctx),
             Modal::Repository(p) => p.key(k, ctx),
@@ -929,6 +928,8 @@ impl Modal {
         let click = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
         match self {
             Modal::DeploymentChoices(picker) => picker.mouse(m),
+            Modal::HealthRepair(p) => p.mouse(m),
+            Modal::Sync(p) => p.mouse(m, ctx),
             Modal::PresetSkills(view) => view.handle_mouse(m, ctx),
             Modal::Batch(p) => p.mouse(m, ctx),
             Modal::Repository(p) => p.mouse(m, ctx),
@@ -1096,6 +1097,8 @@ impl Modal {
                 f.render_widget(block, r);
                 view.draw(f, inner, ctx);
             }
+            Modal::HealthRepair(p) => p.draw(f, area, ctx),
+            Modal::Sync(p) => p.draw(f, area, ctx),
             Modal::Batch(p) => p.draw(f, area, ctx),
             Modal::Repository(p) => p.draw(f, area, ctx),
             Modal::DeployTargets(p) => p.draw(f, area, ctx),
@@ -1514,6 +1517,17 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
                 Ok(format!("Source renamed to {}", repo.display_name()))
             }))]
         }
+        InputKind::Migrate { skill } => {
+            let mut options = skills::ops::repair::Options::default();
+            options.keys.push(skill.clone());
+            options
+                .moves
+                .insert(skill.clone(), value.trim().to_string());
+            vec![
+                Action::CloseModal,
+                Action::Spawn(super::event::Task::RepairPlan(options)),
+            ]
+        }
         InputKind::Rename { skill } => {
             let name = value.trim();
             if name.is_empty() {
@@ -1744,7 +1758,15 @@ fn help_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
     }
 }
 
-const HELP: &str = "Global
+const HELP: &str = "Startup
+  Unique repository moves are repaired automatically. Missing records and tag/preset references
+  are removed after a metadata backup; skill files are preserved.
+Global
+  Ctrl-G            help (? outside text inputs)
+  Ctrl-O            settings
+  Ctrl-R            rescan
+  Ctrl-P            preview health repairs
+  Ctrl-B            root Git sync: configure, sync, push / pull
   Ctrl-Z  Ctrl-Y    undo and redo the last change
   1-6               select a tab outside text inputs; focus stays on the tab strip
   Tab / Shift-Tab   select next / previous tab (close editing dialogs first)
@@ -1755,7 +1777,6 @@ const HELP: &str = "Global
   /                 search the focused panel      Ctrl-R  rescan      Ctrl-C  quit
 
 Library
-  F2                settings
   type              fuzzy search over name, tags, description, note
   tag:x preset:y    filters; also agent:codex  status:modified  source:repository  untagged
   Enter             accept a suggestion / open results / preview
