@@ -77,6 +77,19 @@ pub fn pad(s: &str, cols: usize) -> String {
     t
 }
 
+/// Center a dialog within the available screen while retaining a one-cell
+/// margin whenever the terminal is large enough.
+pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width.saturating_sub(2)).max(1);
+    let h = height.min(area.height.saturating_sub(2)).max(1);
+    Rect::new(
+        area.x + area.width.saturating_sub(w) / 2,
+        area.y + area.height.saturating_sub(h) / 2,
+        w,
+        h,
+    )
+}
+
 pub const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠇"];
 
 // ---- input ----------------------------------------------------------------

@@ -169,7 +169,7 @@ impl SyncPicker {
             area.height.saturating_sub(2),
         );
         f.render_widget(OverlayClear, area);
-        let block = ctx.settings.theme.block(" Root Git sync · Ctrl-B ", true);
+        let block = ctx.settings.theme.block(" Root Git sync ", true);
         let inner = block.inner(area);
         f.render_widget(block, area);
         let text = if let Some((fields, at)) = &self.adding {

@@ -7,7 +7,7 @@
 
 use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
-use crate::tui::components::context_menu::{Command, Request, Target};
+use crate::tui::components::context_menu::{Command, Item, Request, Target};
 use crate::tui::components::group::{self, tag_fill};
 use crate::tui::components::group_prompt::{Ask, Prompt};
 use crate::tui::components::layout::frame;
@@ -365,6 +365,100 @@ impl TagsView {
 }
 
 impl View for TagsView {
+    fn overlay_open(&self) -> bool {
+        self.prompt.is_some()
+            || (self.focus_grid && self.skill_search.as_ref().is_some_and(View::overlay_open))
+    }
+    fn handle_control_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.focus_grid
+            && let Some(view) = self.skill_search.as_mut()
+        {
+            return view.handle_control_key(key, ctx);
+        }
+        vec![]
+    }
+    fn actions_menu(&self, ctx: &Ctx) -> Option<Request> {
+        if self.prompt.is_some() || self.filter.editing {
+            return None;
+        }
+        if self.focus_grid {
+            let mut request = self.skill_search.as_ref()?.actions_menu(ctx)?;
+            request.items.retain(|item| item.command != Command::Accept);
+            for item in &mut request.items {
+                if item.command == Command::Remove {
+                    item.label = "Remove from tag".into();
+                }
+            }
+            if let Target::Batch { all, .. } = &request.target {
+                request.items.push(Item::new(
+                    Command::Remove,
+                    format!("Remove from tag · {} skills", all.len()),
+                    KeyCode::Char('x'),
+                    !all.is_empty(),
+                    "No selected skills",
+                    1,
+                ));
+            }
+            return Some(request);
+        }
+        let tag = self.selected_tag()?.to_string();
+        let editable = tag != UNTAGGED;
+        Some(Request {
+            title: tag.clone(),
+            detail: "Tag".into(),
+            target: Target::Tag(tag),
+            items: vec![
+                Item::new(
+                    Command::EditMembers,
+                    "Edit skills",
+                    KeyCode::Char('e'),
+                    true,
+                    "",
+                    0,
+                ),
+                Item::new(
+                    Command::Description,
+                    "Edit description",
+                    KeyCode::Char('d'),
+                    editable,
+                    "The untagged group has no metadata",
+                    1,
+                ),
+                Item::new(
+                    Command::Rename,
+                    "Rename tag",
+                    KeyCode::Char('r'),
+                    editable,
+                    "The untagged group cannot be renamed",
+                    1,
+                ),
+                Item::new(
+                    Command::Merge,
+                    "Merge into another tag",
+                    KeyCode::Char('m'),
+                    editable,
+                    "The untagged group cannot be merged",
+                    1,
+                ),
+                Item::new(
+                    Command::Color,
+                    "Change colour",
+                    KeyCode::Char('c'),
+                    editable,
+                    "The untagged group has no colour",
+                    1,
+                ),
+                Item::new(
+                    Command::Remove,
+                    "Delete tag",
+                    KeyCode::Char('x'),
+                    editable,
+                    "The untagged group cannot be deleted",
+                    2,
+                ),
+            ],
+        })
+    }
     fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
         if self.prompt.is_some() {
             return None;
@@ -382,7 +476,42 @@ impl View for TagsView {
         Some(request)
     }
     fn context_execute(&mut self, target: &Target, command: Command, ctx: &Ctx) -> Vec<Action> {
+        if let Target::Tag(tag) = target {
+            if self.selected_tag() != Some(tag.as_str()) {
+                return vec![Action::Error(
+                    "Target changed; reopen the actions menu".into(),
+                )];
+            }
+            return match command {
+                Command::EditMembers => self.add_members(ctx),
+                Command::Description => {
+                    let description = ctx
+                        .ws
+                        .config
+                        .tags
+                        .iter()
+                        .find(|item| item.name == *tag)
+                        .and_then(|item| item.description.as_deref());
+                    vec![Action::OpenModal(Box::new(Modal::tag_description(
+                        tag,
+                        description,
+                    )))]
+                }
+                Command::Rename => vec![Action::OpenModal(Box::new(Modal::rename_tag(tag)))],
+                Command::Merge => self.ask_merge(),
+                Command::Color => self.ask_color(ctx),
+                Command::Remove => vec![Action::OpenModal(Box::new(Modal::delete_tag(tag)))],
+                _ => vec![],
+            };
+        }
         if command == Command::Remove {
+            if let Target::Batch { all, .. } = target
+                && self
+                    .actions_menu(ctx)
+                    .is_some_and(|request| request.target == *target)
+            {
+                return self.remove_members(all.clone());
+            }
             if let Target::Skill(key) = target
                 && ctx.snap.get(key).is_some()
             {
@@ -669,7 +798,7 @@ impl View for TagsView {
             None if self.focus_grid => &[
                 ("/", "filter skills"),
                 ("Enter", "preview"),
-                ("a", "add skills"),
+                ("a", "actions"),
                 ("x", "remove from tag"),
                 ("t", "edit tags"),
                 ("m", "multi-select"),
@@ -678,12 +807,7 @@ impl View for TagsView {
             None => &[
                 ("/", "filter tags"),
                 ("c", "create"),
-                ("a", "add skills"),
-                ("e", "description"),
-                ("r", "rename"),
-                ("m", "merge"),
-                ("C", "colour"),
-                ("D", "delete tag"),
+                ("a", "actions"),
                 ("Enter/→", "skills"),
                 ("Esc/q", "clear/back"),
             ],

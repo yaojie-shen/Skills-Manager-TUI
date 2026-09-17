@@ -2,8 +2,9 @@
 use super::search::{SearchView, SkillPanelOptions};
 use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
-use crate::tui::components::context_menu::{Command, Request, Target};
+use crate::tui::components::context_menu::{Command, Item, Request, Target};
 use crate::tui::components::layout::{frame, split_panes};
+use crate::tui::modal::Modal;
 use crate::tui::settings::LayoutScope;
 use crate::tui::widgets::{CardGrid, fit, width};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -199,6 +200,41 @@ impl ReposView {
 }
 
 impl View for ReposView {
+    fn overlay_open(&self) -> bool {
+        self.focus_skills && self.skill_search.as_ref().is_some_and(View::overlay_open)
+    }
+    fn handle_control_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.focus_skills
+            && let Some(view) = self.skill_search.as_mut()
+        {
+            return view.handle_control_key(key, ctx);
+        }
+        vec![]
+    }
+    fn actions_menu(&self, ctx: &Ctx) -> Option<Request> {
+        if self.filter.editing {
+            return None;
+        }
+        if self.focus_skills {
+            return self.skill_search.as_ref()?.actions_menu(ctx);
+        }
+        let project = self.selected()?;
+        let alias = project.alias.clone()?;
+        let registered = ctx.snap.repositories.contains_key(&alias);
+        Some(Request {
+            title: project.name.clone(),
+            detail: "Repository source".into(),
+            target: Target::Repository(alias),
+            items: vec![Item::new(
+                Command::Rename,
+                "Rename source",
+                KeyCode::Char('r'),
+                registered,
+                "This source is not registered",
+                0,
+            )],
+        })
+    }
     fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
         let view = self.skill_search.as_mut()?;
         let request = view.context_menu(x, y, ctx)?;
@@ -207,6 +243,23 @@ impl View for ReposView {
         Some(request)
     }
     fn context_execute(&mut self, target: &Target, command: Command, ctx: &Ctx) -> Vec<Action> {
+        if let (Target::Repository(alias), Command::Rename) = (target, command) {
+            let Some(project) = self
+                .selected()
+                .filter(|project| project.alias.as_deref() == Some(alias))
+            else {
+                return vec![Action::Error(
+                    "Target changed; reopen the actions menu".into(),
+                )];
+            };
+            if !ctx.snap.repositories.contains_key(alias) {
+                return vec![];
+            }
+            return vec![Action::OpenModal(Box::new(Modal::rename_source(
+                alias,
+                &project.name,
+            )))];
+        }
         match self.skill_search.as_mut() {
             Some(view) => view.context_execute(target, command, ctx),
             None => vec![Action::Error(
@@ -486,7 +539,7 @@ impl View for ReposView {
         &[
             ("↑↓", "sources"),
             ("Enter/→", "skills"),
-            ("r", "rename source"),
+            ("a", "actions"),
             ("/", "filter sources"),
             ("Esc/q", "clear/back"),
         ]

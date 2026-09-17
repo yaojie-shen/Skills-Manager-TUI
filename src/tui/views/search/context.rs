@@ -148,11 +148,18 @@ impl SearchView {
             return None;
         }
         let i = self.grid.hit(x, y)?;
-        let key = self.hits.get(i)?.key.clone();
+        self.hits.get(i)?;
         self.grid.select(Some(i));
         self.focus = Focus::List;
         self.preview_scroll = 0;
         self.search_panel.completion.close();
+        self.menu_current(ctx)
+    }
+    pub(super) fn menu_current(&self, ctx: &Ctx) -> Option<Request> {
+        if self.is_picker() || self.overlay.is_open() || self.focus != Focus::List {
+            return None;
+        }
+        let key = self.selected(ctx)?.key.clone();
         if self.multi && self.checked.contains(&key) {
             let all: Vec<_> = self.checked.iter().cloned().collect();
             let visible = self.visible_checked(ctx);

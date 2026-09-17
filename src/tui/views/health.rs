@@ -712,6 +712,15 @@ impl HealthView {
 }
 
 impl View for HealthView {
+    fn overlay_open(&self) -> bool {
+        self.preview.is_open()
+    }
+    fn actions_menu(&self, ctx: &Ctx) -> Option<Request> {
+        if self.preview.is_open() || self.filter.editing {
+            return None;
+        }
+        self.issue_menu(ctx)
+    }
     fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
         if self.preview.is_open() || !self.left.contains((x, y).into()) {
             return None;
@@ -861,7 +870,7 @@ impl View for HealthView {
         let area = self.filter.draw(
             f,
             area,
-            "Ctrl-R rescan · Ctrl-P batch repair · Filter health entries",
+            "Ctrl-R rescan · : commands · Filter health entries",
             &format!(
                 "health · {} faults · {} review · {} independent",
                 self.issue_count(),

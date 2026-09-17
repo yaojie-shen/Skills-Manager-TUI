@@ -1920,11 +1920,10 @@ const HELP: &str = "Startup
   Startup scanning is read-only. Broken deployment links remain unchanged until you explicitly
   analyze, review, and apply a repair in Health.
 Global
-  Ctrl-G            help (? outside text inputs)
-  Ctrl-O            settings
-  Ctrl-R            rescan
-  Ctrl-P            preview health repairs
-  Ctrl-B            root Git sync: configure, sync, push / pull
+  :                 search commands outside text inputs: install, repair, backup, settings
+  a                 open Actions for the selected item
+  ?                 help (outside text inputs)
+  Ctrl-R            rescan      Ctrl-C  quit
   Ctrl-Z  Ctrl-Y    undo and redo the last change
   1-6               select a tab outside text inputs; focus stays on the tab strip
   Tab / Shift-Tab   select next / previous tab (close editing dialogs first)
@@ -1932,34 +1931,28 @@ Global
   Esc / q           return one level inside the current tab; at the tab strip, quit
                     close overlay, end search input, cancel multi-select, clear filter, parent
                     q remains ordinary text while editing
-  /                 search the focused panel      Ctrl-R  rescan      Ctrl-C  quit
+  /                 search the focused panel
+  Direct shortcuts  remain available for frequent actions; menus are the discoverable path
 
 Library
   type              fuzzy search over name, tags, description, note
   tag:x preset:y    filters; also agent:codex  status:modified  source:repository  untagged
   Enter             accept a suggestion / open results / preview
   arrows            navigate panels and lists (Esc goes back)
-  i                 install a skill from a repo or a local path
-  t  n  d  p        tags / note in $EDITOR / deploy picker / add to preset
-  r  s              rename the skill / set where it came from
-  a  x              accept local changes / remove
+  a                 Actions: tags, presets, deploy, notes, source, updates, remove
   m                 enter multi-select (status marker also starts selection)
   Space  Ctrl-A     toggle skill / select current results in multi-select
   t  d  p           selected skills: tags / deploy / add to preset
   Esc               cancel multi-select; Preset actions include selections outside the filter
   u  U              check upstream / update from upstream (Git or archive sources)
 Tags / Presets
-  C                 choose group colour (name or #rrggbb; none resets)
+  a                 Actions for the selected group or skill
   c                 create a group
-  a                 edit group members
-  e / r / D         description / rename / delete group
-  C / m             Tags: color / merge (left panel)
   /                 filter names on the left or skills on the right
   arrows            navigate lists and move between panels
   m                 multi-select skills in the current panel
   Ctrl-A            select current skill results; earlier selections are retained
-  t / d / p         batch tags / deploy / add to preset
-  x                 remove selected skills from the current tag or preset
+  a                 selected skills: tags / deploy / preset operations
   Tag composition   read-only coverage of the Preset's fixed members
   Enter / click     toggle or create a tag immediately; Esc closes the picker
   Tab               complete an existing tag in the picker
@@ -1980,15 +1973,13 @@ Agents
   +N presets/tags    expand hidden deployment groups; Esc closes without changes
   Skill badges      Left/Right selects; Enter/Space toggles a filter, preserving text and other fields
   Bold + underline  currently applied group filter in the skills panel
-  i / x             install / uninstall skills
-  m                 multi-uninstall skills
+  a                 Actions for the selected skill
   v                 change skill layout
   [ / ]             previous / next agent
-  a                 adopt an entry the agent has but the root does not
 Mouse
   click             focus panes, select rows, press buttons, switch tabs
   double-click      open preview (or tag / preset / health item)
-  right-click       deploy picker for that skill
+  right-click       open Actions for that item
   wheel             scroll lists and preview
 ";
 

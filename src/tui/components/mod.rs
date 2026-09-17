@@ -14,5 +14,6 @@ pub(crate) mod completion;
 pub(crate) mod search_panel;
 
 pub(crate) mod choice_footer;
+pub(crate) mod command_palette;
 
 pub(crate) mod context_menu;

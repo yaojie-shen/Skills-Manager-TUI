@@ -2,6 +2,7 @@
 //! view or modal, and applies the `Action`s they return.
 
 use super::event::{Msg, Task, TaskOutput, spawn_task};
+use super::keymap;
 use super::modal::Modal;
 use super::settings::{LayoutScope, RuntimeSettings, SessionSettings};
 use super::theme::Theme;
@@ -11,9 +12,14 @@ use super::views::{
     search::SearchView, tags::TagsView,
 };
 use super::widgets::{SPINNER, fit, width};
+use crate::tui::components::command_palette::{
+    Command as AppCommand, CommandPalette, Event as PaletteEvent,
+};
 use crate::tui::components::context_menu::{ContextMenu, MenuEvent};
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+#[cfg(test)]
+use crossterm::event::KeyModifiers;
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -210,6 +216,7 @@ pub struct App {
     pub repos: ReposView,
     pub modal: Option<Modal>,
     context_menu: Option<ContextMenu>,
+    command_palette: Option<CommandPalette>,
     pending_task_ui: VecDeque<Action>,
     batch_running: bool,
     batch_modal_owned: bool,
@@ -385,6 +392,7 @@ impl App {
             repos: ReposView::default(),
             modal: None,
             context_menu: None,
+            command_palette: None,
             pending_task_ui: VecDeque::new(),
             batch_running: false,
             batch_modal_owned: false,
@@ -433,6 +441,7 @@ impl App {
 
     fn on_snapshot(&mut self) {
         self.context_menu = None;
+        self.command_palette = None;
         self.settings
             .reload(&self.ws.config, &self.session_settings);
         if !self.settings.tags_enabled && self.tab == Tab::Tags {
@@ -520,6 +529,7 @@ impl App {
             }
             Msg::Resize => {
                 self.context_menu = None;
+                self.command_palette = None;
                 Vec::new()
             }
             Msg::Progress(id, detail) => {
@@ -569,6 +579,7 @@ impl App {
             && !self.batch_running
             && !self.task_ui_blocked()
             && self.context_menu.is_none()
+            && self.command_palette.is_none()
             && self.external.is_none()
         {
             self.root_sync_pending = false;
@@ -588,6 +599,8 @@ impl App {
     fn task_ui_blocked(&self) -> bool {
         self.quit_prompt.is_some()
             || self.modal.is_some()
+            || self.context_menu.is_some()
+            || self.command_palette.is_some()
             || (self.tab == Tab::Tags && self.tags.input_focused())
     }
 
@@ -873,6 +886,12 @@ impl App {
         if self.context_menu.is_some() {
             return vec![];
         }
+        if let Some(palette) = self.command_palette.as_mut() {
+            return palette
+                .paste(text)
+                .err()
+                .map_or_else(Vec::new, |error| vec![Action::Error(error)]);
+        }
         if self.focus == AppFocus::Tabs && self.modal.is_none() {
             return vec![];
         }
@@ -916,12 +935,16 @@ impl App {
             }
             return vec![];
         }
-        if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+        if keymap::control(k, 'c') {
             return vec![Action::Quit];
         }
         if let Some(menu) = self.context_menu.as_mut() {
             let event = menu.key(k);
             return self.context_event(event);
+        }
+        if let Some(palette) = self.command_palette.as_mut() {
+            let event = palette.key(k);
+            return self.palette_event(event);
         }
         if self.batch_running
             && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)))
@@ -936,11 +959,21 @@ impl App {
         if let Some(m) = self.modal.as_mut() {
             return m.handle_key(k, &ctx);
         }
-        match (k.code, k.modifiers) {
-            (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+        if self.focus == AppFocus::Page && self.active_view().overlay_open() {
+            return match self.tab {
+                Tab::Search => self.search.handle_key(k, &ctx),
+                Tab::Tags => self.tags.handle_key(k, &ctx),
+                Tab::Presets => self.presets.handle_key(k, &ctx),
+                Tab::Agents => self.agents.handle_key(k, &ctx),
+                Tab::Health => self.health.handle_key(k, &ctx),
+                Tab::Repos => self.repos.handle_key(k, &ctx),
+            };
+        }
+        match k.code {
+            KeyCode::Char('r') if keymap::control(k, 'r') => {
                 return vec![Action::Rescan, Action::Toast("rescanning".into())];
             }
-            (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+            KeyCode::Char('o') if keymap::control(k, 'o') => {
                 let enabled = !self.settings.tags_enabled;
                 return vec![Action::OpenModal(Box::new(Modal::confirm_write(
                     "Settings · Tags".into(),
@@ -948,18 +981,60 @@ impl App {
                     Box::new(move |ws| { skills::config::Config::set_tags_enabled(&ws.root, enabled)?; Ok(format!("Tags {}", if enabled { "enabled" } else { "disabled" })) })
                 )))];
             }
-            (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                return vec![Action::OpenModal(Box::new(Modal::HealthRepair(
-                    Box::default(),
-                )))];
-            }
-            (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
-                return vec![Action::OpenModal(Box::new(super::sync_picker::open(&ctx)))];
-            }
-            (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
+            KeyCode::Char('g') if keymap::control(k, 'g') => {
                 return vec![Action::OpenModal(Box::new(Modal::help()))];
             }
+            KeyCode::Char('z') if keymap::control(k, 'z') => return self.step(Step::Undo),
+            KeyCode::Char('y') if keymap::control(k, 'y') => return self.step(Step::Redo),
             _ => {}
+        }
+        let in_search_input = self.text_input_focused();
+        if in_search_input && !matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
+            return match self.tab {
+                Tab::Search => self.search.handle_key(k, &ctx),
+                Tab::Tags => self.tags.handle_key(k, &ctx),
+                Tab::Presets => self.presets.handle_key(k, &ctx),
+                Tab::Agents => self.agents.handle_key(k, &ctx),
+                Tab::Health => self.health.handle_key(k, &ctx),
+                Tab::Repos => self.repos.handle_key(k, &ctx),
+            };
+        }
+        if !keymap::plain(k) {
+            if self.focus == AppFocus::Tabs {
+                return vec![];
+            }
+            return match self.tab {
+                Tab::Search => self.search.handle_control_key(k, &ctx),
+                Tab::Tags => self.tags.handle_control_key(k, &ctx),
+                Tab::Presets => self.presets.handle_control_key(k, &ctx),
+                Tab::Agents => self.agents.handle_control_key(k, &ctx),
+                Tab::Health => self.health.handle_control_key(k, &ctx),
+                Tab::Repos => self.repos.handle_control_key(k, &ctx),
+            };
+        }
+        if keymap::character(k, ':') {
+            self.command_palette = Some(CommandPalette::default());
+            return vec![];
+        }
+        let actions_menu = if self.focus == AppFocus::Page && keymap::character(k, 'a') {
+            match self.tab {
+                Tab::Search => self.search.actions_menu(&ctx),
+                Tab::Tags => self.tags.actions_menu(&ctx),
+                Tab::Presets => self.presets.actions_menu(&ctx),
+                Tab::Agents => self.agents.actions_menu(&ctx),
+                Tab::Health => self.health.actions_menu(&ctx),
+                Tab::Repos => self.repos.actions_menu(&ctx),
+            }
+        } else {
+            None
+        };
+        if let Some(mut request) = actions_menu {
+            request.title = format!("Actions · {}", request.title);
+            self.context_menu = Some(ContextMenu::keyboard(request));
+            return vec![];
+        }
+        if keymap::character(k, 'a') {
+            return vec![];
         }
         if self.focus == AppFocus::Tabs {
             let tabs = Tab::visible(self.settings.tags_enabled);
@@ -988,13 +1063,13 @@ impl App {
                 KeyCode::Right | KeyCode::Tab => {
                     return vec![Action::SwitchTab(tabs[(index + 1) % tabs.len()])];
                 }
-                KeyCode::Char(c @ '1'..='6') => {
+                KeyCode::Char(c @ '1'..='6') if keymap::plain(k) => {
                     return tabs
                         .get((c as u8 - b'1') as usize)
                         .map(|t| vec![Action::SwitchTab(*t)])
                         .unwrap_or_default();
                 }
-                KeyCode::Char('?') => {
+                KeyCode::Char('?') if keymap::plain(k) => {
                     return vec![Action::OpenModal(Box::new(Modal::help()))];
                 }
                 _ => return vec![],
@@ -1036,22 +1111,14 @@ impl App {
                 },
             );
         }
-        let in_search_input = (self.tab == Tab::Search && self.search.input_focused())
-            || (self.tab == Tab::Tags && self.tags.input_focused())
-            || (self.tab == Tab::Presets && self.presets.input_focused())
-            || (self.tab == Tab::Health && self.health.input_focused())
-            || (self.tab == Tab::Repos && self.repos.input_focused());
-        match (k.code, k.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => return vec![Action::Quit],
-            (KeyCode::Char('z'), KeyModifiers::CONTROL) => return self.step(Step::Undo),
-            (KeyCode::Char('y'), KeyModifiers::CONTROL) => return self.step(Step::Redo),
-            (KeyCode::Char('R'), _) if !in_search_input => {
+        match k.code {
+            KeyCode::Char('R') if keymap::plain(k) => {
                 return vec![Action::OpenModal(Box::new(Modal::repositories(&ctx)))];
             }
-            (KeyCode::Char('?'), _) if !in_search_input => {
+            KeyCode::Char('?') if keymap::plain(k) => {
                 return vec![Action::OpenModal(Box::new(Modal::help()))];
             }
-            (KeyCode::Char(c @ '1'..='6'), KeyModifiers::NONE) if !in_search_input => {
+            KeyCode::Char(c @ '1'..='6') if keymap::plain(k) => {
                 return Tab::visible(self.settings.tags_enabled)
                     .get((c as u8 - b'1') as usize)
                     .map(|t| vec![Action::SwitchTab(*t)])
@@ -1067,6 +1134,98 @@ impl App {
             Tab::Health => self.health.handle_key(k, &ctx),
             Tab::Repos => self.repos.handle_key(k, &ctx),
         }
+    }
+
+    fn palette_event(&mut self, event: PaletteEvent) -> Vec<Action> {
+        match event {
+            PaletteEvent::Stay => vec![],
+            PaletteEvent::Close => {
+                self.command_palette = None;
+                vec![]
+            }
+            PaletteEvent::Execute(command) => {
+                self.command_palette = None;
+                let ctx = Ctx {
+                    ws: &self.ws,
+                    snap: &self.snap,
+                    settings: &self.settings,
+                };
+                match command {
+                    AppCommand::Rescan => vec![Action::Rescan, Action::Toast("rescanning".into())],
+                    AppCommand::Install => vec![Action::OpenModal(Box::new(Modal::install()))],
+                    AppCommand::Repositories => {
+                        vec![Action::OpenModal(Box::new(Modal::repositories(&ctx)))]
+                    }
+                    AppCommand::Repair => vec![Action::OpenModal(Box::new(Modal::HealthRepair(
+                        Box::default(),
+                    )))],
+                    AppCommand::RootSync => {
+                        vec![Action::OpenModal(Box::new(super::sync_picker::open(&ctx)))]
+                    }
+                    AppCommand::ToggleTags => {
+                        let enabled = !self.settings.tags_enabled;
+                        vec![Action::OpenModal(Box::new(Modal::confirm_write(
+                            "Settings · Tags".into(),
+                            vec![format!("Tags: {} → {}", !enabled, enabled), "Hide or show tag classification throughout the interface. Existing data and preset membership are preserved.".into()],
+                            Box::new(move |ws| { skills::config::Config::set_tags_enabled(&ws.root, enabled)?; Ok(format!("Tags {}", if enabled { "enabled" } else { "disabled" })) })
+                        )))]
+                    }
+                    AppCommand::Undo => self.step(Step::Undo),
+                    AppCommand::Redo => self.step(Step::Redo),
+                    AppCommand::Help => vec![Action::OpenModal(Box::new(Modal::help()))],
+                }
+            }
+        }
+    }
+
+    fn text_input_focused(&self) -> bool {
+        self.focus == AppFocus::Page
+            && ((self.tab == Tab::Search && self.search.input_focused())
+                || (self.tab == Tab::Tags && self.tags.input_focused())
+                || (self.tab == Tab::Presets && self.presets.input_focused())
+                || (self.tab == Tab::Health && self.health.input_focused())
+                || (self.tab == Tab::Repos && self.repos.input_focused())
+                || (self.tab == Tab::Agents && self.agents.editing()))
+    }
+
+    fn actions_available(&self) -> bool {
+        if self.focus != AppFocus::Page || self.text_input_focused() {
+            return false;
+        }
+        let ctx = Ctx {
+            ws: &self.ws,
+            snap: &self.snap,
+            settings: &self.settings,
+        };
+        match self.tab {
+            Tab::Search => self.search.actions_menu(&ctx),
+            Tab::Tags => self.tags.actions_menu(&ctx),
+            Tab::Presets => self.presets.actions_menu(&ctx),
+            Tab::Agents => self.agents.actions_menu(&ctx),
+            Tab::Health => self.health.actions_menu(&ctx),
+            Tab::Repos => self.repos.actions_menu(&ctx),
+        }
+        .is_some()
+    }
+
+    fn active_view(&self) -> &dyn View {
+        match self.tab {
+            Tab::Search => &self.search,
+            Tab::Tags => &self.tags,
+            Tab::Presets => &self.presets,
+            Tab::Agents => &self.agents,
+            Tab::Health => &self.health,
+            Tab::Repos => &self.repos,
+        }
+    }
+
+    fn global_hints_visible(&self) -> bool {
+        self.modal.is_none()
+            && self.quit_prompt.is_none()
+            && self.context_menu.is_none()
+            && self.command_palette.is_none()
+            && !self.text_input_focused()
+            && (self.focus == AppFocus::Tabs || !self.active_view().overlay_open())
     }
 
     fn context_event(&mut self, event: MenuEvent) -> Vec<Action> {
@@ -1114,6 +1273,10 @@ impl App {
         if let Some(menu) = self.context_menu.as_mut() {
             let event = menu.mouse(m);
             return self.context_event(event);
+        }
+        if let Some(palette) = self.command_palette.as_mut() {
+            let event = palette.mouse(m);
+            return self.palette_event(event);
         }
         if self.batch_running
             && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)))
@@ -1255,6 +1418,7 @@ impl App {
             Action::Spawn(task) => self.spawn(task),
             Action::OpenModal(m) => {
                 self.context_menu = None;
+                self.command_palette = None;
                 self.modal = Some(*m);
             }
             Action::CloseModal => {
@@ -1467,6 +1631,7 @@ impl App {
     /// must not throw away a focus the user has just set.
     fn switch_tab(&mut self, t: Tab) {
         self.context_menu = None;
+        self.command_palette = None;
         let t = if t == Tab::Tags && !self.settings.tags_enabled {
             Tab::Search
         } else {
@@ -1682,6 +1847,7 @@ impl App {
     pub fn draw(&mut self, f: &mut Frame) {
         if self.modal.is_some() || self.quit_prompt.is_some() {
             self.context_menu = None;
+            self.command_palette = None;
         }
         let area = f.area();
         let rows = Layout::default()
@@ -1732,6 +1898,9 @@ impl App {
         }
         if let Some(menu) = self.context_menu.as_mut() {
             menu.draw(f, area, &self.settings.theme);
+        }
+        if let Some(palette) = self.command_palette.as_mut() {
+            palette.draw(f, area, &ctx);
         }
         // Above everything: a notification should be readable over a dialog.
         self.toasts.draw(f, area, &self.settings.theme);
@@ -1853,16 +2022,26 @@ impl App {
         let mut spans: Vec<Span> = Vec::new();
         let mut hint_w = 0usize;
         let escape = hints.iter().find(|(key, _)| key.contains("Esc"));
-        let reserve = escape.map_or(0, |(key, desc)| width(key) + width(desc) + 3)
-            + if self.modal.is_none() && self.quit_prompt.is_none() {
-                13
-            } else {
-                0
-            };
+        let show_globals = self.global_hints_visible();
+        let global_hints = [
+            self.actions_available().then_some(("a", "actions")),
+            Some((":", "commands")),
+            Some(("?", "help")),
+        ];
+        let global_width = if show_globals {
+            global_hints
+                .iter()
+                .flatten()
+                .map(|(key, desc)| width(key) + width(desc) + 3)
+                .sum()
+        } else {
+            0
+        };
+        let reserve = escape.map_or(0, |(key, desc)| width(key) + width(desc) + 3) + global_width;
         for (key, desc) in hints {
             if (!self.settings.tags_enabled && *key == "t")
                 || key.contains("Esc")
-                || (*key == "Ctrl-G" && self.modal.is_none() && self.quit_prompt.is_none())
+                || (show_globals && global_hints.contains(&Some((*key, *desc))))
             {
                 continue;
             }
@@ -1888,10 +2067,19 @@ impl App {
                 hint_w += piece_w;
             }
         }
-        if self.modal.is_none() && self.quit_prompt.is_none() && hint_w + 13 <= budget {
-            spans.push(Span::styled("Ctrl-G", th.key_hint()));
-            spans.push(Span::styled(" help  ", Style::default().fg(th.placeholder)));
-            hint_w += 13;
+        if show_globals {
+            for (key, desc) in global_hints.into_iter().flatten() {
+                let piece_w = width(key) + width(desc) + 3;
+                if hint_w + piece_w > budget {
+                    break;
+                }
+                spans.push(Span::styled(key, th.key_hint()));
+                spans.push(Span::styled(
+                    format!(" {desc}  "),
+                    Style::default().fg(th.placeholder),
+                ));
+                hint_w += piece_w;
+            }
         }
         let pad = budget.saturating_sub(hint_w);
         let mut line = vec![
@@ -1916,8 +2104,16 @@ impl App {
         if let Some(m) = &self.modal {
             return m.hints();
         }
+        if let Some(palette) = &self.command_palette {
+            return palette.hints();
+        }
         if self.focus == AppFocus::Tabs {
-            return &[("←→/Tab", "tabs"), ("Enter/↓", "enter"), ("Esc/q", "quit")];
+            return &[
+                ("←→/Tab", "tabs"),
+                ("Enter/↓", "enter"),
+                (":", "commands"),
+                ("Esc/q", "quit"),
+            ];
         }
         match self.tab {
             Tab::Search => self.search.hints(),
@@ -2765,14 +2961,17 @@ mod matrix_key_tests {
         app.tab = Tab::Agents;
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         assert!(app.on_key(key(KeyCode::Char('M'))).is_empty());
-        assert!(matches!(
-            app.on_key(key(KeyCode::Tab)).as_slice(),
-            [Action::SwitchTab(Tab::Repos)]
-        ));
-        assert!(matches!(
-            app.on_key(key(KeyCode::BackTab)).as_slice(),
-            [Action::SwitchTab(Tab::Presets)]
-        ));
+        for code in [
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Char(':'),
+            KeyCode::Char('a'),
+        ] {
+            assert!(app.on_key(key(code)).is_empty());
+            assert!(app.command_palette.is_none());
+            assert!(app.context_menu.is_none());
+            assert_eq!(app.tab, Tab::Agents);
+        }
         for code in [KeyCode::Char('/'), KeyCode::Char('1')] {
             assert!(app.on_key(key(code)).is_empty());
             assert_eq!(app.tab, Tab::Agents);
@@ -2932,22 +3131,24 @@ mod escape_hierarchy_tests {
     use super::*;
 
     #[test]
-    fn control_shortcuts_work_in_tabs_and_text_input_without_function_keys() {
+    fn global_shortcuts_do_not_conflict_with_page_or_text_input_keys() {
         let (_root, mut app) = app();
         for focus in [AppFocus::Tabs, AppFocus::Page] {
             app.focus = focus;
             let query = app.search.query().to_owned();
-            for key in ['g', 'o', 'p', 'b'] {
+            for key in ['g', 'o'] {
                 let actions = app.on_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL));
                 assert!(
                     matches!(actions.as_slice(), [Action::OpenModal(_)]),
                     "{key}"
                 );
-                if key == 'p' {
-                    assert!(
-                        matches!(&actions[0], Action::OpenModal(modal) if matches!(modal.as_ref(), Modal::HealthRepair(_)))
-                    );
-                }
+            }
+            for key in ['p', 'b'] {
+                assert!(
+                    app.on_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL))
+                        .is_empty(),
+                    "Ctrl-{key} must not leak into page shortcuts"
+                );
             }
             assert!(matches!(
                 app.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
@@ -2969,6 +3170,100 @@ mod escape_hierarchy_tests {
             app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn actions_and_command_palette_are_keyboard_discoverable() {
+        let (_root, mut app) = app();
+        app.focus = AppFocus::Page;
+        app.search.focus_list();
+
+        assert!(
+            app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+                .is_empty()
+        );
+        assert!(app.context_menu.is_some());
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.context_menu.is_none());
+
+        assert!(
+            app.on_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT))
+                .is_empty()
+        );
+        assert!(app.command_palette.is_some());
+        for character in "backup".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        let actions = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(actions.as_slice(), [Action::OpenModal(_)]));
+        assert!(app.command_palette.is_none());
+    }
+
+    #[test]
+    fn select_all_reaches_member_panels_without_modified_key_fallthrough() {
+        use crate::tui::components::context_menu::Target;
+        for tab in [Tab::Search, Tab::Tags, Tab::Presets, Tab::Repos] {
+            let (_root, mut app) = app();
+            app.switch_tab(tab);
+            app.enter_page();
+            if tab != Tab::Search {
+                app.on_key(KeyCode::Enter.into());
+            }
+            app.on_key(KeyCode::Char('m').into());
+            app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+            app.on_key(KeyCode::Char('a').into());
+            let menu = app
+                .context_menu
+                .as_ref()
+                .expect("Actions should open on selected skills");
+            assert!(
+                matches!(&menu.request.target, Target::Batch { all, .. } if !all.is_empty()),
+                "{tab:?}"
+            );
+        }
+        let (_root, mut app) = app();
+        app.focus = AppFocus::Tabs;
+        assert!(
+            app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT))
+                .is_empty()
+        );
+        app.enter_page();
+        assert!(
+            app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+                .is_empty()
+        );
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn palette_blocks_background_dialogs_and_clears_on_transitions() {
+        let (_root, mut app) = app();
+        app.enter_page();
+        app.on_key(KeyCode::Char(':').into());
+        assert!(app.task_ui_blocked());
+        app.pending_task_ui
+            .push_back(Action::OpenModal(Box::new(Modal::help())));
+        app.handle(Msg::Key(KeyCode::Char('x').into()));
+        assert!(app.modal.is_none());
+        app.handle(Msg::Key(KeyCode::Esc.into()));
+        assert!(matches!(app.modal, Some(Modal::Help { .. })));
+        app.modal = None;
+        app.on_key(KeyCode::Char(':').into());
+        app.handle(Msg::Resize);
+        assert!(app.command_palette.is_none());
+        app.on_key(KeyCode::Char(':').into());
+        app.switch_tab(Tab::Tags);
+        assert!(app.command_palette.is_none());
+    }
+
+    #[test]
+    fn actions_key_remains_text_while_search_is_editing() {
+        let (_root, mut app) = app();
+        app.focus = AppFocus::Page;
+        app.search.focus_input();
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(app.search.query(), "a");
+        assert!(app.context_menu.is_none());
     }
 
     #[test]
@@ -3401,11 +3696,17 @@ mod context_menu_tests {
 
     fn expected_rendered_hints(app: &App, hints: Hints) -> Vec<(String, String)> {
         let escape = hints.iter().find(|(key, _)| key.contains("Esc"));
+        let show_globals = app.global_hints_visible();
+        let globals = [
+            app.actions_available().then_some(("a", "actions")),
+            Some((":", "commands")),
+            Some(("?", "help")),
+        ];
         let mut expected = Vec::new();
         for (key, desc) in hints {
             if (!app.settings.tags_enabled && *key == "t")
                 || key.contains("Esc")
-                || (*key == "Ctrl-G" && app.modal.is_none() && app.quit_prompt.is_none())
+                || (show_globals && globals.contains(&Some((*key, *desc))))
             {
                 continue;
             }
@@ -3414,8 +3715,13 @@ mod context_menu_tests {
         if let Some((key, desc)) = escape {
             expected.push(((*key).to_owned(), (*desc).to_owned()));
         }
-        if app.modal.is_none() && app.quit_prompt.is_none() {
-            expected.push(("Ctrl-G".into(), "help".into()));
+        if show_globals {
+            expected.extend(
+                globals
+                    .into_iter()
+                    .flatten()
+                    .map(|(key, desc)| (key.into(), desc.into())),
+            );
         }
         expected
     }
@@ -3566,7 +3872,6 @@ mod context_menu_tests {
                 ("↓", "list"),
                 ("Enter", "list"),
                 ("Esc", "clear/results"),
-                ("Ctrl-G", "help"),
             ],
         );
         key(&mut app, KeyCode::Esc);
@@ -4346,9 +4651,15 @@ mod context_menu_tests {
             relink |= hints
                 .iter()
                 .any(|(key, desc)| *key == "r" && *desc == "relink");
-            adopt |= hints
-                .iter()
-                .any(|(key, desc)| *key == "a" && *desc == "adopt");
+            let ctx = Ctx {
+                ws: &app.ws,
+                snap: &app.snap,
+                settings: &app.settings,
+            };
+            adopt |= app
+                .agents
+                .actions_menu(&ctx)
+                .is_some_and(|menu| menu.allows(Command::Adopt));
             no_repair |= hints
                 .iter()
                 .all(|(key, _)| !matches!(*key, "x" | "r" | "a"));
@@ -4631,8 +4942,11 @@ mod root_sync_tests {
             panic!("must not write during checkout")
         })));
         assert!(
-            !app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
-                .is_empty(),
+            matches!(
+                app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+                    .as_slice(),
+                [Action::SwitchTab(_)]
+            ),
             "root sync must not swallow navigation shortcuts"
         );
         app.root_sync_running = false;
