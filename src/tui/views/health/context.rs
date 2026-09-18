@@ -68,14 +68,6 @@ impl HealthView {
                     1,
                 ),
                 Item::new(
-                    Command::Migrate,
-                    "Migrate metadata",
-                    KeyCode::Char('m'),
-                    caps.migrate,
-                    "No detected rename to migrate",
-                    1,
-                ),
-                Item::new(
                     Command::Remove,
                     "Clean up invalid / missing skill",
                     KeyCode::Char('x'),
@@ -128,28 +120,12 @@ impl HealthView {
                 }
                 None => vec![],
             },
-            Command::Migrate if caps.migrate => match self.selected(ctx) {
-                Some(r) => match &r.status {
-                    SkillStatus::Renamed { to } => {
-                        let (old, new) = (r.key.clone(), to.clone());
-                        vec![Action::Write(Box::new(move |ws| {
-                            edit::migrate_meta(ws, &old, &new)
-                                .map(|_| format!("migrated {old} → {new}"))
-                        }))]
-                    }
-                    _ => vec![],
-                },
-                None => vec![],
-            },
-            // Clean up an entry that is not a working skill. What that means
-            // depends on which half is missing: the directory or the files in it.
+            // Invalid on-disk content may be discarded explicitly. Missing
+            // records remain informational in Repair v1.
             Command::Remove if caps.clean => match self
                 .selected(ctx)
                 .map(|r| (r.key.clone(), r.status.clone()))
             {
-                Some((key, SkillStatus::Missing)) => {
-                    vec![Action::OpenModal(Box::new(Modal::forget_missing(&key)))]
-                }
                 Some((key, SkillStatus::Invalid { reason })) => {
                     vec![Action::OpenModal(Box::new(Modal::discard_invalid(
                         &key, &reason,

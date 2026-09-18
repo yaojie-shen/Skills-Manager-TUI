@@ -84,15 +84,17 @@ fn local_cli_installs_into_standard_directory_and_deploys_to_project_agents() {
 }
 
 #[test]
-fn shared_root_is_deployed_and_cannot_be_converted_relinked_or_pruned() {
+fn shared_root_is_read_only_and_cannot_be_relinked_or_pruned() {
     let f = Fixture::new("shared");
     skill(&f.0.join(".agents/skills/sample"));
     let mut ws = Workspace::open_local(&f.0, false).unwrap();
     ws.config.agents.retain(|a| a.key == "codex");
     let snap = ws.scan().unwrap();
-    assert_eq!(snap.agent("codex").unwrap().mode, AgentDirMode::SharedRoot);
-    assert_eq!(snap.get("sample").unwrap().deployed_to(), vec!["codex"]);
-    assert!(deploy::plan_convert(&ws, &snap, "codex").is_err());
+    assert!(matches!(
+        snap.agent("codex").unwrap().mode,
+        AgentDirMode::ReadOnly { .. }
+    ));
+    assert!(snap.get("sample").unwrap().deployed_to().is_empty());
     assert!(
         deploy::plan_relink(&ws, &snap, "codex", &[])
             .unwrap()
@@ -157,10 +159,11 @@ fn shared_root_repository_alias_is_not_discovered_as_a_duplicate_skill() {
     skill(&ws.root.join(key));
     let snap = ws.scan().unwrap();
     let plan = deploy::plan_deploy(&ws, &snap, &[key.into()], &["codex".into()]).unwrap();
+    assert!(plan.iter().all(|action| !action.is_change()));
     deploy::apply(&plan).unwrap();
     let snap = ws.scan().unwrap();
     assert_eq!(snap.skills.len(), 1);
-    assert!(snap.get(key).unwrap().deployed_to().contains(&"codex"));
+    assert!(snap.get(key).unwrap().deployed_to().is_empty());
     let plan = deploy::plan_undeploy(&ws, &snap, &[key.into()], &["codex".into()]).unwrap();
     deploy::apply(&plan).unwrap();
     assert!(ws.root.join(key).join("SKILL.md").is_file());
@@ -183,7 +186,8 @@ fn shared_source_rename_preserves_directory_and_shared_alias_removal_cleans_link
     skill(&ws.root.join(key));
     let conflict =
         deploy::plan_deploy(&ws, &ws.scan().unwrap(), &[key.into()], &["codex".into()]).unwrap();
-    assert!(deploy::apply(&conflict).is_err());
+    assert!(conflict.iter().all(|action| !action.is_change()));
+    deploy::apply(&conflict).unwrap();
     std::fs::write(
         ws.root.join(key).join("SKILL.md"),
         "---\nname: repo-sample\n---\nbody",
@@ -193,10 +197,18 @@ fn shared_source_rename_preserves_directory_and_shared_alias_removal_cleans_link
         &deploy::plan_deploy(&ws, &ws.scan().unwrap(), &[key.into()], &["codex".into()]).unwrap(),
     )
     .unwrap();
-    let alias = ws.root.join(skills::repository::default_deploy_name(key));
-    assert!(alias.exists());
+    let alias = ws.root.join("repo-sample");
+    assert!(!alias.exists());
+    assert!(
+        !ws.config.agents[0]
+            .skills_path()
+            .join("repo-sample")
+            .exists()
+    );
     skills::ops::edit::remove(&ws, &ws.scan().unwrap(), key, false).unwrap();
-    assert!(std::fs::symlink_metadata(alias).is_err());
+    assert!(
+        std::fs::symlink_metadata(ws.config.agents[0].skills_path().join("repo-sample")).is_err()
+    );
     assert!(ws.root.join("renamed/SKILL.md").is_file());
 }
 
@@ -233,16 +245,10 @@ fn shared_readers_observe_deployment_and_undeploy_only_once() {
         &["gemini-cli".into()],
     )
     .unwrap();
-    assert_eq!(
-        plan.iter()
-            .filter(|a| matches!(a, deploy::Action::Link { .. }))
-            .count(),
-        1
-    );
+    assert!(plan.iter().all(|action| !action.is_change()));
     deploy::apply(&plan).unwrap();
     let snap = ws.scan().unwrap();
-    assert!(snap.get(key).unwrap().deployed_to().contains(&"codex"));
-    assert!(snap.get(key).unwrap().deployed_to().contains(&"gemini-cli"));
+    assert!(snap.get(key).unwrap().deployed_to().is_empty());
     let plan = deploy::plan_undeploy(
         &ws,
         &snap,
@@ -250,7 +256,7 @@ fn shared_readers_observe_deployment_and_undeploy_only_once() {
         &["codex".into(), "gemini-cli".into()],
     )
     .unwrap();
-    assert_eq!(plan.iter().filter(|a| a.is_change()).count(), 1);
+    assert!(plan.iter().all(|action| !action.is_change()));
     deploy::apply(&plan).unwrap();
     assert!(ws.root.join(key).join("SKILL.md").is_file());
 }
@@ -281,7 +287,7 @@ fn catalog_needs_no_root_and_agent_registration_preserves_global_config() {
 }
 
 #[test]
-fn git_repository_install_deploys_into_local_shared_root() {
+fn git_repository_install_keeps_local_shared_root_read_only() {
     let f = Fixture::new("git");
     let repo = f.0.join("upstream");
     skill(&repo.join("sample"));
@@ -313,11 +319,16 @@ fn git_repository_install_deploys_into_local_shared_root() {
     let snap = ws.scan().unwrap();
     assert_eq!(snap.skills.len(), 1);
     assert!(snap.skills[0].key.starts_with("repos/"));
-    assert!(snap.skills[0].deployed_to().contains(&"codex"));
+    assert!(snap.skills[0].deployed_to().is_empty());
+    assert!(matches!(
+        snap.agent("codex").unwrap().mode,
+        AgentDirMode::ReadOnly { .. }
+    ));
     assert!(
-        std::fs::symlink_metadata(ws.root.join(snap.skills[0].deployment_name()))
-            .unwrap()
-            .file_type()
-            .is_symlink()
+        std::fs::symlink_metadata(
+            ws.root
+                .join(snap.skills[0].deployment_name().expect("valid name"))
+        )
+        .is_err()
     );
 }

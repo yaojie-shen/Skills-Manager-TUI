@@ -44,8 +44,8 @@ impl AgentDirMode {
     pub fn health_class(&self) -> Option<HealthClass> {
         match self {
             Self::Missing => Some(HealthClass::Review),
-            Self::DirForeign { .. } => Some(HealthClass::Independent),
-            _ => None,
+            Self::ReadOnly { .. } => Some(HealthClass::Review),
+            Self::Real => None,
         }
     }
 }
@@ -125,7 +125,6 @@ pub struct SkillRecord {
     #[serde(skip)]
     pub body: Option<String>,
     pub external: bool,
-    pub name_mismatch: bool,
     pub tags: Vec<String>,
     /// Computed package membership from this snapshot's preset index.
     pub presets: Vec<String>,
@@ -160,8 +159,8 @@ impl SkillRecord {
         }
     }
 
-    pub fn deployment_name(&self) -> String {
-        crate::repository::default_deploy_name(&self.key)
+    pub fn deployment_name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 
     pub fn deployed_to(&self) -> Vec<&str> {
@@ -179,12 +178,11 @@ impl SkillRecord {
 pub enum AgentDirMode {
     /// Directory does not exist.
     Missing,
-    /// The whole skills dir is a symlink to the skills root.
-    DirLinked,
-    /// The agent reads the root directly; its real directories must never be relinked.
-    SharedRoot,
-    /// The skills dir is a symlink to somewhere else.
-    DirForeign { target: PathBuf },
+    /// The configured path is not an independent directory that can be managed safely.
+    ReadOnly {
+        reason: String,
+        resolved: Option<PathBuf>,
+    },
     /// A real directory containing per-skill entries.
     Real,
 }
@@ -452,8 +450,10 @@ fn scan_inventory(
     let aliases: std::collections::BTreeSet<PathBuf> = discovered
         .iter()
         .filter(|(key, _)| key.contains('/'))
-        .filter_map(|(key, path)| {
-            let alias = root.join(crate::repository::default_deploy_name(key));
+        .filter_map(|(_, path)| {
+            let alias = crate::skill::SkillDoc::load(path)
+                .ok()
+                .map(|doc| root.join(doc.name))?;
             (is_symlink(&alias)
                 && std::fs::canonicalize(&alias).ok() == std::fs::canonicalize(path).ok())
             .then_some(alias)
@@ -486,7 +486,6 @@ fn scan_inventory(
                     .filter(|d| !d.is_empty()),
                 body: doc.as_ref().map(|d| d.body.clone()),
                 external,
-                name_mismatch: doc.as_ref().map(|d| d.name_mismatch()).unwrap_or(false),
                 tags: Vec::new(),
                 presets: Vec::new(),
                 note: None,
@@ -512,7 +511,6 @@ fn scan_inventory(
                     description: None,
                     body: None,
                     external: false,
-                    name_mismatch: false,
                     tags: Vec::new(),
                     presets: Vec::new(),
                     note: None,
@@ -539,7 +537,6 @@ fn scan_inventory(
                     description: None,
                     body: None,
                     external: false,
-                    name_mismatch: false,
                     tags: Vec::new(),
                     presets: Vec::new(),
                     note: None,
@@ -579,7 +576,6 @@ fn scan_inventory(
             description: None,
             body: None,
             external: false,
-            name_mismatch: false,
             tags: Vec::new(),
             presets: Vec::new(),
             note: None,
@@ -741,6 +737,7 @@ fn scan_agent(
     hash: &mut dyn FnMut(&Path) -> Result<String>,
 ) -> Result<AgentReport> {
     let dir = a.skills_path();
+    let normalized_dir = prospective_path(&dir);
     let mut report = AgentReport {
         key: a.key.clone(),
         name: a.display_name().to_string(),
@@ -749,36 +746,48 @@ fn scan_agent(
         entries: BTreeMap::new(),
         documents: BTreeMap::new(),
     };
+    if normalized_dir == root
+        || normalized_dir.starts_with(root)
+        || root.starts_with(&normalized_dir)
+    {
+        report.mode = AgentDirMode::ReadOnly {
+            reason: "configured skills path overlaps the Library".into(),
+            resolved: Some(normalized_dir),
+        };
+        return Ok(report);
+    }
     let meta = match std::fs::symlink_metadata(&dir) {
         Ok(m) => m,
         Err(_) => return Ok(report),
     };
-    let shared_link = crate::agents::linked_skill_directory(&dir);
-    if meta.file_type().is_symlink() && shared_link.is_none() {
-        let target = link_target_abs(&dir).unwrap_or_default();
-        let resolved = std::fs::canonicalize(&dir).unwrap_or(target.clone());
-        report.mode = if resolved == root {
-            AgentDirMode::DirLinked
-        } else {
-            AgentDirMode::DirForeign { target }
+    if meta.file_type().is_symlink() {
+        let target = link_target_abs(&dir);
+        let resolved = std::fs::canonicalize(&dir).ok().or_else(|| target.clone());
+        report.mode = AgentDirMode::ReadOnly {
+            reason: "configured skills path is a symlink".into(),
+            resolved,
         };
-        if report.mode == AgentDirMode::DirLinked {
-            for (key, record) in records.iter().filter(|(key, _)| !key.contains('/')) {
-                if let Ok(doc) = crate::skill::SkillDoc::load(&record.path) {
-                    report.documents.insert(key.clone(), doc);
-                }
-            }
-        }
         return Ok(report);
     }
-    if !meta.is_dir() && shared_link.is_none() {
+    if !meta.is_dir() {
+        report.mode = AgentDirMode::ReadOnly {
+            reason: "configured skills path is not a directory".into(),
+            resolved: None,
+        };
         return Ok(report);
     }
-    report.mode = if std::fs::canonicalize(&dir).ok().as_deref() == Some(root) {
-        AgentDirMode::SharedRoot
-    } else {
-        AgentDirMode::Real
-    };
+    let resolved = std::fs::canonicalize(&dir).ok();
+    if resolved
+        .as_deref()
+        .is_none_or(|path| path == root || path.starts_with(root) || root.starts_with(path))
+    {
+        report.mode = AgentDirMode::ReadOnly {
+            reason: "configured skills path overlaps the Library".into(),
+            resolved,
+        };
+        return Ok(report);
+    }
+    report.mode = AgentDirMode::Real;
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -794,33 +803,22 @@ fn scan_agent(
                 None => EntryState::Broken { target },
                 Some(res) => {
                     if records.values().any(|r| {
-                        r.key.contains('/')
-                            && r.deployment_name() == name
+                        r.deployment_name() == Some(name.as_str())
                             && std::fs::canonicalize(&r.path).ok().as_ref() == Some(&res)
-                    }) || (res.parent() == Some(root)
-                        && res
-                            .file_name()
-                            .map(|n| n.to_string_lossy() == name)
-                            .unwrap_or(false))
-                    {
+                    }) {
                         EntryState::Deployed
                     } else if res.starts_with(root) {
-                        // Link into the root but under a different name: treat as deployed alias.
+                        // A managed target under a stale name is repaired explicitly.
                         EntryState::Foreign { target }
                     } else {
                         EntryState::Foreign { target }
                     }
                 }
             }
-        } else if ft.is_dir()
-            && report.mode == AgentDirMode::SharedRoot
-            && records.contains_key(&name)
-        {
-            EntryState::Deployed
         } else if ft.is_dir() {
             let central = records
                 .values()
-                .find(|r| r.deployment_name() == name)
+                .find(|r| r.deployment_name() == Some(name.as_str()))
                 .map(|r| r.path.clone())
                 .unwrap_or_else(|| root.join(&name));
             if central.is_dir() {
@@ -846,20 +844,36 @@ fn scan_agent(
     Ok(report)
 }
 
+/// Resolve the nearest existing ancestor, then append the missing suffix.
+/// This catches a not-yet-created Agent directory whose parent symlink points
+/// into the Library before deployment has a chance to create it there.
+fn prospective_path(path: &Path) -> PathBuf {
+    let mut existing = path;
+    while std::fs::symlink_metadata(existing).is_err() {
+        let Some(parent) = existing.parent() else {
+            return crate::util::normalize(path);
+        };
+        existing = parent;
+    }
+    let resolved = std::fs::canonicalize(existing).unwrap_or_else(|_| existing.to_path_buf());
+    let suffix = path
+        .strip_prefix(existing)
+        .unwrap_or_else(|_| Path::new(""));
+    crate::util::normalize(&resolved.join(suffix))
+}
+
 fn deploy_state(a: &AgentReport, record: &SkillRecord) -> DeployState {
-    let key = &record.key;
     match &a.mode {
         AgentDirMode::Missing => DeployState::NoAgentDir,
-        AgentDirMode::DirLinked if key.contains('/') || record.name.is_none() => {
-            DeployState::NotDeployed
-        }
-        AgentDirMode::DirLinked => DeployState::Deployed,
-        AgentDirMode::DirForeign { .. } => DeployState::NotDeployed,
-        AgentDirMode::Real | AgentDirMode::SharedRoot => {
-            match a.entries.get(&crate::repository::default_deploy_name(key)) {
+        AgentDirMode::ReadOnly { .. } => DeployState::NotDeployed,
+        AgentDirMode::Real => {
+            let Some(name) = record.deployment_name() else {
+                return DeployState::NotDeployed;
+            };
+            match a.entries.get(name) {
                 None => DeployState::NotDeployed,
                 Some(EntryState::Deployed) => {
-                    let destination = a.skills_dir.join(record.deployment_name());
+                    let destination = a.skills_dir.join(name);
                     if std::fs::canonicalize(destination).ok()
                         == std::fs::canonicalize(&record.path).ok()
                     {
@@ -1017,7 +1031,7 @@ mod scan_cost_tests {
         assert!(snap.get("one").unwrap().status.is_present());
         assert!(snap.get("one").unwrap().current_hash.is_none());
         let agent = tmp.path().join("agent");
-        skill(&agent, "one");
+        skill(&agent, "example");
         config.agents.push(AgentConfig {
             key: "a".into(),
             name: "A".into(),
@@ -1033,7 +1047,7 @@ mod scan_cost_tests {
                 same_content: false
             }
         );
-        std::fs::write(agent.join("one/script.py"), "changed").unwrap();
+        std::fs::write(agent.join("example/script.py"), "changed").unwrap();
         assert_eq!(
             scan_for_links(&root, &config)
                 .unwrap()
@@ -1239,8 +1253,8 @@ mod scan_cost_tests {
         let central = skill(&root, "one");
         let a = tmp.path().join("agent-a");
         let b = tmp.path().join("agent-b");
-        skill(&a, "one");
-        skill(&b, "one");
+        skill(&a, "example");
+        skill(&b, "example");
         let config = Config {
             agents: vec![
                 AgentConfig {
@@ -1274,7 +1288,7 @@ mod scan_cost_tests {
             snap.get("one").unwrap().deploy["b"],
             DeployState::Shadow { same_content: true }
         );
-        std::fs::write(b.join("one/changed.txt"), "changed").unwrap();
+        std::fs::write(b.join("example/changed.txt"), "changed").unwrap();
         assert_eq!(
             scan(&root, &config).unwrap().get("one").unwrap().deploy["b"],
             DeployState::Shadow {

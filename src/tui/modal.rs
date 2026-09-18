@@ -12,10 +12,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 use skills::history;
-use skills::ops::deploy;
-use skills::ops::edit;
-use skills::ops::install;
 use skills::ops::update::{self, FileChange, Prepared, Take};
+use skills::ops::{MutationScope, deploy, edit, install};
 use skills::reconcile::{AgentDirMode, EntryState};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -29,7 +27,6 @@ pub struct PickItem {
 }
 
 pub enum InputKind {
-    Migrate { skill: String },
     PresetName,
     TagName,
     TagDescription { name: String },
@@ -78,6 +75,7 @@ pub enum Modal {
         lines: Vec<String>,
         write: Option<MetaFn>,
         background: Option<Vec<String>>,
+        scope: MutationScope,
         /// Set when this confirmation is a history step.
         then: Option<Step>,
         btn: usize,
@@ -187,6 +185,7 @@ impl Modal {
             lines,
             write: Some(write),
             background: None,
+            scope: MutationScope::Library,
             then: None,
             btn: 1,
             btn_rects: Vec::new(),
@@ -197,6 +196,13 @@ impl Modal {
     pub(crate) fn in_background(mut self, keys: Vec<String>) -> Self {
         if let Self::ConfirmWrite { background, .. } = &mut self {
             *background = Some(keys);
+        }
+        self
+    }
+
+    pub(crate) fn deployment_only(mut self) -> Self {
+        if let Self::ConfirmWrite { scope, .. } = &mut self {
+            *scope = MutationScope::Deployment;
         }
         self
     }
@@ -442,11 +448,6 @@ impl Modal {
         .in_background(vec![skill.to_string()])
     }
 
-    /// Archive a missing record using the same preview/revalidation as batch repair.
-    pub fn forget_missing(skill: &str) -> Self {
-        Self::HealthRepair(Box::new(super::views::health::RepairDialog::forget(skill)))
-    }
-
     /// Edit the preset's fixed membership using the shared skill selector.
     pub fn preset_members(preset: &str, ctx: &Ctx) -> Self {
         Self::PresetSkills(Box::new(SearchView::preset_members(preset, ctx)))
@@ -577,6 +578,11 @@ impl Modal {
                 ("PgUp/PgDn", "page"),
                 ("Esc", "back to selection"),
             ],
+            Modal::Message { title, .. } if title.trim() == "Repair results" => &[
+                ("↑↓", "scroll"),
+                ("PgUp/PgDn", "page"),
+                ("Enter/Esc", "close"),
+            ],
             Modal::Help { .. } | Modal::Message { .. } => {
                 &[("↑↓", "scroll"), ("PgUp/PgDn", "page"), ("Esc", "close")]
             }
@@ -621,7 +627,7 @@ impl Modal {
     pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
         match self {
             Modal::PresetSkills(view) => view.paste(text, ctx),
-            Modal::HealthRepair(_) => vec![],
+            Modal::HealthRepair(dialog) => dialog.paste(text, ctx),
             Modal::Sync(p) => p.paste(text),
             Modal::Batch(picker) => picker.paste(text),
             Modal::Repository(picker) => picker.paste(text, ctx),
@@ -660,12 +666,24 @@ impl Modal {
         }
         match self {
             Modal::DeploymentChoices(picker) => picker.key(k),
-            Modal::HealthRepair(p) => p.key(k),
+            Modal::HealthRepair(p) => p.key(k, ctx),
             Modal::Sync(p) => p.key(k, ctx),
             Modal::PresetSkills(view) => view.handle_key(k, ctx),
             Modal::Batch(p) => p.key(k, ctx),
             Modal::Repository(p) => p.key(k, ctx),
             Modal::DeployTargets(p) => p.key(k, ctx),
+            Modal::Message {
+                title,
+                return_to: None,
+                ..
+            } if title.trim() == "Repair results"
+                && k.code == KeyCode::Enter
+                && !k.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                vec![Action::CloseModal]
+            }
             Modal::Help { scroll } | Modal::Message { scroll, .. } => match k.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     *scroll = scroll.saturating_add(1);
@@ -729,19 +747,28 @@ impl Modal {
                 then,
                 btn,
                 background,
+                scope,
                 title,
                 ..
             } => match k.code {
                 KeyCode::Char('y') => write
                     .take()
-                    .map(|w| write_actions(w, then.take(), background.take(), title.clone()))
+                    .map(|w| {
+                        write_actions(w, then.take(), background.take(), title.clone(), *scope)
+                    })
                     .unwrap_or_default(),
                 KeyCode::Enter => {
                     if *btn == 0 {
                         write
                             .take()
                             .map(|w| {
-                                write_actions(w, then.take(), background.take(), title.clone())
+                                write_actions(
+                                    w,
+                                    then.take(),
+                                    background.take(),
+                                    title.clone(),
+                                    *scope,
+                                )
                             })
                             .unwrap_or_default()
                     } else {
@@ -968,6 +995,7 @@ impl Modal {
                 write,
                 then,
                 background,
+                scope,
                 title,
                 btn_rects,
                 rect,
@@ -978,7 +1006,13 @@ impl Modal {
                         return write
                             .take()
                             .map(|w| {
-                                write_actions(w, then.take(), background.take(), title.clone())
+                                write_actions(
+                                    w,
+                                    then.take(),
+                                    background.take(),
+                                    title.clone(),
+                                    *scope,
+                                )
                             })
                             .unwrap_or_default();
                     }
@@ -1137,21 +1171,56 @@ impl Modal {
                 scroll,
                 return_to,
             } => {
-                let r = centered(area, 84, lines.len() as u16 + 4);
-                f.render_widget(Clear, r);
-                let mut ls: Vec<Line> = lines.iter().map(|l| Line::from(l.as_str())).collect();
+                let repair_result = title.trim() == "Repair results";
+                let mut ls: Vec<Line> = lines
+                    .iter()
+                    .map(|line| {
+                        if repair_result {
+                            repair_result_line(line, th)
+                        } else {
+                            Line::from(line.as_str())
+                        }
+                    })
+                    .collect();
                 ls.push(Line::from(""));
                 ls.push(Line::from(Span::styled(
                     if return_to.is_some() {
                         "Esc returns to your selection; fix the error and apply again."
+                    } else if title.trim() == "Repair results" {
+                        "↑↓ scroll · PgUp/PgDn page · Enter/Esc close"
                     } else {
                         "↑↓ scroll · PgUp/PgDn page · Esc close"
                     },
                     th.dim(),
                 )));
+                let wanted_width = if repair_result {
+                    area.width.saturating_sub(8).min(112)
+                } else {
+                    84
+                };
+                let content_width = wanted_width
+                    .min(area.width.saturating_sub(2))
+                    .saturating_sub(2);
+                let paragraph = Paragraph::new(ls).wrap(Wrap { trim: false });
+                let content_height = paragraph
+                    .line_count(content_width.max(1))
+                    .min(u16::MAX as usize) as u16;
+                let wanted_height = if repair_result {
+                    content_height.saturating_add(2).max(16)
+                } else {
+                    content_height.saturating_add(2)
+                };
+                let height = wanted_height.min(if repair_result {
+                    area.height.saturating_sub(4)
+                } else {
+                    area.height.saturating_sub(2)
+                });
+                let r = centered(area, wanted_width, height);
+                let visible = r.height.saturating_sub(2);
+                *scroll = (*scroll).min(content_height.saturating_sub(visible));
+                f.render_widget(Clear, r);
                 f.render_widget(
-                    Paragraph::new(ls)
-                        .wrap(Wrap { trim: false })
+                    paragraph
                         .scroll((*scroll, 0))
                         .block(th.block(format!(" {} ", title.trim()), true)),
                     r,
@@ -1447,6 +1516,7 @@ fn write_actions(
     then: Option<Step>,
     background: Option<Vec<String>>,
     title: String,
+    scope: MutationScope,
 ) -> Vec<Action> {
     let action = match (background, then) {
         (Some(keys), None) => Action::BackgroundWrite {
@@ -1455,6 +1525,11 @@ fn write_actions(
             keys,
         },
         _ => Action::WriteMeta(w),
+    };
+    let action = if scope == MutationScope::Deployment {
+        Action::deployment(action)
+    } else {
+        action
     };
     let mut out = vec![Action::CloseModal, action];
     if let Some(step) = then {
@@ -1516,17 +1591,6 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
                 let repo = skills::repository::Repository::rename(ws, &alias, &value)?;
                 Ok(format!("Source renamed to {}", repo.display_name()))
             }))]
-        }
-        InputKind::Migrate { skill } => {
-            let mut options = skills::ops::repair::Options::default();
-            options.keys.push(skill.clone());
-            options
-                .moves
-                .insert(skill.clone(), value.trim().to_string());
-            vec![
-                Action::CloseModal,
-                Action::Spawn(super::event::Task::RepairPlan(options)),
-            ]
         }
         InputKind::Rename { skill } => {
             let name = value.trim();
@@ -1744,6 +1808,100 @@ fn action_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
     Line::from(Span::styled(l, style))
 }
 
+fn repair_result_line<'a>(line: &'a str, th: &super::theme::Theme) -> Line<'a> {
+    if line.contains(" repaired · ") && line.contains(" unchanged · ") && line.ends_with(" failed")
+    {
+        let mut spans = Vec::new();
+        for (index, part) in line.split(" · ").enumerate() {
+            if index > 0 {
+                spans.push(Span::styled(" · ", th.dim()));
+            }
+            let count = part
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            let style = if count == 0 {
+                th.description()
+            } else if part.ends_with(" repaired") {
+                th.ok()
+            } else if part.ends_with(" failed") {
+                th.err()
+            } else {
+                th.description()
+            };
+            spans.push(Span::styled(
+                part,
+                style.add_modifier(ratatui::style::Modifier::BOLD),
+            ));
+        }
+        return Line::from(spans);
+    }
+    if line.ends_with(" faults remain after a fresh scan") {
+        let style = if line.starts_with("0 ") {
+            th.ok()
+        } else {
+            th.err()
+        };
+        return Line::from(Span::styled(line, style));
+    }
+    if line == "Metadata backup" {
+        return Line::from(Span::styled(line, th.description()));
+    }
+    if let Some(path) = line.strip_prefix("  ") {
+        return Line::from(vec![Span::raw("  "), Span::styled(path, th.source())]);
+    }
+
+    let Some((status, rest)) = line.split_once(' ') else {
+        return Line::from(line);
+    };
+    let status_style = match status {
+        "REPAIRED" => th.ok(),
+        "FAILED" => th.err(),
+        "UNCHANGED" => th.description(),
+        _ => return Line::from(line),
+    }
+    .add_modifier(ratatui::style::Modifier::BOLD);
+    let rest = rest.trim_start();
+    let padding = 10usize.saturating_sub(status.len());
+    let mut spans = vec![
+        Span::styled(status, status_style),
+        Span::raw(" ".repeat(padding)),
+    ];
+    if let Some((source, target)) = rest.split_once(" → ") {
+        spans.push(Span::raw(source));
+        spans.push(Span::styled(" → ", th.accent()));
+        if let Some((target, detail)) = target.split_once(" · ") {
+            spans.push(Span::styled(target, th.source()));
+            spans.push(Span::styled(" · ", th.dim()));
+            spans.push(Span::styled(
+                detail,
+                if status == "FAILED" {
+                    th.err()
+                } else {
+                    th.description()
+                },
+            ));
+        } else {
+            spans.push(Span::styled(target, th.source()));
+        }
+    } else if let Some((source, detail)) = rest.split_once(" · ") {
+        spans.push(Span::raw(source));
+        spans.push(Span::styled(" · ", th.dim()));
+        spans.push(Span::styled(
+            detail,
+            if status == "FAILED" {
+                th.err()
+            } else {
+                th.description()
+            },
+        ));
+    } else {
+        spans.push(Span::raw(rest));
+    }
+    Line::from(spans)
+}
+
 fn help_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
     if l.starts_with("  ") || l.is_empty() {
         match l.find("  ").filter(|_| l.len() > 18) {
@@ -1759,8 +1917,8 @@ fn help_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
 }
 
 const HELP: &str = "Startup
-  Unique repository moves are repaired automatically. Missing records and tag/preset references
-  are removed after a metadata backup; skill files are preserved.
+  Startup scanning is read-only. Broken deployment links remain unchanged until you explicitly
+  analyze, review, and apply a repair in Health.
 Global
   Ctrl-G            help (? outside text inputs)
   Ctrl-O            settings
@@ -1850,6 +2008,172 @@ mod picker_tests {
     use crate::tui::theme::Theme;
     use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::Config, preset::Preset};
+
+    #[test]
+    fn startup_help_describes_read_only_explicit_repair() {
+        assert!(HELP.contains("Startup scanning is read-only"));
+        assert!(HELP.contains("analyze, review, and apply a repair"));
+        assert!(!HELP.contains("repaired automatically"));
+        assert!(!HELP.contains("are removed after"));
+    }
+
+    #[test]
+    fn repair_results_close_with_enter_or_escape_without_changing_other_messages() {
+        let tmp = skills::ops::DownloadDir::new("repair-results-keys").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut modal = Modal::message("Repair results", vec!["1 repaired".into()]);
+        assert!(modal.hints().contains(&("Enter/Esc", "close")));
+        for width in [60, 140] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 42)).unwrap();
+            terminal.draw(|f| modal.draw(f, f.area(), &ctx)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("Enter/Esc close"));
+            assert!(!text.contains("page · Esc close"));
+        }
+        let mut narrow = Modal::message(
+            "Repair results",
+            vec![
+                "1 repaired · 0 unchanged · 0 failed".into(),
+                format!(
+                    "REPAIRED  shared/{} → Library/repos/example/{}",
+                    "long-skill-name-".repeat(4),
+                    "long-skill-name-".repeat(4)
+                ),
+            ],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|f| narrow.draw(f, f.area(), &ctx)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Repair results"));
+        assert!(text.contains("Enter/Esc close"));
+        for code in [
+            KeyCode::Down,
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+            KeyCode::Home,
+        ] {
+            assert!(modal.handle_key(KeyEvent::from(code), &ctx).is_empty());
+        }
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            assert!(
+                modal
+                    .handle_key(KeyEvent::new(KeyCode::Enter, modifiers), &ctx)
+                    .is_empty()
+            );
+        }
+        assert!(matches!(
+            modal
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT), &ctx)
+                .as_slice(),
+            [Action::CloseModal]
+        ));
+        for code in [KeyCode::Enter, KeyCode::Esc] {
+            assert!(matches!(
+                modal.handle_key(KeyEvent::from(code), &ctx).as_slice(),
+                [Action::CloseModal]
+            ));
+        }
+        for mut other in [
+            Modal::help(),
+            Modal::message("Other results", vec![]),
+            Modal::Message {
+                title: "Repair results".into(),
+                lines: vec![],
+                scroll: 0,
+                return_to: Some(Box::new(Modal::help())),
+            },
+        ] {
+            assert!(!other.hints().contains(&("Enter/Esc", "close")));
+            assert!(
+                other
+                    .handle_key(KeyEvent::from(KeyCode::Enter), &ctx)
+                    .is_empty()
+            );
+            assert!(matches!(
+                other
+                    .handle_key(KeyEvent::from(KeyCode::Esc), &ctx)
+                    .as_slice(),
+                [Action::CloseModal]
+            ));
+        }
+    }
+
+    #[test]
+    fn repair_result_lines_style_status_arrows_and_targets() {
+        let theme = Theme::default();
+        let repaired = repair_result_line(
+            "REPAIRED  shared/lark-doc → Library/repos/larksuite--cli/lark-doc",
+            &theme,
+        );
+        assert_eq!(repaired.spans[0].content, "REPAIRED");
+        assert_eq!(repaired.spans[0].style.fg, Some(theme.ok));
+        assert_eq!(repaired.spans[3].content, " → ");
+        assert_eq!(repaired.spans[3].style.fg, Some(theme.accent));
+        assert_eq!(
+            repaired.spans[4].content,
+            "Library/repos/larksuite--cli/lark-doc"
+        );
+        assert_eq!(repaired.spans[4].style.fg, Some(theme.source));
+
+        let failed = repair_result_line(
+            "FAILED    shared/foo → Library/bar · destination changed",
+            &theme,
+        );
+        assert_eq!(failed.spans[0].style.fg, Some(theme.err));
+        assert_eq!(failed.spans.last().unwrap().style.fg, Some(theme.err));
+
+        let summary = repair_result_line("76 repaired · 2 unchanged · 1 failed", &theme);
+        assert_eq!(summary.spans[0].style.fg, Some(theme.ok));
+        assert_eq!(
+            summary.spans[2].style,
+            theme
+                .description()
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        );
+        assert_eq!(summary.spans[4].style.fg, Some(theme.err));
+        let clean = repair_result_line("76 repaired · 0 unchanged · 0 failed", &theme);
+        assert_eq!(
+            clean.spans[2].style,
+            theme
+                .description()
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        );
+        assert_eq!(
+            clean.spans[4].style,
+            theme
+                .description()
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        );
+    }
 
     #[test]
     fn install_hint_wraps_without_losing_cancel_instruction() {

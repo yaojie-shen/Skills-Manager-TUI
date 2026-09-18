@@ -23,7 +23,7 @@ use skills::Workspace;
 #[cfg(test)]
 use skills::config::Config;
 use skills::history::{self, History, Plan};
-use skills::ops::deploy;
+use skills::ops::{MutationScope, deploy};
 use skills::reconcile::Snapshot;
 use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
@@ -102,6 +102,10 @@ pub enum Action {
     Error(String),
     /// Re-scan in the background.
     Rescan,
+    /// Re-scan after a successful Library mutation and schedule root sync.
+    LibraryChanged,
+    /// Mark a nested mutation as Agent-only; it must not schedule root sync.
+    Deployment(Box<Action>),
     Spawn(Task),
     OpenModal(Box<Modal>),
     CloseModal,
@@ -148,6 +152,20 @@ pub enum Action {
     Record(history::Intent),
     /// Move the history after a confirmed undo or redo went through.
     Step(Step),
+}
+
+impl Action {
+    pub fn deployment(action: Action) -> Self {
+        Self::Deployment(Box::new(action))
+    }
+
+    #[cfg(test)]
+    pub fn into_scoped(self) -> (MutationScope, Action) {
+        match self {
+            Self::Deployment(action) => (MutationScope::Deployment, *action),
+            action => (MutationScope::Library, action),
+        }
+    }
 }
 
 /// Which way the history moves once a confirmed change has been applied.
@@ -216,21 +234,33 @@ pub struct App {
 /// Kept separate from the editing modal so cancelling quit preserves its input.
 #[derive(Default)]
 struct QuitPrompt {
-    quit_selected: bool,
+    force_exit_selected: bool,
+    sync_in_progress: bool,
     area: Rect,
-    quit_button: Rect,
+    force_exit_button: Rect,
     cancel_button: Rect,
 }
 
 impl QuitPrompt {
+    fn for_sync() -> Self {
+        Self {
+            sync_in_progress: true,
+            ..Self::default()
+        }
+    }
+
     fn draw(&mut self, f: &mut Frame, outer: Rect, th: &Theme, tasks: Vec<String>) {
         use super::widgets::{OverlayClear, button, fit};
         let w = outer.width.saturating_sub(2).min(86);
-        let h = outer
-            .height
-            .saturating_sub(2)
-            .min(tasks.len() as u16 + 6)
-            .max(1);
+        let h = if self.sync_in_progress {
+            outer.height.saturating_sub(2).clamp(1, 6)
+        } else {
+            outer
+                .height
+                .saturating_sub(2)
+                .min(tasks.len() as u16 + 6)
+                .max(1)
+        };
         self.area = Rect::new(
             outer.x + (outer.width - w) / 2,
             outer.y + (outer.height - h) / 2,
@@ -241,46 +271,62 @@ impl QuitPrompt {
         let block = th.block(" quit ", true);
         let inner = block.inner(self.area);
         f.render_widget(block, self.area);
-        let available = inner.height.saturating_sub(3) as usize;
-        let total = tasks.len();
-        let mut lines: Vec<Line> = tasks
-            .into_iter()
-            .take(available)
-            .map(|task| Line::raw(fit(&task, inner.width as usize)))
-            .collect();
-        if total == 0 {
-            lines.push(Line::raw("Background work has finished. Quit now?"));
-        } else {
-            if total > available
-                && let Some(last) = lines.last_mut()
-            {
-                *last = Line::raw(format!("… {} more tasks running", total - available + 1));
-            }
-            lines.push(Line::raw(fit(
-                "Quit now and abandon running work?",
+        let lines = if self.sync_in_progress {
+            vec![Line::raw(fit(
+                "Root sync is still in progress.",
                 inner.width as usize,
-            )));
-        }
+            ))]
+        } else {
+            let available = inner.height.saturating_sub(3) as usize;
+            let total = tasks.len();
+            let mut lines: Vec<Line> = tasks
+                .into_iter()
+                .take(available)
+                .map(|task| Line::raw(fit(&task, inner.width as usize)))
+                .collect();
+            if total == 0 {
+                lines.push(Line::raw("Background work has finished. Quit now?"));
+            } else {
+                if total > available
+                    && let Some(last) = lines.last_mut()
+                {
+                    *last = Line::raw(format!("… {} more tasks running", total - available + 1));
+                }
+                lines.push(Line::raw(fit(
+                    "Quit now and abandon running work?",
+                    inner.width as usize,
+                )));
+            }
+            lines
+        };
         f.render_widget(Paragraph::new(lines), inner);
         let y = inner.bottom().saturating_sub(1);
         self.cancel_button = Rect::new(
-            inner.right().saturating_sub(10).max(inner.x),
+            inner.right().saturating_sub(12).max(inner.x),
             y,
-            inner.width.min(10),
+            inner.width.min(12),
             u16::from(inner.height > 0),
         );
-        self.quit_button = Rect::new(
-            self.cancel_button.x.saturating_sub(10).max(inner.x),
+        self.force_exit_button = Rect::new(
+            self.cancel_button.x.saturating_sub(12).max(inner.x),
             y,
-            self.cancel_button.x.saturating_sub(inner.x).min(8),
+            self.cancel_button.x.saturating_sub(inner.x).min(12),
             u16::from(inner.height > 0),
         );
         f.render_widget(
-            Paragraph::new(Line::from(button("Quit", self.quit_selected, th))),
-            self.quit_button,
+            Paragraph::new(Line::from(button(
+                if self.sync_in_progress {
+                    "Force exit"
+                } else {
+                    "Quit"
+                },
+                self.force_exit_selected,
+                th,
+            ))),
+            self.force_exit_button,
         );
         f.render_widget(
-            Paragraph::new(Line::from(button("Cancel", !self.quit_selected, th))),
+            Paragraph::new(Line::from(button("Cancel", !self.force_exit_selected, th))),
             self.cancel_button,
         );
     }
@@ -313,12 +359,6 @@ impl App {
             ws.inventory_project = Some(start.to_path_buf());
         }
         Self::discover_local_agents(&mut ws)?;
-        let startup_repair = skills::ops::repair::startup(&ws);
-        // Repairs can migrate or remove tag membership; display the persisted result.
-        if !matches!(&startup_repair, Ok(report) if report.repaired == 0 && report.failed == 0) {
-            ws.config = ws.load_config()?;
-            Self::discover_local_agents(&mut ws)?;
-        }
         let local_project = ws
             .inventory_project
             .clone()
@@ -350,7 +390,7 @@ impl App {
             batch_modal_owned: false,
             history: History::default(),
             tasks_running: 0,
-            root_sync_pending: true,
+            root_sync_pending: false,
             root_sync_running: false,
             next_task_id: 0,
             spinner: 0,
@@ -374,26 +414,6 @@ impl App {
                 ),
                 Level::Info,
             );
-        }
-        match startup_repair {
-            Ok(report) if report.repaired > 0 || report.failed > 0 => {
-                app.toast(
-                    format!(
-                        "Startup repair: {} repaired, {} failed",
-                        report.repaired, report.failed
-                    ),
-                    if report.failed > 0 {
-                        Level::Error
-                    } else {
-                        Level::Ok
-                    },
-                );
-            }
-            Err(error) => app.toast(
-                format!("Startup repair: {error:#}; review Health"),
-                Level::Error,
-            ),
-            _ => {}
         }
         Ok(app)
     }
@@ -463,12 +483,16 @@ impl App {
                 self.toast(format!("note unchanged on {skill}"), Level::Info);
                 return;
             }
-            Ok((skill, Some(text))) => match history::note_edit(&self.ws, &skill, Some(&text)) {
+            Ok((skill, Some(text))) => match self.run_meta(
+                MutationScope::Library,
+                Box::new(move |ws| history::note_edit(ws, &skill, Some(&text))),
+            ) {
                 Ok((msg, intent)) => {
                     self.toast(msg, Level::Ok);
                     if let Some(intent) = intent {
                         self.history.record(intent);
                     }
+                    self.root_sync_pending = true;
                 }
                 Err(e) => self.toast(format!("note failed: {e:#}"), Level::Error),
             },
@@ -569,9 +593,9 @@ impl App {
 
     fn on_task(&mut self, out: TaskOutput) -> Vec<Action> {
         match out {
-            TaskOutput::RepairPlan(result) => match result {
-                Ok(report) => vec![Action::OpenModal(Box::new(Modal::HealthRepair(Box::new(
-                    super::views::health::RepairDialog::preview(report),
+            TaskOutput::RepairPlan(options, result) => match result {
+                Ok(plan) => vec![Action::OpenModal(Box::new(Modal::HealthRepair(Box::new(
+                    super::views::health::RepairDialog::preview(options, plan),
                 ))))],
                 Err(e) => vec![Action::Error(format!("Repair preview: {e:#}"))],
             },
@@ -596,6 +620,14 @@ impl App {
             TaskOutput::Sync(request, result) => {
                 self.root_sync_running = false;
                 self.batch_running = false;
+                if self
+                    .quit_prompt
+                    .as_ref()
+                    .is_some_and(|prompt| prompt.sync_in_progress)
+                {
+                    self.quit_prompt = None;
+                    self.quit = true;
+                }
                 match result {
                     Ok(report) if request.dry_run => {
                         let ctx = Ctx {
@@ -630,6 +662,7 @@ impl App {
             }
             TaskOutput::Batch(outcome) => {
                 self.batch_running = false;
+                let changed_scope = outcome.changed_scope;
                 let return_to = if self.batch_modal_owned
                     && matches!(self.modal, Some(Modal::Batch(_) | Modal::PresetSkills(_)))
                 {
@@ -666,7 +699,11 @@ impl App {
                         Level::Error,
                     );
                 }
-                self.rescan();
+                if let Some(scope) = changed_scope {
+                    self.mutation_finished(scope);
+                } else {
+                    self.rescan();
+                }
                 if outcome.errors.is_empty() {
                     vec![]
                 } else {
@@ -712,7 +749,7 @@ impl App {
                         .map(|key| Action::Record(history::Intent::Install { skill: key.clone() }))
                         .collect();
                     actions.extend([
-                        Action::Rescan,
+                        Action::LibraryChanged,
                         Action::Toast(format!(
                             "installed {} skills{} — choose destination agents",
                             keys.len(),
@@ -807,7 +844,7 @@ impl App {
             // one key away.
             TaskOutput::Installed(_, Ok(key)) => vec![
                 Action::Record(history::Intent::Install { skill: key.clone() }),
-                Action::Rescan,
+                Action::LibraryChanged,
                 Action::Toast(format!("installed {key} — choose destination agents")),
                 Action::Search {
                     query: key.clone(),
@@ -833,9 +870,6 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) -> Vec<Action> {
-        if self.root_sync_running {
-            return vec![];
-        }
         if self.context_menu.is_some() {
             return vec![];
         }
@@ -872,10 +906,10 @@ impl App {
             match k.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.quit_prompt = None,
                 KeyCode::Left | KeyCode::Right => {
-                    prompt.quit_selected = !prompt.quit_selected;
+                    prompt.force_exit_selected = !prompt.force_exit_selected;
                 }
                 KeyCode::Enter => {
-                    self.quit = prompt.quit_selected;
+                    self.quit = prompt.force_exit_selected;
                     self.quit_prompt = None;
                 }
                 _ => {}
@@ -884,9 +918,6 @@ impl App {
         }
         if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
             return vec![Action::Quit];
-        }
-        if self.root_sync_running {
-            return vec![];
         }
         if let Some(menu) = self.context_menu.as_mut() {
             let event = menu.key(k);
@@ -1068,13 +1099,10 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) -> Vec<Action> {
-        if self.root_sync_running {
-            return vec![];
-        }
         if let Some(prompt) = self.quit_prompt.as_ref() {
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
                 let point = (m.column, m.row).into();
-                if prompt.quit_button.contains(point) {
+                if prompt.force_exit_button.contains(point) {
                     self.quit = true;
                     self.quit_prompt = None;
                 } else if prompt.cancel_button.contains(point) || !prompt.area.contains(point) {
@@ -1148,6 +1176,14 @@ impl App {
     }
 
     fn apply(&mut self, action: Action) {
+        self.apply_scoped(action, MutationScope::Library);
+    }
+
+    fn apply_scoped(&mut self, action: Action, scope: MutationScope) {
+        if let Action::Deployment(action) = action {
+            self.apply_scoped(*action, MutationScope::Deployment);
+            return;
+        }
         if self.batch_running
             && matches!(
                 &action,
@@ -1192,6 +1228,8 @@ impl App {
                 self.sync_if_ready();
                 if self.tasks_running == 0 {
                     self.quit = true;
+                } else if self.root_sync_running {
+                    self.quit_prompt = Some(QuitPrompt::for_sync());
                 } else {
                     self.quit_prompt = Some(QuitPrompt::default());
                 }
@@ -1212,6 +1250,8 @@ impl App {
             Action::Toast(t) => self.toast(t, Level::Ok),
             Action::Error(t) => self.toast(t, Level::Error),
             Action::Rescan => self.rescan(),
+            Action::LibraryChanged => self.library_changed(),
+            Action::Deployment(_) => unreachable!("deployment actions are unwrapped above"),
             Action::Spawn(task) => self.spawn(task),
             Action::OpenModal(m) => {
                 self.context_menu = None;
@@ -1226,16 +1266,28 @@ impl App {
             Action::SubmitInput(actions) => {
                 let prompt = self.modal.take();
                 for action in actions {
+                    let (scope, action) = match action {
+                        Action::Deployment(action) => (MutationScope::Deployment, *action),
+                        action => (scope, action),
+                    };
                     let result = match action {
                         Action::Error(error) => Err(anyhow::anyhow!(error)),
                         Action::Write(write) => {
-                            let result = write(&self.ws);
-                            self.rescan();
+                            let result = self.run_write(scope, write);
+                            if result.is_ok() {
+                                self.mutation_finished(scope);
+                            } else {
+                                self.rescan();
+                            }
                             result.map(|message| self.toast(message, Level::Ok))
                         }
                         Action::WriteMeta(write) => {
-                            let result = write(&self.ws);
-                            self.rescan();
+                            let result = self.run_meta(scope, write);
+                            if result.is_ok() {
+                                self.mutation_finished(scope);
+                            } else {
+                                self.rescan();
+                            }
                             result.map(|(message, intent)| {
                                 self.toast(message, Level::Ok);
                                 if let Some(intent) = intent {
@@ -1244,7 +1296,7 @@ impl App {
                             })
                         }
                         other => {
-                            self.apply(other);
+                            self.apply_scoped(other, scope);
                             Ok(())
                         }
                     };
@@ -1339,19 +1391,22 @@ impl App {
             Action::Record(intent) => self.history.record(intent),
             Action::Step(Step::Undo) => self.history.commit_undo(),
             Action::Step(Step::Redo) => self.history.commit_redo(),
-            Action::Write(f) => {
-                match f(&self.ws) {
-                    Ok(msg) => self.toast(msg, Level::Ok),
-                    Err(e) => self.toast(format!("{e:#}"), Level::Error),
+            Action::Write(write) => match self.run_write(scope, write) {
+                Ok(msg) => {
+                    self.toast(msg, Level::Ok);
+                    self.mutation_finished(scope);
                 }
-                self.rescan();
-            }
+                Err(e) => {
+                    self.toast(format!("{e:#}"), Level::Error);
+                    self.rescan();
+                }
+            },
             Action::BackgroundWrite { title, write, keys } => {
-                self.spawn_batch(super::event::BatchWork::Metadata(write, keys), title);
+                self.spawn_batch(super::event::BatchWork::Metadata(scope, write, keys), title);
             }
             Action::BatchMeta(write, keys) => {
                 self.spawn_batch(
-                    super::event::BatchWork::Metadata(write, keys.clone()),
+                    super::event::BatchWork::Metadata(scope, write, keys.clone()),
                     format!("Applying metadata to {} skills…", keys.len()),
                 );
             }
@@ -1362,8 +1417,8 @@ impl App {
             } => {
                 self.spawn_batch(super::event::BatchWork::Links(actions, keys), title);
             }
-            Action::WriteMeta(f) => {
-                match f(&self.ws) {
+            Action::WriteMeta(write) => {
+                match self.run_meta(scope, write) {
                     Ok((msg, intent)) => {
                         let undo_hint = if intent.is_some() {
                             " · Ctrl+Z undo"
@@ -1375,6 +1430,7 @@ impl App {
                         if let Some(intent) = intent {
                             self.history.record(intent);
                         }
+                        self.mutation_finished(scope);
                     }
                     Err(e) => {
                         if let Some(pending) =
@@ -1386,9 +1442,9 @@ impl App {
                         } else {
                             self.toast(format!("{e:#}"), Level::Error);
                         }
+                        self.rescan();
                     }
                 }
-                self.rescan();
             }
         }
     }
@@ -1577,7 +1633,6 @@ impl App {
     }
 
     pub fn rescan(&mut self) {
-        self.root_sync_pending = true;
         // Refresh one configuration snapshot for every view. Invalid edits keep
         // the last valid settings and report the error without disrupting input.
         match self.ws.load_config() {
@@ -1594,6 +1649,32 @@ impl App {
             Err(e) => self.toast(format!("{e:#}"), Level::Error),
         }
         self.spawn(Task::Scan);
+    }
+
+    fn library_changed(&mut self) {
+        self.root_sync_pending = true;
+        self.rescan();
+    }
+
+    fn mutation_finished(&mut self, scope: MutationScope) {
+        match scope {
+            MutationScope::Library => self.library_changed(),
+            MutationScope::Deployment => self.rescan(),
+        }
+    }
+
+    fn run_write(&self, scope: MutationScope, write: WriteFn) -> Result<String> {
+        let _guard = scope.guard(&self.ws, "Library write")?;
+        write(&self.ws)
+    }
+
+    fn run_meta(
+        &self,
+        scope: MutationScope,
+        write: MetaFn,
+    ) -> Result<(String, Option<history::Intent>)> {
+        let _guard = scope.guard(&self.ws, "Library metadata write")?;
+        write(&self.ws)
     }
 
     // ---- drawing ----------------------------------------------------------
@@ -1716,7 +1797,9 @@ impl App {
         spans.push(Span::styled(" Tab ↔ ", Style::default().fg(th.placeholder)));
         x += width(" Tab ↔ ") as u16;
         let used = (x - area.x) as usize;
-        let right = if self.tasks_running > 0 {
+        let right = if self.root_sync_running {
+            format!("{} Root sync in progress  ", SPINNER[self.spinner])
+        } else if self.tasks_running > 0 {
             format!("{} working  ", SPINNER[self.spinner])
         } else {
             format!(
@@ -2372,6 +2455,64 @@ mod matrix_key_tests {
         app.handle(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
         assert!(app.quit);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn root_sync_keeps_navigation_live_and_dismisses_its_exit_prompt_when_done() {
+        let temp = skills::ops::DownloadDir::new("sync-exit-prompt").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(temp.path())
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(temp.path()).unwrap(), tx).unwrap();
+        app.root_sync_running = true;
+        app.batch_running = true;
+        app.tasks_running = 1;
+
+        app.handle(Msg::Key(KeyEvent::from(KeyCode::Tab)));
+        assert_eq!(app.tab, Tab::Tags, "sync must not swallow navigation");
+
+        app.apply(Action::Quit);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("Root sync is still in progress."));
+        assert!(rendered.contains("Force exit"));
+        assert!(!app.quit);
+
+        app.handle(Msg::Key(KeyEvent::from(KeyCode::Enter)));
+        assert!(!app.quit, "Cancel must be selected by default");
+        assert!(app.quit_prompt.is_none());
+
+        app.apply(Action::Quit);
+        app.handle(Msg::Key(KeyEvent::from(KeyCode::Left)));
+        app.handle(Msg::Key(KeyEvent::from(KeyCode::Enter)));
+        assert!(app.quit, "Force exit must leave immediately");
+        app.quit = false;
+        app.apply(Action::Quit);
+
+        app.handle(Msg::Task(
+            1,
+            Box::new(TaskOutput::Sync(
+                super::super::sync_picker::Request {
+                    mode: skills::ops::sync::Mode::Sync,
+                    dry_run: false,
+                },
+                Ok(skills::ops::sync::Report::default()),
+            )),
+        ));
+        assert!(app.quit_prompt.is_none());
+        assert!(app.quit, "a completed sync must finish the pending exit");
     }
 
     #[test]
@@ -4224,37 +4365,17 @@ mod context_menu_tests {
 
         app.apply(Action::SwitchTab(Tab::Health));
         app.enter_page();
-        let mut remove_link = false;
-        let mut adopt_copy = false;
-        let mut health_relink = false;
-        let mut health_adopt = false;
         for _ in 0..64 {
             assert_footer_matches_focus(&mut app, "health repair-state row");
             let hints = app.footer_hints();
-            remove_link |= hints
-                .iter()
-                .any(|(key, desc)| *key == "x" && *desc == "remove link");
-            adopt_copy |= hints
-                .iter()
-                .any(|(key, desc)| *key == "a" && *desc == "adopt copy");
-            health_relink |= hints
-                .iter()
-                .any(|(key, desc)| *key == "r" && *desc == "relink");
-            health_adopt |= hints
-                .iter()
-                .any(|(key, desc)| *key == "a" && *desc == "adopt");
+            assert!(
+                hints
+                    .iter()
+                    .any(|(key, desc)| *key == "a" && *desc == "actions")
+            );
+            assert!(hints.iter().all(|(key, _)| !matches!(*key, "x" | "r")));
             key(&mut app, KeyCode::Down);
         }
-        assert!(
-            remove_link,
-            "broken or foreign health row should expose remove link"
-        );
-        assert!(adopt_copy, "foreign health row should expose adopt copy");
-        assert!(
-            health_relink,
-            "identical shadow health row should expose relink"
-        );
-        assert!(health_adopt, "agent-only health row should expose adopt");
     }
 
     #[test]
@@ -4441,45 +4562,42 @@ mod context_menu_tests {
 }
 
 #[cfg(test)]
-mod startup_repair_tests {
+mod root_sync_tests {
     use super::*;
 
-    #[test]
-    fn startup_removes_absent_metadata_before_building_the_first_snapshot() {
-        let temp = skills::ops::DownloadDir::new("tui-startup-repair").unwrap();
-        let root = temp.path().join("root");
-        skills::config::Config {
+    fn app() -> App {
+        let temp = skills::ops::DownloadDir::new("tui-sync-scope").unwrap();
+        Config {
             agents: vec![],
             ..Default::default()
         }
-        .save(&root)
+        .save(temp.path())
         .unwrap();
-        let ws = Workspace::open(&root).unwrap();
-        ws.meta
-            .save(
-                "gone",
-                &skills::meta::SkillMeta {
-                    source: Some(skills::meta::Source::Git {
-                        url: "https://example.invalid/source.git".into(),
-                        branch: None,
-                        subpath: None,
-                        revision: None,
-                    }),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
         let (tx, _) = std::sync::mpsc::channel();
-        let app = App::new_with_launch_directory(ws, tx, Some(temp.path())).unwrap();
-        assert!(!app.ws.meta.exists("gone"));
-        assert!(app.snap.get("gone").is_none());
-        assert!(app.ws.meta.dir.join(".repair-backups").is_dir());
+        App::new(Workspace::open(temp.path()).unwrap(), tx).unwrap()
     }
-}
 
-#[cfg(test)]
-mod root_sync_tests {
-    use super::*;
+    #[test]
+    fn startup_rescan_and_deployment_mutations_do_not_schedule_root_sync() {
+        let mut app = app();
+        assert!(!app.root_sync_pending);
+
+        app.rescan();
+        assert!(!app.root_sync_pending);
+
+        app.apply(Action::deployment(Action::Write(Box::new(|_| {
+            Ok("deployed".into())
+        }))));
+        assert!(!app.root_sync_pending);
+    }
+
+    #[test]
+    fn successful_library_mutation_schedules_root_sync() {
+        let mut app = app();
+        app.apply(Action::Write(Box::new(|_| Ok("saved".into()))));
+        assert!(app.root_sync_pending);
+    }
+
     #[test]
     fn metadata_write_schedules_one_root_backup_and_blocks_overlapping_writes() {
         let temp = skills::ops::DownloadDir::new("tui-root-sync").unwrap();
@@ -4513,8 +4631,9 @@ mod root_sync_tests {
             panic!("must not write during checkout")
         })));
         assert!(
-            app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
-                .is_empty()
+            !app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+                .is_empty(),
+            "root sync must not swallow navigation shortcuts"
         );
         app.root_sync_running = false;
         app.batch_running = false;

@@ -57,30 +57,14 @@ pub enum Command {
     Note(NoteArgs),
     /// Record repository skill content as the new baseline (accept changes)
     Accept { skill: String },
-    /// Repair an external move: migrate metadata, deployment links and references
-    Migrate { old: String, new: String },
-    /// Preview repairs after directory reorganization; --apply executes the plan
+    /// Preview deployment-link repairs; --apply executes the plan
     Repair {
         /// Execute repairs (default is a read-only preview)
-        #[arg(long, conflicts_with = "dry_run")]
+        #[arg(long)]
         apply: bool,
-        /// Explicitly request a read-only preview
-        #[arg(long)]
-        dry_run: bool,
-        /// Restore missing skills only from a baseline-matching local source
-        #[arg(long, conflicts_with = "forget_missing")]
-        restore_missing: bool,
-        /// Back up and forget obsolete missing records (never delete skill files)
-        #[arg(long)]
-        forget_missing: bool,
-        /// Remove remaining broken deployment links after repairs
-        #[arg(long)]
-        clean_links: bool,
-        /// Explicit old-to-new mapping, including moves with edited content
-        #[arg(long = "move", value_name = "OLD=NEW")]
-        moves: Vec<String>,
-        /// Restrict skill repairs to these keys
-        skills: Vec<String>,
+        /// Point a broken deployment at a current Library skill
+        #[arg(long = "deployment", value_name = "AGENT/LINK=SKILL_KEY")]
+        deployments: Vec<String>,
     },
     /// Install skills from a Git repository, archive URL, or local path
     #[command(
@@ -126,7 +110,7 @@ pub enum Command {
     Undeploy(DeployArgs),
     /// Synchronize the entire root with its Git remote
     #[command(
-        long_about = "Synchronize the root as a Git working tree. Configure URL [--branch main] explicitly enables automatic backup at TUI startup and around modifying CLI commands, and after TUI changes. Read-only CLI commands and previews do not sync. Skills, metadata, notes, presets and configuration are shared, including machine-specific paths; deletions propagate. Runtime files stay local and normal Git ignore rules apply. Sync saves local changes, merges remote updates, then pushes without force. Conflicts stop synchronization and retain the local backup commit. Use an empty remote or clone an existing root repository first. Legacy per-skill backup repositories are not automatically converted."
+        long_about = "Synchronize the root as a Git working tree. Configure URL [--branch main] explicitly enables automatic backup after Library changes. Startup, read-only commands, previews, and Agent-only deployment changes do not sync. Skills, metadata, notes, presets and configuration are shared, including machine-specific paths; deletions propagate. Runtime files stay local and normal Git ignore rules apply. Sync saves local changes, merges remote updates, then pushes without force. Conflicts stop synchronization and retain the local backup commit. Use an empty remote or clone an existing root repository first. Legacy per-skill backup repositories are not automatically converted."
     )]
     Sync {
         #[arg(long, global = true)]
@@ -338,14 +322,6 @@ pub enum AgentsCommand {
     Status {
         agent: Option<String>,
     },
-    /// Turn a whole-directory link into per-skill links
-    Convert {
-        agent: String,
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long, short)]
-        yes: bool,
-    },
     /// Remove links whose target is gone; all of them when no skill is named
     Clean {
         agent: String,
@@ -485,46 +461,54 @@ impl Cli {
             Workspace::open(&paths::resolve_root(self.root.as_deref())?)
         }
     }
+
+    fn mutation_scope(&self) -> Option<skills::ops::MutationScope> {
+        use skills::ops::MutationScope::{Deployment, Library};
+
+        match &self.command {
+            Some(
+                Command::Init
+                | Command::Accept { .. }
+                | Command::Adopt { .. }
+                | Command::Rename { .. }
+                | Command::SetSource(_),
+            ) => Some(Library),
+            Some(Command::Tag(a)) if !matches!(a.command, TagCommand::List { .. }) => Some(Library),
+            Some(Command::Note(a)) if !matches!(a.command, NoteCommand::Get { .. }) => {
+                Some(Library)
+            }
+            Some(Command::Remove { yes: true, .. }) => Some(Library),
+            Some(Command::Install(a)) if !a.list => Some(Library),
+            Some(Command::Update(a)) if !a.dry_run => Some(Library),
+            Some(Command::Deploy(a) | Command::Undeploy(a)) if !a.dry_run => Some(Deployment),
+            Some(Command::Repair { apply: true, .. }) => Some(Deployment),
+            Some(Command::Repos { command: Some(_) }) => Some(Library),
+            Some(Command::Preset(a)) => match &a.command {
+                PresetCommand::List | PresetCommand::Show { .. } => None,
+                PresetCommand::Deploy { dry_run, .. } | PresetCommand::Undeploy { dry_run, .. } => {
+                    (!dry_run).then_some(Deployment)
+                }
+                _ => Some(Library),
+            },
+            Some(Command::Agents(a)) => match &a.command {
+                Some(AgentsCommand::Add { .. }) => Some(Library),
+                Some(AgentsCommand::AdoptLink { dry_run, yes, .. }) => {
+                    (!dry_run && *yes).then_some(Library)
+                }
+                Some(
+                    AgentsCommand::Clean { dry_run, yes, .. }
+                    | AgentsCommand::RemoveLink { dry_run, yes, .. }
+                    | AgentsCommand::Relink { dry_run, yes, .. },
+                ) => (!dry_run && *yes).then_some(Deployment),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 pub fn run(cli: Cli) -> Result<()> {
-    let auto = match &cli.command {
-        Some(
-            Command::Init
-            | Command::Accept { .. }
-            | Command::Migrate { .. }
-            | Command::Adopt { .. }
-            | Command::Rename { .. }
-            | Command::SetSource(_),
-        ) => true,
-        Some(Command::Tag(a)) => !matches!(a.command, TagCommand::List { .. }),
-        Some(Command::Note(a)) => !matches!(a.command, NoteCommand::Get { .. }),
-        Some(Command::Remove { yes, .. }) => *yes,
-        Some(Command::Install(a)) => !a.list,
-        Some(Command::Update(a)) => !a.dry_run,
-        Some(Command::Deploy(a) | Command::Undeploy(a)) => !a.dry_run,
-        Some(Command::Repair { apply, .. }) => *apply,
-        Some(Command::Repos { command: Some(_) }) => true,
-        Some(Command::Preset(a)) => match &a.command {
-            PresetCommand::List | PresetCommand::Show { .. } => false,
-            PresetCommand::Deploy { dry_run, .. } | PresetCommand::Undeploy { dry_run, .. } => {
-                !dry_run
-            }
-            _ => true,
-        },
-        Some(Command::Agents(a)) => match &a.command {
-            Some(AgentsCommand::Add { .. }) => true,
-            Some(
-                AgentsCommand::Convert { dry_run, yes, .. }
-                | AgentsCommand::Clean { dry_run, yes, .. }
-                | AgentsCommand::RemoveLink { dry_run, yes, .. }
-                | AgentsCommand::AdoptLink { dry_run, yes, .. }
-                | AgentsCommand::Relink { dry_run, yes, .. },
-            ) => !dry_run && *yes,
-            _ => false,
-        },
-        _ => false,
-    };
+    let scope = cli.mutation_scope();
     let create = matches!(
         &cli.command,
         Some(
@@ -535,18 +519,21 @@ pub fn run(cli: Cli) -> Result<()> {
                 })
         )
     );
-    let ws = if auto {
+    let ws = if scope.is_some() {
         Some(cli.workspace(create)?)
     } else {
         None
     };
-    if let Some(ws) = &ws
-        && let Err(e) = skills::ops::sync::automatic(ws)
-    {
-        eprintln!("Root sync: {e:#}; continuing with local data");
-    }
+    let guard = scope
+        .zip(ws.as_ref())
+        .map(|(scope, ws)| scope.guard(ws, "CLI Library mutation"))
+        .transpose()?
+        .flatten();
     let result = run_command(cli);
-    if let Some(ws) = &ws
+    drop(guard);
+    if result.is_ok()
+        && scope.is_some_and(skills::ops::MutationScope::changes_library)
+        && let Some(ws) = &ws
         && let Err(e) = skills::ops::sync::automatic(ws)
     {
         eprintln!("Root backup pending: {e:#}; local changes retained");
@@ -608,32 +595,34 @@ fn run_command(cli: Cli) -> Result<()> {
         Command::Show { skill } => cmd_show(&ctx, &skill),
         Command::Status => cmd_status(&ctx),
         Command::Repair {
-            apply,
-            restore_missing,
-            forget_missing,
-            clean_links,
-            moves,
-            skills,
-            ..
+            apply, deployments, ..
         } => {
             let mut ws = ctx.ws.clone();
             if ws.project.is_none() {
                 skills::ops::targets::discover(&mut ws, &std::env::current_dir()?)?;
             }
-            let mut options = skills::ops::repair::Options {
-                restore_missing,
-                forget_missing,
-                clean_links,
-                keys: skills,
-                ..Default::default()
-            };
-            for mapping in moves {
-                let (old, new) = mapping.split_once('=').context("expected --move OLD=NEW")?;
-                anyhow::ensure!(
-                    options.moves.insert(old.into(), new.into()).is_none(),
-                    "duplicate move for {old}"
-                );
+            let mut options = skills::ops::repair::Options::default();
+            fn mappings(
+                values: Vec<String>,
+                flag: &str,
+            ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+                let mut out = std::collections::BTreeMap::new();
+                for mapping in values {
+                    let (old, new) = mapping
+                        .split_once('=')
+                        .with_context(|| format!("expected {flag} LEFT=RIGHT"))?;
+                    anyhow::ensure!(
+                        !old.is_empty() && !new.is_empty(),
+                        "expected {flag} LEFT=RIGHT"
+                    );
+                    anyhow::ensure!(
+                        out.insert(old.into(), new.into()).is_none(),
+                        "duplicate mapping for {old}"
+                    );
+                }
+                Ok(out)
             }
+            options.deployments = mappings(deployments, "--deployment")?;
             let report = skills::ops::repair::run_with_options(&ws, apply, &options)?;
             ctx.out(&report, || {
                 for line in report.lines() {
@@ -656,13 +645,6 @@ fn run_command(cli: Cli) -> Result<()> {
         Command::Accept { skill } => {
             let m = edit::accept(&ctx.ws, &skill)?;
             ctx.out(&m, || println!("baseline updated for {skill}"))
-        }
-        Command::Migrate { old, new } => {
-            edit::migrate_meta(&ctx.ws, &old, &new)?;
-            ctx.out(
-                &serde_json::json!({"migrated": {"from": old, "to": new}}),
-                || println!("migrated {old} -> {new}"),
-            )
         }
         Command::Install(a) => cmd_install(&ctx, a),
         Command::Adopt { path, name } => {
@@ -937,15 +919,7 @@ fn cmd_show(ctx: &Ctx, key: &str) -> Result<()> {
     ctx.out(r, || {
         println!("key:         {}", r.key);
         if let Some(n) = &r.name {
-            println!(
-                "name:        {}{}",
-                n,
-                if r.name_mismatch {
-                    "  (differs from directory name)"
-                } else {
-                    ""
-                }
-            );
+            println!("name:        {n}");
         }
         println!(
             "path:        {}{}",
@@ -1040,13 +1014,6 @@ fn print_status(snap: &Snapshot) {
     for s in snap.skills.iter().filter(|s| !s.status.is_healthy()) {
         println!("  {:<24} {}", s.key, status_detail(&s.status));
     }
-    for s in snap.skills.iter().filter(|s| s.name_mismatch) {
-        println!(
-            "  {:<24} warning: frontmatter name {:?} differs from directory",
-            s.key,
-            s.name.as_deref().unwrap_or("")
-        );
-    }
     println!();
     for a in &snap.agents {
         print_agent(a);
@@ -1056,9 +1023,13 @@ fn print_status(snap: &Snapshot) {
 fn print_agent(a: &skills::reconcile::AgentReport) {
     let mode = match &a.mode {
         AgentDirMode::Missing => "missing".to_string(),
-        AgentDirMode::SharedRoot => "shared skills root".into(),
-        AgentDirMode::DirLinked => "dir-linked (whole directory -> root)".into(),
-        AgentDirMode::DirForeign { target } => format!("dir-foreign -> {}", target.display()),
+        AgentDirMode::ReadOnly { reason, resolved } => format!(
+            "read-only: {reason}{}",
+            resolved
+                .as_ref()
+                .map(|path| format!(" -> {}", path.display()))
+                .unwrap_or_default()
+        ),
         AgentDirMode::Real => {
             let d = a.valid_count(|s| matches!(s, skills::reconcile::EntryState::Deployed));
             let other = a.documents.len() - d;
@@ -1642,20 +1613,6 @@ fn cmd_agents(ctx: &Ctx, c: Option<AgentsCommand>) -> Result<()> {
                     print_agent(a);
                 }
             })
-        }
-        AgentsCommand::Convert {
-            agent,
-            dry_run,
-            yes,
-        } => {
-            let snap = ctx.ws.scan()?;
-            let actions = deploy::plan_convert(&ctx.ws, &snap, &agent)?;
-            if !dry_run && !yes {
-                bail!(
-                    "converting replaces the whole-directory link; re-run with --yes (or --dry-run to preview)"
-                );
-            }
-            run_actions(ctx, &actions, dry_run)
         }
         AgentsCommand::Clean {
             agent,

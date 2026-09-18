@@ -14,6 +14,35 @@ pub mod update;
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
+/// Which durable area an operation mutates.
+///
+/// Library mutations participate in root Git coordination. Deployment
+/// mutations only touch Agent directories and never schedule root sync.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MutationScope {
+    #[default]
+    Library,
+    Deployment,
+}
+
+impl MutationScope {
+    /// Library writes share one cross-process lock and schedule root backup.
+    pub const fn changes_library(self) -> bool {
+        matches!(self, Self::Library)
+    }
+
+    /// Acquire coordination only when this scope can modify the Library.
+    pub fn guard(
+        self,
+        ws: &crate::Workspace,
+        operation: &str,
+    ) -> Result<Option<sync::MutationGuard>> {
+        self.changes_library()
+            .then(|| sync::MutationGuard::acquire(ws, operation))
+            .transpose()
+    }
+}
+
 /// Download and inspection workspace outside the tracked root. Keep final
 /// installation staging on the root filesystem so publication stays atomic.
 pub struct DownloadDir {

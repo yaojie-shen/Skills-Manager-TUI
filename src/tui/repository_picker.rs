@@ -809,7 +809,6 @@ fn candidate_snapshot(fetched: &FetchedRepository) -> Snapshot {
                 description: doc.as_ref().map(|doc| doc.description.clone()),
                 body: doc.map(|doc| doc.body),
                 external: false,
-                name_mismatch: false,
                 tags: vec![],
                 presets: vec![],
                 note: None,

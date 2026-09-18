@@ -1176,7 +1176,6 @@ mod tests {
             description: Some(desc.into()),
             body: Some(body.into()),
             external: false,
-            name_mismatch: false,
             tags: tags.iter().map(|t| t.to_string()).collect(),
             presets: Vec::new(),
             note: None,

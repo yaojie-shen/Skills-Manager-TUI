@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 pub const SKILL_FILE: &str = "SKILL.md";
 
-/// A skill as found on disk. `key` is the directory name, the identity used everywhere.
+/// A skill as found on disk. Its Library key is assigned by reconciliation;
+/// the directory basename has no identity or deployment meaning.
 #[derive(Debug, Clone)]
 pub struct SkillDoc {
     pub key: String,
@@ -57,10 +58,6 @@ impl SkillDoc {
             body: body.to_string(),
             external: crate::util::is_symlink(dir),
         })
-    }
-
-    pub fn name_mismatch(&self) -> bool {
-        self.name != self.key
     }
 }
 

@@ -442,7 +442,7 @@ impl AgentsView {
             return vec![];
         };
         let project = self.project();
-        vec![Action::BatchMeta(
+        vec![Action::deployment(Action::BatchMeta(
             Box::new({
                 let keys = keys.clone();
                 move |ws| {
@@ -450,7 +450,7 @@ impl AgentsView {
                 }
             }),
             keys,
-        )]
+        ))]
     }
     fn activate_quick(&mut self, index: usize, ctx: &Ctx) -> Vec<Action> {
         let Some((_, keys, hidden)) = self.quick.hits.get(index).cloned() else {
@@ -793,7 +793,8 @@ mod interaction_tests {
         let actions = view
             .quick_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx)
             .unwrap();
-        let Action::BatchMeta(write, keys) = actions.into_iter().next().unwrap() else {
+        let (_, Action::BatchMeta(write, keys)) = actions.into_iter().next().unwrap().into_scoped()
+        else {
             panic!("install group")
         };
         assert_eq!(keys, ["one"]);
@@ -848,7 +849,8 @@ mod interaction_tests {
             },
             &ctx,
         );
-        let Action::BatchMeta(write, _) = actions.into_iter().next().unwrap() else {
+        let (_, Action::BatchMeta(write, _)) = actions.into_iter().next().unwrap().into_scoped()
+        else {
             panic!("uninstall full tag")
         };
         write(&ws).unwrap();

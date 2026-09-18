@@ -8,6 +8,8 @@ use crate::util::is_symlink;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -27,6 +29,18 @@ pub enum Action {
         agent: String,
         skill: String,
         path: PathBuf,
+    },
+    /// Remove only the exact broken link that was previewed.
+    #[serde(rename = "unlink")]
+    Clean {
+        agent: String,
+        skill: String,
+        path: PathBuf,
+        target: PathBuf,
+        #[serde(skip)]
+        parent_identity: (u64, u64),
+        #[serde(skip)]
+        link_identity: (u64, u64),
     },
     /// Delete a real directory the agent holds and put a link to the root in
     /// its place. Only planned for a copy whose content matches the root, and
@@ -61,6 +75,11 @@ impl Action {
             }
             Action::Unlink { agent, skill, path } => {
                 format!("unlink {agent}/{skill} ({})", path.display())
+            }
+            Action::Clean {
+                agent, skill, path, ..
+            } => {
+                format!("clean  {agent}/{skill} ({})", path.display())
             }
             Action::Relink {
                 agent,
@@ -113,32 +132,27 @@ pub fn plan_deploy(
         let report = snap.agent(&agent).context("agent not scanned")?;
         for skill in skills {
             let rec = match snap.get(skill) {
-                Some(r) if r.status.is_present() => r,
+                Some(r) if r.status.is_present() && r.deployment_name().is_some() => r,
                 Some(r) => {
                     actions.push(Action::Skip {
                         agent: agent.clone(),
                         skill: skill.clone(),
-                        reason: format!("skill is {}", r.status.label()),
+                        reason: if r.status.is_present() {
+                            "skill has no valid declared name".into()
+                        } else {
+                            format!("skill is {}", r.status.label())
+                        },
                     });
                     continue;
                 }
                 None => bail!("no such skill: {skill}"),
             };
+            let name = rec.deployment_name().expect("checked above");
             match &report.mode {
-                AgentDirMode::DirLinked => actions.push(Action::Skip {
+                AgentDirMode::ReadOnly { reason, .. } => actions.push(Action::Skip {
                     agent: agent.clone(),
                     skill: skill.clone(),
-                    reason: if skill.contains('/') {
-                        "repository skill requires a separate per-skill deployment directory"
-                    } else {
-                        "agent reads the skills root directly; already deployed"
-                    }
-                    .into(),
-                }),
-                AgentDirMode::DirForeign { target } => actions.push(Action::Skip {
-                    agent: agent.clone(),
-                    skill: skill.clone(),
-                    reason: format!("agent dir is a symlink to {}", target.display()),
+                    reason: format!("agent directory is read-only: {reason}"),
                 }),
                 AgentDirMode::Missing => {
                     if mkdir_done.insert(agent.clone()) {
@@ -150,18 +164,15 @@ pub fn plan_deploy(
                     actions.push(Action::Link {
                         agent: agent.clone(),
                         skill: skill.clone(),
-                        path: dir.join(crate::repository::default_deploy_name(skill)),
+                        path: dir.join(name),
                         target: rec.path.clone(),
                     });
                 }
-                AgentDirMode::Real | AgentDirMode::SharedRoot => match report
-                    .entries
-                    .get(&crate::repository::default_deploy_name(skill))
-                {
+                AgentDirMode::Real => match report.entries.get(name) {
                     None => actions.push(Action::Link {
                         agent: agent.clone(),
                         skill: skill.clone(),
-                        path: dir.join(crate::repository::default_deploy_name(skill)),
+                        path: dir.join(name),
                         target: rec.path.clone(),
                     }),
                     Some(EntryState::Deployed)
@@ -181,13 +192,13 @@ pub fn plan_deploy(
                     Some(EntryState::Deployed) => actions.push(Action::Link {
                         agent: agent.clone(),
                         skill: skill.clone(),
-                        path: dir.join(rec.deployment_name()),
+                        path: dir.join(name),
                         target: rec.path.clone(),
                     }),
                     Some(_) => actions.push(Action::Link {
                         agent: agent.clone(),
                         skill: skill.clone(),
-                        path: dir.join(rec.deployment_name()),
+                        path: dir.join(name),
                         target: rec.path.clone(),
                     }),
                 },
@@ -208,24 +219,21 @@ pub fn plan_undeploy(
     for (agent, dir) in agent_dirs(ws, agents)? {
         let report = snap.agent(&agent).context("agent not scanned")?;
         for skill in skills {
+            let Some(name) = snap.get(skill).and_then(|record| record.deployment_name()) else {
+                actions.push(Action::Skip {
+                    agent: agent.clone(),
+                    skill: skill.clone(),
+                    reason: "skill has no valid declared name".into(),
+                });
+                continue;
+            };
             match &report.mode {
-                AgentDirMode::SharedRoot if !skill.contains('/') => actions.push(Action::Skip {
+                AgentDirMode::ReadOnly { reason, .. } => actions.push(Action::Skip {
                     agent: agent.clone(),
                     skill: skill.clone(),
-                    reason:
-                        "skill lives in the shared root; use remove to delete it for every reader"
-                            .into(),
+                    reason: format!("agent directory is read-only: {reason}"),
                 }),
-                AgentDirMode::DirLinked => actions.push(Action::Skip {
-                    agent: agent.clone(),
-                    skill: skill.clone(),
-                    reason: "agent dir is a whole-directory link; run `agents convert` first"
-                        .into(),
-                }),
-                AgentDirMode::Real | AgentDirMode::SharedRoot => match report
-                    .entries
-                    .get(&crate::repository::default_deploy_name(skill))
-                {
+                AgentDirMode::Real => match report.entries.get(name) {
                     Some(EntryState::Deployed)
                         if snap.get(skill).is_some_and(|r| {
                             r.deploy.get(&agent) != Some(&DeployState::Deployed)
@@ -241,7 +249,7 @@ pub fn plan_undeploy(
                         actions.push(Action::Unlink {
                             agent: agent.clone(),
                             skill: skill.clone(),
-                            path: dir.join(crate::repository::default_deploy_name(skill)),
+                            path: dir.join(name),
                         })
                     }
                     None => actions.push(Action::Skip {
@@ -304,14 +312,8 @@ fn entries_of<'a>(
 fn repairable(report: &crate::reconcile::AgentReport, agent: &str) -> Option<Action> {
     let reason = match &report.mode {
         AgentDirMode::Real => return None,
-        AgentDirMode::SharedRoot => {
-            "shared root contains source skills; per-agent repair is unavailable".to_string()
-        }
-        AgentDirMode::DirLinked => {
-            "agent dir is a whole-directory link; run `agents convert` first".to_string()
-        }
-        AgentDirMode::DirForeign { target } => {
-            format!("agent dir is a symlink to {}", target.display())
+        AgentDirMode::ReadOnly { reason, .. } => {
+            format!("agent directory is read-only: {reason}")
         }
         AgentDirMode::Missing => "agent dir does not exist".to_string(),
     };
@@ -341,16 +343,22 @@ pub fn plan_clean(
     let (entries, mut actions) = entries_of(report, &agent, skills);
     for (name, state) in entries {
         match state {
-            EntryState::Broken { .. } => actions.push(Action::Unlink {
-                agent: agent.clone(),
-                skill: snap
-                    .skills
-                    .iter()
-                    .find(|s| s.deployment_name() == name)
-                    .map(|s| s.key.clone())
-                    .unwrap_or_else(|| name.into()),
-                path: dir.join(name),
-            }),
+            EntryState::Broken { target } => {
+                let path = dir.join(name);
+                actions.push(Action::Clean {
+                    agent: agent.clone(),
+                    skill: snap
+                        .skills
+                        .iter()
+                        .find(|s| s.deployment_name() == Some(name))
+                        .map(|s| s.key.clone())
+                        .unwrap_or_else(|| name.into()),
+                    target: target.clone(),
+                    parent_identity: identity(&fs::symlink_metadata(&dir)?),
+                    link_identity: identity(&fs::symlink_metadata(&path)?),
+                    path,
+                });
+            }
             // With nothing named, the healthy entries are simply not the
             // subject; with a name given, the answer is why it does not apply.
             _ if skills.is_empty() => {}
@@ -388,14 +396,14 @@ pub fn plan_relink(
                 skill: snap
                     .skills
                     .iter()
-                    .find(|s| s.deployment_name() == name)
+                    .find(|s| s.deployment_name() == Some(name))
                     .map(|s| s.key.clone())
                     .unwrap_or_else(|| name.into()),
                 path: dir.join(name),
                 target: snap
                     .skills
                     .iter()
-                    .find(|s| s.deployment_name() == name)
+                    .find(|s| s.deployment_name() == Some(name))
                     .map(|s| s.path.clone())
                     .unwrap_or_else(|| ws.skill_path(name)),
             }),
@@ -420,49 +428,21 @@ pub fn plan_relink(
     Ok(actions)
 }
 
-/// Plan turning a whole-directory link into a real directory with per-skill links.
-pub fn plan_convert(ws: &Workspace, snap: &Snapshot, agent: &str) -> Result<Vec<Action>> {
-    let cfg = ws
-        .config
-        .agent(agent)
-        .with_context(|| format!("unknown agent: {agent}"))?;
-    let report = snap.agent(agent).context("agent not scanned")?;
-    if report.mode != AgentDirMode::DirLinked {
-        bail!(
-            "agent {agent} is not a whole-directory link (mode: {:?})",
-            report.mode
-        );
-    }
-    let dir = cfg.skills_path();
-    let mut actions = vec![
-        Action::Unlink {
-            agent: agent.into(),
-            skill: "*".into(),
-            path: dir.clone(),
-        },
-        Action::Mkdir {
-            agent: agent.into(),
-            path: dir.clone(),
-        },
-    ];
-    for s in snap.skills.iter().filter(|s| s.status.is_present()) {
-        actions.push(Action::Link {
-            agent: agent.into(),
-            skill: s.key.clone(),
-            path: dir.join(s.deployment_name()),
-            target: s.path.clone(),
-        });
-    }
-    Ok(actions)
-}
-
 /// Execute planned actions in order. Stops at the first failure.
 pub fn apply(actions: &[Action]) -> Result<usize> {
+    // A clean preview is permission to remove only the exact broken links it
+    // observed. Preflight the whole batch before any mutations, and validate
+    // again at the individual removal to narrow the race window.
+    for action in actions {
+        if matches!(action, Action::Clean { .. }) {
+            validate_clean(action)?;
+        }
+    }
     // Validate the entire batch before changing even the first directory.
     let removed: BTreeSet<_> = actions
         .iter()
         .filter_map(|a| match a {
-            Action::Unlink { path, .. } => Some(path.clone()),
+            Action::Unlink { path, .. } | Action::Clean { path, .. } => Some(path.clone()),
             _ => None,
         })
         .collect();
@@ -583,9 +563,70 @@ pub fn apply(actions: &[Action]) -> Result<usize> {
                     }
                 }
             }
+            Action::Clean { path, .. } => {
+                if validate_clean(a)? == CleanState::Remove {
+                    fs::remove_file(path)
+                        .with_context(|| format!("removing {}", path.display()))?;
+                    done += 1;
+                }
+            }
         }
     }
     Ok(done)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CleanState {
+    Gone,
+    Repaired,
+    Remove,
+}
+
+fn identity(metadata: &fs::Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
+}
+
+fn validate_clean(action: &Action) -> Result<CleanState> {
+    let Action::Clean {
+        path,
+        target,
+        parent_identity,
+        link_identity,
+        ..
+    } = action
+    else {
+        unreachable!("clean validation called for another action")
+    };
+
+    let parent = path.parent().context("invalid clean path")?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .with_context(|| format!("checking agent directory {}", parent.display()))?;
+    if !parent_metadata.is_dir() || identity(&parent_metadata) != *parent_identity {
+        bail!(
+            "agent directory changed; refusing to clean {}",
+            path.display()
+        );
+    }
+    let link_metadata = match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CleanState::Gone);
+        }
+        Err(error) => return Err(error).with_context(|| format!("checking {}", path.display())),
+        Ok(metadata) => metadata,
+    };
+    if !link_metadata.file_type().is_symlink() {
+        bail!("refusing to remove non-symlink {}", path.display());
+    }
+    if identity(&link_metadata) != *link_identity
+        || crate::util::link_target_abs(path).as_ref() != Some(target)
+    {
+        bail!("broken link changed; refusing to clean {}", path.display());
+    }
+    if fs::canonicalize(path).is_ok() {
+        Ok(CleanState::Repaired)
+    } else {
+        Ok(CleanState::Remove)
+    }
 }
 
 // ---- presets ---------------------------------------------------------------
@@ -745,7 +786,7 @@ pub fn summarize(actions: &[Action]) -> String {
                 added.0.push(skill.clone());
                 added.1.push(agent.clone());
             }
-            Action::Unlink { skill, agent, .. } => {
+            Action::Unlink { skill, agent, .. } | Action::Clean { skill, agent, .. } => {
                 removed.0.push(skill.clone());
                 removed.1.push(agent.clone());
             }

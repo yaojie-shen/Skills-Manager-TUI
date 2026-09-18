@@ -88,6 +88,12 @@ impl DeployPicker {
                     .is_none_or(|products| products.contains(targets::product_key(agent)))
             });
             let snap = skills::reconcile::rescope(ctx.snap, &agents)?;
+            agents.retain(|agent| {
+                !matches!(
+                    snap.agent(&agent.key).map(|report| &report.mode),
+                    Some(skills::reconcile::AgentDirMode::ReadOnly { .. })
+                )
+            });
             self.rows = agents
                 .into_iter()
                 .map(|a| {
@@ -180,10 +186,10 @@ impl DeployPicker {
         let keys = self.keys.clone();
         vec![
             Action::CloseModal,
-            Action::BatchMeta(
+            Action::deployment(Action::BatchMeta(
                 Box::new(move |ws| targets::apply_scoped(ws, &keys, &changes)),
                 self.keys.clone(),
-            ),
+            )),
         ]
     }
     pub fn hints(&self) -> Hints {
@@ -547,19 +553,11 @@ mod tests {
         picker.toggle();
         assert!(!project.join(".cursor").exists());
         assert_eq!(picker.rows[cursor].2, Some(true));
-        let codex = picker
-            .rows
-            .iter()
-            .position(|(a, _, _)| a.key == "codex")
-            .unwrap();
-        picker.list.select(Some(codex));
-        picker.toggle();
         assert!(
             picker
                 .rows
                 .iter()
-                .filter(|(a, _, _)| a.skills_path() == ws.root)
-                .all(|(_, _, selected)| *selected == Some(false))
+                .all(|(a, _, _)| a.skills_path() != ws.root)
         );
         for (w, h) in [(100, 30), (80, 24), (50, 16), (40, 12)] {
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -578,7 +576,7 @@ mod tests {
                     assert!(text.contains("Local"));
                 }
                 assert!(text.contains("Target:"));
-                let path = picker.rows[codex].0.skills_path();
+                let path = picker.rows[cursor].0.skills_path();
                 let suffix = path
                     .parent()
                     .unwrap()

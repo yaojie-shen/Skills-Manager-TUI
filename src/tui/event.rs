@@ -24,7 +24,7 @@ pub enum Msg {
 #[derive(Debug, Clone)]
 pub enum Task {
     RepairPlan(skills::ops::repair::Options),
-    RepairApply(skills::ops::repair::Report),
+    RepairApply(skills::ops::repair::RepairPlan),
     Sync(super::sync_picker::Request),
     DiscoverRepository(String),
     InstallRepository(Box<super::repository_picker::InstallSelection>),
@@ -41,7 +41,10 @@ pub enum Task {
 }
 
 pub enum TaskOutput {
-    RepairPlan(Result<skills::ops::repair::Report>),
+    RepairPlan(
+        skills::ops::repair::Options,
+        Result<skills::ops::repair::RepairPlan>,
+    ),
     RepairApplied(Result<skills::ops::repair::Report>),
     Sync(
         super::sync_picker::Request,
@@ -164,10 +167,11 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
             };
             let out = match task {
                 Task::RepairPlan(options) => {
-                    TaskOutput::RepairPlan(skills::ops::repair::plan(&ws, &options))
+                    let result = skills::ops::repair::build_plan(&ws, &options);
+                    TaskOutput::RepairPlan(options, result)
                 }
                 Task::RepairApply(plan) => {
-                    TaskOutput::RepairApplied(skills::ops::repair::apply(&ws, &plan))
+                    TaskOutput::RepairApplied(skills::ops::repair::apply_plan(&ws, &plan))
                 }
                 Task::Sync(request) => {
                     let result =
@@ -187,12 +191,16 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                     TaskOutput::RepositoryFetched(reference, result)
                 }
                 Task::InstallRepository(selection) => {
-                    let result = selection.fetched.install_with_progress(
-                        &ws,
-                        &selection.paths,
-                        &selection.names,
-                        &mut progress,
-                    );
+                    let result =
+                        skills::ops::sync::MutationGuard::acquire(&ws, "repository install")
+                            .and_then(|_guard| {
+                                selection.fetched.install_with_progress(
+                                    &ws,
+                                    &selection.paths,
+                                    &selection.names,
+                                    &mut progress,
+                                )
+                            });
                     TaskOutput::RepositoryInstalled(selection, result)
                 }
                 Task::Scan => {
@@ -222,7 +230,11 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                 Task::Install { reference, subpath } => {
                     progress("Install: preparing source files…");
                     let out = skills::ops::install::parse_ref(&reference, None, subpath.as_deref())
-                        .and_then(|r| skills::ops::install::install(&ws, &r, None));
+                        .and_then(|r| {
+                            let _guard =
+                                skills::ops::sync::MutationGuard::acquire(&ws, "skill install")?;
+                            skills::ops::install::install(&ws, &r, None)
+                        });
                     TaskOutput::Installed(reference, out)
                 }
                 Task::Prepare(key) => {
@@ -240,7 +252,7 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
 
 /// Batch closures are not cloneable, so they use a dedicated worker rather than Task.
 pub enum BatchWork {
-    Metadata(super::app::MetaFn, Vec<String>),
+    Metadata(skills::ops::MutationScope, super::app::MetaFn, Vec<String>),
     Links(Vec<skills::ops::deploy::Action>, Vec<String>),
 }
 pub struct BatchOutcome {
@@ -249,45 +261,53 @@ pub struct BatchOutcome {
     pub intent: Option<skills::history::Intent>,
     pub failed: Vec<String>,
     pub errors: Vec<String>,
+    pub changed_scope: Option<skills::ops::MutationScope>,
 }
 impl BatchWork {
     fn keys(&self) -> &[String] {
         match self {
-            Self::Metadata(_, keys) | Self::Links(_, keys) => keys,
+            Self::Metadata(_, _, keys) | Self::Links(_, keys) => keys,
         }
     }
     fn run(self, ws: &Workspace, progress: &mut dyn FnMut(&str)) -> BatchOutcome {
         match self {
-            Self::Metadata(write, keys) => match write(ws) {
-                Ok((message, intent)) => BatchOutcome {
-                    conflict: None,
-                    message,
-                    intent,
-                    failed: vec![],
-                    errors: vec![],
-                },
-                Err(e)
-                    if e.downcast_ref::<skills::ops::name_choices::Pending>()
-                        .is_some() =>
-                {
-                    BatchOutcome {
-                        conflict: e
-                            .downcast_ref::<skills::ops::name_choices::Pending>()
-                            .cloned(),
-                        message: "Choose conflicting skills".into(),
-                        intent: None,
+            Self::Metadata(scope, write, keys) => {
+                let guard = scope.guard(ws, "Library batch write");
+                let result = guard.and_then(|_guard| write(ws));
+                match result {
+                    Ok((message, intent)) => BatchOutcome {
+                        conflict: None,
+                        message,
+                        intent,
                         failed: vec![],
                         errors: vec![],
+                        changed_scope: Some(scope),
+                    },
+                    Err(e)
+                        if e.downcast_ref::<skills::ops::name_choices::Pending>()
+                            .is_some() =>
+                    {
+                        BatchOutcome {
+                            conflict: e
+                                .downcast_ref::<skills::ops::name_choices::Pending>()
+                                .cloned(),
+                            message: "Choose conflicting skills".into(),
+                            intent: None,
+                            failed: vec![],
+                            errors: vec![],
+                            changed_scope: None,
+                        }
                     }
+                    Err(e) => BatchOutcome {
+                        conflict: None,
+                        message: "Batch metadata edit failed".into(),
+                        intent: None,
+                        failed: keys,
+                        errors: vec![format!("{e:#}")],
+                        changed_scope: None,
+                    },
                 }
-                Err(e) => BatchOutcome {
-                    conflict: None,
-                    message: "Batch metadata edit failed".into(),
-                    intent: None,
-                    failed: keys,
-                    errors: vec![format!("{e:#}")],
-                },
-            },
+            }
             Self::Links(actions, keys) => {
                 use skills::{history, ops::deploy};
                 // Recheck names in the worker against the current filesystem.
@@ -302,6 +322,7 @@ impl BatchWork {
                             intent: None,
                             failed: vec![],
                             errors: vec![],
+                            changed_scope: None,
                         };
                     }
                     Err(error) => {
@@ -311,6 +332,7 @@ impl BatchWork {
                             intent: None,
                             failed: keys,
                             errors: vec![format!("{error:#}")],
+                            changed_scope: None,
                         };
                     }
                 }
@@ -355,6 +377,7 @@ impl BatchWork {
                     intent: history::Intent::from_actions(&completed),
                     failed: failed.into_iter().collect(),
                     errors,
+                    changed_scope: Some(skills::ops::MutationScope::Deployment),
                 }
             }
         }
@@ -370,7 +393,7 @@ pub fn spawn_batch(
         let keys = work.keys().to_vec();
         let mut progress = |text: &str| { let _ = tx.send(Msg::Progress(id, text.into())); };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.run(&ws, &mut progress)))
-            .unwrap_or_else(|_| BatchOutcome { conflict: None, message: "Batch worker failed".into(), intent: None, failed: keys, errors: vec!["The worker stopped unexpectedly. Refresh and inspect affected skills before retrying.".into()] });
+            .unwrap_or_else(|_| BatchOutcome { conflict: None, message: "Batch worker failed".into(), intent: None, failed: keys, errors: vec!["The worker stopped unexpectedly. Refresh and inspect affected skills before retrying.".into()], changed_scope: None });
         let _ = tx.send(Msg::Task(id, Box::new(TaskOutput::Batch(outcome))));
     }).map(|_| ())
 }

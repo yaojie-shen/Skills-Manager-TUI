@@ -454,7 +454,7 @@ impl SearchView {
             }
             return vec![
                 Action::CloseModal,
-                Action::BatchMeta(
+                Action::deployment(Action::BatchMeta(
                     Box::new({
                         let keys = keys.clone();
                         move |ws| {
@@ -468,7 +468,7 @@ impl SearchView {
                         }
                     }),
                     keys,
-                ),
+                )),
             ];
         }
         if let Some(tag) = self.tag.clone() {
@@ -860,18 +860,6 @@ impl SearchView {
         let key = r.key.clone();
         vec![Action::Write(Box::new(move |ws| {
             edit::accept(ws, &key).map(|_| format!("baseline updated for {key}"))
-        }))]
-    }
-    fn act_migrate(&self, ctx: &Ctx) -> Vec<Action> {
-        let Some(r) = self.selected(ctx) else {
-            return vec![];
-        };
-        let SkillStatus::Renamed { to } = &r.status else {
-            return vec![Action::Error("migrate applies to renamed? skills".into())];
-        };
-        let (old, new) = (r.key.clone(), to.clone());
-        vec![Action::Write(Box::new(move |ws| {
-            edit::migrate_meta(ws, &old, &new).map(|_| format!("migrated {old} → {new}"))
         }))]
     }
     fn act_check(&self, ctx: &Ctx) -> Vec<Action> {
@@ -1435,7 +1423,6 @@ impl View for SearchView {
                 KeyCode::Char('s') => acts = self.skill_command(Command::Source, ctx),
                 KeyCode::Char('a') => acts = self.skill_command(Command::Accept, ctx),
                 KeyCode::Char('m') => self.multi = true,
-                KeyCode::Char('M') => acts = self.skill_command(Command::Migrate, ctx),
                 KeyCode::Char('u') => acts = self.skill_command(Command::Check, ctx),
                 KeyCode::Char('U') => acts = self.skill_command(Command::Update, ctx),
                 KeyCode::Char('x') => acts = self.skill_command(Command::Remove, ctx),

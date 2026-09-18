@@ -92,13 +92,12 @@ fn representative_tui_latency() {
             vec![keys[0].clone()]
         } {
             assert_eq!(selection.contains(&key), on);
-            assert_eq!(
-                target
-                    .skills_path()
-                    .join(skills::repository::default_deploy_name(&key))
-                    .is_symlink(),
-                on
-            );
+            let name = app
+                .snap
+                .get(&key)
+                .and_then(|skill| skill.deployment_name())
+                .expect("benchmark skill has a valid declared name");
+            assert_eq!(target.skills_path().join(name).is_symlink(), on);
         }
         println!(
             "LATENCY {label}_dispatch_ms {:.3}",

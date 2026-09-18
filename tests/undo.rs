@@ -454,12 +454,13 @@ fn renaming_a_skill_goes_back_and_forth_with_its_link() {
     assert!(!fx.root.join("printer").exists());
     assert_eq!(tags(&ws, "etcd"), ["office"], "metadata moved with it");
     assert_eq!(
-        std::fs::read_link(agent.join("etcd")).unwrap(),
+        std::fs::read_link(agent.join("printer")).unwrap(),
         fx.root.join("etcd")
     );
-    assert!(!agent.join("printer").exists());
+    assert!(!agent.join("etcd").exists());
 
-    // Back: the directory, the metadata and the link all return to the old name.
+    // Back: the directory and metadata return to the old key. The deployment
+    // filename stays on the declared Skill Name throughout.
     let message = step(&ws, &mut log, true);
     assert_eq!(message, "renamed etcd to printer");
     assert!(fx.root.join("printer").is_dir());
@@ -474,7 +475,11 @@ fn renaming_a_skill_goes_back_and_forth_with_its_link() {
     // And forward again.
     step(&ws, &mut log, false);
     assert!(fx.root.join("etcd").is_dir());
-    assert!(agent.join("etcd").exists());
+    assert_eq!(
+        std::fs::read_link(agent.join("printer")).unwrap(),
+        fx.root.join("etcd")
+    );
+    assert!(!agent.join("etcd").exists());
     assert!(!fx.root.join("printer").exists());
 }
 

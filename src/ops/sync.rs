@@ -2,6 +2,7 @@
 use crate::{Workspace, ops::git};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const EXCLUDES: &[&str] = &[
@@ -79,7 +80,7 @@ pub fn configure(ws: &Workspace, url: &str, branch: &str) -> Result<()> {
         )?;
     }
     repository(&ws.root)?;
-    let _lock = Lock::new(&ws.root)?;
+    let _lock = MutationGuard::acquire(ws, "configure root sync")?;
     ensure_ready(ws, branch)?;
     if let Some(existing) = config(&ws.root, "remote.origin.url") {
         ensure!(
@@ -102,7 +103,7 @@ pub fn configure(ws: &Workspace, url: &str, branch: &str) -> Result<()> {
 }
 pub fn disable(ws: &Workspace) -> Result<()> {
     repository(&ws.root)?;
-    let _lock = Lock::new(&ws.root)?;
+    let _lock = MutationGuard::acquire(ws, "disable root sync")?;
     git(
         &["config", "--local", "skills.autosync", "false"],
         Some(&ws.root),
@@ -212,7 +213,7 @@ pub fn run(
         .branch
         .context("root sync is not configured; use skills sync configure URL")?;
     repository(&ws.root)?;
-    let _lock = Lock::new(&ws.root)?;
+    let _lock = MutationGuard::acquire(ws, "root sync")?;
     ensure_ready(ws, &branch)?;
     validate_tree(ws, None)?;
     let mut report = Report {
@@ -373,17 +374,85 @@ pub fn automatic(ws: &Workspace) -> Result<Option<Report>> {
     }
     run(ws, Mode::Sync, false, &mut |_| {}).map(Some)
 }
-struct Lock(PathBuf);
-impl Lock {
-    fn new(root: &Path) -> Result<Self> {
-        let path = root.join(".git/skills-sync.lock");
-        std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
-            .context("root sync is already running; after a crash inspect Git, then remove .git/skills-sync.lock")?;
-        Ok(Self(path))
+/// Serializes root Git operations with Library writes across processes.
+///
+/// Agent-only deployment operations deliberately do not acquire this guard.
+pub struct MutationGuard(Option<(PathBuf, String)>);
+
+impl MutationGuard {
+    pub fn acquire(ws: &Workspace, operation: &str) -> Result<Self> {
+        let git_dir = ws.root.join(".git");
+        if !git_dir.is_dir() {
+            return Ok(Self(None));
+        }
+        let path = git_dir.join("skills-sync.lock");
+        for attempt in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let owner = format!("{}\t{operation}\n", std::process::id());
+                    if let Err(error) = file
+                        .write_all(owner.as_bytes())
+                        .and_then(|_| file.sync_all())
+                    {
+                        let _ = std::fs::remove_file(&path);
+                        return Err(error).context("initialize Skills coordination lock");
+                    }
+                    return Ok(Self(Some((path, owner))));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if attempt == 0 && stale_lock(&path) {
+                        std::fs::remove_file(&path)
+                            .context("remove stale Skills coordination lock")?;
+                        continue;
+                    }
+                    let owner = std::fs::read_to_string(&path)
+                        .ok()
+                        .filter(|text| !text.trim().is_empty())
+                        .map(|text| format!(" ({})", text.trim()))
+                        .unwrap_or_default();
+                    bail!("another Skills Library operation is still in progress{owner}");
+                }
+                Err(error) => return Err(error).context("create Skills coordination lock"),
+            }
+        }
+        unreachable!()
     }
 }
-impl Drop for Lock {
+
+fn stale_lock(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Some(pid) = text
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<i32>().ok())
+    else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        // Signal 0 checks process existence without delivering a signal.
+        let result = unsafe { libc::kill(pid, 0) };
+        result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+impl Drop for MutationGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if let Some((path, owner)) = &self.0
+            && std::fs::read_to_string(path).is_ok_and(|current| current == *owner)
+        {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }

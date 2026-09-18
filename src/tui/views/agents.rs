@@ -87,7 +87,6 @@ type ScopeKey = Vec<(String, std::path::PathBuf)>;
 pub struct AgentsView {
     /// Key of the agent on show. Empty only while none is configured.
     scope: String,
-    can_convert: bool,
     destinations: Vec<skills::ops::targets::Scope>,
     launch_directory: Option<std::path::PathBuf>,
     destination: usize,
@@ -394,30 +393,33 @@ impl AgentsView {
                 Action::ApplyLinks { title: _, actions } => {
                     let agent = agent.clone();
                     let project = project.clone();
-                    Action::WriteMeta(Box::new(move |ws| {
+                    Action::deployment(Action::WriteMeta(Box::new(move |ws| {
                         skills::ops::targets::apply_actions(
                             ws,
                             &agent,
                             project.as_deref(),
                             &actions,
                         )
-                    }))
+                    })))
                 }
                 Action::ConfirmLinks { title, actions } => {
                     let agent = agent.clone();
                     let project = project.clone();
-                    Action::OpenModal(Box::new(Modal::confirm_meta(
-                        title,
-                        actions.iter().map(|a| a.describe()).collect(),
-                        Box::new(move |ws| {
-                            skills::ops::targets::apply_actions(
-                                ws,
-                                &agent,
-                                project.as_deref(),
-                                &actions,
-                            )
-                        }),
-                    )))
+                    Action::OpenModal(Box::new(
+                        Modal::confirm_meta(
+                            title,
+                            actions.iter().map(|a| a.describe()).collect(),
+                            Box::new(move |ws| {
+                                skills::ops::targets::apply_actions(
+                                    ws,
+                                    &agent,
+                                    project.as_deref(),
+                                    &actions,
+                                )
+                            }),
+                        )
+                        .deployment_only(),
+                    ))
                 }
                 other => other,
             })
@@ -471,11 +473,9 @@ impl AgentsView {
             .iter()
             .map(|(name, state)| {
                 let linked = matches!(state, EntryState::Deployed);
-                let record = ctx
-                    .snap
-                    .skills
-                    .iter()
-                    .find(|r| r.deployment_name() == *name && (!linked || deployed(r)));
+                let record = ctx.snap.skills.iter().find(|r| {
+                    r.deployment_name() == Some(name.as_str()) && (!linked || deployed(r))
+                });
                 Row {
                     key: if linked {
                         record.map_or_else(|| name.clone(), |r| r.key.clone())
@@ -648,10 +648,6 @@ impl AgentsView {
                 .cloned()
                 .unwrap_or_default();
         }
-        self.can_convert = ctx
-            .snap
-            .agent(&self.scope)
-            .is_some_and(|a| a.mode == AgentDirMode::DirLinked);
         let scope = self.scope_agents();
         self.presets = ctx
             .snap
@@ -705,7 +701,6 @@ impl AgentsView {
                     description: Some(doc.description.clone()),
                     body: Some(doc.body.clone()),
                     external: doc.external,
-                    name_mismatch: doc.name != row.name,
                     tags: vec![],
                     presets: vec![],
                     note: None,
@@ -852,19 +847,6 @@ impl AgentsView {
                     scope: LayoutScope::Agents,
                     layout: ctx.settings.layout_for(LayoutScope::Agents).next(),
                 }];
-            }
-            KeyCode::Char('c') if self.focus() == Focus::Agents && self.can_convert => {
-                let agent = self.scope.clone();
-                if agent.is_empty() {
-                    return vec![Action::Error("no agent is configured".into())];
-                }
-                return match deploy::plan_convert(ctx.ws, ctx.snap, &agent) {
-                    Ok(actions) => vec![Action::ConfirmLinks {
-                        title: format!("convert {agent} to per-skill links"),
-                        actions,
-                    }],
-                    Err(e) => vec![Action::Error(format!("{e:#}"))],
-                };
             }
             _ => {}
         }
@@ -1116,13 +1098,7 @@ impl AgentsView {
                     )
                 }) {
                     None | Some((AgentDirMode::Missing, ..)) => "no directory".to_string(),
-                    Some((AgentDirMode::SharedRoot, _, total)) => {
-                        format!("{total} skills · shared root")
-                    }
-                    Some((AgentDirMode::DirLinked, _, total)) => {
-                        format!("{total} linked · whole dir")
-                    }
-                    Some((AgentDirMode::DirForeign { .. }, ..)) => "dir links elsewhere".into(),
+                    Some((AgentDirMode::ReadOnly { .. }, ..)) => "read-only directory".into(),
                     Some((AgentDirMode::Real, linked, total)) if total > linked => {
                         format!("{linked} linked · {} own", total - linked)
                     }
@@ -1162,11 +1138,7 @@ impl AgentsView {
                 )
             }) {
                 None | Some((AgentDirMode::Missing, ..)) => "no directory".to_string(),
-                Some((AgentDirMode::SharedRoot, _, total)) => {
-                    format!("{total} skills · shared root")
-                }
-                Some((AgentDirMode::DirLinked, _, total)) => format!("{total} linked · whole dir"),
-                Some((AgentDirMode::DirForeign { .. }, ..)) => "dir links elsewhere".into(),
+                Some((AgentDirMode::ReadOnly { .. }, ..)) => "read-only directory".into(),
                 Some((AgentDirMode::Real, linked, total)) if total > linked => {
                     format!("{linked} linked · {} own", total - linked)
                 }
@@ -1619,14 +1591,6 @@ impl AgentsView {
                 ("Esc", "results"),
             ];
         }
-        if self.focus() == Focus::Agents && !self.can_convert {
-            return &[
-                ("←→", "agent"),
-                ("↓/Enter", "scopes"),
-                ("[ ]", "agent"),
-                ("Esc/q", "back"),
-            ];
-        }
         if !self.destinations.is_empty() && self.focus() == Focus::Entries && self.caps.is_empty() {
             return &[
                 ("/", "filter skills"),
@@ -1746,7 +1710,6 @@ impl AgentsView {
             Focus::Agents => &[
                 ("←→", "pick agent"),
                 ("↓/Enter", "scopes"),
-                ("c", "convert dir-link"),
                 ("[ ]", "agent"),
                 ("Esc/q", "back"),
             ],
@@ -2976,7 +2939,8 @@ mod deployment_scope_tests {
             },
             &ctx,
         );
-        let Action::BatchMeta(write, keys) = actions.into_iter().next().unwrap() else {
+        let (_, Action::BatchMeta(write, keys)) = actions.into_iter().next().unwrap().into_scoped()
+        else {
             panic!("group install")
         };
         assert_eq!(keys, ["one", "two"]);
@@ -3500,7 +3464,7 @@ mod deployment_scope_tests {
         let write = actions
             .into_iter()
             .find_map(|action| {
-                if let Action::BatchMeta(write, _) = action {
+                if let (_, Action::BatchMeta(write, _)) = action.into_scoped() {
                     Some(write)
                 } else {
                     None
@@ -3508,7 +3472,7 @@ mod deployment_scope_tests {
             })
             .unwrap();
         write(&ws).unwrap();
-        assert!(project.join(".claude/skills/sample").is_symlink());
+        assert!(project.join(".claude/skills/sample-skill").is_symlink());
         assert!(!base.join("global/claude/sample").exists());
         assert!(root.join("sample/SKILL.md").exists());
         view.move_destination(1, &ctx);
@@ -3529,7 +3493,8 @@ mod deployment_scope_tests {
             },
             &scoped_ctx,
         );
-        let Action::BatchMeta(write, keys) = actions.into_iter().next().unwrap() else {
+        let (_, Action::BatchMeta(write, keys)) = actions.into_iter().next().unwrap().into_scoped()
+        else {
             panic!("preset install")
         };
         assert_eq!(keys, ["sample"]);
@@ -3557,7 +3522,8 @@ mod deployment_scope_tests {
             },
             &scoped_ctx,
         );
-        let Action::BatchMeta(write, _) = actions.into_iter().next().unwrap() else {
+        let (_, Action::BatchMeta(write, _)) = actions.into_iter().next().unwrap().into_scoped()
+        else {
             panic!("reinstall preset")
         };
         write(&ws).unwrap();
@@ -3573,7 +3539,7 @@ mod deployment_scope_tests {
             project
                 .canonicalize()
                 .unwrap()
-                .join(".claude/skills/sample")
+                .join(".claude/skills/sample-skill")
         );
         assert!(matches!(
             view.handle_key(key(KeyCode::Char('x')), &ctx).as_slice(),

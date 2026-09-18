@@ -15,5 +15,6 @@
 *.tmp
 
 # Local agent state
+AGENTS.md
 .claude/
 .codex/
