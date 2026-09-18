@@ -40,7 +40,7 @@ pub enum Action {
         #[serde(skip)]
         parent_identity: (u64, u64),
         #[serde(skip)]
-        link_identity: (u64, u64),
+        link_identity: (u64, u64, i64, i64),
     },
     /// Delete a real directory the agent holds and put a link to the root in
     /// its place. Only planned for a copy whose content matches the root, and
@@ -355,7 +355,7 @@ pub fn plan_clean(
                         .unwrap_or_else(|| name.into()),
                     target: target.clone(),
                     parent_identity: identity(&fs::symlink_metadata(&dir)?),
-                    link_identity: identity(&fs::symlink_metadata(&path)?),
+                    link_identity: symlink_identity(&fs::symlink_metadata(&path)?),
                     path,
                 });
             }
@@ -586,6 +586,15 @@ fn identity(metadata: &fs::Metadata) -> (u64, u64) {
     (metadata.dev(), metadata.ino())
 }
 
+fn symlink_identity(metadata: &fs::Metadata) -> (u64, u64, i64, i64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
 fn validate_clean(action: &Action) -> Result<CleanState> {
     let Action::Clean {
         path,
@@ -617,7 +626,7 @@ fn validate_clean(action: &Action) -> Result<CleanState> {
     if !link_metadata.file_type().is_symlink() {
         bail!("refusing to remove non-symlink {}", path.display());
     }
-    if identity(&link_metadata) != *link_identity
+    if symlink_identity(&link_metadata) != *link_identity
         || crate::util::link_target_abs(path).as_ref() != Some(target)
     {
         bail!("broken link changed; refusing to clean {}", path.display());
