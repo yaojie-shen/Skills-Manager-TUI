@@ -87,14 +87,6 @@ impl SearchView {
             "Requires changes or a missing baseline",
             3,
         );
-        add(
-            Migrate,
-            "Migrate metadata",
-            KeyCode::Char('M'),
-            matches!(r.status, SkillStatus::Renamed { .. }),
-            "No detected rename to migrate",
-            3,
-        );
         add(Remove, "Delete skill", KeyCode::Char('x'), true, "", 4);
         items
     }
@@ -119,7 +111,6 @@ impl SearchView {
             Command::Check => self.act_check(ctx),
             Command::Update => self.act_update(ctx),
             Command::Accept => self.act_accept(ctx),
-            Command::Migrate => self.act_migrate(ctx),
             Command::Remove => self.act_remove(ctx),
             Command::Presets => self
                 .selected(ctx)

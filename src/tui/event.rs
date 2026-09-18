@@ -24,7 +24,7 @@ pub enum Msg {
 #[derive(Debug, Clone)]
 pub enum Task {
     RepairPlan(skills::ops::repair::Options),
-    RepairApply(skills::ops::repair::Report),
+    RepairApply(skills::ops::repair::RepairPlan),
     Sync(super::sync_picker::Request),
     DiscoverRepository(String),
     InstallRepository(Box<super::repository_picker::InstallSelection>),
@@ -41,7 +41,10 @@ pub enum Task {
 }
 
 pub enum TaskOutput {
-    RepairPlan(Result<skills::ops::repair::Report>),
+    RepairPlan(
+        skills::ops::repair::Options,
+        Result<skills::ops::repair::RepairPlan>,
+    ),
     RepairApplied(Result<skills::ops::repair::Report>),
     Sync(
         super::sync_picker::Request,
@@ -164,10 +167,11 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
             };
             let out = match task {
                 Task::RepairPlan(options) => {
-                    TaskOutput::RepairPlan(skills::ops::repair::plan(&ws, &options))
+                    let result = skills::ops::repair::build_plan(&ws, &options);
+                    TaskOutput::RepairPlan(options, result)
                 }
                 Task::RepairApply(plan) => {
-                    TaskOutput::RepairApplied(skills::ops::repair::apply(&ws, &plan))
+                    TaskOutput::RepairApplied(skills::ops::repair::apply_plan(&ws, &plan))
                 }
                 Task::Sync(request) => {
                     let result =

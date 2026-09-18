@@ -27,10 +27,7 @@ fn local_namespace_install_metadata_scan_and_removal() {
     let snap = ws.scan().unwrap();
     assert_eq!(snap.skills.len(), 1);
     assert!(snap.get(&key).is_some());
-    assert_eq!(
-        skills::repository::default_deploy_name(&key),
-        "project--example"
-    );
+    assert_eq!(snap.get(&key).unwrap().deployment_name(), Some("example"));
     assert!(!skills::repository::valid_id("local/../escape"));
     skills::ops::deploy::apply(
         &skills::ops::deploy::plan_deploy(
@@ -46,7 +43,7 @@ fn local_namespace_install_metadata_scan_and_removal() {
     edit::rename(&ws, &ws.scan().unwrap(), &key, new).unwrap();
     assert!(!ws.skill_path(&key).exists());
     assert_eq!(
-        std::fs::read_link(base.join("agent/project--example")).unwrap(),
+        std::fs::read_link(base.join("agent/example")).unwrap(),
         ws.skill_path(new)
     );
     assert!(ws.meta.list_keys().unwrap().is_empty());

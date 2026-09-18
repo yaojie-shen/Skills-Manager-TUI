@@ -313,12 +313,6 @@ impl App {
             ws.inventory_project = Some(start.to_path_buf());
         }
         Self::discover_local_agents(&mut ws)?;
-        let startup_repair = skills::ops::repair::startup(&ws);
-        // Repairs can migrate or remove tag membership; display the persisted result.
-        if !matches!(&startup_repair, Ok(report) if report.repaired == 0 && report.failed == 0) {
-            ws.config = ws.load_config()?;
-            Self::discover_local_agents(&mut ws)?;
-        }
         let local_project = ws
             .inventory_project
             .clone()
@@ -374,26 +368,6 @@ impl App {
                 ),
                 Level::Info,
             );
-        }
-        match startup_repair {
-            Ok(report) if report.repaired > 0 || report.failed > 0 => {
-                app.toast(
-                    format!(
-                        "Startup repair: {} repaired, {} failed",
-                        report.repaired, report.failed
-                    ),
-                    if report.failed > 0 {
-                        Level::Error
-                    } else {
-                        Level::Ok
-                    },
-                );
-            }
-            Err(error) => app.toast(
-                format!("Startup repair: {error:#}; review Health"),
-                Level::Error,
-            ),
-            _ => {}
         }
         Ok(app)
     }
@@ -569,9 +543,9 @@ impl App {
 
     fn on_task(&mut self, out: TaskOutput) -> Vec<Action> {
         match out {
-            TaskOutput::RepairPlan(result) => match result {
-                Ok(report) => vec![Action::OpenModal(Box::new(Modal::HealthRepair(Box::new(
-                    super::views::health::RepairDialog::preview(report),
+            TaskOutput::RepairPlan(options, result) => match result {
+                Ok(plan) => vec![Action::OpenModal(Box::new(Modal::HealthRepair(Box::new(
+                    super::views::health::RepairDialog::preview(options, plan),
                 ))))],
                 Err(e) => vec![Action::Error(format!("Repair preview: {e:#}"))],
             },
@@ -4224,37 +4198,17 @@ mod context_menu_tests {
 
         app.apply(Action::SwitchTab(Tab::Health));
         app.enter_page();
-        let mut remove_link = false;
-        let mut adopt_copy = false;
-        let mut health_relink = false;
-        let mut health_adopt = false;
         for _ in 0..64 {
             assert_footer_matches_focus(&mut app, "health repair-state row");
             let hints = app.footer_hints();
-            remove_link |= hints
-                .iter()
-                .any(|(key, desc)| *key == "x" && *desc == "remove link");
-            adopt_copy |= hints
-                .iter()
-                .any(|(key, desc)| *key == "a" && *desc == "adopt copy");
-            health_relink |= hints
-                .iter()
-                .any(|(key, desc)| *key == "r" && *desc == "relink");
-            health_adopt |= hints
-                .iter()
-                .any(|(key, desc)| *key == "a" && *desc == "adopt");
+            assert!(
+                hints
+                    .iter()
+                    .any(|(key, desc)| *key == "a" && *desc == "actions")
+            );
+            assert!(hints.iter().all(|(key, _)| !matches!(*key, "x" | "r")));
             key(&mut app, KeyCode::Down);
         }
-        assert!(
-            remove_link,
-            "broken or foreign health row should expose remove link"
-        );
-        assert!(adopt_copy, "foreign health row should expose adopt copy");
-        assert!(
-            health_relink,
-            "identical shadow health row should expose relink"
-        );
-        assert!(health_adopt, "agent-only health row should expose adopt");
     }
 
     #[test]
@@ -4437,43 +4391,6 @@ mod context_menu_tests {
                 .as_slice(),
             [Action::Quit]
         ));
-    }
-}
-
-#[cfg(test)]
-mod startup_repair_tests {
-    use super::*;
-
-    #[test]
-    fn startup_removes_absent_metadata_before_building_the_first_snapshot() {
-        let temp = skills::ops::DownloadDir::new("tui-startup-repair").unwrap();
-        let root = temp.path().join("root");
-        skills::config::Config {
-            agents: vec![],
-            ..Default::default()
-        }
-        .save(&root)
-        .unwrap();
-        let ws = Workspace::open(&root).unwrap();
-        ws.meta
-            .save(
-                "gone",
-                &skills::meta::SkillMeta {
-                    source: Some(skills::meta::Source::Git {
-                        url: "https://example.invalid/source.git".into(),
-                        branch: None,
-                        subpath: None,
-                        revision: None,
-                    }),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let (tx, _) = std::sync::mpsc::channel();
-        let app = App::new_with_launch_directory(ws, tx, Some(temp.path())).unwrap();
-        assert!(!app.ws.meta.exists("gone"));
-        assert!(app.snap.get("gone").is_none());
-        assert!(app.ws.meta.dir.join(".repair-backups").is_dir());
     }
 }
 

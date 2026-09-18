@@ -45,6 +45,19 @@ pub(crate) fn draw(
     summary: &str,
     th: &Theme,
 ) -> [Rect; 2] {
+    draw_with_labels(f, area, focus, enabled, summary, ("✓ Apply", "Cancel"), th)
+}
+
+/// Draw a shared footer with caller-provided primary and secondary labels.
+pub(crate) fn draw_with_labels(
+    f: &mut Frame,
+    area: Rect,
+    focus: ChoiceFocus,
+    enabled: bool,
+    summary: &str,
+    labels: (&str, &str),
+    th: &Theme,
+) -> [Rect; 2] {
     if area.height == 0 || area.width == 0 {
         return [Rect::default(); 2];
     }
@@ -54,15 +67,22 @@ pub(crate) fn draw(
             Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1),
         );
     }
-    let bw = 11.min(area.width / 2);
-    let x = area.right().saturating_sub(bw * 2);
+    let labels = [format!("[ {} ]", labels.0), format!("[ {} ]", labels.1)];
+    let widths = labels
+        .each_ref()
+        .map(|label| (label.len() as u16).min(area.width / 2));
+    let total_width = widths[0].saturating_add(widths[1]);
+    let x = area.right().saturating_sub(total_width);
     let y = area.bottom() - 1;
     f.render_widget(
         Paragraph::new(summary).style(th.dim()),
         Rect::new(area.x, y, x - area.x, 1),
     );
-    let rects = [Rect::new(x, y, bw, 1), Rect::new(x + bw, y, bw, 1)];
-    for (i, label) in ["[ ✓ Apply ]", "[ Cancel ]"].iter().enumerate() {
+    let rects = [
+        Rect::new(x, y, widths[0], 1),
+        Rect::new(x + widths[0], y, widths[1], 1),
+    ];
+    for (i, label) in labels.iter().enumerate() {
         let active = focus
             == if i == 0 {
                 ChoiceFocus::Apply
@@ -77,7 +97,7 @@ pub(crate) fn draw(
         if i == 0 && !enabled {
             style = style.fg(th.placeholder);
         }
-        f.render_widget(Paragraph::new(*label).style(style), rects[i]);
+        f.render_widget(Paragraph::new(label.as_str()).style(style), rects[i]);
     }
     rects
 }
@@ -142,5 +162,28 @@ mod tests {
             f.key(KeyCode::BackTab, false);
             assert_eq!(f, expected);
         }
+    }
+
+    #[test]
+    fn custom_labels_get_independent_button_widths() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut terminal = Terminal::new(TestBackend::new(80, 2)).unwrap();
+        let mut rects = [Rect::default(); 2];
+        terminal
+            .draw(|f| {
+                rects = draw_with_labels(
+                    f,
+                    f.area(),
+                    ChoiceFocus::Apply,
+                    true,
+                    "Ready",
+                    ("Analyze", "Back"),
+                    &Theme::default(),
+                )
+            })
+            .unwrap();
+        assert_eq!(rects[0].width, "[ Analyze ]".len() as u16);
+        assert_eq!(rects[1].width, "[ Back ]".len() as u16);
+        assert_eq!(rects[0].right(), rects[1].x);
     }
 }

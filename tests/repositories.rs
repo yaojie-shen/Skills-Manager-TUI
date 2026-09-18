@@ -123,7 +123,7 @@ fn repository_deployment_preserves_skill_name_without_source_prefix() {
         .unwrap();
     fetched.cleanup();
     let snap = f.ws.scan().unwrap();
-    assert_eq!(snap.get(&keys[0]).unwrap().deployment_name(), name);
+    assert_eq!(snap.get(&keys[0]).unwrap().deployment_name(), Some(name));
     let plan = deploy::plan_deploy(&f.ws, &snap, &keys, &["sample".into()]).unwrap();
     deploy::apply(&plan).unwrap();
     assert_eq!(
@@ -771,35 +771,19 @@ fn same_folder_different_sources_require_choice_and_track_actual_link() {
     let snap = f.ws.scan().unwrap();
     let both =
         deploy::plan_deploy(&f.ws, &snap, &[a.clone(), b.clone()], &["sample".into()]).unwrap();
-    assert!(deploy::apply(&both).is_err());
-    assert!(!f.dir.join("agent").exists());
-    let only_a =
-        deploy::plan_deploy(&f.ws, &snap, std::slice::from_ref(&a), &["sample".into()]).unwrap();
-    deploy::apply(&only_a).unwrap();
-    let snap = f.ws.scan().unwrap();
-    assert_eq!(
-        snap.get(&a).unwrap().deploy["sample"],
-        DeployState::Deployed
+    assert!(
+        skills::ops::name_choices::Pending::for_actions(&f.ws, &snap, &both)
+            .unwrap()
+            .is_none(),
+        "folder/key aliases do not create a Name conflict"
     );
-    assert_eq!(
-        snap.get(&b).unwrap().deploy["sample"],
-        DeployState::NotDeployed
-    );
-    let plan =
-        deploy::plan_deploy(&f.ws, &snap, std::slice::from_ref(&b), &["sample".into()]).unwrap();
-    let pending = skills::ops::name_choices::Pending::for_actions(&f.ws, &snap, &plan)
-        .unwrap()
-        .unwrap();
-    assert_eq!(pending.groups.len(), 1);
-    assert_eq!(pending.groups[0].candidates.len(), 2);
-    let choice = pending.groups[0]
-        .candidates
-        .iter()
-        .position(|c| c.key.as_ref() == Some(&b))
-        .unwrap();
-    pending.apply(&f.ws, &[Some(choice)]).unwrap();
+    deploy::apply(&both).unwrap();
     assert_eq!(
         std::fs::read_link(f.dir.join("agent/review")).unwrap(),
+        f.ws.skill_path(&a)
+    );
+    assert_eq!(
+        std::fs::read_link(f.dir.join("agent/audit")).unwrap(),
         f.ws.skill_path(&b)
     );
     let snap = f.ws.scan().unwrap();
@@ -807,7 +791,7 @@ fn same_folder_different_sources_require_choice_and_track_actual_link() {
         deploy::plan_undeploy(&f.ws, &snap, std::slice::from_ref(&a), &["sample".into()]).unwrap();
     deploy::apply(&remove_a).unwrap();
     assert_eq!(
-        std::fs::read_link(f.dir.join("agent/review")).unwrap(),
+        std::fs::read_link(f.dir.join("agent/audit")).unwrap(),
         f.ws.skill_path(&b)
     );
     assert!(f.ws.skill_path(&a).is_dir());

@@ -16,7 +16,6 @@ pub enum Command {
     Check,
     Update,
     Accept,
-    Migrate,
     Remove,
     Relink,
     Adopt,

@@ -421,6 +421,16 @@ pub fn apply_scoped(
         }
     }
     let snap = scoped.scan_for_links()?;
+    for (agent, _, _) in changes {
+        if let Some(report) = snap.agent(&agent.key)
+            && let crate::reconcile::AgentDirMode::ReadOnly { reason, .. } = &report.mode
+        {
+            anyhow::bail!(
+                "{}: agent directory is read-only: {reason}",
+                agent.display_name()
+            );
+        }
+    }
     let mut actions = Vec::new();
     let mut visited = std::collections::BTreeMap::new();
     for (agent, on, _) in changes {
@@ -470,7 +480,6 @@ pub fn apply_scoped(
         if let super::deploy::Action::Skip { reason, skill, .. } = action {
             ensure!(
                 reason == "already deployed"
-                    || reason == "agent reads the skills root directly; already deployed"
                     || reason == "not deployed"
                     || reason == "agent dir missing or foreign",
                 "{skill}: {reason}"
@@ -556,6 +565,7 @@ pub fn apply_actions(
     // set of installed skill keys. Keep their maintenance out of reversible history.
     let irreversible = actions.iter().any(|a| match a {
         Action::Relink { .. } => true,
+        Action::Clean { .. } => true,
         Action::Unlink { skill, .. } => !before.contains(skill),
         _ => false,
     });
@@ -606,6 +616,14 @@ fn restore_scanned_deployment(
     desired: &DeploymentState,
     snap: &crate::reconcile::Snapshot,
 ) -> Result<String> {
+    if let Some(report) = snap.agent(&agent.key)
+        && let crate::reconcile::AgentDirMode::ReadOnly { reason, .. } = &report.mode
+    {
+        anyhow::bail!(
+            "{}: agent directory is read-only: {reason}",
+            agent.display_name()
+        );
+    }
     ensure!(
         &deployed_in(snap, agent) == expected,
         "deployment state changed since this operation; refresh and retry"
@@ -642,7 +660,12 @@ fn restore_scanned_deployment(
     }
     let actions = super::deploy::resolve_names(snap, &actions, None)?;
     let mut actions = actions;
-    actions.sort_by_key(|a| !matches!(a, super::deploy::Action::Unlink { .. }));
+    actions.sort_by_key(|a| {
+        !matches!(
+            a,
+            super::deploy::Action::Unlink { .. } | super::deploy::Action::Clean { .. }
+        )
+    });
     for action in &actions {
         if let super::deploy::Action::Skip { reason, skill, .. } = action {
             let missing_removal = removed.contains(skill)
@@ -650,10 +673,7 @@ fn restore_scanned_deployment(
                     .agent(&agent.key)
                     .is_some_and(|a| a.mode == crate::reconcile::AgentDirMode::Missing);
             ensure!(
-                reason == "already deployed"
-                    || reason == "agent reads the skills root directly; already deployed"
-                    || reason == "not deployed"
-                    || missing_removal,
+                reason == "already deployed" || reason == "not deployed" || missing_removal,
                 "{skill}: {reason}"
             );
         }

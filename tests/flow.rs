@@ -128,149 +128,7 @@ fn scan_tags_notes_and_baseline() {
 }
 
 #[test]
-fn missing_and_rename_detection() {
-    let f = Fixture::new("rename");
-    f.add_skill("gamma", "g");
-    let mut ws = f.ws();
-    edit::tag_add(&ws, "gamma", &["x".into()]).unwrap();
-    ws.config = ws.load_config().unwrap();
-    std::os::unix::fs::symlink(&f.root, &f.agent_a).unwrap();
-
-    std::fs::rename(f.root.join("gamma"), f.root.join("gamma2")).unwrap();
-    let snap = ws.scan().unwrap();
-    assert_eq!(snap.get("gamma").unwrap().status, SkillStatus::Missing);
-    assert_eq!(snap.get("gamma2").unwrap().status, SkillStatus::Local);
-    assert_eq!(
-        snap.get("gamma").unwrap().deploy["a"],
-        DeployState::NotDeployed
-    );
-
-    edit::migrate_meta(&ws, "gamma", "gamma2").unwrap();
-    ws.config = ws.load_config().unwrap();
-    let snap = ws.scan().unwrap();
-    assert!(snap.get("gamma").is_none());
-    assert_eq!(snap.get("gamma2").unwrap().tags, vec!["x"]);
-
-    std::fs::remove_dir_all(f.root.join("gamma2")).unwrap();
-    let snap = ws.scan().unwrap();
-    assert_eq!(snap.get("gamma2").unwrap().status, SkillStatus::Missing);
-    assert_eq!(
-        snap.get("gamma2").unwrap().deploy["a"],
-        DeployState::NotDeployed
-    );
-}
-
-#[test]
-fn external_move_repairs_links_presets_and_preserves_metadata() {
-    let f = Fixture::new("external-move");
-    f.add_skill("old", "move me");
-    let mut ws = f.ws();
-    edit::tag_add(&ws, "old", &["keep".into()]).unwrap();
-    ws.presets
-        .save(&Preset {
-            name: "daily".into(),
-            skills: vec!["old".into(), "local/new".into()],
-            ..Default::default()
-        })
-        .unwrap();
-    std::fs::create_dir_all(&f.agent_a).unwrap();
-    std::fs::create_dir_all(&f.agent_b).unwrap();
-    std::os::unix::fs::symlink(f.root.join("old"), f.agent_a.join("old")).unwrap();
-    // An unrelated link with the old name must never be touched.
-    std::os::unix::fs::symlink(f.base.join("elsewhere"), f.agent_b.join("old")).unwrap();
-    std::fs::create_dir_all(f.root.join("local")).unwrap();
-    std::fs::rename(f.root.join("old"), f.root.join("local/new")).unwrap();
-    edit::migrate_meta(&ws, "old", "local/new").unwrap();
-    assert!(!skills::util::is_symlink(&f.agent_a.join("old")));
-    assert_eq!(
-        link_state(&f.agent_a, "new"),
-        Some(f.root.join("local/new"))
-    );
-    assert_eq!(
-        link_state(&f.agent_b, "old"),
-        Some(f.base.join("elsewhere"))
-    );
-    assert_eq!(
-        ws.presets.load("daily").unwrap().unwrap().skills,
-        vec!["local/new"]
-    );
-    ws.config = ws.load_config().unwrap();
-    let snap = ws.scan().unwrap();
-    assert!(snap.get("old").is_none());
-    assert_eq!(snap.get("local/new").unwrap().tags, vec!["keep"]);
-}
-
-#[test]
-fn external_move_conflict_is_detected_before_any_link_or_metadata_changes() {
-    let f = Fixture::new("external-conflict");
-    f.add_skill("old", "move me");
-    let ws = f.ws();
-    edit::tag_add(&ws, "old", &["keep".into()]).unwrap();
-    for agent in [&f.agent_a, &f.agent_b] {
-        std::fs::create_dir_all(agent).unwrap();
-        std::os::unix::fs::symlink(f.root.join("old"), agent.join("old")).unwrap();
-    }
-    std::fs::create_dir(f.agent_b.join("new")).unwrap();
-    std::fs::rename(f.root.join("old"), f.root.join("new")).unwrap();
-    assert!(edit::migrate_meta(&ws, "old", "new").is_err());
-    assert_eq!(
-        skills::config::Config::load(&ws.root)
-            .unwrap()
-            .skill_tags("old"),
-        vec!["keep"]
-    );
-    assert!(!ws.meta.exists("new"));
-    for agent in [&f.agent_a, &f.agent_b] {
-        assert_eq!(link_state(agent, "old"), Some(f.root.join("old")));
-    }
-    assert!(!f.agent_a.join("new").exists());
-}
-
-#[test]
-fn external_move_preserves_deployment_name_when_moving_between_repositories() {
-    let f = Fixture::new("external-same-name");
-    f.add_skill("repos/a/one", "move me");
-    std::fs::write(
-        f.root.join("repos/a/one/SKILL.md"),
-        "---\nname: one\n---\nmove me",
-    )
-    .unwrap();
-    let ws = f.ws();
-    edit::tag_add(&ws, "repos/a/one", &["keep".into()]).unwrap();
-    std::fs::create_dir_all(&f.agent_a).unwrap();
-    std::os::unix::fs::symlink(f.root.join("repos/a/one"), f.agent_a.join("one")).unwrap();
-    std::os::unix::fs::symlink(f.root.join("repos/a/one"), f.root.join("one")).unwrap();
-    std::fs::create_dir_all(f.root.join("repos/b")).unwrap();
-    std::fs::rename(f.root.join("repos/a/one"), f.root.join("repos/b/one")).unwrap();
-    edit::migrate_meta(&ws, "repos/a/one", "repos/b/one").unwrap();
-    for dir in [&f.agent_a, &f.root] {
-        assert_eq!(link_state(dir, "one"), Some(f.root.join("repos/b/one")));
-    }
-}
-
-#[test]
-fn migration_rejects_existing_source_and_missing_or_external_destination() {
-    let f = Fixture::new("external-validation");
-    f.add_skill("old", "keep me");
-    f.add_skill("new", "different");
-    let ws = f.ws();
-    edit::tag_add(&ws, "old", &["keep".into()]).unwrap();
-    assert!(edit::migrate_meta(&ws, "old", "new").is_err());
-    std::fs::remove_dir_all(f.root.join("old")).unwrap();
-    assert!(edit::migrate_meta(&ws, "old", "missing").is_err());
-    std::fs::rename(f.root.join("new"), f.base.join("outside")).unwrap();
-    std::os::unix::fs::symlink(f.base.join("outside"), f.root.join("new")).unwrap();
-    assert!(edit::migrate_meta(&ws, "old", "new").is_err());
-    assert_eq!(
-        skills::config::Config::load(&ws.root)
-            .unwrap()
-            .skill_tags("old"),
-        vec!["keep"]
-    );
-}
-
-#[test]
-fn deploy_undeploy_and_convert() {
+fn deploy_skips_read_only_directory_and_manages_independent_directory() {
     let f = Fixture::new("deploy");
     f.add_skill("one", "1");
     f.add_skill("two", "2");
@@ -279,9 +137,15 @@ fn deploy_undeploy_and_convert() {
     let ws = f.ws();
 
     let snap = ws.scan().unwrap();
-    assert_eq!(snap.agent("a").unwrap().mode, AgentDirMode::DirLinked);
+    assert!(matches!(
+        snap.agent("a").unwrap().mode,
+        AgentDirMode::ReadOnly { .. }
+    ));
     assert_eq!(snap.agent("b").unwrap().mode, AgentDirMode::Missing);
-    assert_eq!(snap.get("one").unwrap().deploy["a"], DeployState::Deployed);
+    assert_eq!(
+        snap.get("one").unwrap().deploy["a"],
+        DeployState::NotDeployed
+    );
     assert_eq!(
         snap.get("one").unwrap().deploy["b"],
         DeployState::NoAgentDir
@@ -310,25 +174,8 @@ fn deploy_undeploy_and_convert() {
     deploy::apply(&actions).unwrap();
     assert_eq!(link_state(&f.agent_b, "one").unwrap(), f.root.join("one"));
 
-    // Convert A to per-skill links.
     let snap = ws.scan().unwrap();
-    let actions = deploy::plan_convert(&ws, &snap, "a").unwrap();
-    deploy::apply(&actions).unwrap();
-    let snap = ws.scan().unwrap();
-    assert_eq!(snap.agent("a").unwrap().mode, AgentDirMode::Real);
-    assert_eq!(
-        snap.agent("a").unwrap().entries["two"],
-        EntryState::Deployed
-    );
-
-    // Undeploy one from A only.
-    let actions = deploy::plan_undeploy(&ws, &snap, &["one".into()], &["a".into()]).unwrap();
-    deploy::apply(&actions).unwrap();
-    let snap = ws.scan().unwrap();
-    assert_eq!(
-        snap.get("one").unwrap().deploy["a"],
-        DeployState::NotDeployed
-    );
+    assert!(snap.agent("a").unwrap().entries.is_empty());
     assert_eq!(snap.get("one").unwrap().deploy["b"], DeployState::Deployed);
 
     // Shadow: a real copy in agent B is never touched.
@@ -410,7 +257,7 @@ fn install_local_rename_remove() {
         DeployState::Deployed
     );
     assert_eq!(
-        link_state(&f.agent_a, "renamed").unwrap(),
+        link_state(&f.agent_a, "srcskill").unwrap(),
         f.root.join("renamed")
     );
 
@@ -418,7 +265,7 @@ fn install_local_rename_remove() {
     edit::remove(&ws, &snap, "renamed", false).unwrap();
     let snap = ws.scan().unwrap();
     assert!(snap.get("renamed").is_none());
-    assert!(!f.agent_a.join("renamed").exists());
+    assert!(!f.agent_a.join("srcskill").exists());
     assert!(!ws.meta.exists("renamed"));
 }
 
@@ -820,14 +667,14 @@ fn clean_removes_a_broken_link_and_undo_relinks_once_the_skill_is_back() {
     // Naming nothing cleans every broken link and leaves the healthy ones
     // out of it; naming a healthy one is answered rather than ignored.
     let plan = deploy::plan_clean(&ws, &snap, "a", &[]).unwrap();
-    assert_eq!(
-        plan,
-        vec![Action::Unlink {
-            agent: "a".into(),
-            skill: "printer".into(),
-            path: f.agent_a.join("printer"),
-        }]
-    );
+    assert!(matches!(
+        plan.as_slice(),
+        [Action::Clean { agent, skill, path, target, .. }]
+            if agent == "a"
+                && skill == "printer"
+                && path == &f.agent_a.join("printer")
+                && target == &dir
+    ));
     let named = deploy::plan_clean(&ws, &snap, "a", &["bicycle".into()]).unwrap();
     assert!(matches!(&named[0], Action::Skip { skill, .. } if skill == "bicycle"));
 
@@ -860,6 +707,122 @@ fn clean_removes_a_broken_link_and_undo_relinks_once_the_skill_is_back() {
         link_state(&f.agent_a, "printer").unwrap(),
         f.root.join("printer")
     );
+}
+
+#[test]
+fn clean_preview_tolerates_an_already_removed_or_safely_repaired_link() {
+    let removed = Fixture::new("clean-already-removed");
+    let missing = removed.base.join("missing");
+    std::fs::create_dir_all(&removed.agent_a).unwrap();
+    std::os::unix::fs::symlink(&missing, removed.agent_a.join("broken")).unwrap();
+    let ws = removed.ws();
+    let plan = deploy::plan_clean(&ws, &ws.scan().unwrap(), "a", &[]).unwrap();
+    std::fs::remove_file(removed.agent_a.join("broken")).unwrap();
+    assert_eq!(deploy::apply(&plan).unwrap(), 0);
+
+    let repaired = Fixture::new("clean-safely-repaired");
+    let target = repaired.base.join("later");
+    std::fs::create_dir_all(&repaired.agent_a).unwrap();
+    std::os::unix::fs::symlink(&target, repaired.agent_a.join("broken")).unwrap();
+    let ws = repaired.ws();
+    let plan = deploy::plan_clean(&ws, &ws.scan().unwrap(), "a", &[]).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    assert_eq!(deploy::apply(&plan).unwrap(), 0);
+    assert_eq!(
+        std::fs::read_link(repaired.agent_a.join("broken")).unwrap(),
+        target
+    );
+}
+
+#[test]
+fn clean_preview_rejects_a_retargeted_replaced_or_non_link_entry() {
+    for replacement in ["retargeted", "same-target", "ordinary-file"] {
+        let f = Fixture::new(&format!("clean-{replacement}"));
+        let original = f.base.join("original-missing");
+        let other = f.base.join("other-missing");
+        let path = f.agent_a.join("broken");
+        std::fs::create_dir_all(&f.agent_a).unwrap();
+        std::os::unix::fs::symlink(&original, &path).unwrap();
+        let ws = f.ws();
+        let plan = deploy::plan_clean(&ws, &ws.scan().unwrap(), "a", &[]).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        match replacement {
+            "retargeted" => std::os::unix::fs::symlink(&other, &path).unwrap(),
+            "same-target" => std::os::unix::fs::symlink(&original, &path).unwrap(),
+            "ordinary-file" => std::fs::write(&path, "keep me").unwrap(),
+            _ => unreachable!(),
+        }
+
+        assert!(deploy::apply(&plan).is_err(), "accepted {replacement}");
+        if replacement == "ordinary-file" {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+        } else {
+            assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+        }
+    }
+}
+
+#[test]
+fn clean_preview_rejects_a_replaced_parent_directory() {
+    let f = Fixture::new("clean-parent-replaced");
+    let target = f.base.join("missing");
+    let path = f.agent_a.join("broken");
+    std::fs::create_dir_all(&f.agent_a).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    let ws = f.ws();
+    let plan = deploy::plan_clean(&ws, &ws.scan().unwrap(), "a", &[]).unwrap();
+
+    std::fs::rename(&f.agent_a, f.base.join("old-agent-a")).unwrap();
+    std::fs::create_dir_all(&f.agent_a).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+
+    assert!(deploy::apply(&plan).is_err());
+    assert!(std::fs::symlink_metadata(path).unwrap().is_symlink());
+}
+
+#[test]
+fn clean_batch_validates_every_link_before_removing_any() {
+    let f = Fixture::new("clean-batch-atomic");
+    std::fs::create_dir_all(&f.agent_a).unwrap();
+    for name in ["first", "second"] {
+        std::os::unix::fs::symlink(f.base.join(format!("missing-{name}")), f.agent_a.join(name))
+            .unwrap();
+    }
+    let ws = f.ws();
+    let plan = deploy::plan_clean(&ws, &ws.scan().unwrap(), "a", &[]).unwrap();
+    assert_eq!(plan.len(), 2);
+
+    std::fs::remove_file(f.agent_a.join("second")).unwrap();
+    std::os::unix::fs::symlink(f.base.join("changed"), f.agent_a.join("second")).unwrap();
+
+    assert!(deploy::apply(&plan).is_err());
+    assert!(
+        std::fs::symlink_metadata(f.agent_a.join("first"))
+            .unwrap()
+            .is_symlink(),
+        "batch preflight must run before the first removal"
+    );
+}
+
+#[test]
+fn ordinary_undeploy_keeps_its_existing_unlink_semantics() {
+    let f = Fixture::new("undeploy-retargeted");
+    f.add_skill("printer", "prints");
+    let ws = f.ws();
+    let deploy_plan =
+        deploy::plan_deploy(&ws, &ws.scan().unwrap(), &["printer".into()], &["a".into()]).unwrap();
+    deploy::apply(&deploy_plan).unwrap();
+    let undeploy_plan =
+        deploy::plan_undeploy(&ws, &ws.scan().unwrap(), &["printer".into()], &["a".into()])
+            .unwrap();
+
+    let path = f.agent_a.join("printer");
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(f.base.join("other"), &path).unwrap();
+
+    assert_eq!(deploy::apply(&undeploy_plan).unwrap(), 1);
+    assert!(!entry_exists(&path));
 }
 
 #[test]
@@ -1034,13 +997,18 @@ fn aliased_roots_use_the_same_identity_for_adopt_and_deployment() {
     // Also exercise the public scan entry point with an unnormalized path.
     let snap = skills::reconcile::scan(&alias, &ws.config).unwrap();
     assert_eq!(snap.root, f.root);
-    assert_eq!(snap.agent("b").unwrap().mode, AgentDirMode::DirLinked);
-    for agent in ["a", "b"] {
-        assert_eq!(
-            snap.get("printer").unwrap().deploy[agent],
-            DeployState::Deployed
-        );
-    }
+    assert!(matches!(
+        snap.agent("b").unwrap().mode,
+        AgentDirMode::ReadOnly { .. }
+    ));
+    assert_eq!(
+        snap.get("printer").unwrap().deploy["a"],
+        DeployState::Deployed
+    );
+    assert_eq!(
+        snap.get("printer").unwrap().deploy["b"],
+        DeployState::NotDeployed
+    );
     let entries = &snap.agent("a").unwrap().entries;
     assert!(matches!(entries["other-name"], EntryState::Foreign { .. }));
     assert!(matches!(entries["foreign"], EntryState::Foreign { .. }));

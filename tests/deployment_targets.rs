@@ -231,7 +231,7 @@ fn reviewed_local_actions_can_be_undone_without_a_registered_agent() {
 }
 
 #[test]
-fn installing_into_a_whole_directory_reader_is_a_noop() {
+fn installing_into_a_whole_directory_reader_is_rejected() {
     let f = Fixture::new("whole-directory-noop");
     let ws = f.ws();
     let path = f.0.join("reader");
@@ -241,8 +241,7 @@ fn installing_into_a_whole_directory_reader_is_a_noop() {
         name: "Reader".into(),
         skills_dir: path.display().to_string(),
     };
-    let (_, intent) = targets::set_deployed(&ws, &target, None, &["sample".into()], true).unwrap();
-    assert!(intent.is_none());
+    assert!(targets::set_deployed(&ws, &target, None, &["sample".into()], true).is_err());
     assert!(targets::set_deployed(&ws, &target, None, &["sample".into()], false).is_err());
     assert!(ws.skill_path("sample").is_dir());
     assert_eq!(std::fs::read_link(path).unwrap(), ws.root);
@@ -1127,22 +1126,39 @@ fn shared_directory_links_have_identical_base_scan_and_scope_reports() {
             },
         ];
         let snap = ws.scan().unwrap();
-        for report in &snap.agents {
-            assert_eq!(report.mode, skills::reconcile::AgentDirMode::Real);
-            assert_eq!(report.documents.len(), 1);
-            assert_eq!(
-                report.entries.len(),
-                3,
-                "health still sees invalid and broken entries"
-            );
-            assert_eq!(
-                report.valid_count(|s| matches!(s, skills::reconcile::EntryState::Deployed)),
-                1
-            );
-        }
-        assert_eq!(snap.agents[0].entries, snap.agents[1].entries);
+        let linked = snap
+            .agents
+            .iter()
+            .find(|report| report.skills_dir == *source)
+            .unwrap();
+        assert!(matches!(
+            linked.mode,
+            skills::reconcile::AgentDirMode::ReadOnly { .. }
+        ));
+        assert!(linked.entries.is_empty());
+        assert!(linked.documents.is_empty());
+        let real = snap
+            .agents
+            .iter()
+            .find(|report| report.skills_dir == *target)
+            .unwrap();
+        assert_eq!(real.mode, skills::reconcile::AgentDirMode::Real);
+        assert_eq!(real.documents.len(), 1);
+        assert_eq!(real.entries.len(), 3);
+        assert_eq!(
+            real.valid_count(|s| matches!(s, skills::reconcile::EntryState::Deployed)),
+            1
+        );
         let scoped = skills::reconcile::rescope(&snap, &ws.config.agents).unwrap();
-        assert_eq!(scoped.agents[0].entries, snap.agents[0].entries);
+        assert_eq!(
+            scoped
+                .agents
+                .iter()
+                .find(|report| report.skills_dir == *source)
+                .unwrap()
+                .mode,
+            linked.mode
+        );
     }
 }
 
@@ -1186,8 +1202,17 @@ fn name_choices_keep_one_or_none_without_deleting_library_sources() {
         });
         pending.apply(&ws, &[choice]).unwrap();
         for key in ["first", "second"] {
-            assert_eq!(agent.skills_path().join(key).exists(), keep == Some(key));
             assert!(ws.root.join(key).join("SKILL.md").exists());
+        }
+        assert_eq!(
+            agent.skills_path().join("duplicate").exists(),
+            keep.is_some()
+        );
+        if let Some(key) = keep {
+            assert_eq!(
+                std::fs::canonicalize(agent.skills_path().join("duplicate")).unwrap(),
+                std::fs::canonicalize(ws.root.join(key)).unwrap()
+            );
         }
         assert!(
             agent.skills_path().join("sample").exists(),

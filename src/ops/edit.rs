@@ -145,122 +145,6 @@ pub fn accept(ws: &Workspace, key: &str) -> Result<SkillMeta> {
     Ok(meta)
 }
 
-/// Complete an externally performed move: preserve metadata, repair links that
-/// pointed exactly at the old path, and update tag and preset references.
-/// Content matching is only a suggestion; the caller explicitly chooses the pair.
-pub fn migrate_meta(ws: &Workspace, old: &str, new: &str) -> Result<()> {
-    migrate_meta_checked(ws, old, new, true, &ws.scan()?)
-}
-
-/// Use a caller's fresh scan for layout validation; filesystem preconditions
-/// are still checked below in both preview and apply mode.
-pub(crate) fn migrate_meta_checked(
-    ws: &Workspace,
-    old: &str,
-    new: &str,
-    apply: bool,
-    snap: &Snapshot,
-) -> Result<()> {
-    require_key(old)?;
-    require_key(new)?;
-    let from = ws.skill_path(old);
-    let to = ws.skill_path(new);
-    match std::fs::symlink_metadata(&from) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-        Ok(_) => bail!("{old} still exists; use rename to move an existing skill"),
-    }
-    crate::skill::SkillDoc::load(&to).context("migration destination is not a readable skill")?;
-    if snap.get(new).is_none_or(|r| r.name.is_none()) {
-        bail!("migration destination is outside the supported library layout");
-    }
-    let resolved = std::fs::canonicalize(&to)?;
-    if !resolved.starts_with(&ws.root) || crate::util::is_symlink(&to) {
-        bail!("migration destination must be a skill directory inside the root");
-    }
-
-    if ws.meta.exists(new) {
-        bail!("metadata for {new} already exists");
-    }
-    // Validate every destination before changing anything. Canonicalize agent
-    // directories so aliases of a shared directory are handled only once.
-    let config = ws.load_config()?;
-    let mut dirs = std::collections::BTreeSet::new();
-    for a in config.agents.iter().chain(&ws.config.agents) {
-        if a.skills_path().is_dir() {
-            dirs.insert(std::fs::canonicalize(a.skills_path())?);
-        }
-    }
-    dirs.insert(ws.root.clone()); // Root aliases for nested skills are deployments too.
-    let mut links = Vec::new();
-    for dir in dirs {
-        let link = dir.join(crate::repository::default_deploy_name(old));
-        if crate::util::link_target_abs(&link).as_ref() != Some(&from) {
-            continue;
-        }
-        let destination = dir.join(crate::repository::default_deploy_name(new));
-        let already_linked = std::fs::canonicalize(&destination).ok().as_ref() == Some(&resolved);
-        if destination != link && !already_linked {
-            match std::fs::symlink_metadata(&destination) {
-                Ok(_) => bail!(
-                    "migration blocked: {} already exists",
-                    destination.display()
-                ),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        links.push((link, destination, already_linked));
-    }
-    let mut presets = ws.presets.list()?;
-    for p in &mut presets {
-        if p.skills.iter().any(|s| s == old) {
-            for key in &mut p.skills {
-                if key == old {
-                    *key = new.to_string();
-                }
-            }
-            let mut seen = std::collections::BTreeSet::new();
-            p.skills.retain(|key| seen.insert(key.clone()));
-        }
-    }
-    if !apply {
-        return Ok(());
-    }
-    // Metadata is moved last so a failed reference write can be retried with the
-    // same old/new pair. Already repaired links are left intact on retry.
-    for (link, destination, already_linked) in links {
-        if crate::util::link_target_abs(&link).as_ref() != Some(&from) {
-            bail!("{} changed during migration; retry", link.display());
-        }
-        if destination == link {
-            let temporary = link.with_file_name(format!(
-                ".skills-migrate-{}-{}",
-                std::process::id(),
-                super::nanos()
-            ));
-            std::os::unix::fs::symlink(&to, &temporary)?;
-            let result = std::fs::rename(&temporary, &link);
-            if result.is_err() {
-                let _ = std::fs::remove_file(&temporary);
-            }
-            result?;
-        } else {
-            if !already_linked {
-                std::os::unix::fs::symlink(&to, &destination)?;
-            }
-            std::fs::remove_file(&link)?;
-        }
-    }
-    for p in presets {
-        if ws.presets.load(&p.name)?.as_ref() != Some(&p) {
-            ws.presets.save(&p)?;
-        }
-    }
-    Config::rename_tag_skill(&ws.root, old, Some(new))?;
-    ws.meta.rename(old, new)
-}
-
 /// Rename a skill: directory, metadata, and every agent link.
 pub fn rename(ws: &Workspace, snap: &Snapshot, old: &str, new: &str) -> Result<Vec<String>> {
     require_key(old)?;
@@ -273,18 +157,19 @@ pub fn rename(ws: &Workspace, snap: &Snapshot, old: &str, new: &str) -> Result<V
     if to.exists() || ws.meta.exists(new) {
         bail!("{new} already exists");
     }
+    let deployment_name = snap
+        .get(old)
+        .and_then(|record| record.deployment_name())
+        .context("skill has no valid declared name")?
+        .to_string();
     let mut log = Vec::new();
     // Drop old links first so no agent sees a dangling link longer than necessary.
     let agents: Vec<String> = snap
         .agents
         .iter()
         .filter(|a| {
-            (a.mode == AgentDirMode::Real
-                || (a.mode == AgentDirMode::SharedRoot && old.contains('/')))
-                && matches!(
-                    a.entries.get(&crate::repository::default_deploy_name(old)),
-                    Some(EntryState::Deployed)
-                )
+            a.mode == AgentDirMode::Real
+                && matches!(a.entries.get(&deployment_name), Some(EntryState::Deployed))
         })
         .map(|a| a.key.clone())
         .collect();
@@ -298,9 +183,7 @@ pub fn rename(ws: &Workspace, snap: &Snapshot, old: &str, new: &str) -> Result<V
     let mut linked = std::collections::BTreeSet::new();
     for a in &agents {
         let cfg = ws.config.agent(a).context("agent vanished")?;
-        let link = cfg
-            .skills_path()
-            .join(crate::repository::default_deploy_name(new));
+        let link = cfg.skills_path().join(&deployment_name);
         if link == to || !linked.insert(link.clone()) {
             continue;
         }
@@ -333,8 +216,10 @@ pub fn remove(ws: &Workspace, snap: &Snapshot, key: &str, keep_meta: bool) -> Re
         .agents
         .iter()
         .filter(|a| {
-            (a.mode == AgentDirMode::Real || a.mode == AgentDirMode::SharedRoot)
-                && a.entries.contains_key(&rec.deployment_name())
+            a.mode == AgentDirMode::Real
+                && rec
+                    .deployment_name()
+                    .is_some_and(|name| a.entries.contains_key(name))
         })
         .map(|a| a.key.clone())
         .collect();

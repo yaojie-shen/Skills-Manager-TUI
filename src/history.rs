@@ -101,7 +101,9 @@ impl Intent {
         for a in actions {
             match a {
                 Action::Link { skill, agent, .. } => added.push((skill.clone(), agent.clone())),
-                Action::Unlink { skill, agent, .. } => removed.push((skill.clone(), agent.clone())),
+                Action::Unlink { skill, agent, .. } | Action::Clean { skill, agent, .. } => {
+                    removed.push((skill.clone(), agent.clone()))
+                }
                 // A relink deleted a directory. Taking the link out again would
                 // not bring the directory back, and the link planners have no
                 // way to say "a real directory with this content"; a step that
@@ -1058,7 +1060,10 @@ fn plan_pairs(
     remove: &[Pair],
 ) -> Result<Vec<Action>> {
     let mut actions = Vec::new();
-    for (pairs, deploying) in [(add, true), (remove, false)] {
+    // Remove first so replacing one same-named deployment with another is
+    // reversible: linking first would collide, and unlinking last would delete
+    // the newly restored link.
+    for (pairs, deploying) in [(remove, false), (add, true)] {
         let mut by_agent: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         for (skill, agent) in pairs {
             by_agent.entry(agent).or_default().push(skill.clone());

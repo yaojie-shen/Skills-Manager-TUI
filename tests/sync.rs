@@ -260,7 +260,7 @@ fn cli_operations_back_up_automatically_but_preview_is_read_only() {
     let before = head(&one);
     write(&one, "unsaved", "change");
     let output = Command::new(env!("CARGO_BIN_EXE_skills"))
-        .args(["--root", one.root.to_str().unwrap(), "repair", "--dry-run"])
+        .args(["--root", one.root.to_str().unwrap(), "repair"])
         .output()
         .unwrap();
     assert!(

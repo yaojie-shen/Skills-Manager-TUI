@@ -65,6 +65,9 @@ impl Pending {
                     }
                     deploy::Action::Unlink {
                         agent: key, skill, ..
+                    }
+                    | deploy::Action::Clean {
+                        agent: key, skill, ..
                     } if key == &agent.key => {
                         after.remove(skill);
                     }
@@ -94,10 +97,9 @@ impl Pending {
                 .agent(&conflict.agent)
                 .ok_or_else(|| anyhow::anyhow!("agent no longer exists"))?;
             let directory = identity(&report.skills_dir);
-            let options = groups
-                .entry((directory.clone(), conflict.name))
-                .or_default();
-            let path = directory.join(crate::repository::default_deploy_name(&conflict.skill));
+            let name = conflict.name.clone();
+            let options = groups.entry((directory.clone(), name.clone())).or_default();
+            let path = directory.join(name);
             options
                 .entry((path.clone(), Some(conflict.skill.clone())))
                 .or_insert(Candidate {

@@ -9,6 +9,7 @@ mod context;
 use super::preview::{Overlay, kv};
 use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints, Tab};
+use crate::tui::components::choice_footer::{self, ChoiceEvent, ChoiceFocus};
 use crate::tui::components::context_menu::{Command, Item, Request, Target};
 use crate::tui::components::layout::split_panes;
 use crate::tui::components::skill::{status_glyph, status_text};
@@ -24,7 +25,7 @@ use skills::meta::{Source, short_rev};
 use skills::ops::update::CheckResult;
 use skills::ops::{deploy, edit};
 use skills::reconcile::{AgentDirMode, EntryState, HealthClass, SkillRecord, SkillStatus};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Which of the page's actions apply to one row. Decided once per rebuild
 /// from the record and its check result, so both the key handler and the
@@ -32,7 +33,6 @@ use std::collections::BTreeMap;
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Caps {
     accept: bool,
-    migrate: bool,
     clean: bool,
     update: bool,
 }
@@ -46,8 +46,7 @@ impl Caps {
                 r.status,
                 SkillStatus::Modified | SkillStatus::MissingBaseline
             ),
-            migrate: matches!(r.status, SkillStatus::Renamed { .. }),
-            clean: matches!(r.status, SkillStatus::Missing | SkillStatus::Invalid { .. }),
+            clean: matches!(r.status, SkillStatus::Invalid { .. }),
             // `update::prepare` requires usable repository content, so
             // offering `U` for a missing or invalid skill would only produce
             // an error toast.
@@ -63,7 +62,6 @@ impl Caps {
 
 struct Row {
     class: Option<HealthClass>,
-    archive: bool,
     key: String,
     caps: Caps,
     agent: Option<String>,
@@ -203,7 +201,6 @@ impl HealthView {
             })
             .map(|s| Row {
                 class: s.status.health_class().or(Some(HealthClass::Review)),
-                archive: s.status == SkillStatus::Missing,
                 key: s.key.clone(),
                 caps: Caps::of(s, self.checks.get(&s.key)),
                 agent: None,
@@ -226,9 +223,12 @@ impl HealthView {
                     "Review: agent directory does not exist. Deploy from Agents if needed; unused agents do not need a directory."
                         .to_string(),
                 ),
-                AgentDirMode::DirForeign { target } => Some(format!(
-                    "Independent: agent directory links outside the root → {}. No repair required unless central management is intended.",
-                    target.display()
+                AgentDirMode::ReadOnly { reason, resolved } => Some(format!(
+                    "Read-only: {reason}. Skills Manager will not modify this directory{}.",
+                    resolved
+                        .as_ref()
+                        .map(|path| format!(" → {}", path.display()))
+                        .unwrap_or_default()
                 )),
                 _ => None,
             };
@@ -245,7 +245,6 @@ impl HealthView {
             if let Some(explanation) = mode_issue {
                 self.rows.push(Row {
                     class: agent.mode.health_class(),
-                    archive: false,
                     key: "directory".into(),
                     caps: Caps::default(),
                     agent: Some(agent.key.clone()),
@@ -257,7 +256,6 @@ impl HealthView {
             for (name, state) in issues {
                 self.rows.push(Row {
                     class: state.health_class(),
-                    archive: false,
                     key: name.clone(),
                     caps: Caps::default(),
                     agent: Some(agent.key.clone()),
@@ -529,11 +527,6 @@ impl HealthView {
                 )));
                 lines.push(kv("meta", ctx.ws.meta.path(&key).display().to_string(), th));
                 meta_lines(&mut lines);
-                actions.push(action(
-                    "x",
-                    "Ctrl-P: restore or archive missing records in bulk; m: locate a moved skill"
-                        .into(),
-                ));
                 match &r.source {
                     Some(Source::Git { .. } | Source::Archive { .. }) => actions.push(action(
                         "",
@@ -572,8 +565,9 @@ impl HealthView {
                 ));
                 meta_lines(&mut lines);
                 actions.push(action(
-                    "m",
-                    format!("migrate: move metadata, repair links and references to \"{to}\""),
+                    "",
+                    "This possible move is informational only; no automatic migration is available."
+                        .into(),
                 ));
             }
             SkillStatus::Invalid { reason } => {
@@ -760,29 +754,12 @@ impl View for HealthView {
             self.rebuild(ctx);
             return vec![];
         }
-        if k.code == KeyCode::Char('m')
-            && self
-                .selected(ctx)
-                .is_some_and(|r| matches!(r.status, SkillStatus::Missing))
-        {
-            let r = self.selected(ctx).unwrap();
-            return vec![Action::OpenModal(Box::new(Modal::Input {
-                title: format!("Locate moved skill: {}", r.key),
-                input: crate::tui::widgets::Input::default(),
-                kind: crate::tui::modal::InputKind::Migrate {
-                    skill: r.key.clone(),
-                },
-                hint: "New library key (e.g. local/design/pdf); Enter previews changes".into(),
-                rect: Rect::default(),
-            }))];
-        }
         if let Some(actions) = self.agent_action(k.code, ctx) {
             return actions;
         }
         let command = match k.code {
             KeyCode::Char('U') => Some(Command::Update),
             KeyCode::Char('a') => Some(Command::Accept),
-            KeyCode::Char('m') => Some(Command::Migrate),
             KeyCode::Char('x') => Some(Command::Remove),
             _ => None,
         };
@@ -1003,9 +980,6 @@ impl View for HealthView {
         self.preview.draw(f, area, ctx);
     }
 
-    /// Only the keys that do something for the selected row. The statuses
-    /// are mutually exclusive, so at most one of `a`, `m`, `x` applies, with
-    /// or without `U`.
     fn hints(&self) -> Hints {
         if self.filter.editing {
             return &[("Enter/↓", "issues"), ("Esc", "clear filter")];
@@ -1013,145 +987,38 @@ impl View for HealthView {
         if let Some(hints) = self.preview.hints() {
             return hints;
         }
-        if let Some(row) = self.selected_row() {
-            if row.heading.is_some() {
-                return &[("c", "check updates"), ("Esc/q", "clear/back")];
-            }
-            if row.agent.is_some() {
-                return match row.state {
-                    Some(EntryState::Foreign { .. }) => &[
-                        ("x", "remove link"),
-                        ("a", "adopt copy"),
-                        ("Enter", "agents"),
-                        ("c", "check updates"),
-                        ("Esc/q", "clear/back"),
-                    ],
-                    Some(EntryState::Broken { .. }) => &[
-                        ("x", "remove link"),
-                        ("Enter", "act"),
-                        ("c", "check updates"),
-                        ("Esc/q", "clear/back"),
-                    ],
-                    Some(EntryState::Shadow { same_content: true }) => &[
-                        ("r", "relink"),
-                        ("Enter", "act"),
-                        ("c", "check updates"),
-                        ("Esc/q", "clear/back"),
-                    ],
-                    Some(EntryState::AgentOnly) => &[
-                        ("a", "adopt"),
-                        ("Enter", "act"),
-                        ("c", "check updates"),
-                        ("Esc/q", "clear/back"),
-                    ],
-                    _ => &[
-                        ("Enter", "agents"),
-                        ("c", "check updates"),
-                        ("Esc/q", "clear/back"),
-                    ],
-                };
-            }
-        }
-        let Some(caps) = self.selected_row().map(|r| r.caps) else {
+        if self.selected_row().is_none_or(|row| row.heading.is_some()) {
             return &[
                 ("c", "check updates"),
-                ("Esc", "clear/back"),
-                ("q", "clear/back"),
+                ("/", "filter"),
+                ("Esc/q", "clear/back"),
             ];
-        };
-        if caps.clean {
-            return if self.selected_row().is_some_and(|r| r.archive) {
-                &[
-                    ("x", "archive record"),
-                    ("m", "locate move"),
-                    ("Ctrl-P", "batch repair"),
-                    ("Esc", "clear/back"),
-                ]
-            } else {
-                &[
-                    ("x", "delete folder"),
-                    ("Enter", "details"),
-                    ("Ctrl-P", "batch repair"),
-                    ("Esc", "clear/back"),
-                ]
-            };
         }
-        match (caps.update, caps.accept, caps.migrate, caps.clean) {
-            (true, true, _, _) => &[
-                ("c", "check updates"),
-                ("U", "update"),
-                ("a", "accept"),
-                ("Enter", "open"),
-                ("M", "multi-select"),
-                ("Esc", "clear/back"),
-                ("q", "clear/back"),
-            ],
-            (true, false, true, _) => &[
-                ("c", "check updates"),
-                ("U", "update"),
-                ("m", "migrate"),
-                ("Enter", "open"),
-                ("M", "multi-select"),
-                ("Esc", "clear/back"),
-                ("q", "clear/back"),
-            ],
-            (true, false, false, true) => &[
-                ("c", "check updates"),
-                ("U", "update"),
-                ("x", "archive/delete"),
-                ("Enter", "open"),
-                ("M", "multi-select"),
-                ("Esc", "clear/back"),
-                ("q", "clear/back"),
-            ],
-            (true, false, false, false) => &[
-                ("c", "check updates"),
-                ("U", "update"),
-                ("Enter", "open"),
-                ("M", "multi-select"),
-                ("Esc", "clear/back"),
-                ("q", "clear/back"),
-            ],
-            (false, true, _, _) => &[
-                ("c", "check updates"),
-                ("a", "accept"),
-                ("Enter", "open"),
-                ("M", "multi-select"),
-                ("Esc", "clear/back"),
-                ("q", "clear/back"),
-            ],
-            (false, false, true, _) => &[
-                ("c", "check updates"),
-                ("m", "migrate"),
-                ("Enter", "open"),
-                ("M", "multi-select"),
-                ("Esc", "clear/back"),
-                ("q", "clear/back"),
-            ],
-            (false, false, false, true) => &[
-                ("c", "check updates"),
-                ("x", "archive/delete"),
-                ("Enter", "open"),
-                ("M", "multi-select"),
-                ("Esc", "clear/back"),
-                ("q", "clear/back"),
-            ],
-            (false, false, false, false) => &[
-                ("c", "check updates"),
-                ("Enter", "open"),
-                ("M", "multi-select"),
-                ("Esc", "clear/back"),
-                ("q", "clear/back"),
-            ],
-        }
+        &[
+            ("Enter", "open / resolve"),
+            ("a", "actions"),
+            ("/", "filter"),
+            ("c", "check updates"),
+            ("Esc/q", "clear/back"),
+        ]
     }
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 impl Row {
     fn heading(text: String) -> Self {
         Self {
             class: None,
-            archive: false,
             key: String::new(),
             caps: Caps::default(),
             agent: None,
@@ -1454,188 +1321,586 @@ mod tests {
     }
 }
 
-/// Shared CLI repair policies with a scrollable, explicit preview before writes.
+/// A staged deployment-link repair review. Nothing is written until Apply.
 #[derive(Default)]
 pub struct RepairDialog {
     options: skills::ops::repair::Options,
-    preview: Option<skills::ops::repair::Report>,
-    scroll: u16,
+    preview: Option<skills::ops::repair::RepairPlan>,
+    resolve: Option<RepairResolve>,
+    skipped: BTreeSet<String>,
+    list: ListNav,
+    focus: ChoiceFocus,
+    rect: Rect,
+    buttons: [Rect; 2],
 }
+
+#[derive(Default)]
+struct RepairResolve {
+    issue: usize,
+    input: crate::tui::widgets::Input,
+    shown: Vec<String>,
+    list: ListNav,
+}
+
 impl RepairDialog {
-    pub fn forget(key: &str) -> Self {
-        Self {
-            options: skills::ops::repair::Options {
-                forget_missing: true,
-                keys: vec![key.into()],
-                ..Default::default()
-            },
+    pub fn preview(
+        options: skills::ops::repair::Options,
+        report: skills::ops::repair::RepairPlan,
+    ) -> Self {
+        let mut dialog = Self {
+            options,
+            preview: Some(report),
             ..Default::default()
+        };
+        dialog.list.first(dialog.row_count());
+        dialog
+    }
+
+    pub fn hints(&self) -> Hints {
+        if self.resolve.is_some() {
+            return &[
+                ("type", "search Library"),
+                ("↑↓", "choose"),
+                ("Enter", "stage"),
+                ("Esc", "back"),
+            ];
+        }
+        if self.preview.is_some() {
+            &[
+                ("↑↓", "review"),
+                ("Enter", "resolve"),
+                ("Space", "stage / skip"),
+                ("Tab", "Apply"),
+                ("Esc", "cancel"),
+            ]
+        } else {
+            &[("Enter", "analyze"), ("Esc", "cancel")]
         }
     }
 
-    pub fn preview(report: skills::ops::repair::Report) -> Self {
-        Self {
-            preview: Some(report),
-            ..Default::default()
-        }
+    fn row_count(&self) -> usize {
+        self.preview
+            .as_ref()
+            .map_or(1, |plan| plan.analysis.issues.len())
     }
-    pub fn hints(&self) -> Hints {
-        if self.preview.is_some() {
-            &[("y", "apply preview"), ("↑↓", "scroll"), ("Esc", "cancel")]
+
+    fn staged_plan(&self) -> Option<skills::ops::repair::RepairPlan> {
+        let plan = self.preview.as_ref()?;
+        let mut staged = plan.clone();
+        staged
+            .actions
+            .retain(|action| !self.skipped.contains(action_id(action)));
+        Some(staged)
+    }
+
+    fn primary(&mut self) -> Vec<Action> {
+        if let Some(plan) = self.staged_plan() {
+            if plan.actions.is_empty() {
+                return vec![Action::CloseModal];
+            }
+            return vec![Action::CloseModal, Action::Spawn(Task::RepairApply(plan))];
+        }
+        vec![
+            Action::CloseModal,
+            Action::Spawn(Task::RepairPlan(self.options.clone())),
+        ]
+    }
+
+    fn secondary(&mut self) -> Vec<Action> {
+        if self.preview.take().is_some() {
+            self.skipped.clear();
+            self.focus = ChoiceFocus::List;
+            self.list.first(1);
+            vec![]
         } else {
-            &[
-                ("r", "restore missing"),
-                ("f", "archive missing"),
-                ("c", "clean links"),
-                ("Enter", "preview"),
-                ("Esc", "cancel"),
-            ]
+            vec![Action::CloseModal]
         }
     }
-    pub fn key(&mut self, key: KeyEvent) -> Vec<Action> {
-        match key.code {
-            KeyCode::Esc => return vec![Action::CloseModal],
-            KeyCode::Down => self.scroll = self.scroll.saturating_add(1),
-            KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(10),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::Char('y') if self.preview.as_ref().is_some_and(|p| p.planned > 0) => {
-                return vec![
-                    Action::CloseModal,
-                    Action::Spawn(Task::RepairApply(self.preview.take().unwrap())),
-                ];
-            }
-            KeyCode::Char('r') if self.preview.is_none() => {
-                self.options.restore_missing = !self.options.restore_missing;
-                self.options.forget_missing = false;
-            }
-            KeyCode::Char('f') if self.preview.is_none() => {
-                self.options.forget_missing = !self.options.forget_missing;
-                self.options.restore_missing = false;
-            }
-            KeyCode::Char('c') if self.preview.is_none() => {
-                self.options.clean_links = !self.options.clean_links
-            }
-            KeyCode::Enter if self.preview.is_none() => {
-                return vec![
-                    Action::CloseModal,
-                    Action::Spawn(Task::RepairPlan(self.options.clone())),
-                ];
-            }
-            _ => {}
-        }
-        vec![]
-    }
-    pub fn mouse(&mut self, m: MouseEvent) -> Vec<Action> {
-        match m.kind {
-            MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_add(3),
-            MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_sub(3),
-            _ => {}
-        }
-        vec![]
-    }
-    pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let area = Rect::new(
-            area.x + 1,
-            area.y + 1,
-            area.width.saturating_sub(2),
-            area.height.saturating_sub(2),
-        );
-        f.render_widget(crate::tui::widgets::OverlayClear, area);
-        let block = ctx
-            .settings
-            .theme
-            .block(" Health repair · Esc cancel ", true);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        let mut lines = if let Some(report) = &self.preview {
-            let mut lines = vec!["Preview only. y: apply listed actions; Esc: cancel.".into(), "Each item is checked again. Metadata is backed up; failures do not roll back earlier items.".into()];
-            lines.extend(report.lines());
-            lines
-        } else {
-            vec![
-                "Moved, deleted or edited folders: scan first, then review repairs.".into(),
-                "[x] Migrate unique content-matched moves and repair references".into(),
-                format!("[{}] r: Restore missing skills from baseline-matching local sources", if self.options.restore_missing { "x" } else { " " }),
-                format!("[{}] f: Archive obsolete missing records, then remove their references", if self.options.forget_missing { "x" } else { " " }),
-                format!("[{}] c: Remove links still broken after migration/restoration", if self.options.clean_links { "x" } else { " " }),
-                "Restore and archive are alternatives. Existing skill files are never deleted.".into(),
-                "Edited moves: close this dialog, select the missing skill and press m to specify its new library key.".into(),
-                "Different managed replacements: compare copies first; archive the obsolete record if no longer needed.".into(),
-                "Enter: scan and preview. Nothing is written yet.".into(),
-            ]
+
+    fn refilter_resolve(&mut self, ctx: &Ctx) {
+        let Some(resolve) = &mut self.resolve else {
+            return;
         };
-        if !self.options.keys.is_empty() && self.preview.is_none() {
-            lines.insert(
-                0,
-                format!("Selected records: {}", self.options.keys.join(", ")),
+        let query = resolve.input.value().to_lowercase();
+        let Some(skills::ops::repair::RepairIssue::Broken { link_name, .. }) = self
+            .preview
+            .as_ref()
+            .and_then(|plan| plan.analysis.issues.get(resolve.issue))
+        else {
+            return;
+        };
+        resolve.shown = ctx
+            .snap
+            .skills
+            .iter()
+            .filter(|skill| {
+                skill.status.is_present()
+                    && skill.deployment_name() == Some(link_name.as_str())
+                    && (skill.key.to_lowercase().contains(&query)
+                        || skill
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.contains(&query)))
+            })
+            .map(|skill| skill.key.clone())
+            .collect();
+        resolve.list.first(resolve.shown.len());
+    }
+
+    fn open_resolve(&mut self, ctx: &Ctx) {
+        let Some(issue) = self
+            .preview
+            .as_ref()
+            .and_then(|plan| plan.analysis.issues.get(self.list.selected()?))
+        else {
+            return;
+        };
+        if !matches!(
+            issue,
+            skills::ops::repair::RepairIssue::Broken { candidates, .. }
+                if candidates.len() != 1
+        ) {
+            return;
+        }
+        self.resolve = Some(RepairResolve {
+            issue: self.list.selected().unwrap_or(0),
+            ..Default::default()
+        });
+        self.refilter_resolve(ctx);
+    }
+
+    fn accept_resolve(&mut self) -> bool {
+        let Some(resolve) = &self.resolve else {
+            return false;
+        };
+        let Some(chosen) = resolve
+            .list
+            .selected()
+            .and_then(|index| resolve.shown.get(index))
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(issue) = self
+            .preview
+            .as_ref()
+            .and_then(|plan| plan.analysis.issues.get(resolve.issue))
+        else {
+            return false;
+        };
+        self.options
+            .deployments
+            .insert(issue.id().to_string(), chosen);
+        self.resolve = None;
+        true
+    }
+
+    pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
+        let Some(resolve) = &mut self.resolve else {
+            return vec![];
+        };
+        match resolve.input.paste(text) {
+            Ok(true) => {
+                self.refilter_resolve(ctx);
+                vec![]
+            }
+            Ok(false) => vec![],
+            Err(error) => vec![Action::Error(error.into())],
+        }
+    }
+
+    pub fn key(&mut self, key: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if let Some(resolve) = &mut self.resolve {
+            match key.code {
+                KeyCode::Esc => self.resolve = None,
+                KeyCode::Down => resolve.list.move_by(1, resolve.shown.len()),
+                KeyCode::Up => resolve.list.move_by(-1, resolve.shown.len()),
+                KeyCode::Enter => {
+                    if self.accept_resolve() {
+                        return vec![
+                            Action::CloseModal,
+                            Action::Spawn(Task::RepairPlan(self.options.clone())),
+                        ];
+                    }
+                }
+                _ if resolve.input.handle_key(key) => self.refilter_resolve(ctx),
+                _ => {}
+            }
+            return vec![];
+        }
+        if key.code == KeyCode::Esc {
+            return vec![Action::CloseModal];
+        }
+        let at_end = self.row_count() == 0
+            || self.list.selected() == Some(self.row_count().saturating_sub(1));
+        if let Some(event) = self.focus.key(key.code, at_end) {
+            return match event {
+                ChoiceEvent::Apply => self.primary(),
+                ChoiceEvent::Cancel => self.secondary(),
+                ChoiceEvent::Moved => vec![],
+            };
+        }
+        match key.code {
+            KeyCode::Down => self.list.move_by(1, self.row_count()),
+            KeyCode::Up => self.list.move_by(-1, self.row_count()),
+            KeyCode::PageDown => self.list.move_by(10, self.row_count()),
+            KeyCode::PageUp => self.list.move_by(-10, self.row_count()),
+            KeyCode::Home => self.list.first(self.row_count()),
+            KeyCode::End => self.list.last(self.row_count()),
+            KeyCode::Enter if self.preview.is_none() => return self.primary(),
+            KeyCode::Enter if self.focus == ChoiceFocus::List => self.open_resolve(ctx),
+            KeyCode::Char(' ') if self.preview.is_some() => {
+                if let Some(id) = self
+                    .preview
+                    .as_ref()
+                    .and_then(|plan| plan.analysis.issues.get(self.list.selected()?))
+                    .map(|issue| issue.id().to_string())
+                    && !self.skipped.remove(&id)
+                {
+                    self.skipped.insert(id);
+                }
+            }
+            KeyCode::Enter => self.focus = ChoiceFocus::Apply,
+            _ => {}
+        }
+        vec![]
+    }
+
+    pub fn mouse(&mut self, mouse: MouseEvent) -> Vec<Action> {
+        let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::ScrollDown => self.list.move_by(3, self.row_count()),
+            MouseEventKind::ScrollUp => self.list.move_by(-3, self.row_count()),
+            MouseEventKind::Down(MouseButton::Left) if !self.rect.contains(position) => {
+                return vec![Action::CloseModal];
+            }
+            MouseEventKind::Down(MouseButton::Left) if self.buttons[0].contains(position) => {
+                return self.primary();
+            }
+            MouseEventKind::Down(MouseButton::Left) if self.buttons[1].contains(position) => {
+                return self.secondary();
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if self.list.click(mouse.row, self.row_count()).is_some() =>
+            {
+                self.focus = ChoiceFocus::List;
+            }
+            _ => {}
+        }
+        vec![]
+    }
+
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
+        let preview = self.preview.is_some();
+        let area = centered(
+            area,
+            area.width.saturating_sub(8).min(112),
+            if preview {
+                area.height.saturating_sub(4).min(56)
+            } else {
+                15.min(area.height.saturating_sub(4))
+            },
+        );
+        self.rect = area;
+        frame.render_widget(crate::tui::widgets::OverlayClear, area);
+        let theme = &ctx.settings.theme;
+        let block = theme.block(
+            if preview {
+                " Repair deployments · preview "
+            } else {
+                " Repair deployments "
+            },
+            true,
+        );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.height < 6 || inner.width < 30 {
+            frame.render_widget(Paragraph::new("Enlarge terminal · Esc cancel"), inner);
+            return;
+        }
+        let footer_height = 2.min(inner.height.saturating_sub(2));
+        let summary_area = Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), 2);
+        self.list.rows = Rect::new(
+            inner.x + 1,
+            inner.y + 2,
+            inner.width.saturating_sub(2),
+            inner.height.saturating_sub(2 + footer_height),
+        );
+        self.list.item_height = 3;
+        self.list.clamp(self.row_count());
+        let (items, summary, primary, secondary, enabled) = if let Some(plan) = &self.preview {
+            let items = plan
+                .analysis
+                .issues
+                .iter()
+                .map(|issue| {
+                    let staged = plan
+                        .actions
+                        .iter()
+                        .any(|action| action_id(action) == issue.id())
+                        && !self.skipped.contains(issue.id());
+                    let (label, style) = if staged {
+                        ("STAGED", theme.ok())
+                    } else {
+                        ("UNRESOLVED", theme.warn())
+                    };
+                    let detail = match issue {
+                        skills::ops::repair::RepairIssue::Broken {
+                            link_name,
+                            target,
+                            candidates,
+                            ..
+                        } => {
+                            if let Some(action) = plan
+                                .actions
+                                .iter()
+                                .find(|action| action_id(action) == issue.id())
+                            {
+                                let (skill, library_target) = action_target(action);
+                                format!(
+                                    "broken: {} · target: {} · {}",
+                                    target.display(),
+                                    skill,
+                                    candidates
+                                        .iter()
+                                        .find(|candidate| candidate.key == skill)
+                                        .map(|candidate| candidate.path.display().to_string())
+                                        .unwrap_or_else(|| library_target.display().to_string())
+                                )
+                            } else if candidates.is_empty() {
+                                format!(
+                                    "broken: {} · no Library skill named {link_name}",
+                                    target.display()
+                                )
+                            } else {
+                                format!(
+                                    "broken: {} · {} Library matches; Enter to choose",
+                                    target.display(),
+                                    candidates.len()
+                                )
+                            }
+                        }
+                        skills::ops::repair::RepairIssue::OutdatedName {
+                            link_name,
+                            name,
+                            skill,
+                            blocked,
+                            ..
+                        } => blocked
+                            .clone()
+                            .unwrap_or_else(|| format!("{link_name} → {name} · {skill}")),
+                    };
+                    ListItem::new(vec![
+                        Line::from(vec![
+                            Span::styled(format!("{label:<11}"), style),
+                            Span::styled(issue.id(), theme.bold()),
+                        ]),
+                        Line::from(Span::styled(
+                            format!("  {}", fit(&detail, inner.width.saturating_sub(4) as usize)),
+                            theme.description(),
+                        )),
+                        Line::default(),
+                    ])
+                })
+                .collect::<Vec<_>>();
+            let staged = plan
+                .actions
+                .iter()
+                .filter(|action| !self.skipped.contains(action_id(action)))
+                .count();
+            (
+                items,
+                format!(
+                    "{staged} staged · {} unresolved",
+                    plan.analysis.issues.len().saturating_sub(staged)
+                ),
+                if staged > 0 { "✓ Apply" } else { "Done" },
+                "Back",
+                true,
+            )
+        } else {
+            (
+                vec![ListItem::new(vec![
+                    Line::from(
+                        "Find broken deployments and deployments using an outdated skill name.",
+                    ),
+                    Line::from(Span::styled(
+                        "Only independent, managed Agent directories are scanned.",
+                        theme.description(),
+                    )),
+                ])],
+                "Deployment links".into(),
+                "Analyze",
+                "Cancel",
+                true,
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(fit(&summary, summary_area.width as usize)).style(theme.dim()),
+            summary_area,
+        );
+        frame.render_stateful_widget(
+            List::new(items).highlight_style(if self.focus == ChoiceFocus::List {
+                theme.selected()
+            } else {
+                theme.selected_unfocused()
+            }),
+            self.list.rows,
+            &mut self.list.state,
+        );
+        self.buttons = choice_footer::draw_with_labels(
+            frame,
+            Rect::new(
+                inner.x,
+                inner.bottom().saturating_sub(footer_height),
+                inner.width,
+                footer_height,
+            ),
+            self.focus,
+            enabled,
+            if preview {
+                "Nothing is written until Apply"
+            } else {
+                "Enter analyzes current managed Agent directories"
+            },
+            (primary, secondary),
+            theme,
+        );
+        if let Some(resolve) = &mut self.resolve {
+            let picker = centered(area, 72, 18);
+            frame.render_widget(crate::tui::widgets::OverlayClear, picker);
+            let block = theme.block(" Choose Library skill ", true);
+            let inside = block.inner(picker);
+            frame.render_widget(block, picker);
+            frame.render_widget(
+                Paragraph::new(format!("Search: {}", resolve.input.value())).style(theme.accent()),
+                Rect::new(inside.x + 1, inside.y, inside.width.saturating_sub(2), 1),
+            );
+            resolve.list.rows = Rect::new(
+                inside.x + 1,
+                inside.y + 2,
+                inside.width.saturating_sub(2),
+                inside.height.saturating_sub(3),
+            );
+            let rows = resolve
+                .shown
+                .iter()
+                .map(|key| ListItem::new(key.clone()))
+                .collect::<Vec<_>>();
+            frame.render_stateful_widget(
+                List::new(rows)
+                    .highlight_style(theme.selected())
+                    .highlight_symbol("▸ "),
+                resolve.list.rows,
+                &mut resolve.list.state,
             );
         }
-        lines.push("↑↓ / PgUp PgDn / wheel: scroll".into());
-        let text = lines.join("\n\n");
-        let rows = text
-            .lines()
-            .map(|l| {
-                (crate::tui::widgets::width(l) as u16)
-                    .div_ceil(inner.width.max(1))
-                    .max(1)
-            })
-            .fold(0u16, |a, b| a.saturating_add(b));
-        self.scroll = self.scroll.min(rows.saturating_sub(inner.height));
-        f.render_widget(
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .scroll((self.scroll, 0)),
-            inner,
-        );
+    }
+}
+
+fn action_id(action: &skills::ops::repair::RepairAction) -> &str {
+    match action {
+        skills::ops::repair::RepairAction::Relink { id, .. }
+        | skills::ops::repair::RepairAction::Rename { id, .. } => id,
+    }
+}
+
+fn action_target(action: &skills::ops::repair::RepairAction) -> (&str, &std::path::Path) {
+    match action {
+        skills::ops::repair::RepairAction::Relink { skill, target, .. }
+        | skills::ops::repair::RepairAction::Rename { skill, target, .. } => {
+            (skill, target.as_path())
+        }
     }
 }
 
 #[cfg(test)]
-mod repair_dialog_tests {
+mod deployment_repair_dialog_tests {
     use super::*;
-    #[test]
-    fn repair_dialog_requires_preview_and_explicit_apply_and_renders_small_terminals() {
-        let tmp = skills::ops::DownloadDir::new("repair-dialog").unwrap();
-        let ws = skills::Workspace::open(tmp.path()).unwrap();
-        let snap = ws.scan().unwrap();
-        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
-        let ctx = Ctx {
-            ws: &ws,
-            snap: &snap,
-            settings: &settings,
+    use skills::ops::repair::{Candidate, RepairAction, RepairAnalysis, RepairIssue, RepairPlan};
+    use std::path::PathBuf;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::from(code)
+    }
+
+    fn plan(candidates: Vec<Candidate>) -> RepairPlan {
+        let id = "test/shared".to_string();
+        let issue = RepairIssue::Broken {
+            id: id.clone(),
+            agent: "test".into(),
+            link_name: "shared".into(),
+            target: PathBuf::from("/gone/shared"),
+            candidates,
         };
-        let mut dialog = RepairDialog::default();
-        assert!(dialog.key(KeyCode::Char('y').into()).is_empty());
-        dialog.key(KeyCode::Char('r').into());
-        assert!(dialog.options.restore_missing);
-        dialog.key(KeyCode::Char('f').into());
-        assert!(dialog.options.forget_missing && !dialog.options.restore_missing);
-        assert!(matches!(
-            dialog.key(KeyCode::Enter.into()).as_slice(),
-            [Action::CloseModal, Action::Spawn(Task::RepairPlan(_))]
-        ));
-        for (w, h) in [(80, 24), (48, 12)] {
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-            terminal.draw(|f| dialog.draw(f, f.area(), &ctx)).unwrap();
-            let text: String = terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .map(|c| c.symbol())
-                .collect();
-            assert!(text.contains("Health repair"));
+        let actions = match &issue {
+            RepairIssue::Broken { candidates, .. } if candidates.len() == 1 => {
+                vec![RepairAction::Relink {
+                    id,
+                    agent: "test".into(),
+                    path: PathBuf::from("/agent/shared"),
+                    old_target: PathBuf::from("/gone/shared"),
+                    skill: candidates[0].key.clone(),
+                    target: candidates[0].path.clone(),
+                    name: "shared".into(),
+                    parent_identity: (1, 1),
+                    link_identity: (2, 2),
+                }]
+            }
+            _ => vec![],
+        };
+        RepairPlan {
+            analysis: RepairAnalysis {
+                ready: usize::from(actions.len() == 1),
+                unresolved: usize::from(actions.is_empty()),
+                issues: vec![issue],
+            },
+            actions,
         }
-        let mut dialog = RepairDialog::preview(skills::ops::repair::Report {
-            planned: 1,
-            ..Default::default()
-        });
-        assert!(dialog.key(KeyCode::Enter.into()).is_empty());
-        assert!(matches!(
-            dialog.key(KeyCode::Char('y').into()).as_slice(),
-            [Action::CloseModal, Action::Spawn(Task::RepairApply(_))]
+    }
+
+    #[test]
+    fn staged_repair_can_be_skipped_without_applying() {
+        let mut dialog = RepairDialog::preview(
+            Default::default(),
+            plan(vec![Candidate {
+                key: "repos/example/folder".into(),
+                name: "shared".into(),
+                path: PathBuf::from("/library/repos/example/folder"),
+            }]),
+        );
+        assert_eq!(dialog.staged_plan().unwrap().actions.len(), 1);
+        dialog.key(key(KeyCode::Char(' ')), &test_ctx());
+        assert!(dialog.staged_plan().unwrap().actions.is_empty());
+    }
+
+    #[test]
+    fn duplicate_name_opens_library_key_resolver() {
+        let candidates = ["repos/one/folder", "repos/two/folder"]
+            .into_iter()
+            .map(|key| Candidate {
+                key: key.into(),
+                name: "shared".into(),
+                path: PathBuf::from("/library").join(key),
+            })
+            .collect();
+        let mut dialog = RepairDialog::preview(Default::default(), plan(candidates));
+        let ctx = test_ctx();
+        dialog.key(key(KeyCode::Enter), &ctx);
+        assert!(dialog.resolve.is_some());
+    }
+
+    fn test_ctx() -> Ctx<'static> {
+        let tmp = Box::leak(Box::new(
+            skills::ops::DownloadDir::new("repair-dialog").unwrap(),
         ));
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = Box::leak(Box::new(skills::Workspace::open(&root).unwrap()));
+        let snap = Box::leak(Box::new(ws.scan().unwrap()));
+        let settings = Box::leak(Box::new(crate::tui::settings::RuntimeSettings::new(
+            &ws.config,
+        )));
+        Ctx { ws, snap, settings }
     }
 }

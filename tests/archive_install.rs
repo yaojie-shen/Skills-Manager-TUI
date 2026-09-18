@@ -266,8 +266,12 @@ fn archive_cli_reuses_repository_selection_names_deployment_and_duplicate_handli
     );
     let key = "repos/tools/review-copy";
     assert_eq!(
-        std::fs::read_link(fixture.temp.path().join("agent/review-copy")).unwrap(),
+        std::fs::read_link(fixture.temp.path().join("agent/review")).unwrap(),
         fixture.ws.skill_path(key)
+    );
+    assert!(
+        !fixture.temp.path().join("agent/review-copy").exists(),
+        "deployment names come from SKILL.md, not the Library folder"
     );
     assert!(fixture.ws.skill_path(key).join("scripts/run.sh").is_file());
     assert!(!fixture.ws.skill_path(key).join("README.md").exists());

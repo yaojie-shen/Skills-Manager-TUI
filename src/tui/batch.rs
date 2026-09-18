@@ -392,6 +392,7 @@ impl Batch {
                 !(reason == "already deployed"
                     || reason == "not deployed"
                     || reason.ends_with("; already deployed")
+                    || reason.starts_with("agent directory is read-only:")
                     || (reason == "agent dir missing or foreign"
                         && ctx
                             .snap

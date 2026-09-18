@@ -395,12 +395,12 @@ impl MetaStore {
         let from = self.path(old);
         let to = self.path(new);
         let mut source = Self::read(&from)?;
+        let entry = source["skills"]
+            .as_table_mut()
+            .context("source metadata entry missing")?
+            .remove(Self::entry(old))
+            .context("source metadata entry missing")?;
         if from == to {
-            let entry = source["skills"]
-                .as_table_mut()
-                .unwrap()
-                .remove(Self::entry(old))
-                .unwrap();
             source["skills"][Self::entry(new)] = entry;
             return write_atomic(&from, source.to_string().as_bytes());
         }
@@ -409,13 +409,9 @@ impl MetaStore {
         if target.get("skills").is_none() {
             target["skills"] = Item::Table(Table::new());
         }
-        target["skills"][Self::entry(new)] = source["skills"][Self::entry(old)].clone();
+        target["skills"][Self::entry(new)] = entry;
         Self::put(&mut target, new, &meta)?;
         write_atomic(&to, target.to_string().as_bytes())?;
-        source["skills"]
-            .as_table_mut()
-            .unwrap()
-            .remove(Self::entry(old));
         if let Err(error) = write_atomic(&from, source.to_string().as_bytes()) {
             write_atomic(&to, original.to_string().as_bytes())?;
             return Err(error);

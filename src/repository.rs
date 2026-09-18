@@ -307,14 +307,6 @@ pub fn valid_id(key: &str) -> bool {
 pub fn alias_of(key: &str) -> Option<&str> {
     key.strip_prefix("repos/")?.split('/').next()
 }
-pub fn default_deploy_name(key: &str) -> String {
-    // Repository aliases identify sources in storage, not the skill's name
-    // in an agent directory. Preserve explicit local names verbatim.
-    if let Some(path) = key.strip_prefix("repos/") {
-        return path.rsplit('/').next().unwrap_or(path).to_string();
-    }
-    key.strip_prefix("local/").unwrap_or(key).replace('/', "--")
-}
 
 #[derive(Debug, Clone)]
 pub struct FetchedRepository {
