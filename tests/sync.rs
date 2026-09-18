@@ -172,7 +172,11 @@ fn preview_disable_offline_and_lock_preserve_work() {
     assert!(sync::automatic(&one).unwrap().is_none());
     assert_eq!(before, head(&one));
     configure(&one, &repo);
-    fs::write(one.root.join(".git/skills-sync.lock"), "").unwrap();
+    fs::write(
+        one.root.join(".git/skills-sync.lock"),
+        format!("{}\ttest lock", std::process::id()),
+    )
+    .unwrap();
     assert!(run(&one).is_err());
     fs::remove_file(one.root.join(".git/skills-sync.lock")).unwrap();
     fs::rename(&repo, tmp.path().join("offline.git")).unwrap();
@@ -185,6 +189,30 @@ fn preview_disable_offline_and_lock_preserve_work() {
     assert!(!one.root.join(".git/skills-sync.lock").exists());
     fs::rename(tmp.path().join("offline.git"), &repo).unwrap();
     run(&one).unwrap();
+}
+
+#[test]
+fn stale_skills_lock_is_recovered_without_touching_git_index_lock() {
+    let tmp = DownloadDir::new("root-stale-lock").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+    let one = ws(&tmp.path().join("one"));
+    configure(&one, &repo);
+    write(&one, "file", "first");
+
+    fs::write(
+        one.root.join(".git/skills-sync.lock"),
+        "2147483647\tstale test",
+    )
+    .unwrap();
+    run(&one).unwrap();
+    assert!(!one.root.join(".git/skills-sync.lock").exists());
+
+    fs::write(one.root.join(".git/index.lock"), "").unwrap();
+    let error = run(&one).unwrap_err().to_string();
+    assert!(error.contains("index.lock"));
+    assert!(one.root.join(".git/index.lock").exists());
+    fs::remove_file(one.root.join(".git/index.lock")).unwrap();
 }
 #[test]
 fn rejects_nested_repos_wrong_branch_and_unrelated_remote_without_overwrite() {

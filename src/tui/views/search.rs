@@ -454,7 +454,7 @@ impl SearchView {
             }
             return vec![
                 Action::CloseModal,
-                Action::BatchMeta(
+                Action::deployment(Action::BatchMeta(
                     Box::new({
                         let keys = keys.clone();
                         move |ws| {
@@ -468,7 +468,7 @@ impl SearchView {
                         }
                     }),
                     keys,
-                ),
+                )),
             ];
         }
         if let Some(tag) = self.tag.clone() {

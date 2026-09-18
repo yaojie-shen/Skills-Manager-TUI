@@ -393,30 +393,33 @@ impl AgentsView {
                 Action::ApplyLinks { title: _, actions } => {
                     let agent = agent.clone();
                     let project = project.clone();
-                    Action::WriteMeta(Box::new(move |ws| {
+                    Action::deployment(Action::WriteMeta(Box::new(move |ws| {
                         skills::ops::targets::apply_actions(
                             ws,
                             &agent,
                             project.as_deref(),
                             &actions,
                         )
-                    }))
+                    })))
                 }
                 Action::ConfirmLinks { title, actions } => {
                     let agent = agent.clone();
                     let project = project.clone();
-                    Action::OpenModal(Box::new(Modal::confirm_meta(
-                        title,
-                        actions.iter().map(|a| a.describe()).collect(),
-                        Box::new(move |ws| {
-                            skills::ops::targets::apply_actions(
-                                ws,
-                                &agent,
-                                project.as_deref(),
-                                &actions,
-                            )
-                        }),
-                    )))
+                    Action::OpenModal(Box::new(
+                        Modal::confirm_meta(
+                            title,
+                            actions.iter().map(|a| a.describe()).collect(),
+                            Box::new(move |ws| {
+                                skills::ops::targets::apply_actions(
+                                    ws,
+                                    &agent,
+                                    project.as_deref(),
+                                    &actions,
+                                )
+                            }),
+                        )
+                        .deployment_only(),
+                    ))
                 }
                 other => other,
             })
@@ -2936,7 +2939,8 @@ mod deployment_scope_tests {
             },
             &ctx,
         );
-        let Action::BatchMeta(write, keys) = actions.into_iter().next().unwrap() else {
+        let (_, Action::BatchMeta(write, keys)) = actions.into_iter().next().unwrap().into_scoped()
+        else {
             panic!("group install")
         };
         assert_eq!(keys, ["one", "two"]);
@@ -3460,7 +3464,7 @@ mod deployment_scope_tests {
         let write = actions
             .into_iter()
             .find_map(|action| {
-                if let Action::BatchMeta(write, _) = action {
+                if let (_, Action::BatchMeta(write, _)) = action.into_scoped() {
                     Some(write)
                 } else {
                     None
@@ -3489,7 +3493,8 @@ mod deployment_scope_tests {
             },
             &scoped_ctx,
         );
-        let Action::BatchMeta(write, keys) = actions.into_iter().next().unwrap() else {
+        let (_, Action::BatchMeta(write, keys)) = actions.into_iter().next().unwrap().into_scoped()
+        else {
             panic!("preset install")
         };
         assert_eq!(keys, ["sample"]);
@@ -3517,7 +3522,8 @@ mod deployment_scope_tests {
             },
             &scoped_ctx,
         );
-        let Action::BatchMeta(write, _) = actions.into_iter().next().unwrap() else {
+        let (_, Action::BatchMeta(write, _)) = actions.into_iter().next().unwrap().into_scoped()
+        else {
             panic!("reinstall preset")
         };
         write(&ws).unwrap();

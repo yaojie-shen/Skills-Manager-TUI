@@ -461,44 +461,54 @@ impl Cli {
             Workspace::open(&paths::resolve_root(self.root.as_deref())?)
         }
     }
+
+    fn mutation_scope(&self) -> Option<skills::ops::MutationScope> {
+        use skills::ops::MutationScope::{Deployment, Library};
+
+        match &self.command {
+            Some(
+                Command::Init
+                | Command::Accept { .. }
+                | Command::Adopt { .. }
+                | Command::Rename { .. }
+                | Command::SetSource(_),
+            ) => Some(Library),
+            Some(Command::Tag(a)) if !matches!(a.command, TagCommand::List { .. }) => Some(Library),
+            Some(Command::Note(a)) if !matches!(a.command, NoteCommand::Get { .. }) => {
+                Some(Library)
+            }
+            Some(Command::Remove { yes: true, .. }) => Some(Library),
+            Some(Command::Install(a)) if !a.list => Some(Library),
+            Some(Command::Update(a)) if !a.dry_run => Some(Library),
+            Some(Command::Deploy(a) | Command::Undeploy(a)) if !a.dry_run => Some(Deployment),
+            Some(Command::Repair { apply: true, .. }) => Some(Deployment),
+            Some(Command::Repos { command: Some(_) }) => Some(Library),
+            Some(Command::Preset(a)) => match &a.command {
+                PresetCommand::List | PresetCommand::Show { .. } => None,
+                PresetCommand::Deploy { dry_run, .. } | PresetCommand::Undeploy { dry_run, .. } => {
+                    (!dry_run).then_some(Deployment)
+                }
+                _ => Some(Library),
+            },
+            Some(Command::Agents(a)) => match &a.command {
+                Some(AgentsCommand::Add { .. }) => Some(Library),
+                Some(AgentsCommand::AdoptLink { dry_run, yes, .. }) => {
+                    (!dry_run && *yes).then_some(Library)
+                }
+                Some(
+                    AgentsCommand::Clean { dry_run, yes, .. }
+                    | AgentsCommand::RemoveLink { dry_run, yes, .. }
+                    | AgentsCommand::Relink { dry_run, yes, .. },
+                ) => (!dry_run && *yes).then_some(Deployment),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 pub fn run(cli: Cli) -> Result<()> {
-    let auto = match &cli.command {
-        Some(
-            Command::Init
-            | Command::Accept { .. }
-            | Command::Adopt { .. }
-            | Command::Rename { .. }
-            | Command::SetSource(_),
-        ) => true,
-        Some(Command::Tag(a)) => !matches!(a.command, TagCommand::List { .. }),
-        Some(Command::Note(a)) => !matches!(a.command, NoteCommand::Get { .. }),
-        Some(Command::Remove { yes, .. }) => *yes,
-        Some(Command::Install(a)) => !a.list,
-        Some(Command::Update(a)) => !a.dry_run,
-        Some(Command::Deploy(a) | Command::Undeploy(a)) => !a.dry_run,
-        Some(Command::Repair { apply, .. }) => *apply,
-        Some(Command::Repos { command: Some(_) }) => true,
-        Some(Command::Preset(a)) => match &a.command {
-            PresetCommand::List | PresetCommand::Show { .. } => false,
-            PresetCommand::Deploy { dry_run, .. } | PresetCommand::Undeploy { dry_run, .. } => {
-                !dry_run
-            }
-            _ => true,
-        },
-        Some(Command::Agents(a)) => match &a.command {
-            Some(AgentsCommand::Add { .. }) => true,
-            Some(
-                AgentsCommand::Clean { dry_run, yes, .. }
-                | AgentsCommand::RemoveLink { dry_run, yes, .. }
-                | AgentsCommand::AdoptLink { dry_run, yes, .. }
-                | AgentsCommand::Relink { dry_run, yes, .. },
-            ) => !dry_run && *yes,
-            _ => false,
-        },
-        _ => false,
-    };
+    let scope = cli.mutation_scope();
     let create = matches!(
         &cli.command,
         Some(
@@ -509,18 +519,21 @@ pub fn run(cli: Cli) -> Result<()> {
                 })
         )
     );
-    let ws = if auto {
+    let ws = if scope.is_some() {
         Some(cli.workspace(create)?)
     } else {
         None
     };
-    if let Some(ws) = &ws
-        && let Err(e) = skills::ops::sync::automatic(ws)
-    {
-        eprintln!("Root sync: {e:#}; continuing with local data");
-    }
+    let guard = scope
+        .zip(ws.as_ref())
+        .map(|(scope, ws)| scope.guard(ws, "CLI Library mutation"))
+        .transpose()?
+        .flatten();
     let result = run_command(cli);
-    if let Some(ws) = &ws
+    drop(guard);
+    if result.is_ok()
+        && scope.is_some_and(skills::ops::MutationScope::changes_library)
+        && let Some(ws) = &ws
         && let Err(e) = skills::ops::sync::automatic(ws)
     {
         eprintln!("Root backup pending: {e:#}; local changes retained");

@@ -114,6 +114,7 @@ impl AgentsView {
                     )
                 }),
             )
+            .deployment_only()
             .in_background(vec![record.key.clone()]),
         ))]
     }

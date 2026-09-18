@@ -363,11 +363,17 @@ impl HealthView {
                     },
                     "Undo does not cover this repair.".into(),
                 ];
-                return Some(vec![Action::OpenModal(Box::new(Modal::confirm_write(
+                let modal = Modal::confirm_write(
                     format!("repair {agent}/{}", row.key),
                     lines,
                     Box::new(move |ws| plan.apply(ws)),
-                )))]);
+                );
+                let modal = if matches!(operation, Repair::Remove) {
+                    modal.deployment_only()
+                } else {
+                    modal
+                };
+                return Some(vec![Action::OpenModal(Box::new(modal))]);
             }
             (Some(EntryState::Broken { .. }), Command::Remove | Command::Open) => {
                 deploy::plan_clean(ctx.ws, ctx.snap, agent, std::slice::from_ref(&row.key))

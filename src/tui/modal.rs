@@ -12,10 +12,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 use skills::history;
-use skills::ops::deploy;
-use skills::ops::edit;
-use skills::ops::install;
 use skills::ops::update::{self, FileChange, Prepared, Take};
+use skills::ops::{MutationScope, deploy, edit, install};
 use skills::reconcile::{AgentDirMode, EntryState};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -77,6 +75,7 @@ pub enum Modal {
         lines: Vec<String>,
         write: Option<MetaFn>,
         background: Option<Vec<String>>,
+        scope: MutationScope,
         /// Set when this confirmation is a history step.
         then: Option<Step>,
         btn: usize,
@@ -186,6 +185,7 @@ impl Modal {
             lines,
             write: Some(write),
             background: None,
+            scope: MutationScope::Library,
             then: None,
             btn: 1,
             btn_rects: Vec::new(),
@@ -196,6 +196,13 @@ impl Modal {
     pub(crate) fn in_background(mut self, keys: Vec<String>) -> Self {
         if let Self::ConfirmWrite { background, .. } = &mut self {
             *background = Some(keys);
+        }
+        self
+    }
+
+    pub(crate) fn deployment_only(mut self) -> Self {
+        if let Self::ConfirmWrite { scope, .. } = &mut self {
+            *scope = MutationScope::Deployment;
         }
         self
     }
@@ -740,19 +747,28 @@ impl Modal {
                 then,
                 btn,
                 background,
+                scope,
                 title,
                 ..
             } => match k.code {
                 KeyCode::Char('y') => write
                     .take()
-                    .map(|w| write_actions(w, then.take(), background.take(), title.clone()))
+                    .map(|w| {
+                        write_actions(w, then.take(), background.take(), title.clone(), *scope)
+                    })
                     .unwrap_or_default(),
                 KeyCode::Enter => {
                     if *btn == 0 {
                         write
                             .take()
                             .map(|w| {
-                                write_actions(w, then.take(), background.take(), title.clone())
+                                write_actions(
+                                    w,
+                                    then.take(),
+                                    background.take(),
+                                    title.clone(),
+                                    *scope,
+                                )
                             })
                             .unwrap_or_default()
                     } else {
@@ -979,6 +995,7 @@ impl Modal {
                 write,
                 then,
                 background,
+                scope,
                 title,
                 btn_rects,
                 rect,
@@ -989,7 +1006,13 @@ impl Modal {
                         return write
                             .take()
                             .map(|w| {
-                                write_actions(w, then.take(), background.take(), title.clone())
+                                write_actions(
+                                    w,
+                                    then.take(),
+                                    background.take(),
+                                    title.clone(),
+                                    *scope,
+                                )
                             })
                             .unwrap_or_default();
                     }
@@ -1493,6 +1516,7 @@ fn write_actions(
     then: Option<Step>,
     background: Option<Vec<String>>,
     title: String,
+    scope: MutationScope,
 ) -> Vec<Action> {
     let action = match (background, then) {
         (Some(keys), None) => Action::BackgroundWrite {
@@ -1501,6 +1525,11 @@ fn write_actions(
             keys,
         },
         _ => Action::WriteMeta(w),
+    };
+    let action = if scope == MutationScope::Deployment {
+        Action::deployment(action)
+    } else {
+        action
     };
     let mut out = vec![Action::CloseModal, action];
     if let Some(step) = then {

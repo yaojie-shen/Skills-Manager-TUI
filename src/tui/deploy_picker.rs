@@ -186,10 +186,10 @@ impl DeployPicker {
         let keys = self.keys.clone();
         vec![
             Action::CloseModal,
-            Action::BatchMeta(
+            Action::deployment(Action::BatchMeta(
                 Box::new(move |ws| targets::apply_scoped(ws, &keys, &changes)),
                 self.keys.clone(),
-            ),
+            )),
         ]
     }
     pub fn hints(&self) -> Hints {
