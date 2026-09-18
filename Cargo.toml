@@ -1,8 +1,10 @@
 [package]
 name = "skills"
-version = "0.1.0-alpha.5"
+version = "0.1.0"
 edition = "2024"
+rust-version = "1.98"
 description = "Terminal manager for Agent Skills shared between coding agents: one central directory, per-agent symlinks, metadata in TOML, no database"
+readme = "README.md"
 license = "MIT"
 repository = "https://github.com/yaojie-shen/Skills-Manager-TUI"
 keywords = ["agent-skills", "tui", "cli", "symlink", "claude-code"]

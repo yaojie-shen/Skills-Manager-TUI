@@ -110,7 +110,7 @@ pub enum Command {
     Undeploy(DeployArgs),
     /// Synchronize the entire root with its Git remote
     #[command(
-        long_about = "Synchronize the root as a Git working tree. Configure URL [--branch main] explicitly enables automatic backup at TUI startup and around modifying CLI commands, and after TUI changes. Read-only CLI commands and previews do not sync. Skills, metadata, notes, presets and configuration are shared, including machine-specific paths; deletions propagate. Runtime files stay local and normal Git ignore rules apply. Sync saves local changes, merges remote updates, then pushes without force. Conflicts stop synchronization and retain the local backup commit. Use an empty remote or clone an existing root repository first. Legacy per-skill backup repositories are not automatically converted."
+        long_about = "Synchronize the root as a Git working tree. Configure URL [--branch main] explicitly enables automatic backup after Library changes. Startup, read-only commands, previews, and Agent-only deployment changes do not sync. Skills, metadata, notes, presets and configuration are shared, including machine-specific paths; deletions propagate. Runtime files stay local and normal Git ignore rules apply. Sync saves local changes, merges remote updates, then pushes without force. Conflicts stop synchronization and retain the local backup commit. Use an empty remote or clone an existing root repository first. Legacy per-skill backup repositories are not automatically converted."
     )]
     Sync {
         #[arg(long, global = true)]

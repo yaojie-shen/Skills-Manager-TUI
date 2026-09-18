@@ -193,7 +193,7 @@ impl SyncPicker {
             )
         } else {
             format!(
-                "Root: {}\nRemote: {}\nBranch: {}\nAutomatic sync: {}\n\nThe root is the Git working tree. After changes and on startup, save local work, merge remote updates and push.\n\nSkills, metadata, tags, notes and presets are included. Runtime locks, staging and backups are excluded.\n\ns: preview sync · p: push · P: pull\na: configure/enable · d: disable automatic sync\n\nConflicts require Git resolution; no force push or reset is performed.",
+                "Root: {}\nRemote: {}\nBranch: {}\nAutomatic sync: {}\n\nThe root is the Git working tree. After Library changes, save local work, merge remote updates and push. Startup and Agent-only deployment changes do not sync.\n\nSkills, metadata, tags, notes and presets are included. Runtime locks, staging and backups are excluded.\n\ns: preview sync · p: push · P: pull\na: configure/enable · d: disable automatic sync\n\nConflicts require Git resolution; no force push or reset is performed.",
                 ctx.ws.root.display(),
                 self.settings.url.as_deref().unwrap_or("Not configured"),
                 self.settings.branch.as_deref().unwrap_or("—"),

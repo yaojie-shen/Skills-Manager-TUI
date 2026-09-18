@@ -69,6 +69,8 @@ impl Fixture {
             "user.name=Test",
             "-c",
             "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "-qm",
             "Sample change",
