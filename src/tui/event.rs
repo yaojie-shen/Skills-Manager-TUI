@@ -25,6 +25,11 @@ pub enum Msg {
 pub enum Task {
     RepairPlan(skills::ops::repair::Options),
     RepairApply(skills::ops::repair::RepairPlan),
+    SyncConfigure {
+        url: String,
+        branch: String,
+    },
+    SyncDisable,
     Sync(super::sync_picker::Request),
     DiscoverRepository(String),
     InstallRepository(Box<super::repository_picker::InstallSelection>),
@@ -40,12 +45,52 @@ pub enum Task {
     },
 }
 
+impl Task {
+    /// Root backup operations are mutually exclusive with every other task.
+    pub fn is_root_operation(&self) -> bool {
+        matches!(
+            self,
+            Self::SyncConfigure { .. } | Self::SyncDisable | Self::Sync(_)
+        )
+    }
+
+    /// Only a real sync affects the sync status indicator and exit prompt.
+    pub fn is_root_sync(&self) -> bool {
+        matches!(self, Self::Sync(_))
+    }
+
+    pub fn label(&self) -> Option<String> {
+        match self {
+            Self::RepairPlan(_) => Some("Scan and preview health repairs".into()),
+            Self::RepairApply(_) => Some("Apply health repairs".into()),
+            Self::SyncConfigure { .. } => Some("Configure root backup".into()),
+            Self::SyncDisable => Some("Disable automatic root backup".into()),
+            Self::Sync(request) => Some(format!(
+                "Root sync {:?}{}",
+                request.mode,
+                if request.dry_run { " (preview)" } else { "" }
+            )),
+            Self::DiscoverRepository(reference) => Some(format!("Fetch {reference}")),
+            Self::InstallRepository(selection) => Some(format!(
+                "Install {}",
+                selection.fetched.repository.display_name()
+            )),
+            Self::Scan | Self::PollRoot => None,
+            Self::Check(keys) => Some(format!("Check upstream: {} skills", keys.len())),
+            Self::Prepare(key) => Some(format!("Prepare update: {key}")),
+            Self::Install { reference, .. } => Some(format!("Install {reference}")),
+        }
+    }
+}
+
 pub enum TaskOutput {
     RepairPlan(
         skills::ops::repair::Options,
         Result<skills::ops::repair::RepairPlan>,
     ),
     RepairApplied(Result<skills::ops::repair::Report>),
+    SyncConfigured(Result<()>),
+    SyncDisabled(Result<()>),
     Sync(
         super::sync_picker::Request,
         Result<skills::ops::sync::Report>,
@@ -173,6 +218,10 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                 Task::RepairApply(plan) => {
                     TaskOutput::RepairApplied(skills::ops::repair::apply_plan(&ws, &plan))
                 }
+                Task::SyncConfigure { url, branch } => {
+                    TaskOutput::SyncConfigured(skills::ops::sync::configure(&ws, &url, &branch))
+                }
+                Task::SyncDisable => TaskOutput::SyncDisabled(skills::ops::sync::disable(&ws)),
                 Task::Sync(request) => {
                     let result =
                         skills::ops::sync::run(&ws, request.mode, request.dry_run, &mut progress);

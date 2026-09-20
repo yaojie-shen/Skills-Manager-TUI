@@ -630,6 +630,25 @@ impl App {
                     ],
                 }
             }
+            TaskOutput::SyncConfigured(result) => {
+                self.batch_running = false;
+                match result {
+                    Ok(()) => vec![
+                        Action::Rescan,
+                        Action::Toast("Root auto-sync enabled".into()),
+                    ],
+                    Err(e) => vec![Action::Error(format!("Root sync setup: {e:#}"))],
+                }
+            }
+            TaskOutput::SyncDisabled(result) => {
+                self.batch_running = false;
+                match result {
+                    Ok(()) => vec![Action::Toast(
+                        "Automatic root sync disabled; Git history retained".into(),
+                    )],
+                    Err(e) => vec![Action::Error(format!("Disable root sync: {e:#}"))],
+                }
+            }
             TaskOutput::Sync(request, result) => {
                 self.root_sync_running = false;
                 self.batch_running = false;
@@ -1755,17 +1774,19 @@ impl App {
     }
 
     fn spawn(&mut self, task: Task) {
-        if matches!(task, Task::Sync(_)) {
+        if task.is_root_operation() {
             if self.tasks_running > 0 {
                 self.toast(
-                    "Wait for the current operation before syncing the root",
+                    "Wait for the current operation before changing root backup",
                     Level::Info,
                 );
                 return;
             }
-            self.root_sync_pending = false;
-            self.root_sync_running = true;
             self.batch_running = true;
+            if task.is_root_sync() {
+                self.root_sync_pending = false;
+                self.root_sync_running = true;
+            }
         }
         if matches!(task, Task::RepairApply(_)) {
             self.batch_running = true;
@@ -1773,24 +1794,7 @@ impl App {
         self.tasks_running += 1;
         self.next_task_id += 1;
         let id = self.next_task_id;
-        let label = match &task {
-            Task::RepairPlan(_) => Some("Scan and preview health repairs".into()),
-            Task::RepairApply(_) => Some("Apply health repairs".into()),
-            Task::Scan | Task::PollRoot => None,
-            Task::DiscoverRepository(reference) => Some(format!("Fetch {reference}")),
-            Task::InstallRepository(selection) => Some(format!(
-                "Install {}",
-                selection.fetched.repository.display_name()
-            )),
-            Task::Install { reference, .. } => Some(format!("Install {reference}")),
-            Task::Check(keys) => Some(format!("Check upstream: {} skills", keys.len())),
-            Task::Sync(r) => Some(format!(
-                "Root sync {:?}{}",
-                r.mode,
-                if r.dry_run { " (preview)" } else { "" }
-            )),
-            Task::Prepare(key) => Some(format!("Prepare update: {key}")),
-        };
+        let label = task.label();
         if let Some(label) = label {
             self.toasts.start(id, label);
         }
