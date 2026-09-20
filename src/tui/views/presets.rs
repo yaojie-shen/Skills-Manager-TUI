@@ -7,7 +7,7 @@
 use super::matrix::Matrix;
 use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
-use crate::tui::components::context_menu::{Command, Request, Target};
+use crate::tui::components::context_menu::{Command, Item, Request, Target};
 use crate::tui::components::group;
 use crate::tui::components::group_prompt::Prompt;
 use crate::tui::components::layout::{frame, split_panes};
@@ -288,6 +288,104 @@ impl PresetsView {
 }
 
 impl View for PresetsView {
+    fn overlay_open(&self) -> bool {
+        self.color_prompt.is_some()
+            || self.matrix.hints().is_some()
+            || (self.focus_members
+                && self
+                    .skill_search
+                    .as_ref()
+                    .is_some_and(|(_, view)| view.overlay_open()))
+    }
+    fn handle_control_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.focus_members
+            && let Some((_, view)) = self.skill_search.as_mut()
+        {
+            return view.handle_control_key(key, ctx);
+        }
+        vec![]
+    }
+    fn actions_menu(&self, ctx: &Ctx) -> Option<Request> {
+        if self.color_prompt.is_some() || self.matrix.hints().is_some() || self.filter.editing {
+            return None;
+        }
+        if self.focus_members {
+            let mut request = self.skill_search.as_ref()?.1.actions_menu(ctx)?;
+            request.items.retain(|item| item.command != Command::Accept);
+            for item in &mut request.items {
+                if item.command == Command::Remove {
+                    item.label = "Remove from preset".into();
+                }
+            }
+            if let Target::Batch { all, .. } = &request.target {
+                request.items.push(Item::new(
+                    Command::Remove,
+                    format!("Remove from preset · {} skills", all.len()),
+                    KeyCode::Char('x'),
+                    !all.is_empty(),
+                    "No selected skills",
+                    1,
+                ));
+            }
+            return Some(request);
+        }
+        let preset = self.selected()?.name.clone();
+        Some(Request {
+            title: preset.clone(),
+            detail: "Preset".into(),
+            target: Target::Preset(preset),
+            items: vec![
+                Item::new(
+                    Command::EditMembers,
+                    "Edit skills",
+                    KeyCode::Char('e'),
+                    true,
+                    "",
+                    0,
+                ),
+                Item::new(
+                    Command::Matrix,
+                    "Deployment matrix",
+                    KeyCode::Char('m'),
+                    true,
+                    "",
+                    0,
+                ),
+                Item::new(
+                    Command::Description,
+                    "Edit description",
+                    KeyCode::Char('d'),
+                    true,
+                    "",
+                    1,
+                ),
+                Item::new(
+                    Command::Rename,
+                    "Rename preset",
+                    KeyCode::Char('r'),
+                    true,
+                    "",
+                    1,
+                ),
+                Item::new(
+                    Command::Color,
+                    "Change colour",
+                    KeyCode::Char('c'),
+                    true,
+                    "",
+                    1,
+                ),
+                Item::new(
+                    Command::Remove,
+                    "Delete preset",
+                    KeyCode::Char('x'),
+                    true,
+                    "",
+                    2,
+                ),
+            ],
+        })
+    }
     fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
         if self.color_prompt.is_some() || self.matrix.hints().is_some() {
             return None;
@@ -305,7 +403,41 @@ impl View for PresetsView {
         Some(request)
     }
     fn context_execute(&mut self, target: &Target, command: Command, ctx: &Ctx) -> Vec<Action> {
+        if let Target::Preset(name) = target {
+            if self.selected().map(|preset| preset.name.as_str()) != Some(name.as_str()) {
+                return vec![Action::Error(
+                    "Target changed; reopen the actions menu".into(),
+                )];
+            }
+            return match command {
+                Command::EditMembers => self.add_members(ctx),
+                Command::Matrix => {
+                    self.matrix.open(ctx);
+                    vec![]
+                }
+                Command::Description => self.with_selected(|preset| {
+                    Modal::preset_description(&preset.name, preset.description.as_deref())
+                }),
+                Command::Rename => self.with_selected(|preset| Modal::rename_preset(&preset.name)),
+                Command::Color => {
+                    if let Some(preset) = self.selected() {
+                        self.color_prompt =
+                            Some(Prompt::for_preset_color(preset, &ctx.settings.theme));
+                    }
+                    vec![]
+                }
+                Command::Remove => self.with_selected(|preset| Modal::delete_preset(&preset.name)),
+                _ => vec![],
+            };
+        }
         if command == Command::Remove {
+            if let Target::Batch { all, .. } = target
+                && self
+                    .actions_menu(ctx)
+                    .is_some_and(|request| request.target == *target)
+            {
+                return self.remove_members(all.clone());
+            }
             if let Target::Skill(key) = target
                 && ctx.snap.get(key).is_some()
             {
@@ -596,7 +728,7 @@ impl View for PresetsView {
         if self.focus_members {
             &[
                 ("/", "filter skills"),
-                ("a", "edit skills"),
+                ("a", "actions"),
                 ("x", "remove"),
                 ("m", "multi-select"),
                 ("Enter", "preview"),
@@ -606,13 +738,8 @@ impl View for PresetsView {
             &[
                 ("Enter/→", "members"),
                 ("/", "filter presets"),
-                ("r", "rename"),
                 ("c", "create"),
-                ("C", "colour"),
-                ("M", "matrix"),
-                ("a", "edit skills"),
-                ("e", "description"),
-                ("D", "delete preset"),
+                ("a", "actions"),
                 ("Esc/q", "clear/back"),
             ]
         }

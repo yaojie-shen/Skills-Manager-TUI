@@ -7,6 +7,11 @@ use ratatui::{Frame, layout::Rect, style::Style, text::Line, widgets::Paragraph}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Open,
+    EditMembers,
+    Description,
+    Color,
+    Merge,
+    Matrix,
     Tags,
     Presets,
     Deploy,
@@ -24,6 +29,9 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     Skill(String),
+    Tag(String),
+    Preset(String),
+    Repository(String),
     Batch {
         all: Vec<String>,
         visible: Vec<String>,
@@ -92,6 +100,7 @@ pub struct ContextMenu {
     offset: usize,
     area: Rect,
     hits: Vec<(Rect, usize)>,
+    keyboard: bool,
 }
 impl ContextMenu {
     pub fn new(request: Request, x: u16, y: u16) -> Self {
@@ -102,6 +111,13 @@ impl ContextMenu {
             offset: 0,
             area: Rect::default(),
             hits: vec![],
+            keyboard: false,
+        }
+    }
+    pub fn keyboard(request: Request) -> Self {
+        Self {
+            keyboard: true,
+            ..Self::new(request, u16::MAX, u16::MAX)
         }
     }
     fn activate(&self) -> MenuEvent {
@@ -154,32 +170,42 @@ impl ContextMenu {
         MenuEvent::Stay
     }
     pub fn draw(&mut self, f: &mut Frame, bounds: Rect, th: &Theme) {
-        const MOUSE_FOOTER: &str = "Left click to run · right click outside to close";
+        const MOUSE_FOOTER: &str = "Left click to run · click outside to close";
+        const KEYBOARD_FOOTER: &str = "↑↓ choose · Enter run · Esc close";
         self.hits.clear();
-        let has_footer = self
+        let has_disabled = self
             .request
             .items
             .iter()
             .any(|item| item.disabled.is_some());
+        let has_footer = self.keyboard || has_disabled;
         let footer_width = if has_footer {
             self.request
                 .items
                 .iter()
                 .filter_map(|item| item.disabled.as_deref())
                 .map(width)
-                .chain([width(MOUSE_FOOTER)])
+                .chain([width(if self.keyboard {
+                    KEYBOARD_FOOTER
+                } else {
+                    MOUSE_FOOTER
+                })])
                 .max()
                 .unwrap_or(0)
                 + 2
         } else {
-            0
+            width(if self.keyboard {
+                KEYBOARD_FOOTER
+            } else {
+                MOUSE_FOOTER
+            }) + 2
         };
         let wanted = self
             .request
             .items
             .iter()
             .map(|i| {
-                (width(&i.label) + 4)
+                (width(&i.label) + shortcut_label(i.shortcut).map_or(0, |key| width(&key) + 2) + 4)
                     .max(i.disabled.as_deref().map_or(0, |reason| width(reason) + 4))
             })
             .chain([
@@ -203,18 +229,22 @@ impl ContextMenu {
         let h = (lines.len() as u16 + 2 + u16::from(has_detail) + 2 * u16::from(has_footer))
             .min(bounds.height);
 
-        self.area = Rect::new(
-            self.anchor
-                .0
-                .min(bounds.right().saturating_sub(w))
-                .max(bounds.x),
-            self.anchor
-                .1
-                .min(bounds.bottom().saturating_sub(h))
-                .max(bounds.y),
-            w,
-            h,
-        );
+        self.area = if self.anchor == (u16::MAX, u16::MAX) {
+            crate::tui::widgets::centered(bounds, w, h)
+        } else {
+            Rect::new(
+                self.anchor
+                    .0
+                    .min(bounds.right().saturating_sub(w))
+                    .max(bounds.x),
+                self.anchor
+                    .1
+                    .min(bounds.bottom().saturating_sub(h))
+                    .max(bounds.y),
+                w,
+                h,
+            )
+        };
         f.render_widget(Clear, self.area);
         let block = th.block(fit(&self.request.title, w.saturating_sub(4) as usize), true);
         let inner = block.inner(self.area);
@@ -268,9 +298,17 @@ impl ContextMenu {
             };
             let item = &self.request.items[index];
             let marker = if index == self.selected { "›" } else { " " };
-            let budget = (inner.width as usize).saturating_sub(2);
+            let shortcut = shortcut_label(item.shortcut);
+            let shortcut_width = shortcut.as_deref().map_or(0, width);
+            let budget = (inner.width as usize).saturating_sub(shortcut_width + 4);
             let label = fit(&item.label, budget);
-            let text = format!("{marker} {label}");
+            let gap = (inner.width as usize)
+                .saturating_sub(width(marker) + 1 + width(&label) + shortcut_width);
+            let text = format!(
+                "{marker} {label}{}{}",
+                " ".repeat(gap),
+                shortcut.unwrap_or_default()
+            );
             let mut style = Style::default();
             if item.danger {
                 style = style.fg(th.err);
@@ -296,7 +334,11 @@ impl ContextMenu {
                 .items
                 .get(self.selected)
                 .and_then(|i| i.disabled.as_deref())
-                .unwrap_or(MOUSE_FOOTER);
+                .unwrap_or(if self.keyboard {
+                    KEYBOARD_FOOTER
+                } else {
+                    MOUSE_FOOTER
+                });
             let message = if self.offset > 0 || self.offset + rows < lines.len() {
                 format!("↕ {reason}")
             } else {
@@ -320,6 +362,14 @@ impl ContextMenu {
     #[cfg(test)]
     pub(crate) fn menu_area(&self) -> Rect {
         self.area
+    }
+}
+
+fn shortcut_label(key: KeyCode) -> Option<String> {
+    match key {
+        KeyCode::Char(character) => Some(character.to_string()),
+        KeyCode::Enter => Some("Enter".into()),
+        _ => None,
     }
 }
 
@@ -459,5 +509,17 @@ mod tests {
         let rendered = draw(&mut m, 80, 24);
         assert!(!rendered.contains("Left click to run"));
         assert!(!rendered.contains("Unavailable now"));
+    }
+
+    #[test]
+    fn keyboard_menu_is_centered_and_shows_keys() {
+        let mut m = ContextMenu::keyboard(menu().request);
+        let rendered = draw(&mut m, 80, 24);
+        assert_eq!(m.area.x, (80 - m.area.width) / 2);
+        assert!(rendered.contains("↑↓ choose · Enter run · Esc close"));
+        assert!(rendered.contains("View"));
+        assert!(rendered.contains("Enter"));
+        assert!(rendered.contains("Check"));
+        assert!(rendered.contains("u"));
     }
 }

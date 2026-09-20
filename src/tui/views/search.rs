@@ -309,7 +309,7 @@ impl SearchView {
             return &[
                 ("/", "filter skills"),
                 ("m", "multi-select"),
-                ("a", "edit members"),
+                ("a", "actions"),
                 ("x", "remove from preset"),
                 ("Enter", "preview"),
                 ("←", "presets"),
@@ -1144,6 +1144,26 @@ impl SearchView {
 }
 
 impl View for SearchView {
+    fn overlay_open(&self) -> bool {
+        self.overlay.is_open()
+    }
+    fn handle_control_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.multi && self.focus == Focus::List && super::super::keymap::control(key, 'a') {
+            return self.handle_key(key, ctx);
+        }
+        if (self.focus == Focus::List
+            && (super::super::keymap::control(key, 'f') || super::super::keymap::control(key, 'b')))
+            || (self.focus == Focus::Preview
+                && (super::super::keymap::control(key, 'd')
+                    || super::super::keymap::control(key, 'u')))
+        {
+            return self.handle_key(key, ctx);
+        }
+        vec![]
+    }
+    fn actions_menu(&self, ctx: &Ctx) -> Option<Request> {
+        self.menu_current(ctx)
+    }
     fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
         self.menu_at(x, y, ctx)
     }
@@ -1678,9 +1698,7 @@ impl View for SearchView {
             return &[
                 ("Space", "select"),
                 ("Ctrl+A", "select all results"),
-                ("t", "tags"),
-                ("d", "deploy"),
-                ("p", "preset (all selected)"),
+                ("a", "actions"),
                 ("/", "filter"),
                 ("Enter", "preview"),
                 ("Esc", "cancel selection"),
@@ -1697,23 +1715,13 @@ impl View for SearchView {
                 ("↓", "list"),
                 ("Enter", "list"),
                 ("Esc", "clear/results"),
-                ("Ctrl-G", "help"),
             ],
             Focus::List => &[
                 ("Enter", "preview"),
                 ("Esc/q", "clear/back"),
                 ("m", "multi-select"),
-                ("t", "tags"),
-                ("n", "note"),
-                ("d", "deploy"),
-                ("p", "add to preset"),
-                ("r", "rename"),
-                ("s", "source"),
-                ("a", "accept repo changes"),
-                ("u/U", "check/update"),
-                ("x", "remove"),
-                ("i", "install"),
-                ("R", "repos"),
+                ("a", "actions"),
+                ("/", "search"),
                 ("v/V", "layout"),
             ],
             Focus::Preview => &[

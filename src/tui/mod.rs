@@ -13,6 +13,7 @@ mod components;
 mod deploy_picker;
 mod event;
 mod icons;
+mod keymap;
 #[cfg(test)]
 mod latency_bench;
 mod markdown;

@@ -1638,7 +1638,7 @@ impl AgentsView {
                     ("↑↓←→", "skill · ↑ first row: filters/search"),
                     ("/", "filter skills"),
                     ("i", "install"),
-                    ("a", "adopt"),
+                    ("a", "actions"),
                     ("Enter", "preview"),
                     ("v", "layout"),
                     ("[ ]", "agent"),
@@ -1692,7 +1692,7 @@ impl AgentsView {
                     ("v", "layout"),
                 ],
                 Caps { adopt: true, .. } => &[
-                    ("a", "adopt"),
+                    ("a", "actions"),
                     ("j/k", "move"),
                     ("↑", "first row: filters/search"),
                     ("Enter", "preview"),
@@ -1860,6 +1860,26 @@ impl AgentsView {
 }
 
 impl View for AgentsView {
+    fn overlay_open(&self) -> bool {
+        self.preview.is_open() || self.matrix.hints().is_some() || self.quick.popup.is_some()
+    }
+    fn actions_menu(&self, ctx: &Ctx) -> Option<Request> {
+        if self.preview.is_open()
+            || self.matrix.hints().is_some()
+            || self.quick.popup.is_some()
+            || self.filter_editing
+            || self.focus() != Focus::Entries
+        {
+            return None;
+        }
+        let data = self.scoped.clone();
+        let scoped = data.as_ref().map(|d| Ctx {
+            ws: &d.0,
+            snap: &d.1,
+            settings: ctx.settings,
+        });
+        self.entry_menu(scoped.as_ref().unwrap_or(ctx))
+    }
     fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
         if self.preview.is_open()
             || self.matrix.hints().is_some()

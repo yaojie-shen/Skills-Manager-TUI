@@ -19,6 +19,15 @@ use ratatui::layout::Rect;
 use crate::tui::components::context_menu::{Command, Request, Target};
 
 pub trait View {
+    fn overlay_open(&self) -> bool {
+        false
+    }
+    fn handle_control_key(&mut self, _key: KeyEvent, _ctx: &Ctx) -> Vec<Action> {
+        vec![]
+    }
+    fn actions_menu(&self, _ctx: &Ctx) -> Option<Request> {
+        None
+    }
     fn context_menu(&mut self, _x: u16, _y: u16, _ctx: &Ctx) -> Option<Request> {
         None
     }
