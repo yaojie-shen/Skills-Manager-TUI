@@ -36,6 +36,125 @@ fn configure(ws: &Workspace, path: &Path) {
 fn head(ws: &Workspace) -> String {
     git(&["rev-parse", "HEAD"], Some(&ws.root)).unwrap()
 }
+
+fn commit(ws: &Workspace, message: &str) {
+    git(&["add", "-A"], Some(&ws.root)).unwrap();
+    git(
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@localhost",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-m",
+            message,
+        ],
+        Some(&ws.root),
+    )
+    .unwrap();
+}
+
+#[test]
+fn status_reports_local_and_remote_work_without_mutating_repository_refs() {
+    let tmp = DownloadDir::new("root-status").unwrap();
+    let unconfigured = ws(&tmp.path().join("unconfigured"));
+    let status = sync::status(&unconfigured, true).unwrap();
+    assert!(status.settings.url.is_none());
+    assert!(status.changes.is_empty());
+
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+    let one = ws(&tmp.path().join("one"));
+    configure(&one, &repo);
+    write(&one, "base", "base");
+    run(&one).unwrap();
+
+    let two = ws(&tmp.path().join("two"));
+    configure(&two, &repo);
+    run(&two).unwrap();
+    write(&two, "uncommitted", "change");
+    let local = sync::status(&two, false).unwrap();
+    assert_eq!(local.changes, vec!["?? uncommitted"]);
+    assert_eq!((local.ahead, local.behind), (0, 0));
+    assert!(!local.remote_checked);
+
+    write(&two, "ahead", "local commit");
+    commit(&two, "local");
+    let ahead = sync::status(&two, true).unwrap();
+    assert_eq!((ahead.ahead, ahead.behind), (1, 0));
+    assert!(ahead.remote_checked);
+    let cache = two.root.join(".git/skills-sync-cache");
+    assert!(cache.join("HEAD").exists());
+
+    write(&one, "behind", "remote commit");
+    run(&one).unwrap();
+    let tracked_ref = two.root.join(".git/refs/remotes/origin/skills-root-sync");
+    let tracked_before = fs::read(&tracked_ref).unwrap();
+    let index_before = fs::read(two.root.join(".git/index")).unwrap();
+    let diverged = sync::status(&two, true).unwrap();
+    assert_eq!((diverged.ahead, diverged.behind), (1, 1));
+    assert_eq!(fs::read(&tracked_ref).unwrap(), tracked_before);
+    assert_eq!(fs::read(two.root.join(".git/index")).unwrap(), index_before);
+    assert!(!two.root.join(".git/index.lock").exists());
+
+    fs::remove_dir_all(&cache).unwrap();
+    fs::write(&cache, "damaged cache").unwrap();
+    let rebuilt = sync::status(&two, true).unwrap();
+    assert_eq!((rebuilt.ahead, rebuilt.behind), (1, 1));
+    assert!(cache.is_dir());
+    assert!(cache.join("HEAD").exists());
+    assert!(!two.root.join(".git/skills-sync-cache.lock").exists());
+}
+
+#[test]
+fn automatic_sync_uses_the_probed_cache_and_rejects_later_tree_changes() {
+    let tmp = DownloadDir::new("root-auto-cache").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+    let one = ws(&tmp.path().join("one"));
+    configure(&one, &repo);
+    write(&one, "base", "base");
+    run(&one).unwrap();
+
+    let two = ws(&tmp.path().join("two"));
+    configure(&two, &repo);
+    run(&two).unwrap();
+    write(&one, "remote-change", "downloaded by probe");
+    run(&one).unwrap();
+
+    let expected = sync::status(&two, true).unwrap().changes;
+    let offline = tmp.path().join("offline.git");
+    fs::rename(&repo, &offline).unwrap();
+    let report = sync::run_automatic(&two, &expected, &mut || {}, &mut |_| {}).unwrap_err();
+    assert!(
+        !report.to_string().contains("WorkingTreeChanged"),
+        "cached reconcile should reach only the offline publish step"
+    );
+    assert_eq!(
+        fs::read_to_string(two.root.join("remote-change")).unwrap(),
+        "downloaded by probe"
+    );
+
+    fs::rename(&offline, &repo).unwrap();
+    sync::status(&two, true).unwrap();
+    let expected = sync::status(&two, false).unwrap().changes;
+    write(&two, "unexpected", "external");
+    let before = head(&two);
+    let error = sync::run_automatic(&two, &expected, &mut || {}, &mut |_| {}).unwrap_err();
+    assert!(
+        error.downcast_ref::<sync::WorkingTreeChanged>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(head(&two), before);
+    assert!(
+        git(&["ls-files", "unexpected"], Some(&two.root))
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[test]
 fn whole_root_roundtrip_includes_metadata_deletions_and_merges_independent_edits() {
     let tmp = DownloadDir::new("root-sync").unwrap();

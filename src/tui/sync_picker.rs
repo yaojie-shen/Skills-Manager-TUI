@@ -3,7 +3,6 @@ use super::{
     app::{Action, Ctx, Hints},
     components::choice_footer::{self, ChoiceEvent, ChoiceFocus},
     event::Task,
-    modal::Modal,
     widgets::{Input, ListNav, OverlayClear, centered, fit},
 };
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -23,7 +22,9 @@ pub struct Request {
 
 #[derive(Clone, Copy)]
 enum OverviewAction {
+    Changes,
     Configure,
+    Check,
     Sync(Mode),
     Disable,
 }
@@ -32,11 +33,15 @@ enum Step {
     Overview,
     Configure { fields: [Input; 2], field: usize },
     Preview { request: Request, report: Report },
+    Changes,
     Disable,
 }
 
 pub struct SyncPicker {
     settings: Settings,
+    status: Option<skills::ops::sync::Status>,
+    checking: bool,
+    error: Option<String>,
     step: Step,
     list: ListNav,
     focus: ChoiceFocus,
@@ -46,8 +51,24 @@ pub struct SyncPicker {
 }
 impl SyncPicker {
     pub fn new(ctx: &Ctx) -> anyhow::Result<Self> {
+        Self::with_status(ctx, None, false, None)
+    }
+
+    pub fn with_status(
+        ctx: &Ctx,
+        status: Option<skills::ops::sync::Status>,
+        checking: bool,
+        error: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let settings = status
+            .as_ref()
+            .map(|status| status.settings.clone())
+            .unwrap_or(Settings::load(ctx.ws)?);
         let mut picker = Self {
-            settings: Settings::load(ctx.ws)?,
+            settings,
+            status,
+            checking,
+            error,
             step: Step::Overview,
             list: ListNav::default(),
             focus: ChoiceFocus::List,
@@ -66,6 +87,24 @@ impl SyncPicker {
         Ok(picker)
     }
 
+    pub fn set_status(&mut self, status: skills::ops::sync::Status, error: Option<String>) {
+        self.settings = status.settings.clone();
+        self.status = Some(status);
+        self.checking = false;
+        self.error = error;
+        if matches!(self.step, Step::Overview) {
+            self.list.clamp(self.actions().len());
+        }
+    }
+
+    pub fn set_checking(&mut self, checking: bool) {
+        self.checking = checking;
+    }
+
+    pub fn set_error(&mut self, error: String) {
+        self.error = Some(error);
+    }
+
     fn configured(&self) -> bool {
         self.settings.url.is_some() && self.settings.branch.is_some()
     }
@@ -74,13 +113,23 @@ impl SyncPicker {
         if !self.configured() {
             vec![OverviewAction::Configure]
         } else {
-            vec![
+            let mut actions = vec![];
+            if self
+                .status
+                .as_ref()
+                .is_some_and(|status| !status.changes.is_empty())
+            {
+                actions.push(OverviewAction::Changes);
+            }
+            actions.extend([
                 OverviewAction::Sync(Mode::Sync),
+                OverviewAction::Check,
                 OverviewAction::Sync(Mode::Push),
                 OverviewAction::Sync(Mode::Pull),
                 OverviewAction::Configure,
                 OverviewAction::Disable,
-            ]
+            ]);
+            actions
         }
     }
 
@@ -88,6 +137,11 @@ impl SyncPicker {
         match &self.step {
             Step::Overview => self.actions().len(),
             Step::Preview { report, .. } => report.status.lines().count().max(1),
+            Step::Changes => self
+                .status
+                .as_ref()
+                .map_or(0, |status| status.changes.len())
+                .max(1),
             Step::Configure { .. } => 2,
             Step::Disable => 1,
         }
@@ -100,7 +154,7 @@ impl SyncPicker {
                 ("Enter", "continue"),
                 ("Esc", "back"),
             ],
-            Step::Preview { .. } | Step::Disable => {
+            Step::Preview { .. } | Step::Changes | Step::Disable => {
                 &[("Tab", "buttons"), ("Enter", "choose"), ("Esc", "back")]
             }
             Step::Overview if !self.configured() => {
@@ -158,6 +212,13 @@ impl SyncPicker {
             return vec![];
         };
         match action {
+            OverviewAction::Changes => {
+                self.step = Step::Changes;
+                self.focus = ChoiceFocus::List;
+                self.list.first(self.row_count());
+                vec![]
+            }
+            OverviewAction::Check => vec![Action::RefreshSyncStatus { remote: true }],
             OverviewAction::Configure => {
                 self.configure();
                 vec![]
@@ -182,6 +243,7 @@ impl SyncPicker {
                 dry_run: false,
                 ..request.clone()
             }),
+            Step::Changes => self.back(),
             Step::Disable => vec![Action::CloseModal, Action::Spawn(Task::SyncDisable)],
             Step::Configure { fields, .. } => {
                 let url = fields[0].value().trim().to_string();
@@ -259,7 +321,12 @@ impl SyncPicker {
             KeyCode::Enter if matches!(self.step, Step::Overview) => {
                 return self.activate_overview();
             }
-            KeyCode::Enter if matches!(self.step, Step::Preview { .. } | Step::Disable) => {
+            KeyCode::Enter
+                if matches!(
+                    self.step,
+                    Step::Preview { .. } | Step::Changes | Step::Disable
+                ) =>
+            {
                 self.focus = ChoiceFocus::Apply;
             }
             KeyCode::Char('a') if matches!(self.step, Step::Overview) => self.configure(),
@@ -324,7 +391,8 @@ impl SyncPicker {
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let height = match self.step {
             Step::Configure { .. } => 17,
-            Step::Preview { .. } | Step::Overview => 21,
+            Step::Preview { .. } | Step::Changes => 21,
+            Step::Overview => 25,
             Step::Disable => 13,
         };
         let area = centered(area, 82, height);
@@ -334,6 +402,7 @@ impl SyncPicker {
             Step::Overview => " Root backup ",
             Step::Configure { .. } => " Root backup · configure ",
             Step::Preview { .. } => " Root backup · review ",
+            Step::Changes => " Root backup · local changes ",
             Step::Disable => " Root backup · turn off automatic sync ",
         };
         let th = &ctx.settings.theme;
@@ -344,7 +413,7 @@ impl SyncPicker {
         self.field_rects = [Rect::default(); 2];
         let minimum_height = match self.step {
             Step::Configure { .. } => 13,
-            Step::Overview | Step::Preview { .. } => 8,
+            Step::Overview | Step::Preview { .. } | Step::Changes => 8,
             Step::Disable => 7,
         };
         if inner.width < 26 || inner.height < minimum_height {
@@ -385,12 +454,63 @@ impl SyncPicker {
                     Paragraph::new(details).style(th.dim()),
                     Rect::new(inner.x + 1, inner.y + 2, inner.width - 2, 2),
                 );
+                let repository = self.status.as_ref().map_or_else(
+                    || {
+                        if self.checking {
+                            "Working tree  checking…\nLocal commits  checking…\nRemote commits checking…"
+                                .into()
+                        } else {
+                            "Working tree  unknown\nLocal commits  unknown\nRemote commits unknown"
+                                .into()
+                        }
+                    },
+                    |status| {
+                        if !configured {
+                            return "Working tree  —\nLocal commits  —\nRemote commits —".into();
+                        }
+                        format!(
+                            "Working tree  {}\nLocal commits  {}\nRemote commits {}",
+                            if status.changes.is_empty() {
+                                "clean".into()
+                            } else {
+                                format!("{} changes", status.changes.len())
+                            },
+                            if status.ahead == 0 {
+                                "none waiting".into()
+                            } else {
+                                format!("{} not pushed", status.ahead)
+                            },
+                            if self.checking {
+                                "checking…".into()
+                            } else if status.remote_checked {
+                                if status.behind == 0 {
+                                    "none waiting".into()
+                                } else {
+                                    format!("{} not pulled", status.behind)
+                                }
+                            } else {
+                                "not checked".into()
+                            }
+                        )
+                    },
+                );
+                f.render_widget(
+                    Paragraph::new(repository).style(th.dim()),
+                    Rect::new(inner.x + 1, inner.y + 5, inner.width - 2, 3),
+                );
+                if let Some(error) = &self.error {
+                    f.render_widget(
+                        Paragraph::new(format!("Last check failed · {}", fit(error, 52)))
+                            .style(th.warn()),
+                        Rect::new(inner.x + 1, inner.y + 8, inner.width - 2, 1),
+                    );
+                }
                 let actions = self.actions();
                 self.list.rows = Rect::new(
                     inner.x + 1,
-                    inner.y + 5,
+                    inner.y + 10,
                     inner.width - 2,
-                    inner.height.saturating_sub(8),
+                    inner.height.saturating_sub(13),
                 );
                 self.list.item_height = 1;
                 self.list.clamp(actions.len());
@@ -398,6 +518,15 @@ impl SyncPicker {
                     .iter()
                     .map(|action| {
                         let (label, tail) = match action {
+                            OverviewAction::Changes => ("View local changes", "details"),
+                            OverviewAction::Check => (
+                                if self.checking {
+                                    "Checking remote…"
+                                } else {
+                                    "Check remote"
+                                },
+                                "status",
+                            ),
                             OverviewAction::Configure if configured => {
                                 ("Configure backup", "settings")
                             }
@@ -550,6 +679,61 @@ impl SyncPicker {
                     th,
                 );
             }
+            Step::Changes => {
+                let changes = self
+                    .status
+                    .as_ref()
+                    .map(|status| status.changes.as_slice())
+                    .unwrap_or_default();
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "{} uncommitted change{}",
+                        changes.len(),
+                        if changes.len() == 1 { "" } else { "s" }
+                    ))
+                    .style(if changes.is_empty() {
+                        th.ok()
+                    } else {
+                        th.warn()
+                    }),
+                    Rect::new(inner.x + 1, inner.y, inner.width - 2, 1),
+                );
+                self.list.rows = Rect::new(
+                    inner.x + 1,
+                    inner.y + 2,
+                    inner.width - 2,
+                    inner.height.saturating_sub(5),
+                );
+                self.list.item_height = 1;
+                self.list.clamp(changes.len().max(1));
+                let rows = if changes.is_empty() {
+                    vec![ListItem::new("  Working tree is clean")]
+                } else {
+                    changes
+                        .iter()
+                        .map(|change| {
+                            ListItem::new(format!(
+                                "  {}",
+                                fit(change, inner.width.saturating_sub(4) as usize)
+                            ))
+                        })
+                        .collect()
+                };
+                f.render_stateful_widget(
+                    List::new(rows).highlight_style(th.selected()),
+                    self.list.rows,
+                    &mut self.list.state,
+                );
+                self.buttons = choice_footer::draw_with_labels(
+                    f,
+                    Rect::new(inner.x, inner.bottom() - 2, inner.width, 2),
+                    ChoiceFocus::Cancel,
+                    false,
+                    "These changes are committed before the next sync",
+                    ("", "Back"),
+                    th,
+                );
+            }
             Step::Disable => {
                 f.render_widget(
                     Paragraph::new(vec![
@@ -582,13 +766,6 @@ impl SyncPicker {
         }
     }
 }
-pub fn open(ctx: &Ctx) -> Modal {
-    match SyncPicker::new(ctx) {
-        Ok(p) => Modal::Sync(Box::new(p)),
-        Err(e) => Modal::message("Root sync", vec![format!("{e:#}")]),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,6 +848,7 @@ mod tests {
         ] {
             assert!(screen.contains(label), "{label}");
         }
+        picker.key(key(KeyCode::Down), &ctx);
         picker.key(key(KeyCode::Down), &ctx);
         assert!(matches!(
             picker.key(key(KeyCode::Enter), &ctx).as_slice(),
@@ -794,7 +972,7 @@ mod tests {
         picker.settings.url = Some("/tmp/remote.git".into());
         picker.settings.branch = Some("main".into());
         render(&mut picker, &ctx, 100, 28);
-        let row = picker.list.rows.y + 2;
+        let row = picker.list.rows.y + 3;
         let column = picker.list.rows.x;
         let click = || MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -803,7 +981,7 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         };
         assert!(picker.mouse(click(), &ctx).is_empty());
-        assert_eq!(picker.list.selected(), Some(2));
+        assert_eq!(picker.list.selected(), Some(3));
         assert!(matches!(
             picker.mouse(click(), &ctx).as_slice(),
             [

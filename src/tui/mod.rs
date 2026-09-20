@@ -21,6 +21,7 @@ mod modal;
 mod name_choices;
 mod repository_picker;
 mod settings;
+mod sync_coordinator;
 mod sync_picker;
 mod text;
 mod theme;

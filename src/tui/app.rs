@@ -1,10 +1,13 @@
 //! Application state: owns the snapshot, dispatches messages to the active
 //! view or modal, and applies the `Action`s they return.
 
-use super::event::{Msg, Task, TaskOutput, spawn_task};
+use super::event::{Msg, Task, TaskOutput, spawn_sync_status, spawn_task};
 use super::keymap;
 use super::modal::Modal;
 use super::settings::{LayoutScope, RuntimeSettings, SessionSettings};
+#[cfg(test)]
+use super::sync_coordinator::Phase as SyncPhase;
+use super::sync_coordinator::SyncCoordinator;
 use super::theme::Theme;
 use super::toast::Toasts;
 use super::views::{
@@ -33,6 +36,7 @@ use skills::ops::{MutationScope, deploy};
 use skills::reconcile::Snapshot;
 use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -108,6 +112,10 @@ pub enum Action {
     Error(String),
     /// Re-scan in the background.
     Rescan,
+    /// Refresh cached root backup status without blocking interaction.
+    RefreshSyncStatus {
+        remote: bool,
+    },
     /// Re-scan after a successful Library mutation and schedule root sync.
     LibraryChanged,
     /// Mark a nested mutation as Agent-only; it must not schedule root sync.
@@ -223,8 +231,7 @@ pub struct App {
     pub toasts: Toasts,
     pub history: History,
     tasks_running: usize,
-    root_sync_pending: bool,
-    root_sync_running: bool,
+    sync: SyncCoordinator,
     next_task_id: u64,
     spinner: usize,
     last_root_poll: std::time::Instant,
@@ -235,6 +242,7 @@ pub struct App {
     quit: bool,
     quit_prompt: Option<QuitPrompt>,
     tab_rects: Vec<(Rect, Tab)>,
+    sync_button: Rect,
     body: Rect,
 }
 
@@ -398,8 +406,7 @@ impl App {
             batch_modal_owned: false,
             history: History::default(),
             tasks_running: 0,
-            root_sync_pending: false,
-            root_sync_running: false,
+            sync: SyncCoordinator::default(),
             next_task_id: 0,
             spinner: 0,
             last_root_poll: std::time::Instant::now(),
@@ -410,9 +417,11 @@ impl App {
             quit: false,
             quit_prompt: None,
             tab_rects: Vec::new(),
+            sync_button: Rect::default(),
             body: Rect::default(),
         };
         app.on_snapshot();
+        app.refresh_sync_status(true);
         if let Some(report) = &app.ws.preset_migration {
             app.toast(
                 format!(
@@ -501,7 +510,7 @@ impl App {
                     if let Some(intent) = intent {
                         self.history.record(intent);
                     }
-                    self.root_sync_pending = true;
+                    self.sync.library_changed();
                 }
                 Err(e) => self.toast(format!("note failed: {e:#}"), Level::Error),
             },
@@ -518,6 +527,9 @@ impl App {
             Msg::Tick => {
                 self.spinner = (self.spinner + 1) % SPINNER.len();
                 self.toasts.expire();
+                if !self.sync.syncing() && self.sync.due(Instant::now()) {
+                    self.refresh_sync_status(true);
+                }
                 if self.tasks_running == 0
                     && !self.task_ui_blocked()
                     && self.last_root_poll.elapsed() >= self.settings.interaction.root_poll_interval
@@ -532,8 +544,30 @@ impl App {
                 self.command_palette = None;
                 Vec::new()
             }
+            Msg::SyncPublishing => {
+                self.sync.start_publishing();
+                Vec::new()
+            }
             Msg::Progress(id, detail) => {
                 self.toasts.progress(id, detail);
+                Vec::new()
+            }
+            Msg::SyncStatus(id, result) => {
+                let displayed = result.as_ref().ok().cloned();
+                let error = result.as_ref().err().map(|error| format!("{error:#}"));
+                let outcome = self.sync.finish_check(id, result);
+                if outcome.accepted {
+                    if let Some(status) = displayed {
+                        if let Some(Modal::Sync(picker)) = self.modal.as_mut() {
+                            picker.set_status(status.clone(), None);
+                        }
+                    } else if let Some(message) = error
+                        && let Some(Modal::Sync(picker)) = self.modal.as_mut()
+                    {
+                        picker.set_checking(false);
+                        picker.set_error(message.clone());
+                    }
+                }
                 Vec::new()
             }
             Msg::Task(id, out) => {
@@ -574,25 +608,46 @@ impl App {
     }
 
     pub fn sync_if_ready(&mut self) {
-        if self.root_sync_pending
-            && self.tasks_running == 0
+        let safe = self.tasks_running == 0
             && !self.batch_running
-            && !self.task_ui_blocked()
-            && self.context_menu.is_none()
-            && self.command_palette.is_none()
-            && self.external.is_none()
-        {
-            self.root_sync_pending = false;
-            match skills::ops::sync::Settings::load(&self.ws) {
-                Ok(settings) if settings.enabled => {
-                    self.spawn(Task::Sync(super::sync_picker::Request {
-                        mode: skills::ops::sync::Mode::Sync,
-                        dry_run: false,
-                    }))
-                }
-                Err(e) => self.toast(format!("Root sync: {e:#}"), Level::Error),
-                _ => {}
-            }
+            && !self.library_edit_active()
+            && self.external.is_none();
+        if self.sync.can_start_sync(safe) {
+            let expected_changes = self.sync.expected_changes();
+            self.sync.start_sync();
+            self.spawn(Task::AutoSync(expected_changes));
+        }
+    }
+
+    fn refresh_sync_status(&mut self, remote: bool) {
+        let Some(request) = self.sync.request_check(remote, remote) else {
+            return;
+        };
+        if let Some(Modal::Sync(picker)) = self.modal.as_mut() {
+            picker.set_checking(true);
+        }
+        spawn_sync_status(self.ws.clone(), remote, request.id, self.tx.clone());
+    }
+
+    fn open_sync(&mut self, check_remote: bool) -> Vec<Action> {
+        let ctx = Ctx {
+            ws: &self.ws,
+            snap: &self.snap,
+            settings: &self.settings,
+        };
+        match super::sync_picker::SyncPicker::with_status(
+            &ctx,
+            self.sync.status.clone(),
+            self.sync.checking() || check_remote,
+            self.sync.error.clone(),
+        ) {
+            Ok(picker) => vec![
+                Action::OpenModal(Box::new(Modal::Sync(Box::new(picker)))),
+                Action::RefreshSyncStatus {
+                    remote: check_remote,
+                },
+            ],
+            Err(error) => vec![Action::Error(format!("{error:#}"))],
         }
     }
 
@@ -601,6 +656,11 @@ impl App {
             || self.modal.is_some()
             || self.context_menu.is_some()
             || self.command_palette.is_some()
+            || (self.tab == Tab::Tags && self.tags.input_focused())
+    }
+
+    fn library_edit_active(&self) -> bool {
+        self.modal.as_ref().is_some_and(Modal::library_edit_active)
             || (self.tab == Tab::Tags && self.tags.input_focused())
     }
 
@@ -635,6 +695,7 @@ impl App {
                 match result {
                     Ok(()) => vec![
                         Action::Rescan,
+                        Action::RefreshSyncStatus { remote: false },
                         Action::Toast("Root auto-sync enabled".into()),
                     ],
                     Err(e) => vec![Action::Error(format!("Root sync setup: {e:#}"))],
@@ -643,14 +704,19 @@ impl App {
             TaskOutput::SyncDisabled(result) => {
                 self.batch_running = false;
                 match result {
-                    Ok(()) => vec![Action::Toast(
-                        "Automatic root sync disabled; Git history retained".into(),
-                    )],
+                    Ok(()) => {
+                        self.sync.disable();
+                        vec![
+                            Action::RefreshSyncStatus { remote: false },
+                            Action::Toast(
+                                "Automatic root sync disabled; Git history retained".into(),
+                            ),
+                        ]
+                    }
                     Err(e) => vec![Action::Error(format!("Disable root sync: {e:#}"))],
                 }
             }
             TaskOutput::Sync(request, result) => {
-                self.root_sync_running = false;
                 self.batch_running = false;
                 if self
                     .quit_prompt
@@ -674,21 +740,86 @@ impl App {
                     }
                     result => {
                         self.rescan();
-                        self.root_sync_pending = false;
                         match result {
                             Ok(report) => {
+                                self.sync.finish_sync(true, false);
                                 if report.pulled {
                                     self.history = History::default();
                                 }
-                                vec![Action::Toast(format!(
-                                    "Root synced: backup {}, pull {}, push {}",
-                                    report.committed, report.pulled, report.pushed
-                                ))]
+                                vec![
+                                    Action::RefreshSyncStatus { remote: true },
+                                    Action::Toast(format!(
+                                        "Root synced: backup {}, pull {}, push {}",
+                                        report.committed, report.pulled, report.pushed
+                                    )),
+                                ]
                             }
-                            Err(e) => vec![Action::Error(format!(
-                                "Root sync pending: {e:#}; local changes retained"
-                            ))],
+                            Err(e) => {
+                                let conflict = e
+                                    .downcast_ref::<skills::ops::sync::SyncConflict>()
+                                    .is_some();
+                                self.sync.finish_sync(false, conflict);
+                                vec![
+                                    Action::RefreshSyncStatus { remote: true },
+                                    Action::Error(format!(
+                                        "Root sync pending: {e:#}; local changes retained"
+                                    )),
+                                ]
+                            }
                         }
+                    }
+                }
+            }
+            TaskOutput::AutoSync(result) => {
+                self.batch_running = false;
+                if self
+                    .quit_prompt
+                    .as_ref()
+                    .is_some_and(|prompt| prompt.sync_in_progress)
+                {
+                    self.quit_prompt = None;
+                    self.quit = true;
+                }
+                self.rescan();
+                match result {
+                    Ok(report) => {
+                        self.sync.finish_sync(true, false);
+                        if report.pulled {
+                            self.history = History::default();
+                        }
+                        vec![
+                            Action::RefreshSyncStatus { remote: true },
+                            Action::Toast(format!(
+                                "Root synced: backup {}, pull {}, push {}",
+                                report.committed, report.pulled, report.pushed
+                            )),
+                        ]
+                    }
+                    Err(error)
+                        if error
+                            .downcast_ref::<skills::ops::sync::WorkingTreeChanged>()
+                            .is_some() =>
+                    {
+                        self.sync.external_changed();
+                        self.sync.finish_sync(false, false);
+                        vec![
+                            Action::RefreshSyncStatus { remote: true },
+                            Action::Toast(
+                                "Library changed externally; automatic sync paused".into(),
+                            ),
+                        ]
+                    }
+                    Err(error) => {
+                        let conflict = error
+                            .downcast_ref::<skills::ops::sync::SyncConflict>()
+                            .is_some();
+                        self.sync.finish_sync(false, conflict);
+                        vec![
+                            Action::RefreshSyncStatus { remote: true },
+                            Action::Error(format!(
+                                "Root sync pending: {error:#}; local changes retained"
+                            )),
+                        ]
                     }
                 }
             }
@@ -824,6 +955,7 @@ impl App {
                 if !self.task_ui_blocked() && self.tasks_running == 0 {
                     self.root_stamp = Some(stamp);
                     if changed {
+                        self.sync.external_changed();
                         return vec![Action::Rescan];
                     }
                 }
@@ -1178,9 +1310,7 @@ impl App {
                     AppCommand::Repair => vec![Action::OpenModal(Box::new(Modal::HealthRepair(
                         Box::default(),
                     )))],
-                    AppCommand::RootSync => {
-                        vec![Action::OpenModal(Box::new(super::sync_picker::open(&ctx)))]
-                    }
+                    AppCommand::RootSync => self.open_sync(true),
                     AppCommand::ToggleTags => {
                         let enabled = !self.settings.tags_enabled;
                         vec![Action::OpenModal(Box::new(Modal::confirm_write(
@@ -1289,6 +1419,14 @@ impl App {
             }
             return vec![];
         }
+        if m.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.modal.is_none()
+            && self.context_menu.is_none()
+            && self.command_palette.is_none()
+            && self.sync_button.contains((m.column, m.row).into())
+        {
+            return self.open_sync(true);
+        }
         if let Some(menu) = self.context_menu.as_mut() {
             let event = menu.mouse(m);
             return self.context_event(event);
@@ -1366,19 +1504,20 @@ impl App {
             self.apply_scoped(*action, MutationScope::Deployment);
             return;
         }
-        if self.batch_running
-            && matches!(
-                &action,
-                Action::Write(_)
-                    | Action::Spawn(_)
-                    | Action::EditNote(_)
-                    | Action::WriteMeta(_)
-                    | Action::SubmitInput(_)
-                    | Action::ApplyLinks { .. }
-                    | Action::BatchMeta(..)
-                    | Action::BatchLinks { .. }
-                    | Action::BackgroundWrite { .. }
-            )
+        let writes = matches!(
+            &action,
+            Action::Write(_)
+                | Action::Spawn(_)
+                | Action::EditNote(_)
+                | Action::WriteMeta(_)
+                | Action::SubmitInput(_)
+                | Action::ApplyLinks { .. }
+                | Action::BatchMeta(..)
+                | Action::BatchLinks { .. }
+                | Action::BackgroundWrite { .. }
+        );
+        if writes
+            && (self.batch_running || (self.sync.switching() && scope == MutationScope::Library))
         {
             self.toast(
                 "An operation is still running; retry when it finishes",
@@ -1410,7 +1549,7 @@ impl App {
                 self.sync_if_ready();
                 if self.tasks_running == 0 {
                     self.quit = true;
-                } else if self.root_sync_running {
+                } else if self.sync.syncing() {
                     self.quit_prompt = Some(QuitPrompt::for_sync());
                 } else {
                     self.quit_prompt = Some(QuitPrompt::default());
@@ -1432,6 +1571,7 @@ impl App {
             Action::Toast(t) => self.toast(t, Level::Ok),
             Action::Error(t) => self.toast(t, Level::Error),
             Action::Rescan => self.rescan(),
+            Action::RefreshSyncStatus { remote } => self.refresh_sync_status(remote),
             Action::LibraryChanged => self.library_changed(),
             Action::Deployment(_) => unreachable!("deployment actions are unwrapped above"),
             Action::Spawn(task) => self.spawn(task),
@@ -1774,6 +1914,13 @@ impl App {
     }
 
     fn spawn(&mut self, task: Task) {
+        if self.sync.switching() && task.writes_library() {
+            self.toast(
+                "Root sync is updating the Library; retry when it finishes",
+                Level::Info,
+            );
+            return;
+        }
         if task.is_root_operation() {
             if self.tasks_running > 0 {
                 self.toast(
@@ -1782,10 +1929,15 @@ impl App {
                 );
                 return;
             }
-            self.batch_running = true;
             if task.is_root_sync() {
-                self.root_sync_pending = false;
-                self.root_sync_running = true;
+                if let Task::Sync(request) = &task
+                    && !request.dry_run
+                    && !self.sync.syncing()
+                {
+                    self.sync.start_sync();
+                }
+            } else {
+                self.batch_running = true;
             }
         }
         if matches!(task, Task::RepairApply(_)) {
@@ -1821,7 +1973,10 @@ impl App {
     }
 
     fn library_changed(&mut self) {
-        self.root_sync_pending = true;
+        self.sync.library_changed();
+        // A running read may have captured the tree before this mutation.
+        // Retire it and replace it without joining either worker.
+        self.refresh_sync_status(false);
         self.rescan();
     }
 
@@ -1921,10 +2076,27 @@ impl App {
     fn draw_header(&mut self, f: &mut Frame, area: Rect) {
         let th = &self.settings.theme;
         self.tab_rects.clear();
-        if area.width < self.settings.layout.narrow_header_width {
+        self.sync_button = Rect::default();
+        let (button, button_style) = self.sync_button_label(area.width >= 72);
+        let button_width = (width(&button) as u16).min(area.width);
+        if button_width > 0 {
+            self.sync_button = Rect::new(area.right() - button_width, area.y, button_width, 1);
+        }
+        let left_area = Rect::new(
+            area.x,
+            area.y,
+            area.width.saturating_sub(button_width),
+            area.height,
+        );
+        if left_area.width < self.settings.layout.narrow_header_width {
             let title = format!(" {} ", self.tab.title());
             self.tab_rects.push((
-                Rect::new(area.x, area.y, (width(&title) as u16).min(area.width), 1),
+                Rect::new(
+                    area.x,
+                    area.y,
+                    (width(&title) as u16).min(left_area.width),
+                    1,
+                ),
                 self.tab,
             ));
             f.render_widget(
@@ -1935,11 +2107,12 @@ impl App {
                         Style::default().fg(th.placeholder),
                     ),
                 ])),
-                area,
+                left_area,
             );
+            f.render_widget(Paragraph::new(button).style(button_style), self.sync_button);
             return;
         }
-        let compact = area.width < self.settings.layout.compact_header_width;
+        let compact = left_area.width < self.settings.layout.compact_header_width;
         let mut spans: Vec<Span> = if compact {
             vec![]
         } else {
@@ -1970,9 +2143,7 @@ impl App {
         spans.push(Span::styled(" Tab ↔ ", Style::default().fg(th.placeholder)));
         x += width(" Tab ↔ ") as u16;
         let used = (x - area.x) as usize;
-        let right = if self.root_sync_running {
-            format!("{} Root sync in progress  ", SPINNER[self.spinner])
-        } else if self.tasks_running > 0 {
+        let right = if self.tasks_running > 0 && !self.sync.syncing() {
             format!("{} working  ", SPINNER[self.spinner])
         } else {
             format!(
@@ -1985,15 +2156,68 @@ impl App {
                 skills::paths::contract_tilde(&self.snap.root)
             )
         };
-        if used + width(&right) < area.width as usize {
-            let pad = area.width as usize - used - width(&right);
+        if used + width(&right) < left_area.width as usize {
+            let pad = left_area.width as usize - used - width(&right);
             spans.push(Span::raw(" ".repeat(pad)));
             spans.push(Span::styled(right, th.dim()));
         }
-        f.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect::new(area.x, area.y, area.width, 1),
-        );
+        f.render_widget(Paragraph::new(Line::from(spans)), left_area);
+        f.render_widget(Paragraph::new(button).style(button_style), self.sync_button);
+    }
+
+    fn sync_button_label(&self, expanded: bool) -> (String, Style) {
+        let th = &self.settings.theme;
+        let (compact, text, style): (String, String, Style) = if self.sync.syncing() {
+            (SPINNER[self.spinner].into(), "Syncing…".into(), th.accent())
+        } else if self.sync.checking() {
+            (SPINNER[self.spinner].into(), "Checking…".into(), th.dim())
+        } else if self.sync.error.is_some() {
+            ("×".into(), "× Check failed".into(), th.err())
+        } else if let Some(status) = &self.sync.status {
+            if status.settings.url.is_none() || status.settings.branch.is_none() {
+                ("○".into(), "○ Set up backup".into(), th.warn())
+            } else if !status.changes.is_empty() || status.ahead > 0 || status.behind > 0 {
+                let mut counts = Vec::new();
+                if !status.changes.is_empty() {
+                    counts.push(format!("● {}", status.changes.len()));
+                }
+                if status.ahead > 0 {
+                    counts.push(format!("↑ {}", status.ahead));
+                }
+                if status.behind > 0 {
+                    counts.push(format!("↓ {}", status.behind));
+                }
+                let compact = if !status.changes.is_empty() {
+                    "●"
+                } else if status.ahead > 0 && status.behind > 0 {
+                    "↑↓"
+                } else if status.ahead > 0 {
+                    "↑"
+                } else {
+                    "↓"
+                };
+                (compact.into(), counts.join(" · "), th.warn())
+            } else if status.remote_checked {
+                ("✓".into(), "✓ Backed up".into(), th.ok())
+            } else {
+                ("○".into(), "○ Backup ready".into(), th.dim())
+            }
+        } else {
+            ("○".into(), "○ Backup".into(), th.dim())
+        };
+        (
+            if expanded {
+                let text = if text.starts_with(&compact) {
+                    text
+                } else {
+                    format!("{compact} {text}")
+                };
+                format!("[{text}]")
+            } else {
+                format!("[{compact}]")
+            },
+            style.add_modifier(Modifier::BOLD),
+        )
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
@@ -2213,8 +2437,11 @@ mod matrix_key_tests {
 
         // Receive the worker result before dropping its temporary root, then
         // exercise the failed-scan path while retaining the known inventory.
-        let Msg::Task(id, _) = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() else {
-            panic!("expected scan completion");
+        let id = loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                Msg::Task(id, out) if matches!(*out, TaskOutput::Scan(..)) => break id,
+                _ => {}
+            }
         };
         app.handle(Msg::Task(
             id,
@@ -2668,7 +2895,7 @@ mod matrix_key_tests {
         .unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(Workspace::open(temp.path()).unwrap(), tx).unwrap();
-        app.root_sync_running = true;
+        app.sync.start_sync();
         app.batch_running = true;
         app.tasks_running = 1;
 
@@ -3199,7 +3426,13 @@ mod escape_hierarchy_tests {
             app.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
         }
         let actions = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(actions.as_slice(), [Action::OpenModal(_)]));
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                Action::OpenModal(_),
+                Action::RefreshSyncStatus { remote: true }
+            ]
+        ));
         assert!(app.command_palette.is_none());
     }
 
@@ -4892,25 +5125,106 @@ mod root_sync_tests {
         App::new(Workspace::open(temp.path()).unwrap(), tx).unwrap()
     }
 
+    fn header(app: &mut App, width: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
+        terminal.draw(|f| app.draw_header(f, f.area())).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn status(
+        changes: usize,
+        ahead: usize,
+        behind: usize,
+        remote_checked: bool,
+    ) -> skills::ops::sync::Status {
+        skills::ops::sync::Status {
+            settings: skills::ops::sync::Settings {
+                url: Some("/tmp/remote.git".into()),
+                branch: Some("main".into()),
+                enabled: true,
+            },
+            changes: (0..changes).map(|i| format!("?? file-{i}")).collect(),
+            ahead,
+            behind,
+            remote_checked,
+        }
+    }
+
+    #[test]
+    fn header_backup_button_is_compact_clickable_and_uses_cached_status() {
+        let mut app = app();
+        app.sync.set_status(status(3, 2, 1, true));
+        let wide = header(&mut app, 120);
+        assert!(wide.contains("● 3 · ↑ 2 · ↓ 1"), "{wide}");
+        assert!(app.sync_button.right() <= 120);
+
+        let narrow = header(&mut app, 40);
+        assert!(narrow.ends_with("[●]"), "{narrow}");
+        assert!(app.sync_button.right() <= 40);
+
+        let actions = app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.sync_button.x,
+            row: app.sync_button.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                Action::OpenModal(_),
+                Action::RefreshSyncStatus { remote: true }
+            ]
+        ));
+    }
+
+    #[test]
+    fn header_backup_states_and_stale_status_results_are_stable() {
+        let mut app = app();
+        app.sync.set_status(status(0, 0, 0, true));
+        assert!(header(&mut app, 100).contains("✓ Backed up"));
+
+        app.sync.set_error(Some("offline".into()));
+        assert!(header(&mut app, 100).contains("× Check failed"));
+        app.sync.set_error(None);
+        app.sync.set_phase(SyncPhase::Checking);
+        assert!(header(&mut app, 100).contains("Checking…"));
+        app.sync.set_phase(SyncPhase::Syncing);
+        assert!(header(&mut app, 100).contains("Syncing…"));
+
+        app.sync.set_phase(SyncPhase::Idle);
+        let current = app.sync.request_check(true, true).unwrap().id;
+        assert!(current > 1);
+        app.handle(Msg::SyncStatus(1, Ok(status(9, 9, 9, true))));
+        assert_eq!(app.sync.status.as_ref().unwrap().changes.len(), 0);
+        assert_eq!(app.tasks_running, 0);
+    }
+
     #[test]
     fn startup_rescan_and_deployment_mutations_do_not_schedule_root_sync() {
         let mut app = app();
-        assert!(!app.root_sync_pending);
+        assert!(!app.sync.pending());
 
         app.rescan();
-        assert!(!app.root_sync_pending);
+        assert!(!app.sync.pending());
 
         app.apply(Action::deployment(Action::Write(Box::new(|_| {
             Ok("deployed".into())
         }))));
-        assert!(!app.root_sync_pending);
+        assert!(!app.sync.pending());
     }
 
     #[test]
     fn successful_library_mutation_schedules_root_sync() {
         let mut app = app();
         app.apply(Action::Write(Box::new(|_| Ok("saved".into()))));
-        assert!(app.root_sync_pending);
+        assert!(app.sync.pending());
     }
 
     #[test]
@@ -4940,8 +5254,7 @@ mod root_sync_tests {
         skills::ops::sync::automatic(&ws).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App::new_with_launch_directory(ws, tx, Some(temp.path())).unwrap();
-        app.root_sync_running = true;
-        app.batch_running = true;
+        app.sync.start_sync();
         app.apply(Action::Write(Box::new(|_| {
             panic!("must not write during checkout")
         })));
@@ -4953,22 +5266,21 @@ mod root_sync_tests {
             ),
             "root sync must not swallow navigation shortcuts"
         );
-        app.root_sync_running = false;
-        app.batch_running = false;
+        app.sync.finish_sync(true, false);
         app.apply(Action::Write(Box::new(|ws| {
             std::fs::write(ws.root.join("saved.txt"), "automatically backed up")?;
             Ok("saved".into())
         })));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while app.tasks_running > 0 || app.root_sync_pending {
+        while app.tasks_running > 0 || app.sync.pending() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "auto-sync did not settle"
             );
             app.sync_if_ready();
-            if app.tasks_running > 0 {
-                app.handle(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
-            }
+            // Status probes are deliberately not counted as blocking tasks.
+            // The production event loop still receives them while idle.
+            app.handle(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
         }
         assert_eq!(
             skills::ops::git(&["show", "HEAD:saved.txt"], Some(&remote)).unwrap(),

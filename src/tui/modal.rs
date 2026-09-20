@@ -114,6 +114,22 @@ pub enum Modal {
 }
 
 impl Modal {
+    /// Whether this dialog contains an in-progress edit of Library state.
+    ///
+    /// Read-only overlays deliberately return false so a background root
+    /// reconcile does not wait for help, status, or navigation dialogs.
+    pub fn library_edit_active(&self) -> bool {
+        matches!(
+            self,
+            Self::Input { .. }
+                | Self::ConfirmWrite {
+                    scope: MutationScope::Library,
+                    ..
+                }
+                | Self::Resolve { .. }
+        )
+    }
+
     // ---- constructors -----------------------------------------------------
 
     pub fn batch_tags(keys: Vec<String>, ctx: &Ctx) -> Self {

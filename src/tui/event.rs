@@ -16,6 +16,8 @@ pub enum Msg {
     Mouse(MouseEvent),
     Resize,
     Tick,
+    SyncPublishing,
+    SyncStatus(u64, Result<skills::ops::sync::Status>),
     Task(u64, Box<TaskOutput>),
     Progress(u64, String),
 }
@@ -31,6 +33,7 @@ pub enum Task {
     },
     SyncDisable,
     Sync(super::sync_picker::Request),
+    AutoSync(Vec<String>),
     DiscoverRepository(String),
     InstallRepository(Box<super::repository_picker::InstallSelection>),
     Scan,
@@ -50,13 +53,20 @@ impl Task {
     pub fn is_root_operation(&self) -> bool {
         matches!(
             self,
-            Self::SyncConfigure { .. } | Self::SyncDisable | Self::Sync(_)
+            Self::SyncConfigure { .. } | Self::SyncDisable | Self::Sync(_) | Self::AutoSync(_)
         )
     }
 
     /// Only a real sync affects the sync status indicator and exit prompt.
     pub fn is_root_sync(&self) -> bool {
-        matches!(self, Self::Sync(_))
+        matches!(self, Self::Sync(_) | Self::AutoSync(_))
+    }
+
+    pub fn writes_library(&self) -> bool {
+        matches!(
+            self,
+            Self::RepairApply(_) | Self::InstallRepository(_) | Self::Install { .. }
+        )
     }
 
     pub fn label(&self) -> Option<String> {
@@ -70,6 +80,7 @@ impl Task {
                 request.mode,
                 if request.dry_run { " (preview)" } else { "" }
             )),
+            Self::AutoSync(_) => Some("Root sync".into()),
             Self::DiscoverRepository(reference) => Some(format!("Fetch {reference}")),
             Self::InstallRepository(selection) => Some(format!(
                 "Install {}",
@@ -95,6 +106,7 @@ pub enum TaskOutput {
         super::sync_picker::Request,
         Result<skills::ops::sync::Report>,
     ),
+    AutoSync(Result<skills::ops::sync::Report>),
     Batch(BatchOutcome),
     RepositoryFetched(String, Result<skills::repository::FetchedRepository>),
     RepositoryInstalled(
@@ -203,6 +215,15 @@ pub fn spawn_ticker(tx: Sender<Msg>, tick_interval: Duration) {
         .expect("spawn ticker thread");
 }
 
+pub fn spawn_sync_status(ws: Workspace, remote: bool, id: u64, tx: Sender<Msg>) {
+    std::thread::Builder::new()
+        .name("sync-status".into())
+        .spawn(move || {
+            let _ = tx.send(Msg::SyncStatus(id, skills::ops::sync::status(&ws, remote)));
+        })
+        .expect("spawn sync status thread");
+}
+
 pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
     std::thread::Builder::new()
         .name("task".into())
@@ -226,6 +247,17 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                     let result =
                         skills::ops::sync::run(&ws, request.mode, request.dry_run, &mut progress);
                     TaskOutput::Sync(request, result)
+                }
+                Task::AutoSync(expected_changes) => {
+                    let publishing_tx = tx.clone();
+                    TaskOutput::AutoSync(skills::ops::sync::run_automatic(
+                        &ws,
+                        &expected_changes,
+                        &mut || {
+                            let _ = publishing_tx.send(Msg::SyncPublishing);
+                        },
+                        &mut progress,
+                    ))
                 }
                 Task::DiscoverRepository(reference) => {
                     let result =
