@@ -170,8 +170,8 @@ impl ContextMenu {
         MenuEvent::Stay
     }
     pub fn draw(&mut self, f: &mut Frame, bounds: Rect, th: &Theme) {
-        const MOUSE_FOOTER: &str = "Left click to run · click outside to close";
-        const KEYBOARD_FOOTER: &str = "↑↓ choose · Enter run · Esc close";
+        const MOUSE_FOOTER: &str = "Click or shown keys run · click outside closes";
+        const KEYBOARD_FOOTER: &str = "↑↓ choose · Enter run · shown keys work here · Esc close";
         self.hits.clear();
         let has_disabled = self
             .request
@@ -446,7 +446,7 @@ mod tests {
             MenuEvent::Stay
         ));
         let rendered = draw(&mut m, 80, 24);
-        assert!(rendered.contains("Left click to run"));
+        assert!(rendered.contains("Click or shown keys run"));
         assert!(!rendered.contains("↑↓ choose"));
         assert!(!rendered.contains("shortcut run"));
         assert!(matches!(
@@ -507,7 +507,7 @@ mod tests {
         let mut m = menu();
         m.request.items.pop();
         let rendered = draw(&mut m, 80, 24);
-        assert!(!rendered.contains("Left click to run"));
+        assert!(!rendered.contains("Click or shown keys run"));
         assert!(!rendered.contains("Unavailable now"));
     }
 
@@ -516,7 +516,7 @@ mod tests {
         let mut m = ContextMenu::keyboard(menu().request);
         let rendered = draw(&mut m, 80, 24);
         assert_eq!(m.area.x, (80 - m.area.width) / 2);
-        assert!(rendered.contains("↑↓ choose · Enter run · Esc close"));
+        assert!(rendered.contains("↑↓ choose · Enter run · shown keys work here · Esc close"));
         assert!(rendered.contains("View"));
         assert!(rendered.contains("Enter"));
         assert!(rendered.contains("Check"));

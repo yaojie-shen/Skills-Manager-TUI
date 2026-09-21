@@ -5,7 +5,7 @@
 //! pane is the skills under the selected tag, as the cards the search and
 //! presets pages use, so a skill reads the same wherever it turns up.
 
-use super::{View, wheel};
+use super::{SplitFocus, View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::components::context_menu::{Command, Item, Request, Target};
 use crate::tui::components::group::{self, tag_fill};
@@ -37,7 +37,7 @@ pub struct TagsView {
     members: Vec<String>,
     members_tag: Option<String>,
     list: CardGrid,
-    focus_grid: bool,
+    focus: SplitFocus,
     left: Rect,
     right: Rect,
     list_track: ScrollTrack,
@@ -54,7 +54,7 @@ impl TagsView {
             self.refilter(ctx);
             return actions;
         }
-        if self.focus_grid
+        if self.focus == SplitFocus::Members
             && let Some(view) = self.skill_search.as_mut()
         {
             return view.paste(text, ctx);
@@ -68,7 +68,7 @@ impl TagsView {
     pub fn input_focused(&self) -> bool {
         self.prompt.is_some()
             || self.filter.editing
-            || (self.focus_grid
+            || (self.focus == SplitFocus::Members
                 && self
                     .skill_search
                     .as_ref()
@@ -121,7 +121,7 @@ impl TagsView {
         self.list
             .select(self.rows.iter().position(|(tag, _)| tag == name));
         self.skill_search = None;
-        self.focus_grid = false;
+        self.focus = SplitFocus::Groups;
         self.sync_members(snap);
     }
 
@@ -152,10 +152,14 @@ impl TagsView {
 
     fn ensure_skill_search(&mut self, ctx: &Ctx) {
         if self.skill_search.is_none() {
-            let focused = self.focus_grid;
+            let focused = self.focus == SplitFocus::Members;
             self.search_members(ctx);
             self.skill_search.as_mut().unwrap().focus_list();
-            self.focus_grid = focused;
+            self.focus = if focused {
+                SplitFocus::Members
+            } else {
+                SplitFocus::Groups
+            };
         }
     }
 
@@ -169,7 +173,7 @@ impl TagsView {
             },
             ctx,
         ));
-        self.focus_grid = true;
+        self.focus = SplitFocus::Members;
     }
 
     fn selected_tag(&self) -> Option<&str> {
@@ -307,7 +311,7 @@ impl TagsView {
 
     fn draw_tags(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let th = &ctx.settings.theme;
-        let focused = !self.focus_grid && self.prompt.is_none();
+        let focused = self.focus == SplitFocus::Groups && self.prompt.is_none();
         let inner = area;
         let content = Rect {
             width: inner.width.saturating_sub(1),
@@ -367,10 +371,11 @@ impl TagsView {
 impl View for TagsView {
     fn overlay_open(&self) -> bool {
         self.prompt.is_some()
-            || (self.focus_grid && self.skill_search.as_ref().is_some_and(View::overlay_open))
+            || (self.focus == SplitFocus::Members
+                && self.skill_search.as_ref().is_some_and(View::overlay_open))
     }
     fn handle_control_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Vec<Action> {
-        if self.focus_grid
+        if self.focus == SplitFocus::Members
             && let Some(view) = self.skill_search.as_mut()
         {
             return view.handle_control_key(key, ctx);
@@ -381,7 +386,7 @@ impl View for TagsView {
         if self.prompt.is_some() || self.filter.editing {
             return None;
         }
-        if self.focus_grid {
+        if self.focus == SplitFocus::Members {
             let mut request = self.skill_search.as_ref()?.actions_menu(ctx)?;
             request.items.retain(|item| item.command != Command::Accept);
             for item in &mut request.items {
@@ -451,7 +456,7 @@ impl View for TagsView {
                 Item::new(
                     Command::Remove,
                     "Delete tag",
-                    KeyCode::Char('x'),
+                    KeyCode::Char('D'),
                     editable,
                     "The untagged group cannot be deleted",
                     2,
@@ -471,7 +476,7 @@ impl View for TagsView {
                 item.label = "Remove from tag".into();
             }
         }
-        self.focus_grid = true;
+        self.focus = SplitFocus::Members;
         self.filter.editing = false;
         Some(request)
     }
@@ -530,12 +535,12 @@ impl View for TagsView {
     }
 
     fn focus_from_above(&mut self) {
-        self.focus_grid = false;
+        self.focus = SplitFocus::Filter;
         self.filter.editing = true;
     }
 
     fn focus_root(&mut self) {
-        self.focus_grid = false;
+        self.focus = SplitFocus::Groups;
         self.filter.editing = false;
     }
 
@@ -581,29 +586,29 @@ impl View for TagsView {
         if self.prompt.is_some() {
             return self.prompt_key(k);
         }
-        if !self.focus_grid
+        if self.focus != SplitFocus::Members
             && self.filter.editing
             && k.code == KeyCode::Right
             && self.filter.input.cursor_byte() == self.filter.input.value().len()
         {
             if let Some(view) = self.skill_search.as_mut() {
                 self.filter.editing = false;
-                self.focus_grid = true;
+                self.focus = SplitFocus::Members;
                 view.focus_input();
             }
             return vec![];
         }
-        if self.focus_grid
+        if self.focus == SplitFocus::Members
             && let Some(view) = self.skill_search.as_mut()
         {
             if k.code == KeyCode::Left && view.input_at_left_edge() {
                 view.close_input_completion();
-                self.focus_grid = false;
+                self.focus = SplitFocus::Filter;
                 self.filter.editing = true;
                 return vec![];
             }
             if k.code == KeyCode::Left && view.panel_back() {
-                self.focus_grid = false;
+                self.focus = SplitFocus::Groups;
                 self.filter.editing = false;
                 return vec![];
             }
@@ -621,22 +626,26 @@ impl View for TagsView {
                 return actions;
             }
             if actions.iter().any(|a| matches!(a, Action::BackToParent)) {
-                self.focus_grid = false;
+                self.focus = SplitFocus::Groups;
                 self.filter.editing = false;
                 actions.retain(|a| !matches!(a, Action::BackToParent));
             }
             return actions;
         }
-        if !self.focus_grid && self.filter.editing && k.code == KeyCode::Up {
+        if self.focus != SplitFocus::Members && self.filter.editing && k.code == KeyCode::Up {
             self.filter.editing = false;
             return vec![Action::BackToParent];
         }
-        if !self.focus_grid && self.filter.key(k) {
+        if self.focus != SplitFocus::Members && self.filter.key(k) {
+            self.focus = if self.filter.editing {
+                SplitFocus::Filter
+            } else {
+                SplitFocus::Groups
+            };
             self.refilter(ctx);
             return vec![];
         }
         let n = self.rows.len();
-        let m = self.members.len();
         match k.code {
             KeyCode::Char('q') => vec![Action::BackToParent],
             KeyCode::Esc => vec![Action::BackToParent],
@@ -647,6 +656,7 @@ impl View for TagsView {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.list.selected().unwrap_or(0) == 0 {
+                    self.focus = SplitFocus::Filter;
                     self.filter.editing = true;
                     return vec![];
                 }
@@ -665,11 +675,9 @@ impl View for TagsView {
                 vec![]
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if m > 0 {
-                    self.focus_grid = true;
-                    if let Some(view) = self.skill_search.as_mut() {
-                        view.focus_list();
-                    }
+                self.focus = SplitFocus::Members;
+                if let Some(view) = self.skill_search.as_mut() {
+                    view.focus_list();
                 }
                 vec![]
             }
@@ -697,7 +705,7 @@ impl View for TagsView {
                 None => vec![],
             },
             KeyCode::Char('C') => self.ask_color(ctx),
-            KeyCode::Char('D' | 'x') | KeyCode::Delete => match self.actionable_tag() {
+            KeyCode::Char('D') => match self.actionable_tag() {
                 Some(t) => vec![Action::OpenModal(Box::new(Modal::delete_tag(&t)))],
                 None => vec![],
             },
@@ -714,20 +722,20 @@ impl View for TagsView {
         let pressing = m.kind == MouseEventKind::Down(MouseButton::Left);
         let dragging = m.kind == MouseEventKind::Drag(MouseButton::Left);
         if pressing && self.filter.click_input(m.column, m.row) {
-            self.focus_grid = false;
+            self.focus = SplitFocus::Filter;
             self.filter.editing = true;
             return vec![];
         }
         if self.right.contains(at) {
             if pressing || wheel(&m, ctx).is_some() {
-                self.focus_grid = true;
+                self.focus = SplitFocus::Members;
                 self.filter.editing = false;
             }
             return self.skill_search.as_mut().unwrap().handle_mouse(m, ctx);
         }
         if let Some(d) = wheel(&m, ctx) {
             if self.left.contains(at) {
-                self.focus_grid = false;
+                self.focus = SplitFocus::Groups;
                 self.filter.editing = false;
                 self.list.move_by(d.signum(), self.rows.len());
                 self.sync_members(ctx.snap);
@@ -736,7 +744,7 @@ impl View for TagsView {
         }
         if (pressing && self.list_track.hit(m.column, m.row)) || (dragging && self.list_drag) {
             self.list_drag = true;
-            self.focus_grid = false;
+            self.focus = SplitFocus::Groups;
             self.filter.editing = false;
             if let Some(row) = self.list_track.index_at(m.row, self.list.grid_rows()) {
                 self.list.select_row(row);
@@ -748,12 +756,12 @@ impl View for TagsView {
             self.list_drag = false;
         }
         if pressing && self.left.contains(at) {
-            self.focus_grid = false;
+            self.focus = SplitFocus::Groups;
             self.filter.editing = false;
             if let Some((_, double)) = self.list.click(m.column, m.row) {
                 self.sync_members(ctx.snap);
-                if double && !self.members.is_empty() {
-                    self.focus_grid = true;
+                if double {
+                    self.focus = SplitFocus::Members;
                     if let Some(view) = self.skill_search.as_mut() {
                         view.focus_list();
                     }
@@ -768,12 +776,17 @@ impl View for TagsView {
         let (left, right) = split_panes(area, 38, ctx);
         self.left = left;
         self.right = right;
-        let content = self
-            .filter
-            .draw(f, left, "Filter tags", "tags", !self.focus_grid, ctx);
+        let content = self.filter.draw(
+            f,
+            left,
+            "Filter tags",
+            "tags",
+            self.focus == SplitFocus::Groups,
+            ctx,
+        );
         self.draw_tags(f, content, ctx);
         if let Some(view) = self.skill_search.as_mut() {
-            view.set_panel_active(self.focus_grid);
+            view.set_panel_active(self.focus == SplitFocus::Members);
             view.draw(f, right, ctx);
         }
         self.draw_prompt(f, area, ctx);
@@ -783,7 +796,7 @@ impl View for TagsView {
         if self.filter.editing {
             return &[("Enter/↓", "tags"), ("Esc", "clear filter")];
         }
-        if self.focus_grid
+        if self.focus == SplitFocus::Members
             && let Some(view) = self.skill_search.as_ref()
         {
             return view.hints();
@@ -795,7 +808,7 @@ impl View for TagsView {
                 ("Enter", "apply"),
                 ("Esc", "cancel"),
             ],
-            None if self.focus_grid => &[
+            None if self.focus == SplitFocus::Members => &[
                 ("/", "filter skills"),
                 ("Enter", "preview"),
                 ("a", "actions"),
@@ -805,11 +818,13 @@ impl View for TagsView {
                 ("←/Esc", "tags"),
             ],
             None => &[
-                ("/", "filter tags"),
-                ("c", "create"),
+                ("↑↓/j/k", "select"),
                 ("a", "actions"),
+                ("c", "create"),
+                ("D", "delete tag"),
                 ("Enter/→", "skills"),
-                ("Esc/q", "clear/back"),
+                ("/", "filter"),
+                ("Esc/q", "back"),
             ],
         }
     }
@@ -959,5 +974,15 @@ mod snapshot_tests {
                 .as_slice(),
             [Action::WriteMeta(_)]
         ));
+        view.focus = SplitFocus::Groups;
+        let root_actions = view.actions_menu(&ctx).unwrap();
+        assert_eq!(
+            root_actions
+                .items
+                .iter()
+                .find(|item| item.command == Command::Remove)
+                .map(|item| item.shortcut),
+            Some(KeyCode::Char('D'))
+        );
     }
 }

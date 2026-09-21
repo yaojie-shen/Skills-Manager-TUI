@@ -18,6 +18,14 @@ use ratatui::layout::Rect;
 
 use crate::tui::components::context_menu::{Command, Request, Target};
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SplitFocus {
+    Filter,
+    #[default]
+    Groups,
+    Members,
+}
+
 pub trait View {
     fn overlay_open(&self) -> bool {
         false

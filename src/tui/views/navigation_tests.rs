@@ -191,12 +191,16 @@ fn tag_and_preset_first_item_move_up_to_filter_and_down_to_results() {
     };
     let mut tags = TagsView::default();
     tags.refresh(&ctx);
+    tags.focus_root();
+    assert!(!tags.input_focused());
     tags.handle_key(key(KeyCode::Up), &ctx);
     assert!(tags.input_focused());
     tags.handle_key(key(KeyCode::Down), &ctx);
     assert!(!tags.input_focused());
     let mut presets = PresetsView::default();
     presets.refresh(&ctx);
+    presets.focus_root();
+    assert!(!presets.input_focused());
     presets.handle_key(key(KeyCode::Up), &ctx);
     assert!(presets.input_focused());
     presets.handle_key(key(KeyCode::Down), &ctx);
@@ -287,8 +291,9 @@ fn create_empty_tag_then_add_members_with_shared_picker() {
     else {
         panic!("member picker")
     };
+    modal.handle_key(key(KeyCode::Char('/')), &ctx);
     modal.paste("alpha", &ctx);
-    modal.handle_key(key(KeyCode::Down), &ctx);
+    modal.handle_key(key(KeyCode::Enter), &ctx);
     modal.handle_key(key(KeyCode::Char(' ')), &ctx);
     let Action::BatchMeta(write, _) = modal
         .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctx)

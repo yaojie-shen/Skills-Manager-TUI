@@ -408,6 +408,7 @@ impl SearchView {
             view.checked = p.members().into_iter().collect();
             view.preset_original = view.checked.clone();
         }
+        view.focus_list();
         view
     }
 
@@ -426,6 +427,7 @@ impl SearchView {
             .filter(|r| r.tags.iter().any(|t| t == tag))
             .map(|r| r.key.clone())
             .collect();
+        view.focus_list();
         view
     }
 
@@ -1295,7 +1297,11 @@ impl View for SearchView {
                 return vec![];
             }
             if self.focus == Focus::List && k.code == KeyCode::Char('a') && k.modifiers.is_empty() {
-                return self.apply_preset(ctx);
+                return if self.target.is_some() {
+                    self.apply_preset(ctx)
+                } else {
+                    vec![]
+                };
             }
             if k.code == KeyCode::Enter && k.modifiers.contains(KeyModifiers::CONTROL) {
                 return self.apply_preset(ctx);
@@ -1686,11 +1692,11 @@ impl View for SearchView {
         }
         if self.is_picker() {
             return &[
-                ("Enter/Space", "select"),
+                ("Enter/Space", "toggle"),
                 ("Ctrl+A", "select all results"),
-                ("/", "search"),
+                ("/", "filter"),
                 ("o", "preview"),
-                ("Tab/Shift+Tab", "list / buttons"),
+                ("Tab", "apply / cancel"),
                 ("Esc", "cancel"),
             ];
         }
@@ -1768,8 +1774,9 @@ mod tests {
             settings: &settings,
         };
         let mut picker = SearchView::preset_members("daily", &ctx);
-        picker.focus_list();
+        assert_eq!(picker.focus, Focus::List);
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(picker.handle_key(key(KeyCode::Char('a')), &ctx).is_empty());
         picker.handle_key(key(KeyCode::Tab), &ctx);
         assert_eq!(picker.choice_focus, ChoiceFocus::Apply);
         assert!(picker.handle_key(key(KeyCode::Enter), &ctx).is_empty());
@@ -1895,8 +1902,9 @@ mod tests {
         let mut newer = ws.presets.load("daily").unwrap().unwrap();
         newer.skills.push("delta".into());
         ws.presets.save(&newer).unwrap();
-        let Action::BatchMeta(write, keys) =
-            picker.handle_key(key(KeyCode::Char('a')), &ctx).remove(0)
+        let Action::BatchMeta(write, keys) = picker
+            .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &ctx)
+            .remove(0)
         else {
             panic!("expected complete member edit");
         };
@@ -2382,7 +2390,12 @@ mod tests {
             ws.presets.load("office").unwrap().unwrap().skills,
             vec!["document"]
         );
-        let mut actions = picker.handle_key(key(KeyCode::Char('a')), &ctx);
+        assert!(
+            picker.handle_key(key(KeyCode::Char('a')), &ctx).is_empty(),
+            "a must not apply a member picker"
+        );
+        picker.handle_key(key(KeyCode::Tab), &ctx);
+        let mut actions = picker.handle_key(key(KeyCode::Enter), &ctx);
         let Action::BatchMeta(write, _) = actions.remove(0) else {
             panic!("not a staged preset apply")
         };

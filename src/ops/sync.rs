@@ -62,6 +62,10 @@ pub struct AutoSyncFailure {
 }
 
 impl AutoSyncFailure {
+    pub fn is_conflict(&self) -> bool {
+        self.source.downcast_ref::<SyncConflict>().is_some()
+    }
+
     fn transient(source: anyhow::Error) -> Self {
         Self {
             disposition: AutoSyncDisposition::Transient,

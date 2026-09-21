@@ -201,6 +201,27 @@ pub enum Level {
     Error,
 }
 
+fn auto_sync_failure_action(
+    disposition: skills::ops::sync::AutoSyncDisposition,
+    conflict: bool,
+    detail: &str,
+) -> Action {
+    match disposition {
+        skills::ops::sync::AutoSyncDisposition::Transient => Action::Error(
+            "Root sync will retry after the next status check; local changes retained".into(),
+        ),
+        skills::ops::sync::AutoSyncDisposition::Fatal if conflict => Action::Error(
+            "Root sync conflict; local backup retained. Resolve with Git, then retry".into(),
+        ),
+        skills::ops::sync::AutoSyncDisposition::Fatal => {
+            Action::Error(format!("Root sync stopped: {detail}"))
+        }
+        skills::ops::sync::AutoSyncDisposition::WorkingTreeChanged => {
+            Action::Toast("Library changed externally; automatic sync paused".into())
+        }
+    }
+}
+
 /// Read-only context handed to views while drawing and handling input.
 pub struct Ctx<'a> {
     pub ws: &'a Workspace,
@@ -812,17 +833,11 @@ impl App {
                     Err(error) => {
                         let disposition = error.disposition;
                         self.sync.finish_auto_sync(Err(disposition));
-                        let message = if disposition
-                            == skills::ops::sync::AutoSyncDisposition::WorkingTreeChanged
-                        {
-                            Action::Toast(
-                                "Library changed externally; automatic sync paused".into(),
-                            )
-                        } else {
-                            Action::Error(format!(
-                                "Root sync pending: {error}; local changes retained"
-                            ))
-                        };
+                        let message = auto_sync_failure_action(
+                            disposition,
+                            error.is_conflict(),
+                            &error.to_string(),
+                        );
                         vec![
                             Action::RefreshSyncStatus {
                                 remote: true,
@@ -2512,10 +2527,8 @@ mod matrix_key_tests {
         let original = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        app.handle(Msg::Key(KeyEvent::new(
-            KeyCode::Char('a'),
-            KeyModifiers::NONE,
-        )));
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
         while app.batch_running || app.tasks_running > 0 {
             app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
         }
@@ -2531,16 +2544,10 @@ mod matrix_key_tests {
         std::fs::remove_dir(&path).unwrap();
         std::fs::write(&path, &original).unwrap();
         // Retry without selecting again: the original staged selection survives.
-        app.handle(Msg::Key(KeyEvent::new(
-            KeyCode::Char('a'),
-            KeyModifiers::NONE,
-        )));
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
         assert!(app.batch_running);
         let task = app.next_task_id;
-        app.handle(Msg::Key(KeyEvent::new(
-            KeyCode::Char('a'),
-            KeyModifiers::NONE,
-        )));
+        app.handle(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
         assert_eq!(
             app.next_task_id, task,
             "repeated apply must not submit twice"
@@ -3489,6 +3496,22 @@ mod escape_hierarchy_tests {
     }
 
     #[test]
+    fn group_delete_uses_capital_d_while_x_is_reserved_for_members() {
+        for tab in [Tab::Tags, Tab::Presets] {
+            let (_root, mut app) = app();
+            app.apply(Action::SwitchTab(tab));
+            key(&mut app, KeyCode::Enter);
+            key(&mut app, KeyCode::Char('x'));
+            assert!(app.modal.is_none(), "x must not delete the {tab:?} group");
+            key(&mut app, KeyCode::Char('D'));
+            assert!(
+                matches!(app.modal, Some(Modal::ConfirmWrite { .. })),
+                "D should confirm deletion of the {tab:?} group"
+            );
+        }
+    }
+
+    #[test]
     fn palette_blocks_background_dialogs_and_clears_on_transitions() {
         let (_root, mut app) = app();
         app.enter_page();
@@ -3589,6 +3612,31 @@ mod escape_hierarchy_tests {
         assert_eq!(app.focus, AppFocus::Tabs);
         assert_eq!(app.tab, Tab::Search);
         assert!(!app.quit);
+    }
+
+    #[test]
+    fn enter_targets_groups_while_down_targets_split_page_filters() {
+        let (_root, mut app) = app();
+        for tab in [Tab::Tags, Tab::Presets] {
+            app.apply(Action::SwitchTab(tab));
+            key(&mut app, KeyCode::Enter);
+            assert!(
+                !app.text_input_focused(),
+                "Enter should target {tab:?} groups"
+            );
+            key(&mut app, KeyCode::Char('a'));
+            assert!(app.context_menu.is_some(), "a should open {tab:?} Actions");
+            key(&mut app, KeyCode::Esc);
+            key(&mut app, KeyCode::Esc);
+            assert_eq!(app.focus, AppFocus::Tabs);
+            key(&mut app, KeyCode::Down);
+            assert!(
+                app.text_input_focused(),
+                "Down should target {tab:?} filter"
+            );
+            key(&mut app, KeyCode::Esc);
+            key(&mut app, KeyCode::Up);
+        }
     }
 
     #[test]
@@ -4580,23 +4628,13 @@ mod context_menu_tests {
         app.modal = Some(Modal::preset_members("Office", &ctx));
         assert_footer_exact(
             &mut app,
-            "preset skill picker input",
-            &[
-                ("Enter/↓", "results"),
-                ("Tab/Shift+Tab", "list / buttons"),
-                ("Esc", "cancel"),
-            ],
-        );
-        key(&mut app, KeyCode::Down);
-        assert_footer_exact(
-            &mut app,
             "preset skill picker list",
             &[
-                ("Enter/Space", "select"),
+                ("Enter/Space", "toggle"),
                 ("Ctrl+A", "select all results"),
-                ("/", "search"),
+                ("/", "filter"),
                 ("o", "preview"),
-                ("Tab/Shift+Tab", "list / buttons"),
+                ("Tab", "apply / cancel"),
                 ("Esc", "cancel"),
             ],
         );
@@ -4629,11 +4667,11 @@ mod context_menu_tests {
             &mut app,
             "preset skill picker list after button",
             &[
-                ("Enter/Space", "select"),
+                ("Enter/Space", "toggle"),
                 ("Ctrl+A", "select all results"),
-                ("/", "search"),
+                ("/", "filter"),
                 ("o", "preview"),
-                ("Tab/Shift+Tab", "list / buttons"),
+                ("Tab", "apply / cancel"),
                 ("Esc", "cancel"),
             ],
         );
@@ -4777,7 +4815,7 @@ mod context_menu_tests {
             modifiers: KeyModifiers::NONE,
         }));
         let enabled_footer = draw_app(&mut app, 140, 35);
-        assert!(enabled_footer.contains("Left click to run"));
+        assert!(enabled_footer.contains("Click or shown keys run"));
         assert!(!enabled_footer.contains("Ctrl-G help"));
     }
 
@@ -5173,6 +5211,50 @@ mod root_sync_tests {
             local_revision: Some("local".into()),
             remote_revision: Some("remote".into()),
         }
+    }
+
+    #[test]
+    fn automatic_sync_failures_use_concise_policy_messages() {
+        use skills::ops::sync::AutoSyncDisposition;
+
+        let Action::Error(transient) = auto_sync_failure_action(
+            AutoSyncDisposition::Transient,
+            false,
+            "git push origin failed: /tmp/private",
+        ) else {
+            panic!("transient failures must be errors");
+        };
+        assert!(transient.contains("next status check"));
+        assert!(transient.contains("local changes retained"));
+        assert!(!transient.contains("backup retained"));
+        assert!(!transient.contains("git push"));
+        assert!(!transient.contains("/tmp/"));
+
+        let Action::Error(conflict) = auto_sync_failure_action(
+            AutoSyncDisposition::Fatal,
+            true,
+            "internal merge command failed",
+        ) else {
+            panic!("conflicts must be errors");
+        };
+        assert!(conflict.contains("conflict"));
+        assert!(conflict.contains("Resolve with Git"));
+        assert!(!conflict.contains("internal merge command"));
+
+        let Action::Error(fatal) = auto_sync_failure_action(
+            AutoSyncDisposition::Fatal,
+            false,
+            "root is on feature; expected main",
+        ) else {
+            panic!("fatal failures must be errors");
+        };
+        assert!(fatal.contains("root is on feature; expected main"));
+        assert!(!fatal.contains("backup retained"));
+
+        assert!(matches!(
+            auto_sync_failure_action(AutoSyncDisposition::WorkingTreeChanged, false, "ignored"),
+            Action::Toast(message) if message.contains("automatic sync paused")
+        ));
     }
 
     #[test]

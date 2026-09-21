@@ -801,7 +801,7 @@ pub fn preset_create(ws: &Workspace, name: &str) -> Result<(String, Option<Inten
     };
     ws.presets.save(&preset)?;
     Ok((
-        format!("created {name} — a adds skills, e sets the description"),
+        format!("created {name} — open Actions to edit skills or description"),
         Some(Intent::Meta(vec![MetaChange::PresetExistence {
             preset,
             present: true,

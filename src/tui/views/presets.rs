@@ -5,7 +5,7 @@
 //! cards summarize each preset's purpose and members; deployment lives on Agents.
 
 use super::matrix::Matrix;
-use super::{View, wheel};
+use super::{SplitFocus, View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::components::context_menu::{Command, Item, Request, Target};
 use crate::tui::components::group;
@@ -34,7 +34,7 @@ pub struct PresetsView {
     filter: super::filter::Filter,
     skill_search: Option<(String, super::search::SearchView)>,
     list: CardGrid,
-    focus_members: bool,
+    focus: SplitFocus,
     left: Rect,
     right: Rect,
     list_track: ScrollTrack,
@@ -85,7 +85,7 @@ impl PresetsView {
     pub fn input_focused(&self) -> bool {
         self.color_prompt.is_some()
             || self.filter.editing
-            || (self.focus_members
+            || (self.focus == SplitFocus::Members
                 && self
                     .skill_search
                     .as_ref()
@@ -100,7 +100,7 @@ impl PresetsView {
             self.refilter(ctx);
             return actions;
         }
-        if self.focus_members
+        if self.focus == SplitFocus::Members
             && let Some((_, view)) = self.skill_search.as_mut()
         {
             return view.paste(text, ctx);
@@ -275,7 +275,7 @@ impl PresetsView {
             let ci = if cell.height < 3 {
                 cell
             } else {
-                frame(f, cell, on, !self.focus_members && !self.filter.editing, th)
+                frame(f, cell, on, self.focus == SplitFocus::Groups, th)
             };
             let lines = group::fit_preset_card(
                 self.preset_card(&self.presets[i], ctx, ci.width as usize),
@@ -291,14 +291,14 @@ impl View for PresetsView {
     fn overlay_open(&self) -> bool {
         self.color_prompt.is_some()
             || self.matrix.hints().is_some()
-            || (self.focus_members
+            || (self.focus == SplitFocus::Members
                 && self
                     .skill_search
                     .as_ref()
                     .is_some_and(|(_, view)| view.overlay_open()))
     }
     fn handle_control_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Vec<Action> {
-        if self.focus_members
+        if self.focus == SplitFocus::Members
             && let Some((_, view)) = self.skill_search.as_mut()
         {
             return view.handle_control_key(key, ctx);
@@ -309,7 +309,7 @@ impl View for PresetsView {
         if self.color_prompt.is_some() || self.matrix.hints().is_some() || self.filter.editing {
             return None;
         }
-        if self.focus_members {
+        if self.focus == SplitFocus::Members {
             let mut request = self.skill_search.as_ref()?.1.actions_menu(ctx)?;
             request.items.retain(|item| item.command != Command::Accept);
             for item in &mut request.items {
@@ -378,7 +378,7 @@ impl View for PresetsView {
                 Item::new(
                     Command::Remove,
                     "Delete preset",
-                    KeyCode::Char('x'),
+                    KeyCode::Char('D'),
                     true,
                     "",
                     2,
@@ -398,7 +398,7 @@ impl View for PresetsView {
                 item.label = "Remove from preset".into();
             }
         }
-        self.focus_members = true;
+        self.focus = SplitFocus::Members;
         self.filter.editing = false;
         Some(request)
     }
@@ -456,12 +456,12 @@ impl View for PresetsView {
     }
 
     fn focus_from_above(&mut self) {
-        self.focus_members = false;
+        self.focus = SplitFocus::Filter;
         self.filter.editing = true;
     }
 
     fn focus_root(&mut self) {
-        self.focus_members = false;
+        self.focus = SplitFocus::Groups;
         self.filter.editing = false;
     }
 
@@ -502,37 +502,42 @@ impl View for PresetsView {
         }
         self.refresh_groups(ctx);
         self.ensure_skill_search(ctx);
-        if !self.focus_members
+        if self.focus != SplitFocus::Members
             && self.filter.editing
             && k.code == KeyCode::Right
             && self.filter.input.cursor_byte() == self.filter.input.value().len()
         {
             if let Some(view) = self.skill_search.as_mut().map(|(_, view)| view) {
                 self.filter.editing = false;
-                self.focus_members = true;
+                self.focus = SplitFocus::Members;
                 view.focus_input();
             }
             return vec![];
         }
-        if !self.focus_members && self.filter.editing && k.code == KeyCode::Up {
+        if self.focus != SplitFocus::Members && self.filter.editing && k.code == KeyCode::Up {
             self.filter.editing = false;
             return vec![Action::BackToParent];
         }
-        if !self.focus_members && self.filter.key(k) {
+        if self.focus != SplitFocus::Members && self.filter.key(k) {
+            self.focus = if self.filter.editing {
+                SplitFocus::Filter
+            } else {
+                SplitFocus::Groups
+            };
             self.refilter(ctx);
             return vec![];
         }
-        if self.focus_members
+        if self.focus == SplitFocus::Members
             && let Some((_, view)) = self.skill_search.as_mut()
         {
             if k.code == KeyCode::Left && view.input_at_left_edge() {
                 view.close_input_completion();
-                self.focus_members = false;
+                self.focus = SplitFocus::Filter;
                 self.filter.editing = true;
                 return vec![];
             }
             if k.code == KeyCode::Left && view.panel_back() {
-                self.focus_members = false;
+                self.focus = SplitFocus::Groups;
                 self.filter.editing = false;
                 return vec![];
             }
@@ -551,7 +556,7 @@ impl View for PresetsView {
                 return actions;
             }
             if actions.iter().any(|a| matches!(a, Action::BackToParent)) {
-                self.focus_members = false;
+                self.focus = SplitFocus::Groups;
                 self.filter.editing = false;
                 actions.retain(|a| !matches!(a, Action::BackToParent));
             }
@@ -572,6 +577,7 @@ impl View for PresetsView {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.list.selected().unwrap_or(0) == 0 {
+                    self.focus = SplitFocus::Filter;
                     self.filter.editing = true;
                     return vec![];
                 }
@@ -591,7 +597,7 @@ impl View for PresetsView {
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if self.selected().is_some() {
-                    self.focus_members = true;
+                    self.focus = SplitFocus::Members;
                     if let Some(view) = self.skill_search.as_mut().map(|(_, view)| view) {
                         view.focus_list();
                     }
@@ -637,20 +643,20 @@ impl View for PresetsView {
             return vec![];
         }
         if pressing && self.filter.click_input(m.column, m.row) {
-            self.focus_members = false;
+            self.focus = SplitFocus::Filter;
             self.filter.editing = true;
             return vec![];
         }
         if self.right.contains(at) {
             if pressing || wheel(&m, ctx).is_some() {
-                self.focus_members = true;
+                self.focus = SplitFocus::Members;
                 self.filter.editing = false;
             }
             return self.skill_search.as_mut().unwrap().1.handle_mouse(m, ctx);
         }
         if let Some(d) = wheel(&m, ctx) {
             if self.left.contains(at) {
-                self.focus_members = false;
+                self.focus = SplitFocus::Groups;
                 self.filter.editing = false;
                 self.list.move_by(d.signum(), self.presets.len());
             }
@@ -658,7 +664,7 @@ impl View for PresetsView {
         }
         if (pressing && self.list_track.hit(m.column, m.row)) || (dragging && self.list_drag) {
             self.list_drag = true;
-            self.focus_members = false;
+            self.focus = SplitFocus::Groups;
             self.filter.editing = false;
             if let Some(row) = self.list_track.index_at(m.row, self.list.grid_rows()) {
                 self.list.select_row(row);
@@ -669,7 +675,7 @@ impl View for PresetsView {
             self.list_drag = false;
         }
         if pressing && self.left.contains(at) {
-            self.focus_members = false;
+            self.focus = SplitFocus::Groups;
             self.filter.editing = false;
             self.list.click(m.column, m.row);
         }
@@ -686,13 +692,13 @@ impl View for PresetsView {
             left,
             "Filter presets",
             "presets",
-            !self.focus_members,
+            self.focus == SplitFocus::Groups,
             ctx,
         );
         self.draw_presets(f, content, ctx);
         self.ensure_skill_search(ctx);
         if let Some((name, mut view)) = self.skill_search.take() {
-            view.set_panel_active(self.focus_members);
+            view.set_panel_active(self.focus == SplitFocus::Members);
             view.draw_with_content_header(
                 f,
                 right,
@@ -717,7 +723,7 @@ impl View for PresetsView {
         if self.filter.editing {
             return &[("Enter/↓", "presets"), ("Esc", "clear filter")];
         }
-        if self.focus_members
+        if self.focus == SplitFocus::Members
             && let Some((_, view)) = self.skill_search.as_ref()
         {
             return view.preset_panel_hints();
@@ -725,7 +731,7 @@ impl View for PresetsView {
         if let Some(hints) = self.matrix.hints() {
             return hints;
         }
-        if self.focus_members {
+        if self.focus == SplitFocus::Members {
             &[
                 ("/", "filter skills"),
                 ("a", "actions"),
@@ -736,11 +742,13 @@ impl View for PresetsView {
             ]
         } else {
             &[
-                ("Enter/→", "members"),
-                ("/", "filter presets"),
-                ("c", "create"),
+                ("↑↓/j/k", "select"),
                 ("a", "actions"),
-                ("Esc/q", "clear/back"),
+                ("c", "create"),
+                ("D", "delete preset"),
+                ("Enter/→", "members"),
+                ("/", "filter"),
+                ("Esc/q", "back"),
             ]
         }
     }
@@ -882,6 +890,16 @@ mod tests {
                 .find(|item| item.command == Command::Remove)
                 .map(|item| item.label.as_str()),
             Some("Remove from preset")
+        );
+        view.focus = SplitFocus::Groups;
+        let root_actions = view.actions_menu(&ctx).unwrap();
+        assert_eq!(
+            root_actions
+                .items
+                .iter()
+                .find(|item| item.command == Command::Remove)
+                .map(|item| item.shortcut),
+            Some(KeyCode::Char('D'))
         );
         assert!(request.items.iter().any(|item| item.disabled.is_some()));
         assert!(matches!(
@@ -1031,7 +1049,7 @@ mod tests {
         for code in [KeyCode::Char('x'), KeyCode::Delete, KeyCode::Char('a')] {
             assert!(view.handle_key(key(code), &ctx).is_empty());
             assert!(!view.skill_search.as_ref().unwrap().1.panel_actions_ready());
-            assert!(view.focus_members);
+            assert_eq!(view.focus, SplitFocus::Members);
             assert_eq!(
                 view.skill_search.as_ref().unwrap().1.panel_keys(&ctx),
                 vec!["printer"]
@@ -1041,7 +1059,7 @@ mod tests {
 
         assert!(view.handle_key(key(KeyCode::Esc), &ctx).is_empty());
         assert!(view.skill_search.as_ref().unwrap().1.panel_actions_ready());
-        assert!(view.focus_members);
+        assert_eq!(view.focus, SplitFocus::Members);
         let mut actions = view.handle_key(key(KeyCode::Char('x')), &ctx);
         assert_eq!(actions.len(), 1);
         let Action::WriteMeta(write) = actions.remove(0) else {
@@ -1170,7 +1188,7 @@ mod tag_group_tests {
             );
             assert!(actions.is_empty());
             assert!(
-                !view.focus_members,
+                view.focus != SplitFocus::Members,
                 "read-only composition must not change focus"
             );
             assert!(!view.filter.editing);

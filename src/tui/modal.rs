@@ -1726,7 +1726,7 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
                             }
                         })?;
                         anyhow::ensure!(!exists, "tag {name} already exists");
-                        Ok(format!("created {name} — press a to add skills"))
+                        Ok(format!("created {name} — open Actions to edit skills"))
                     })
                 })),
                 Action::SelectTag(selected),
@@ -2382,11 +2382,12 @@ mod picker_tests {
         let Modal::PresetSkills(view) = &modal else {
             panic!("expected shared Search view")
         };
-        assert!(view.input_focused());
+        assert!(!view.input_focused());
+        modal.handle_key(key(KeyCode::Char('/')), &ctx);
         for c in "network tools".chars() {
             assert!(modal.handle_key(key(KeyCode::Char(c)), &ctx).is_empty());
         }
-        modal.handle_key(key(KeyCode::Down), &ctx);
+        modal.handle_key(key(KeyCode::Enter), &ctx);
         assert!(modal.handle_key(key(KeyCode::Char(' ')), &ctx).is_empty());
         assert_eq!(std::fs::read(ws.presets.path("reading")).unwrap(), before);
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
