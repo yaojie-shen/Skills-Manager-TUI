@@ -5,9 +5,7 @@ use super::event::{Msg, Task, TaskOutput, spawn_sync_status, spawn_task};
 use super::keymap;
 use super::modal::Modal;
 use super::settings::{LayoutScope, RuntimeSettings, SessionSettings};
-#[cfg(test)]
-use super::sync_coordinator::Phase as SyncPhase;
-use super::sync_coordinator::SyncCoordinator;
+use super::sync_coordinator::{ProbeReason, SyncCoordinator};
 use super::theme::Theme;
 use super::toast::Toasts;
 use super::views::{
@@ -115,6 +113,7 @@ pub enum Action {
     /// Refresh cached root backup status without blocking interaction.
     RefreshSyncStatus {
         remote: bool,
+        reason: ProbeReason,
     },
     /// Re-scan after a successful Library mutation and schedule root sync.
     LibraryChanged,
@@ -421,7 +420,7 @@ impl App {
             body: Rect::default(),
         };
         app.on_snapshot();
-        app.refresh_sync_status(true);
+        app.refresh_sync_status(true, ProbeReason::Startup);
         if let Some(report) = &app.ws.preset_migration {
             app.toast(
                 format!(
@@ -510,7 +509,8 @@ impl App {
                     if let Some(intent) = intent {
                         self.history.record(intent);
                     }
-                    self.sync.library_changed();
+                    self.library_changed();
+                    return;
                 }
                 Err(e) => self.toast(format!("note failed: {e:#}"), Level::Error),
             },
@@ -527,8 +527,8 @@ impl App {
             Msg::Tick => {
                 self.spinner = (self.spinner + 1) % SPINNER.len();
                 self.toasts.expire();
-                if !self.sync.syncing() && self.sync.due(Instant::now()) {
-                    self.refresh_sync_status(true);
+                if self.sync.probe_due(Instant::now()) {
+                    self.refresh_sync_status(true, ProbeReason::Periodic);
                 }
                 if self.tasks_running == 0
                     && !self.task_ui_blocked()
@@ -555,7 +555,7 @@ impl App {
             Msg::SyncStatus(id, result) => {
                 let displayed = result.as_ref().ok().cloned();
                 let error = result.as_ref().err().map(|error| format!("{error:#}"));
-                let outcome = self.sync.finish_check(id, result);
+                let outcome = self.sync.finish_probe(id, result);
                 if outcome.accepted {
                     if let Some(status) = displayed {
                         if let Some(Modal::Sync(picker)) = self.modal.as_mut() {
@@ -566,6 +566,9 @@ impl App {
                     {
                         picker.set_checking(false);
                         picker.set_error(message.clone());
+                    }
+                    if outcome.needs_validation {
+                        self.refresh_sync_status(false, ProbeReason::Mutation);
                     }
                 }
                 Vec::new()
@@ -612,15 +615,13 @@ impl App {
             && !self.batch_running
             && !self.library_edit_active()
             && self.external.is_none();
-        if self.sync.can_start_sync(safe) {
-            let expected_changes = self.sync.expected_changes();
-            self.sync.start_sync();
-            self.spawn(Task::AutoSync(expected_changes));
+        if let Some(request) = self.sync.take_auto_sync(safe) {
+            self.spawn(Task::AutoSync(request.expected_changes));
         }
     }
 
-    fn refresh_sync_status(&mut self, remote: bool) {
-        let Some(request) = self.sync.request_check(remote, remote) else {
+    fn refresh_sync_status(&mut self, remote: bool, reason: ProbeReason) {
+        let Some(request) = self.sync.request_probe(remote, reason) else {
             return;
         };
         if let Some(Modal::Sync(picker)) = self.modal.as_mut() {
@@ -638,13 +639,14 @@ impl App {
         match super::sync_picker::SyncPicker::with_status(
             &ctx,
             self.sync.status.clone(),
-            self.sync.checking() || check_remote,
+            self.sync.probing() || check_remote,
             self.sync.error.clone(),
         ) {
             Ok(picker) => vec![
                 Action::OpenModal(Box::new(Modal::Sync(Box::new(picker)))),
                 Action::RefreshSyncStatus {
                     remote: check_remote,
+                    reason: ProbeReason::Manual,
                 },
             ],
             Err(error) => vec![Action::Error(format!("{error:#}"))],
@@ -695,7 +697,10 @@ impl App {
                 match result {
                     Ok(()) => vec![
                         Action::Rescan,
-                        Action::RefreshSyncStatus { remote: false },
+                        Action::RefreshSyncStatus {
+                            remote: false,
+                            reason: ProbeReason::Configuration,
+                        },
                         Action::Toast("Root auto-sync enabled".into()),
                     ],
                     Err(e) => vec![Action::Error(format!("Root sync setup: {e:#}"))],
@@ -707,7 +712,10 @@ impl App {
                     Ok(()) => {
                         self.sync.disable();
                         vec![
-                            Action::RefreshSyncStatus { remote: false },
+                            Action::RefreshSyncStatus {
+                                remote: false,
+                                reason: ProbeReason::Configuration,
+                            },
                             Action::Toast(
                                 "Automatic root sync disabled; Git history retained".into(),
                             ),
@@ -742,12 +750,15 @@ impl App {
                         self.rescan();
                         match result {
                             Ok(report) => {
-                                self.sync.finish_sync(true, false);
+                                self.sync.finish_manual_sync(true);
                                 if report.pulled {
                                     self.history = History::default();
                                 }
                                 vec![
-                                    Action::RefreshSyncStatus { remote: true },
+                                    Action::RefreshSyncStatus {
+                                        remote: true,
+                                        reason: ProbeReason::AfterRun,
+                                    },
                                     Action::Toast(format!(
                                         "Root synced: backup {}, pull {}, push {}",
                                         report.committed, report.pulled, report.pushed
@@ -755,12 +766,12 @@ impl App {
                                 ]
                             }
                             Err(e) => {
-                                let conflict = e
-                                    .downcast_ref::<skills::ops::sync::SyncConflict>()
-                                    .is_some();
-                                self.sync.finish_sync(false, conflict);
+                                self.sync.finish_manual_sync(false);
                                 vec![
-                                    Action::RefreshSyncStatus { remote: true },
+                                    Action::RefreshSyncStatus {
+                                        remote: true,
+                                        reason: ProbeReason::AfterRun,
+                                    },
                                     Action::Error(format!(
                                         "Root sync pending: {e:#}; local changes retained"
                                     )),
@@ -783,42 +794,41 @@ impl App {
                 self.rescan();
                 match result {
                     Ok(report) => {
-                        self.sync.finish_sync(true, false);
+                        self.sync.finish_auto_sync(Ok(()));
                         if report.pulled {
                             self.history = History::default();
                         }
                         vec![
-                            Action::RefreshSyncStatus { remote: true },
+                            Action::RefreshSyncStatus {
+                                remote: true,
+                                reason: ProbeReason::AfterRun,
+                            },
                             Action::Toast(format!(
                                 "Root synced: backup {}, pull {}, push {}",
                                 report.committed, report.pulled, report.pushed
                             )),
                         ]
                     }
-                    Err(error)
-                        if error
-                            .downcast_ref::<skills::ops::sync::WorkingTreeChanged>()
-                            .is_some() =>
-                    {
-                        self.sync.external_changed();
-                        self.sync.finish_sync(false, false);
-                        vec![
-                            Action::RefreshSyncStatus { remote: true },
+                    Err(error) => {
+                        let disposition = error.disposition;
+                        self.sync.finish_auto_sync(Err(disposition));
+                        let message = if disposition
+                            == skills::ops::sync::AutoSyncDisposition::WorkingTreeChanged
+                        {
                             Action::Toast(
                                 "Library changed externally; automatic sync paused".into(),
-                            ),
-                        ]
-                    }
-                    Err(error) => {
-                        let conflict = error
-                            .downcast_ref::<skills::ops::sync::SyncConflict>()
-                            .is_some();
-                        self.sync.finish_sync(false, conflict);
-                        vec![
-                            Action::RefreshSyncStatus { remote: true },
+                            )
+                        } else {
                             Action::Error(format!(
-                                "Root sync pending: {error:#}; local changes retained"
-                            )),
+                                "Root sync pending: {error}; local changes retained"
+                            ))
+                        };
+                        vec![
+                            Action::RefreshSyncStatus {
+                                remote: true,
+                                reason: ProbeReason::AfterRun,
+                            },
+                            message,
                         ]
                     }
                 }
@@ -956,6 +966,7 @@ impl App {
                     self.root_stamp = Some(stamp);
                     if changed {
                         self.sync.external_changed();
+                        self.refresh_sync_status(false, ProbeReason::ObservedChange);
                         return vec![Action::Rescan];
                     }
                 }
@@ -1571,7 +1582,9 @@ impl App {
             Action::Toast(t) => self.toast(t, Level::Ok),
             Action::Error(t) => self.toast(t, Level::Error),
             Action::Rescan => self.rescan(),
-            Action::RefreshSyncStatus { remote } => self.refresh_sync_status(remote),
+            Action::RefreshSyncStatus { remote, reason } => {
+                self.refresh_sync_status(remote, reason)
+            }
             Action::LibraryChanged => self.library_changed(),
             Action::Deployment(_) => unreachable!("deployment actions are unwrapped above"),
             Action::Spawn(task) => self.spawn(task),
@@ -1934,7 +1947,7 @@ impl App {
                     && !request.dry_run
                     && !self.sync.syncing()
                 {
-                    self.sync.start_sync();
+                    self.sync.start_manual_sync();
                 }
             } else {
                 self.batch_running = true;
@@ -1976,7 +1989,7 @@ impl App {
         self.sync.library_changed();
         // A running read may have captured the tree before this mutation.
         // Retire it and replace it without joining either worker.
-        self.refresh_sync_status(false);
+        self.refresh_sync_status(false, ProbeReason::Mutation);
         self.rescan();
     }
 
@@ -2169,7 +2182,7 @@ impl App {
         let th = &self.settings.theme;
         let (compact, text, style): (String, String, Style) = if self.sync.syncing() {
             (SPINNER[self.spinner].into(), "Syncing…".into(), th.accent())
-        } else if self.sync.checking() {
+        } else if self.sync.probing() {
             (SPINNER[self.spinner].into(), "Checking…".into(), th.dim())
         } else if self.sync.error.is_some() {
             ("×".into(), "× Check failed".into(), th.err())
@@ -2895,7 +2908,7 @@ mod matrix_key_tests {
         .unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(Workspace::open(temp.path()).unwrap(), tx).unwrap();
-        app.sync.start_sync();
+        app.sync.start_manual_sync();
         app.batch_running = true;
         app.tasks_running = 1;
 
@@ -3430,7 +3443,10 @@ mod escape_hierarchy_tests {
             actions.as_slice(),
             [
                 Action::OpenModal(_),
-                Action::RefreshSyncStatus { remote: true }
+                Action::RefreshSyncStatus {
+                    remote: true,
+                    reason: ProbeReason::Manual,
+                }
             ]
         ));
         assert!(app.command_palette.is_none());
@@ -5154,6 +5170,8 @@ mod root_sync_tests {
             ahead,
             behind,
             remote_checked,
+            local_revision: Some("local".into()),
+            remote_revision: Some("remote".into()),
         }
     }
 
@@ -5179,7 +5197,10 @@ mod root_sync_tests {
             actions.as_slice(),
             [
                 Action::OpenModal(_),
-                Action::RefreshSyncStatus { remote: true }
+                Action::RefreshSyncStatus {
+                    remote: true,
+                    reason: ProbeReason::Manual,
+                }
             ]
         ));
     }
@@ -5193,15 +5214,22 @@ mod root_sync_tests {
         app.sync.set_error(Some("offline".into()));
         assert!(header(&mut app, 100).contains("× Check failed"));
         app.sync.set_error(None);
-        app.sync.set_phase(SyncPhase::Checking);
+        app.sync.set_probing(true);
         assert!(header(&mut app, 100).contains("Checking…"));
-        app.sync.set_phase(SyncPhase::Syncing);
+        app.sync.set_syncing(true);
         assert!(header(&mut app, 100).contains("Syncing…"));
 
-        app.sync.set_phase(SyncPhase::Idle);
-        let current = app.sync.request_check(true, true).unwrap().id;
-        assert!(current > 1);
-        app.handle(Msg::SyncStatus(1, Ok(status(9, 9, 9, true))));
+        app.sync.set_syncing(false);
+        app.sync.set_probing(false);
+        let current = app
+            .sync
+            .request_probe(true, ProbeReason::Manual)
+            .unwrap()
+            .id;
+        app.handle(Msg::SyncStatus(
+            current.wrapping_sub(1),
+            Ok(status(9, 9, 9, true)),
+        ));
         assert_eq!(app.sync.status.as_ref().unwrap().changes.len(), 0);
         assert_eq!(app.tasks_running, 0);
     }
@@ -5254,7 +5282,7 @@ mod root_sync_tests {
         skills::ops::sync::automatic(&ws).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App::new_with_launch_directory(ws, tx, Some(temp.path())).unwrap();
-        app.sync.start_sync();
+        app.sync.start_manual_sync();
         app.apply(Action::Write(Box::new(|_| {
             panic!("must not write during checkout")
         })));
@@ -5266,7 +5294,7 @@ mod root_sync_tests {
             ),
             "root sync must not swallow navigation shortcuts"
         );
-        app.sync.finish_sync(true, false);
+        app.sync.finish_manual_sync(false);
         app.apply(Action::Write(Box::new(|ws| {
             std::fs::write(ws.root.join("saved.txt"), "automatically backed up")?;
             Ok("saved".into())

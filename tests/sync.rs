@@ -128,6 +128,7 @@ fn automatic_sync_uses_the_probed_cache_and_rejects_later_tree_changes() {
     let offline = tmp.path().join("offline.git");
     fs::rename(&repo, &offline).unwrap();
     let report = sync::run_automatic(&two, &expected, &mut || {}, &mut |_| {}).unwrap_err();
+    assert_eq!(report.disposition, sync::AutoSyncDisposition::Transient);
     assert!(
         !report.to_string().contains("WorkingTreeChanged"),
         "cached reconcile should reach only the offline publish step"
@@ -138,13 +139,22 @@ fn automatic_sync_uses_the_probed_cache_and_rejects_later_tree_changes() {
     );
 
     fs::rename(&offline, &repo).unwrap();
+    let expected = sync::status(&two, true).unwrap().changes;
+    fs::remove_dir_all(two.root.join(".git/skills-sync-cache")).unwrap();
+    let cache_error = sync::run_automatic(&two, &expected, &mut || {}, &mut |_| {}).unwrap_err();
+    assert_eq!(
+        cache_error.disposition,
+        sync::AutoSyncDisposition::Transient
+    );
+
     sync::status(&two, true).unwrap();
     let expected = sync::status(&two, false).unwrap().changes;
     write(&two, "unexpected", "external");
     let before = head(&two);
     let error = sync::run_automatic(&two, &expected, &mut || {}, &mut |_| {}).unwrap_err();
-    assert!(
-        error.downcast_ref::<sync::WorkingTreeChanged>().is_some(),
+    assert_eq!(
+        error.disposition,
+        sync::AutoSyncDisposition::WorkingTreeChanged,
         "{error:#}"
     );
     assert_eq!(head(&two), before);
@@ -228,13 +238,12 @@ fn conflicts_abort_merge_and_retain_local_backup_then_allow_retry() {
     run(&two).unwrap();
     write(&one, "shared", "remote\n");
     run(&one).unwrap();
+    sync::status(&two, true).unwrap();
     write(&two, "shared", "local\n");
-    assert!(
-        run(&two)
-            .unwrap_err()
-            .to_string()
-            .contains("local backup retained")
-    );
+    let expected = sync::status(&two, false).unwrap().changes;
+    let conflict = sync::run_automatic(&two, &expected, &mut || {}, &mut |_| {}).unwrap_err();
+    assert_eq!(conflict.disposition, sync::AutoSyncDisposition::Fatal);
+    assert!(conflict.to_string().contains("local backup retained"));
     assert_eq!(
         fs::read_to_string(two.root.join("shared")).unwrap(),
         "local\n"

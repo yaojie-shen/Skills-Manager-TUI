@@ -218,7 +218,10 @@ impl SyncPicker {
                 self.list.first(self.row_count());
                 vec![]
             }
-            OverviewAction::Check => vec![Action::RefreshSyncStatus { remote: true }],
+            OverviewAction::Check => vec![Action::RefreshSyncStatus {
+                remote: true,
+                reason: super::sync_coordinator::ProbeReason::Manual,
+            }],
             OverviewAction::Configure => {
                 self.configure();
                 vec![]

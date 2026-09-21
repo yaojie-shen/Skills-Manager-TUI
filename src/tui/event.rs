@@ -106,7 +106,7 @@ pub enum TaskOutput {
         super::sync_picker::Request,
         Result<skills::ops::sync::Report>,
     ),
-    AutoSync(Result<skills::ops::sync::Report>),
+    AutoSync(std::result::Result<skills::ops::sync::Report, skills::ops::sync::AutoSyncFailure>),
     Batch(BatchOutcome),
     RepositoryFetched(String, Result<skills::repository::FetchedRepository>),
     RepositoryInstalled(

@@ -1,11 +1,11 @@
-//! Root-backup scheduling. The coordinator owns policy; `App` owns execution.
+//! Root-backup observation and execution policy. `App` owns execution.
 
 use anyhow::Result;
-use skills::ops::sync::Status;
+use skills::ops::sync::{AutoSyncDisposition, Status};
 use std::time::{Duration, Instant};
 
-const CHECK_INTERVAL: Duration = Duration::from_secs(60);
-const RETRY_DELAYS: [Duration; 4] = [
+const PROBE_INTERVAL: Duration = Duration::from_secs(60);
+const PROBE_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_secs(60),
     Duration::from_secs(2 * 60),
     Duration::from_secs(5 * 60),
@@ -13,37 +13,85 @@ const RETRY_DELAYS: [Duration; 4] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Phase {
-    Idle,
-    Checking,
-    Waiting,
-    Syncing,
-    Publishing,
-    Conflict,
+pub enum ProbeReason {
+    Startup,
+    Periodic,
+    Mutation,
+    Manual,
+    AfterRun,
+    ObservedChange,
+    Configuration,
 }
 
-pub struct CheckRequest {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunState {
+    Idle,
+    Reconciling { automatic: bool },
+    Publishing { automatic: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fingerprint {
+    changes: Vec<String>,
+    local_revision: Option<String>,
+    remote_revision: Option<String>,
+}
+
+impl From<&Status> for Fingerprint {
+    fn from(status: &Status) -> Self {
+        Self {
+            changes: status.changes.clone(),
+            local_revision: status.local_revision.clone(),
+            remote_revision: status.remote_revision.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AutoState {
+    Idle,
+    NeedsProbe,
+    Ready,
+    RetryAfterProbe,
+    PausedFatal(Option<Fingerprint>),
+    PausedExternal,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveProbe {
+    id: u64,
+    remote: bool,
+    reason: ProbeReason,
+    library_generation: u64,
+}
+
+pub struct ProbeRequest {
     pub id: u64,
 }
 
-pub struct CheckOutcome {
+pub struct ProbeOutcome {
     pub accepted: bool,
+    pub needs_validation: bool,
+}
+
+pub struct AutoSyncRequest {
+    pub expected_changes: Vec<String>,
 }
 
 pub struct SyncCoordinator {
     pub status: Option<Status>,
     pub error: Option<String>,
-    pub phase: Phase,
-    request_id: u64,
-    remote_checking: bool,
-    next_check: Instant,
-    failures: usize,
+    probe: Option<ActiveProbe>,
+    next_probe_id: u64,
+    next_remote_probe: Instant,
+    probe_failures: usize,
+    run: RunState,
+    auto: AutoState,
     app_dirty: bool,
-    dirty_at_start: bool,
+    claimed_generation: Option<u64>,
+    library_generation: u64,
     external_dirty: bool,
-    status_current: bool,
     baseline_known: bool,
-    sync_requested: bool,
 }
 
 impl Default for SyncCoordinator {
@@ -51,193 +99,238 @@ impl Default for SyncCoordinator {
         Self {
             status: None,
             error: None,
-            phase: Phase::Idle,
-            request_id: 0,
-            remote_checking: false,
-            next_check: Instant::now(),
-            failures: 0,
+            probe: None,
+            next_probe_id: 0,
+            next_remote_probe: Instant::now(),
+            probe_failures: 0,
+            run: RunState::Idle,
+            auto: AutoState::Idle,
             app_dirty: false,
-            dirty_at_start: false,
+            claimed_generation: None,
+            library_generation: 0,
             external_dirty: false,
-            status_current: false,
             baseline_known: false,
-            sync_requested: false,
         }
     }
 }
 
 impl SyncCoordinator {
-    pub fn checking(&self) -> bool {
-        matches!(self.phase, Phase::Checking)
+    pub fn probing(&self) -> bool {
+        self.probe.is_some()
     }
 
     pub fn syncing(&self) -> bool {
-        matches!(self.phase, Phase::Syncing | Phase::Publishing)
+        !matches!(self.run, RunState::Idle)
     }
 
     pub fn switching(&self) -> bool {
-        matches!(self.phase, Phase::Syncing)
+        matches!(self.run, RunState::Reconciling { .. })
     }
 
     #[cfg(test)]
     pub fn pending(&self) -> bool {
-        self.sync_requested
+        matches!(self.auto, AutoState::NeedsProbe | AutoState::Ready)
     }
 
-    pub fn due(&self, now: Instant) -> bool {
-        !self.remote_checking && now >= self.next_check
+    pub fn probe_due(&self, now: Instant) -> bool {
+        self.probe.is_none() && now >= self.next_remote_probe
     }
 
-    pub fn request_check(&mut self, remote: bool, manual: bool) -> Option<CheckRequest> {
-        if self.syncing() || (self.checking() && remote == self.remote_checking) {
+    pub fn request_probe(&mut self, remote: bool, reason: ProbeReason) -> Option<ProbeRequest> {
+        if self.switching() || self.probe.is_some() {
             return None;
         }
-        self.request_id = self.request_id.wrapping_add(1);
-        self.remote_checking = remote;
-        self.phase = Phase::Checking;
+        self.next_probe_id = self.next_probe_id.wrapping_add(1);
+        self.probe = Some(ActiveProbe {
+            id: self.next_probe_id,
+            remote,
+            reason,
+            library_generation: self.library_generation,
+        });
         self.error = None;
         if remote {
-            // Manual checks bypass the current backoff, but starting one must
-            // still retire the due time or the next tick starts it again.
-            let _ = manual;
-            self.next_check = Instant::now() + CHECK_INTERVAL;
+            self.next_remote_probe = Instant::now() + PROBE_INTERVAL;
         }
-        Some(CheckRequest {
-            id: self.request_id,
+        Some(ProbeRequest {
+            id: self.next_probe_id,
         })
     }
 
-    pub fn finish_check(&mut self, id: u64, result: Result<Status>) -> CheckOutcome {
-        if id != self.request_id {
-            return CheckOutcome { accepted: false };
-        }
-        let remote = self.remote_checking;
-        self.remote_checking = false;
+    pub fn finish_probe(&mut self, id: u64, result: Result<Status>) -> ProbeOutcome {
+        let Some(probe) = self.probe.filter(|probe| probe.id == id) else {
+            return ProbeOutcome {
+                accepted: false,
+                needs_validation: false,
+            };
+        };
+        self.probe = None;
+        let needs_validation = probe.library_generation != self.library_generation;
         match result {
             Ok(status) => {
-                self.failures = 0;
-                if remote {
-                    self.next_check = Instant::now() + CHECK_INTERVAL;
+                self.probe_failures = 0;
+                if probe.remote {
+                    self.next_remote_probe = Instant::now() + PROBE_INTERVAL;
                 }
-                if !status.changes.is_empty() && (!self.baseline_known || !self.app_dirty) {
+                let unexpected_changes = !status.changes.is_empty()
+                    && !self.app_dirty
+                    && (!self.baseline_known || matches!(self.auto, AutoState::Idle));
+                if unexpected_changes {
                     self.external_dirty = true;
                 }
                 self.baseline_known = true;
-                let configured = status.settings.url.is_some() && status.settings.branch.is_some();
-                let automatic_work = status.settings.enabled
-                    && configured
-                    && !self.external_dirty
-                    && (status.changes.is_empty() || self.app_dirty)
-                    && (self.app_dirty || status.ahead > 0 || status.behind > 0);
-                if status.settings.enabled {
-                    self.sync_requested |= automatic_work;
-                } else {
-                    self.sync_requested = false;
+                if !needs_validation {
+                    self.update_auto_state(&status, probe.reason);
                 }
                 self.status = Some(status);
-                self.status_current = true;
                 self.error = None;
-                self.phase = if self.sync_requested {
-                    Phase::Waiting
-                } else {
-                    Phase::Idle
-                };
             }
             Err(error) => {
-                self.failures = (self.failures + 1).min(RETRY_DELAYS.len());
-                self.next_check = Instant::now() + RETRY_DELAYS[self.failures - 1];
+                self.probe_failures = (self.probe_failures + 1).min(PROBE_RETRY_DELAYS.len());
+                self.next_remote_probe =
+                    Instant::now() + PROBE_RETRY_DELAYS[self.probe_failures - 1];
                 self.error = Some(format!("{error:#}"));
-                self.phase = if self.sync_requested {
-                    Phase::Waiting
-                } else {
-                    Phase::Idle
-                };
             }
         }
-        CheckOutcome { accepted: true }
+        ProbeOutcome {
+            accepted: true,
+            needs_validation,
+        }
+    }
+
+    fn update_auto_state(&mut self, status: &Status, reason: ProbeReason) {
+        let enabled = status.settings.enabled
+            && status.settings.url.is_some()
+            && status.settings.branch.is_some();
+        if !enabled {
+            self.auto = AutoState::Idle;
+            return;
+        }
+        let validated = !self.external_dirty && (status.changes.is_empty() || self.app_dirty);
+        self.auto = match &self.auto {
+            AutoState::NeedsProbe if validated => AutoState::Ready,
+            AutoState::NeedsProbe => AutoState::PausedExternal,
+            AutoState::RetryAfterProbe if probe_can_retry(reason) && validated => AutoState::Ready,
+            AutoState::RetryAfterProbe => AutoState::RetryAfterProbe,
+            AutoState::PausedFatal(None) => AutoState::PausedFatal(Some(Fingerprint::from(status))),
+            AutoState::PausedFatal(Some(failed))
+                if failed != &Fingerprint::from(status) && validated =>
+            {
+                AutoState::Ready
+            }
+            AutoState::PausedFatal(_) => self.auto.clone(),
+            state => state.clone(),
+        };
     }
 
     pub fn library_changed(&mut self) {
+        self.library_generation = self.library_generation.wrapping_add(1);
         self.app_dirty = true;
-        self.status_current = false;
-        self.sync_requested = true;
-        if !self.syncing() {
-            self.phase = Phase::Waiting;
+        if !matches!(
+            self.auto,
+            AutoState::PausedExternal | AutoState::PausedFatal(_)
+        ) {
+            self.auto = AutoState::NeedsProbe;
         }
     }
 
     pub fn external_changed(&mut self) {
-        self.external_dirty = true;
-        self.status_current = false;
-    }
-
-    pub fn can_start_sync(&self, safe: bool) -> bool {
-        safe && self.sync_requested
-            && !self.syncing()
-            && self.status_current
-            && self
-                .status
-                .as_ref()
-                .is_some_and(|status| status.settings.enabled)
-            && !self.external_dirty
-    }
-
-    pub fn expected_changes(&self) -> Vec<String> {
-        self.status
-            .as_ref()
-            .map(|status| status.changes.clone())
-            .unwrap_or_default()
-    }
-
-    pub fn start_sync(&mut self) {
-        self.sync_requested = false;
-        self.dirty_at_start = self.app_dirty;
-        self.app_dirty = false;
-        self.phase = Phase::Syncing;
-    }
-
-    pub fn start_publishing(&mut self) {
-        if self.phase == Phase::Syncing {
-            self.phase = Phase::Publishing;
+        if !matches!(self.auto, AutoState::PausedFatal(_)) {
+            self.external_dirty = true;
+            self.auto = AutoState::PausedExternal;
         }
     }
 
-    pub fn finish_sync(&mut self, success: bool, conflict: bool) {
+    pub fn take_auto_sync(&mut self, safe: bool) -> Option<AutoSyncRequest> {
+        if !safe || !matches!(self.run, RunState::Idle) || !matches!(self.auto, AutoState::Ready) {
+            return None;
+        }
+        let status = self.status.as_ref()?;
+        if !status.settings.enabled || self.external_dirty {
+            return None;
+        }
+        let expected_changes = status.changes.clone();
+        self.auto = AutoState::Idle;
+        self.claimed_generation = Some(self.library_generation);
+        self.app_dirty = false;
+        self.run = RunState::Reconciling { automatic: true };
+        Some(AutoSyncRequest { expected_changes })
+    }
+
+    pub fn start_manual_sync(&mut self) {
+        self.claimed_generation = Some(self.library_generation);
+        self.run = RunState::Reconciling { automatic: false };
+    }
+
+    pub fn start_publishing(&mut self) {
+        if let RunState::Reconciling { automatic } = self.run {
+            self.run = RunState::Publishing { automatic };
+        }
+    }
+
+    pub fn finish_manual_sync(&mut self, success: bool) {
+        self.run = RunState::Idle;
+        let changed_during_run = self
+            .claimed_generation
+            .take()
+            .is_some_and(|generation| generation != self.library_generation);
         if success {
-            self.dirty_at_start = false;
             self.external_dirty = false;
-            self.phase = if self.sync_requested {
-                Phase::Waiting
-            } else {
-                Phase::Idle
-            };
-        } else if conflict {
-            self.app_dirty |= self.dirty_at_start;
-            self.dirty_at_start = false;
-            self.sync_requested = false;
-            self.phase = Phase::Conflict;
+        }
+        if changed_during_run {
+            self.app_dirty = true;
+            self.auto = AutoState::NeedsProbe;
         } else {
-            self.app_dirty |= self.dirty_at_start;
-            self.dirty_at_start = false;
-            // A failed network or Git operation is not retried in a tight UI
-            // loop. The next successful probe can schedule fresh work.
-            self.sync_requested = false;
-            self.phase = Phase::Idle;
+            self.app_dirty = false;
+            self.auto = AutoState::Idle;
+        }
+    }
+
+    pub fn finish_auto_sync(&mut self, result: std::result::Result<(), AutoSyncDisposition>) {
+        let was_automatic = matches!(
+            self.run,
+            RunState::Reconciling { automatic: true } | RunState::Publishing { automatic: true }
+        );
+        self.run = RunState::Idle;
+        if !was_automatic {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                self.claimed_generation = None;
+                self.external_dirty = false;
+                if self.app_dirty {
+                    self.auto = AutoState::NeedsProbe;
+                } else {
+                    self.auto = AutoState::Idle;
+                }
+            }
+            Err(AutoSyncDisposition::Transient) => {
+                self.restore_claimed_changes();
+                self.auto = AutoState::RetryAfterProbe;
+            }
+            Err(AutoSyncDisposition::Fatal | AutoSyncDisposition::WorkingTreeChanged) => {
+                self.restore_claimed_changes();
+                self.auto = AutoState::PausedFatal(None);
+            }
+        }
+    }
+
+    fn restore_claimed_changes(&mut self) {
+        if self.claimed_generation.take().is_some() {
+            self.app_dirty = true;
         }
     }
 
     pub fn disable(&mut self) {
-        self.sync_requested = false;
-        if !self.syncing() {
-            self.phase = Phase::Idle;
-        }
+        self.auto = AutoState::Idle;
+        self.app_dirty = false;
     }
 
     #[cfg(test)]
     pub fn set_status(&mut self, status: Status) {
         self.status = Some(status);
-        self.status_current = true;
-        self.phase = Phase::Idle;
+        self.probe = None;
+        self.baseline_known = true;
     }
 
     #[cfg(test)]
@@ -246,9 +339,30 @@ impl SyncCoordinator {
     }
 
     #[cfg(test)]
-    pub fn set_phase(&mut self, phase: Phase) {
-        self.phase = phase;
+    pub fn set_probing(&mut self, probing: bool) {
+        self.probe = probing.then_some(ActiveProbe {
+            id: self.next_probe_id,
+            remote: true,
+            reason: ProbeReason::Manual,
+            library_generation: self.library_generation,
+        });
     }
+
+    #[cfg(test)]
+    pub fn set_syncing(&mut self, syncing: bool) {
+        self.run = if syncing {
+            RunState::Reconciling { automatic: false }
+        } else {
+            RunState::Idle
+        };
+    }
+}
+
+fn probe_can_retry(reason: ProbeReason) -> bool {
+    matches!(
+        reason,
+        ProbeReason::Periodic | ProbeReason::Mutation | ProbeReason::ObservedChange
+    )
 }
 
 #[cfg(test)]
@@ -256,71 +370,292 @@ mod tests {
     use super::*;
     use skills::ops::sync::Settings;
 
-    fn status(enabled: bool, changes: usize, ahead: usize, behind: usize) -> Status {
+    fn status(enabled: bool, changes: &[&str], local: &str, remote: &str) -> Status {
         Status {
             settings: Settings {
                 url: Some("remote".into()),
                 branch: Some("main".into()),
                 enabled,
             },
-            changes: (0..changes).map(|n| format!("?? {n}")).collect(),
-            ahead,
-            behind,
+            changes: changes.iter().map(|value| (*value).into()).collect(),
+            ahead: usize::from(local != remote),
+            behind: usize::from(local != remote),
             remote_checked: true,
+            local_revision: Some(local.into()),
+            remote_revision: Some(remote.into()),
         }
     }
 
+    fn probe(sync: &mut SyncCoordinator, reason: ProbeReason, status: Status) {
+        let id = sync.request_probe(true, reason).unwrap().id;
+        assert!(sync.finish_probe(id, Ok(status)).accepted);
+    }
+
     #[test]
-    fn automatic_mode_reconciles_known_work_and_remote_updates() {
+    fn probes_only_observe_until_an_app_mutation_requests_sync() {
         let mut sync = SyncCoordinator::default();
-        let id = sync.request_check(false, false).unwrap().id;
-        sync.finish_check(id, Ok(status(true, 0, 0, 0)));
+        probe(
+            &mut sync,
+            ProbeReason::Startup,
+            status(true, &[], "local", "remote"),
+        );
+        assert!(!sync.pending());
+
+        probe(
+            &mut sync,
+            ProbeReason::Periodic,
+            status(true, &[], "local", "remote-2"),
+        );
+        assert!(!sync.pending());
+
         sync.library_changed();
-        let id = sync.request_check(true, false).unwrap().id;
-        sync.finish_check(id, Ok(status(true, 1, 0, 1)));
+        probe(
+            &mut sync,
+            ProbeReason::Mutation,
+            status(true, &["?? changed"], "local", "remote-2"),
+        );
         assert!(sync.pending());
-        assert!(sync.can_start_sync(true));
-        sync.start_sync();
+        assert!(sync.take_auto_sync(true).is_some());
+    }
+
+    #[test]
+    fn disabled_and_fatal_paused_states_still_accept_probes() {
+        let mut sync = SyncCoordinator::default();
+        probe(
+            &mut sync,
+            ProbeReason::Startup,
+            status(false, &[], "local", "remote"),
+        );
+        assert!(!sync.pending());
+
+        sync.library_changed();
+        probe(
+            &mut sync,
+            ProbeReason::Mutation,
+            status(true, &["?? changed"], "local", "remote"),
+        );
+        sync.take_auto_sync(true).unwrap();
+        sync.finish_auto_sync(Err(AutoSyncDisposition::Fatal));
+        probe(
+            &mut sync,
+            ProbeReason::AfterRun,
+            status(true, &[], "backup", "remote"),
+        );
+        assert!(sync.probe.is_none());
+        assert!(!sync.pending());
+    }
+
+    #[test]
+    fn fatal_failure_retries_only_after_the_sync_input_changes() {
+        let mut sync = SyncCoordinator::default();
+        probe(
+            &mut sync,
+            ProbeReason::Startup,
+            status(true, &[], "base", "base"),
+        );
+        sync.library_changed();
+        probe(
+            &mut sync,
+            ProbeReason::Mutation,
+            status(true, &[" M skill"], "base", "base"),
+        );
+        sync.take_auto_sync(true).unwrap();
+        sync.finish_auto_sync(Err(AutoSyncDisposition::Fatal));
+
+        let failed = status(true, &[], "backup", "remote");
+        probe(&mut sync, ProbeReason::AfterRun, failed.clone());
+        probe(&mut sync, ProbeReason::Periodic, failed);
+        assert!(!sync.pending());
+        assert!(sync.take_auto_sync(true).is_none());
+
+        probe(
+            &mut sync,
+            ProbeReason::Periodic,
+            status(true, &[], "backup", "remote-2"),
+        );
+        assert!(sync.take_auto_sync(true).is_some());
+    }
+
+    #[test]
+    fn transient_failure_waits_for_a_normal_probe() {
+        let mut sync = SyncCoordinator::default();
+        probe(
+            &mut sync,
+            ProbeReason::Startup,
+            status(true, &[], "base", "base"),
+        );
+        sync.library_changed();
+        probe(
+            &mut sync,
+            ProbeReason::Mutation,
+            status(true, &["?? changed"], "base", "base"),
+        );
+        sync.take_auto_sync(true).unwrap();
+        sync.finish_auto_sync(Err(AutoSyncDisposition::Transient));
+
+        probe(
+            &mut sync,
+            ProbeReason::AfterRun,
+            status(true, &[], "backup", "base"),
+        );
+        assert!(sync.take_auto_sync(true).is_none());
+        probe(
+            &mut sync,
+            ProbeReason::Periodic,
+            status(true, &[], "backup", "base"),
+        );
+        assert!(sync.take_auto_sync(true).is_some());
+    }
+
+    #[test]
+    fn probe_backoff_is_independent_of_execution_state() {
+        let mut sync = SyncCoordinator::default();
+        let start = Instant::now();
+        for expected_delay in PROBE_RETRY_DELAYS {
+            let id = sync.request_probe(true, ProbeReason::Periodic).unwrap().id;
+            sync.finish_probe(id, Err(anyhow::anyhow!("offline")));
+            let remaining = sync
+                .next_remote_probe
+                .saturating_duration_since(Instant::now());
+            assert!(remaining <= expected_delay);
+            assert!(remaining >= expected_delay.saturating_sub(Duration::from_secs(1)));
+            sync.next_remote_probe = start;
+        }
+
+        sync.start_manual_sync();
+        assert!(sync.probe_due(Instant::now()));
+        sync.finish_manual_sync(false);
+    }
+
+    #[test]
+    fn mutation_during_automatic_publish_is_retained() {
+        let mut sync = SyncCoordinator::default();
+        probe(
+            &mut sync,
+            ProbeReason::Startup,
+            status(true, &[], "base", "base"),
+        );
+        sync.library_changed();
+        probe(
+            &mut sync,
+            ProbeReason::Mutation,
+            status(true, &["?? first"], "base", "base"),
+        );
+        sync.take_auto_sync(true).unwrap();
+        sync.start_publishing();
+        sync.library_changed();
+        sync.finish_auto_sync(Ok(()));
+        assert!(sync.pending());
+    }
+
+    #[test]
+    fn probe_started_before_mutation_cannot_authorize_sync() {
+        let mut sync = SyncCoordinator::default();
+        let id = sync.request_probe(true, ProbeReason::Startup).unwrap().id;
+        sync.library_changed();
+        let outcome = sync.finish_probe(id, Ok(status(true, &[], "base", "base")));
+        assert!(outcome.needs_validation);
+        assert!(sync.take_auto_sync(true).is_none());
+
+        probe(
+            &mut sync,
+            ProbeReason::Mutation,
+            status(true, &["?? changed"], "base", "base"),
+        );
+        assert!(sync.take_auto_sync(true).is_some());
+    }
+
+    #[test]
+    fn unchanged_app_event_does_not_clear_fatal_pause() {
+        let mut sync = SyncCoordinator::default();
+        probe(
+            &mut sync,
+            ProbeReason::Startup,
+            status(true, &[], "base", "base"),
+        );
+        sync.library_changed();
+        probe(
+            &mut sync,
+            ProbeReason::Mutation,
+            status(true, &[" M skill"], "base", "base"),
+        );
+        sync.take_auto_sync(true).unwrap();
+        sync.finish_auto_sync(Err(AutoSyncDisposition::Fatal));
+        let failed = status(true, &[], "backup", "remote");
+        probe(&mut sync, ProbeReason::AfterRun, failed.clone());
+
+        sync.library_changed();
+        probe(&mut sync, ProbeReason::Mutation, failed);
+        assert!(sync.take_auto_sync(true).is_none());
+    }
+
+    #[test]
+    fn failed_manual_sync_does_not_replay_an_existing_auto_intent() {
+        let mut sync = SyncCoordinator::default();
+        probe(
+            &mut sync,
+            ProbeReason::Startup,
+            status(true, &[], "base", "base"),
+        );
+        sync.library_changed();
+        probe(
+            &mut sync,
+            ProbeReason::Mutation,
+            status(true, &["?? changed"], "base", "base"),
+        );
+        sync.start_manual_sync();
+        sync.finish_manual_sync(false);
+        assert!(sync.take_auto_sync(true).is_none());
+    }
+
+    #[test]
+    fn mutation_during_manual_publish_is_retained() {
+        let mut sync = SyncCoordinator::default();
+        probe(
+            &mut sync,
+            ProbeReason::Startup,
+            status(true, &[], "base", "base"),
+        );
+        sync.start_manual_sync();
+        sync.start_publishing();
+        sync.library_changed();
+        sync.finish_manual_sync(true);
+        assert!(sync.pending());
+
+        probe(
+            &mut sync,
+            ProbeReason::AfterRun,
+            status(true, &["?? later"], "manual", "manual"),
+        );
+        assert!(sync.take_auto_sync(true).is_some());
+    }
+
+    #[test]
+    fn probes_do_not_overwrite_run_state() {
+        let mut sync = SyncCoordinator::default();
+        sync.start_manual_sync();
+        assert!(sync.request_probe(true, ProbeReason::Periodic).is_none());
+        sync.start_publishing();
+        let id = sync.request_probe(true, ProbeReason::Periodic).unwrap().id;
+        sync.finish_probe(id, Ok(status(true, &[], "local", "remote")));
         assert!(sync.syncing());
-        sync.finish_sync(true, false);
-        assert_eq!(sync.phase, Phase::Idle);
+        sync.finish_manual_sync(true);
+        assert!(!sync.syncing());
     }
 
     #[test]
-    fn disabled_or_unknown_local_changes_never_auto_sync() {
+    fn stale_probe_results_are_ignored() {
         let mut sync = SyncCoordinator::default();
-        let id = sync.request_check(true, false).unwrap().id;
-        sync.finish_check(id, Ok(status(false, 0, 0, 1)));
-        assert!(!sync.pending());
-
-        let id = sync.request_check(true, true).unwrap().id;
-        sync.finish_check(id, Ok(status(true, 1, 0, 1)));
-        assert!(!sync.pending());
-        sync.external_changed();
-        sync.library_changed();
-        assert!(!sync.can_start_sync(true));
-    }
-
-    #[test]
-    fn changes_present_before_the_first_baseline_are_never_claimed_by_the_app() {
-        let mut sync = SyncCoordinator::default();
-        sync.library_changed();
-        let id = sync.request_check(false, false).unwrap().id;
-        sync.finish_check(id, Ok(status(true, 2, 0, 0)));
-        assert!(!sync.can_start_sync(true));
-    }
-
-    #[test]
-    fn stale_results_and_conflicts_do_not_loop() {
-        let mut sync = SyncCoordinator::default();
-        let old = sync.request_check(false, false).unwrap().id;
-        let current = sync.request_check(true, true).unwrap().id;
-        assert!(!sync.finish_check(old, Ok(status(true, 0, 0, 1))).accepted);
-        sync.finish_check(current, Ok(status(true, 0, 0, 1)));
-        assert!(sync.pending());
-        sync.start_sync();
-        sync.finish_sync(false, true);
-        assert_eq!(sync.phase, Phase::Conflict);
-        assert!(!sync.can_start_sync(true));
+        let current = sync.request_probe(true, ProbeReason::Manual).unwrap().id;
+        assert!(
+            !sync
+                .finish_probe(current.wrapping_sub(1), Ok(status(true, &[], "old", "old")),)
+                .accepted
+        );
+        sync.finish_probe(current, Ok(status(true, &[], "new", "new")));
+        assert_eq!(
+            sync.status.as_ref().unwrap().local_revision.as_deref(),
+            Some("new")
+        );
     }
 }

@@ -1,6 +1,6 @@
 //! Root-wide Git backup. Configuration is local to `.git/config`.
 use crate::{Workspace, ops::git};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use serde::Serialize;
 use std::fmt;
 use std::io::Write;
@@ -42,6 +42,56 @@ pub struct Status {
     pub ahead: usize,
     pub behind: usize,
     pub remote_checked: bool,
+    #[serde(skip)]
+    pub local_revision: Option<String>,
+    #[serde(skip)]
+    pub remote_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoSyncDisposition {
+    Transient,
+    Fatal,
+    WorkingTreeChanged,
+}
+
+#[derive(Debug)]
+pub struct AutoSyncFailure {
+    pub disposition: AutoSyncDisposition,
+    source: anyhow::Error,
+}
+
+impl AutoSyncFailure {
+    fn transient(source: anyhow::Error) -> Self {
+        Self {
+            disposition: AutoSyncDisposition::Transient,
+            source,
+        }
+    }
+
+    fn fatal(source: anyhow::Error) -> Self {
+        let disposition = if source.downcast_ref::<WorkingTreeChanged>().is_some() {
+            AutoSyncDisposition::WorkingTreeChanged
+        } else {
+            AutoSyncDisposition::Fatal
+        };
+        Self {
+            disposition,
+            source,
+        }
+    }
+}
+
+impl fmt::Display for AutoSyncFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for AutoSyncFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
 }
 
 #[derive(Debug)]
@@ -51,15 +101,15 @@ pub struct SyncConflict {
 
 impl fmt::Display for SyncConflict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "root sync stopped; local backup retained. Resolve with Git, then retry: {:#}",
-            self.source
-        )
+        f.write_str("root sync conflict; local backup retained. Resolve with Git, then retry")
     }
 }
 
-impl std::error::Error for SyncConflict {}
+impl std::error::Error for SyncConflict {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
 
 #[derive(Debug)]
 pub struct WorkingTreeChanged;
@@ -71,6 +121,41 @@ impl fmt::Display for WorkingTreeChanged {
 }
 
 impl std::error::Error for WorkingTreeChanged {}
+
+#[derive(Debug)]
+struct CoordinationBusy(String);
+
+impl fmt::Display for CoordinationBusy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "another Skills Library operation is still in progress{}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for CoordinationBusy {}
+
+#[derive(Debug)]
+struct StatusCacheUnavailable(anyhow::Error);
+
+impl fmt::Display for StatusCacheUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "root sync status cache is unavailable; check for updates and retry: {:#}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for StatusCacheUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 fn repository(root: &Path) -> Result<()> {
     let meta = std::fs::symlink_metadata(root.join(".git"))?;
     ensure!(
@@ -122,12 +207,43 @@ pub fn status(ws: &Workspace, check_remote: bool) -> Result<Status> {
     } else {
         compare_ref(ws, "refs/remotes/origin/skills-root-sync").unwrap_or_default()
     };
+    let local_revision = git(&["rev-parse", "--verify", "HEAD"], Some(&ws.root))
+        .ok()
+        .map(|revision| revision.trim().to_owned());
+    let remote_revision = if check_remote {
+        let cache = ws.root.join(".git/skills-sync-cache");
+        git(
+            &[
+                "--git-dir",
+                cache.to_string_lossy().as_ref(),
+                "rev-parse",
+                "--verify",
+                "refs/heads/remote",
+            ],
+            None,
+        )
+        .ok()
+        .map(|revision| revision.trim().to_owned())
+    } else {
+        git(
+            &[
+                "rev-parse",
+                "--verify",
+                "refs/remotes/origin/skills-root-sync",
+            ],
+            Some(&ws.root),
+        )
+        .ok()
+        .map(|revision| revision.trim().to_owned())
+    };
     Ok(Status {
         settings,
         changes,
         ahead,
         behind,
         remote_checked: check_remote,
+        local_revision,
+        remote_revision,
     })
 }
 
@@ -514,7 +630,12 @@ pub fn run_automatic(
     expected_changes: &[String],
     publishing: &mut dyn FnMut(),
     progress: &mut dyn FnMut(&str),
-) -> Result<Report> {
+) -> std::result::Result<Report, AutoSyncFailure> {
+    let cache_lock = FileGuard::acquire(
+        ws.root.join(".git/skills-sync-cache.lock"),
+        "consume root sync status",
+    )
+    .map_err(classify_auto_failure)?;
     let mut report = run_checked(
         ws,
         Mode::Sync,
@@ -523,20 +644,33 @@ pub fn run_automatic(
         false,
         true,
         progress,
-    )?;
+    )
+    .map_err(classify_auto_failure)?;
+    drop(cache_lock);
     publishing();
     if git(&["rev-parse", "--verify", "HEAD"], Some(&ws.root)).is_ok() {
         progress("Pushing root backup …");
-        let branch = Settings::load(ws)?
-            .branch
-            .context("root sync branch is missing")?;
+        let branch = Settings::load(ws)
+            .and_then(|settings| settings.branch.context("root sync branch is missing"))
+            .map_err(AutoSyncFailure::fatal)?;
         git(
             &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
             Some(&ws.root),
-        )?;
+        )
+        .map_err(AutoSyncFailure::transient)?;
         report.pushed = true;
     }
     Ok(report)
+}
+
+fn classify_auto_failure(error: anyhow::Error) -> AutoSyncFailure {
+    if error.downcast_ref::<CoordinationBusy>().is_some()
+        || error.downcast_ref::<StatusCacheUnavailable>().is_some()
+    {
+        AutoSyncFailure::transient(error)
+    } else {
+        AutoSyncFailure::fatal(error)
+    }
 }
 
 fn run_checked(
@@ -663,11 +797,16 @@ fn run_checked(
                     Some(&ws.root),
                 );
                 if let Err(error) = merge {
+                    let conflicted = git(&["ls-files", "-u"], Some(&ws.root))
+                        .is_ok_and(|output| !output.trim().is_empty());
                     if ws.root.join(".git/MERGE_HEAD").exists() {
                         git(&["merge", "--abort"], Some(&ws.root))
                             .context("merge failed and could not be aborted; inspect Git status")?;
                     }
-                    return Err(SyncConflict { source: error }.into());
+                    if conflicted {
+                        return Err(SyncConflict { source: error }.into());
+                    }
+                    return Err(error);
                 }
                 if ws.root.join(".git/MERGE_HEAD").exists() {
                     commit(ws, "Merge skills root updates")?;
@@ -693,12 +832,13 @@ fn run_checked(
 
 fn fetch_cached(ws: &Workspace) -> Result<()> {
     let cache = ws.root.join(".git/skills-sync-cache");
-    ensure!(
-        cache_healthy(&cache, false),
-        "root sync status cache is unavailable; check for updates and retry"
-    );
+    if !cache_healthy(&cache, false) {
+        return Err(
+            StatusCacheUnavailable(anyhow!("root sync status cache is unavailable")).into(),
+        );
+    }
     let cache_arg = cache.to_string_lossy();
-    if git(
+    let imported = if git(
         &[
             "--git-dir",
             &cache_arg,
@@ -718,14 +858,16 @@ fn fetch_cached(ws: &Workspace) -> Result<()> {
                 "+refs/heads/remote:refs/remotes/origin/skills-root-sync",
             ],
             Some(&ws.root),
-        )?;
+        )
     } else {
         git(
             &["update-ref", "-d", "refs/remotes/origin/skills-root-sync"],
             Some(&ws.root),
-        )?;
-    }
-    Ok(())
+        )
+    };
+    imported
+        .map(|_| ())
+        .map_err(|error| StatusCacheUnavailable(error).into())
 }
 
 fn fetch(ws: &Workspace, branch: &str) -> Result<()> {
@@ -821,7 +963,7 @@ impl FileGuard {
                         .filter(|text| !text.trim().is_empty())
                         .map(|text| format!(" ({})", text.trim()))
                         .unwrap_or_default();
-                    bail!("another Skills Library operation is still in progress{owner}");
+                    return Err(CoordinationBusy(owner).into());
                 }
                 Err(error) => return Err(error).context("create Skills coordination lock"),
             }
