@@ -1424,7 +1424,8 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
                 continue;
             }
         };
-        let up_to_date = prepared.from_revision.as_deref() == Some(prepared.to_revision.as_str());
+        let up_to_date = prepared.from_revision.as_deref() == Some(prepared.to_revision.as_str())
+            && !prepared.needs_resolution();
         let mut entry = serde_json::to_value(&prepared)?;
         if up_to_date {
             entry["result"] = "up-to-date".into();

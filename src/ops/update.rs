@@ -213,6 +213,7 @@ impl UpdateSession {
             self.latest(&source, progress)?;
         }
         if matches!(source, Source::Git { .. })
+            && rec.status != SkillStatus::Modified
             && let Some(head) = self.heads.get(&identity)
             && revision.as_ref() == Some(head)
         {
@@ -409,8 +410,12 @@ pub fn apply(
         per_file.is_empty(),
         "per-file merging is not supported; choose local or upstream for the whole skill"
     );
-    if take == Take::Local
-        || prepared.from_revision.as_deref() == Some(prepared.to_revision.as_str())
+    if take == Take::Local {
+        prepared.cleanup();
+        return Ok(());
+    }
+    if prepared.from_revision.as_deref() == Some(prepared.to_revision.as_str())
+        && !prepared.needs_resolution()
     {
         prepared.cleanup();
         return Ok(());

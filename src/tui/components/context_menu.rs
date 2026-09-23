@@ -19,6 +19,7 @@ pub enum Command {
     Rename,
     Source,
     Check,
+    Refresh,
     Update,
     Accept,
     Remove,

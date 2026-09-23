@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::hash::{HASH_ALGO, hash_directory};
 use crate::meta::{Baseline, SkillMeta};
 use crate::ops::{deploy, require_key};
-use crate::reconcile::{AgentDirMode, EntryState, Snapshot};
+use crate::reconcile::{AgentDirMode, EntryState, SkillStatus, Snapshot};
 use anyhow::{Context, Result, bail};
 
 /// Load metadata without registering a content baseline for local skills.
@@ -205,32 +205,134 @@ pub fn rename(ws: &Workspace, snap: &Snapshot, old: &str, new: &str) -> Result<V
     Ok(log)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryRemoveSummary {
+    pub alias: String,
+    pub keys: Vec<String>,
+    pub modified: usize,
+    pub missing: usize,
+    pub attention: usize,
+}
+
+impl RepositoryRemoveSummary {
+    pub fn from_snapshot(snap: &Snapshot, alias: &str) -> Result<Self> {
+        anyhow::ensure!(
+            crate::util::valid_skill_key(alias),
+            "invalid repository alias: {alias:?}"
+        );
+        anyhow::ensure!(
+            snap.repositories.contains_key(alias),
+            "source not found: {alias}"
+        );
+        let mut keys = Vec::new();
+        let mut modified = 0;
+        let mut missing = 0;
+        let mut attention = 0;
+        for record in snap
+            .skills
+            .iter()
+            .filter(|record| crate::repository::alias_of(&record.key) == Some(alias))
+        {
+            keys.push(record.key.clone());
+            modified += usize::from(record.status == SkillStatus::Modified);
+            missing += usize::from(record.status == SkillStatus::Missing);
+            attention += usize::from(!matches!(
+                record.status,
+                SkillStatus::Repository | SkillStatus::Missing | SkillStatus::Modified
+            ));
+        }
+        keys.sort();
+        Ok(Self {
+            alias: alias.to_string(),
+            keys,
+            modified,
+            missing,
+            attention,
+        })
+    }
+}
+
+pub fn remove_repository(ws: &Workspace, alias: &str) -> Result<RepositoryRemoveSummary> {
+    let mut current = ws.clone();
+    current.config = current.load_config()?;
+    let snap = current.scan()?;
+    let summary = RepositoryRemoveSummary::from_snapshot(&snap, alias)?;
+
+    let storage = current.root.join("repos").join(alias);
+    anyhow::ensure!(
+        !crate::util::is_symlink(&storage),
+        "repository storage is a symlink; refusing to remove source"
+    );
+    let storage_root = current.root.join("repos");
+    if storage_root.exists() || crate::util::is_symlink(&storage_root) {
+        let metadata = std::fs::symlink_metadata(&storage_root)?;
+        anyhow::ensure!(
+            metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+            "repository storage is not a real directory; refusing to remove source"
+        );
+    }
+
+    for key in &summary.keys {
+        remove_preserving_deployments(&current, &snap, key, false)
+            .with_context(|| format!("removing source {alias} skill {key}"))?;
+    }
+    crate::repository::Repository::remove(&current, alias)?;
+    Ok(summary)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeploymentRemoval {
+    Undeploy,
+    Preserve,
+}
+
 /// Remove a skill: undeploy everywhere, delete the directory, and (unless kept) its metadata.
 pub fn remove(ws: &Workspace, snap: &Snapshot, key: &str, keep_meta: bool) -> Result<Vec<String>> {
+    remove_with_policy(ws, snap, key, keep_meta, DeploymentRemoval::Undeploy)
+}
+
+fn remove_preserving_deployments(
+    ws: &Workspace,
+    snap: &Snapshot,
+    key: &str,
+    keep_meta: bool,
+) -> Result<Vec<String>> {
+    remove_with_policy(ws, snap, key, keep_meta, DeploymentRemoval::Preserve)
+}
+
+fn remove_with_policy(
+    ws: &Workspace,
+    snap: &Snapshot,
+    key: &str,
+    keep_meta: bool,
+    deployment: DeploymentRemoval,
+) -> Result<Vec<String>> {
     require_key(key)?;
     let rec = snap
         .get(key)
         .with_context(|| format!("no such skill: {key}"))?;
     let mut log = Vec::new();
-    let agents: Vec<String> = snap
-        .agents
-        .iter()
-        .filter(|a| {
-            a.mode == AgentDirMode::Real
-                && rec
-                    .deployment_name()
-                    .is_some_and(|name| a.entries.contains_key(name))
-        })
-        .map(|a| a.key.clone())
-        .collect();
-    if !agents.is_empty() {
-        let unlink = deploy::plan_undeploy(ws, snap, &[key.to_string()], &agents)?;
-        for a in &unlink {
-            if a.is_change() {
-                log.push(a.describe());
+    if deployment == DeploymentRemoval::Undeploy {
+        let agents: Vec<String> = snap
+            .agents
+            .iter()
+            .filter(|a| {
+                a.mode == AgentDirMode::Real
+                    && rec
+                        .deployment_name()
+                        .is_some_and(|name| a.entries.contains_key(name))
+            })
+            .map(|a| a.key.clone())
+            .collect();
+        if !agents.is_empty() {
+            let unlink = deploy::plan_undeploy(ws, snap, &[key.to_string()], &agents)?;
+            for a in &unlink {
+                if a.is_change() {
+                    log.push(a.describe());
+                }
             }
+            deploy::apply(&unlink)?;
         }
-        deploy::apply(&unlink)?;
     }
     if rec.status.is_present() || rec.path.exists() {
         if crate::util::is_symlink(&rec.path) {
@@ -245,6 +347,15 @@ pub fn remove(ws: &Workspace, snap: &Snapshot, key: &str, keep_meta: bool) -> Re
         ws.meta.remove(key)?;
         log.push("removed metadata".into());
     }
-    Config::rename_tag_skill(&ws.root, key, None)?;
+    if !keep_meta {
+        Config::rename_tag_skill(&ws.root, key, None)?;
+        // A kept metadata record represents a deliberately restorable Missing
+        // skill, so keep its Tags and Preset memberships as well.
+        for p in ws.presets.list()? {
+            if ws.presets.remove_skill(&p.name, key)? {
+                log.push(format!("updated preset {}", p.name));
+            }
+        }
+    }
     Ok(log)
 }

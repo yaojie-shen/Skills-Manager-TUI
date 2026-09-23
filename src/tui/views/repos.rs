@@ -4,6 +4,7 @@ use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::components::context_menu::{Command, Item, Request, Target};
 use crate::tui::components::layout::{frame, split_panes};
+use crate::tui::event::Task;
 use crate::tui::modal::Modal;
 use crate::tui::settings::LayoutScope;
 use crate::tui::widgets::{CardGrid, fit, width};
@@ -14,7 +15,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
-use skills::repository::alias_of;
+use skills::repository::{RepositoryInventory, RepositoryInventoryState, alias_of};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone)]
 struct Project {
@@ -34,6 +36,9 @@ pub struct ReposView {
     panel_source: Option<Option<String>>,
     nav: CardGrid,
     focus_skills: bool,
+    inventories: BTreeMap<String, RepositoryInventory>,
+    inventory_errors: BTreeMap<String, String>,
+    refreshing: BTreeSet<String>,
     scroll: u16,
     left: Rect,
     details: Rect,
@@ -45,6 +50,45 @@ impl ReposView {
         if let Some(view) = self.skill_search.as_mut() {
             view.batch_finished(failed);
         }
+    }
+
+    pub fn remember_checks(
+        &mut self,
+        results: &[(String, anyhow::Result<skills::ops::update::CheckResult>)],
+    ) {
+        if let Some(view) = self.skill_search.as_mut() {
+            view.remember_checks(results);
+        }
+    }
+
+    pub fn refreshing(&mut self, alias: &str) {
+        self.refreshing.insert(alias.to_string());
+        self.inventory_errors.remove(alias);
+    }
+
+    pub fn inventory_result(
+        &mut self,
+        alias: &str,
+        result: &anyhow::Result<RepositoryInventory>,
+    ) -> bool {
+        // A snapshot refresh clears this marker. Ignore a worker that was
+        // started against an older Library state instead of republishing stale
+        // local-vs-remote classifications.
+        if !self.refreshing.remove(alias) {
+            return false;
+        }
+        match result {
+            Ok(inventory) => {
+                self.inventories
+                    .insert(alias.to_string(), inventory.clone());
+                self.inventory_errors.remove(alias);
+            }
+            Err(error) => {
+                self.inventory_errors
+                    .insert(alias.to_string(), format!("{error:#}"));
+            }
+        }
+        true
     }
 
     pub fn input_focused(&self) -> bool {
@@ -120,6 +164,77 @@ impl ReposView {
         self.sync_panel(ctx, false);
     }
 
+    fn inventory_counts(&self, alias: &str) -> (usize, usize, usize) {
+        let Some(inventory) = self.inventories.get(alias) else {
+            return (0, 0, 0);
+        };
+        let mut available = 0;
+        let mut updates = 0;
+        let mut attention = 0;
+        for entry in &inventory.entries {
+            match entry.state {
+                RepositoryInventoryState::Available => available += 1,
+                RepositoryInventoryState::Update { .. } => updates += 1,
+                RepositoryInventoryState::PossibleMove { .. } => {
+                    available += 1;
+                    attention += 1;
+                }
+                RepositoryInventoryState::Changed { .. }
+                | RepositoryInventoryState::MissingUpstream { .. }
+                | RepositoryInventoryState::Invalid { .. } => attention += 1,
+                RepositoryInventoryState::Installed { .. } => {}
+            }
+        }
+        (available, updates, attention)
+    }
+
+    fn inventory_line(entry: &skills::repository::RepositoryInventoryEntry) -> String {
+        let path = if entry.path.is_empty() {
+            "."
+        } else {
+            &entry.path
+        };
+        let name = entry
+            .skill
+            .as_ref()
+            .map(|skill| skill.name.as_str())
+            .filter(|name| *name != path)
+            .map(|name| format!(" · {name}"))
+            .unwrap_or_default();
+        let state = match &entry.state {
+            RepositoryInventoryState::Installed {
+                key,
+                covered: false,
+            } => {
+                format!("installed · {key}")
+            }
+            RepositoryInventoryState::Installed { key, covered: true } => {
+                format!("covered by {key}")
+            }
+            RepositoryInventoryState::Available => "available · i to install".into(),
+            RepositoryInventoryState::Update { key } => format!("update · {key} · u to check"),
+            RepositoryInventoryState::Changed {
+                key,
+                update_available,
+            } => format!(
+                "local changes{} · {key} · u to resolve",
+                if *update_available {
+                    " + upstream update"
+                } else {
+                    ""
+                }
+            ),
+            RepositoryInventoryState::MissingUpstream { key } => {
+                format!("missing upstream · {key} · review/remove locally")
+            }
+            RepositoryInventoryState::PossibleMove { key, from } => {
+                format!("possible move from {from} · {key} · review manually")
+            }
+            RepositoryInventoryState::Invalid { error } => format!("invalid · {error}"),
+        };
+        format!(" {path}{name}  [{state}]")
+    }
+
     fn source_icon<'a>(&self, project: &Project, ctx: &'a Ctx) -> &'a str {
         if let Some(repo) = project
             .alias
@@ -190,9 +305,34 @@ impl ReposView {
             .unwrap_or_else(|| ctx.ws.root.clone());
         field("Folder", skills::paths::contract_tilde(&path));
         if let Some(repo) = repo {
+            field("Alias", repo.alias.clone());
             field("URL", repo.url.clone());
             if !repo.branch.is_empty() {
                 field("Branch", repo.branch.clone());
+            }
+            if self.refreshing.contains(&repo.alias) {
+                field("Remote", "refreshing…".into());
+            } else if let Some(error) = self.inventory_errors.get(&repo.alias) {
+                field("Remote", format!("error: {error}"));
+            } else if let Some(inventory) = self.inventories.get(&repo.alias) {
+                let (available, updates, attention) = self.inventory_counts(&repo.alias);
+                field(
+                    "Remote",
+                    format!("{available} available · {updates} updates · {attention} attention"),
+                );
+                lines.push(Line::styled(" Inventory", th.bold()));
+                if inventory.entries.is_empty() {
+                    lines.push(Line::styled(" (no skill boundaries found)", th.dim()));
+                } else {
+                    lines.extend(
+                        inventory
+                            .entries
+                            .iter()
+                            .map(|entry| Line::raw(Self::inventory_line(entry))),
+                    );
+                }
+            } else {
+                field("Remote", "not checked · press f".into());
             }
         }
         lines
@@ -224,15 +364,53 @@ impl View for ReposView {
         Some(Request {
             title: project.name.clone(),
             detail: "Repository source".into(),
-            target: Target::Repository(alias),
-            items: vec![Item::new(
-                Command::Rename,
-                "Rename source",
-                KeyCode::Char('r'),
-                registered,
-                "This source is not registered",
-                0,
-            )],
+            target: Target::Repository(alias.clone()),
+            items: vec![
+                Item::new(
+                    Command::Refresh,
+                    "Refresh source inventory",
+                    KeyCode::Char('f'),
+                    registered && !self.refreshing.contains(&alias),
+                    if self.refreshing.contains(&alias) {
+                        "This source is already refreshing"
+                    } else {
+                        "This source is not registered"
+                    },
+                    0,
+                ),
+                Item::new(
+                    Command::Check,
+                    "Check installed skills",
+                    KeyCode::Char('u'),
+                    registered && !project.keys.is_empty(),
+                    "This source has no installed skills",
+                    0,
+                ),
+                Item::new(
+                    Command::Source,
+                    "Install more skills",
+                    KeyCode::Char('i'),
+                    registered,
+                    "This source is not registered",
+                    0,
+                ),
+                Item::new(
+                    Command::Rename,
+                    "Rename source",
+                    KeyCode::Char('r'),
+                    registered,
+                    "This source is not registered",
+                    1,
+                ),
+                Item::new(
+                    Command::Remove,
+                    "Remove local source and skills…",
+                    KeyCode::Char('D'),
+                    registered,
+                    "This source is not registered",
+                    2,
+                ),
+            ],
         })
     }
     fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
@@ -243,7 +421,7 @@ impl View for ReposView {
         Some(request)
     }
     fn context_execute(&mut self, target: &Target, command: Command, ctx: &Ctx) -> Vec<Action> {
-        if let (Target::Repository(alias), Command::Rename) = (target, command) {
+        if let Target::Repository(alias) = target {
             let Some(project) = self
                 .selected()
                 .filter(|project| project.alias.as_deref() == Some(alias))
@@ -252,13 +430,50 @@ impl View for ReposView {
                     "Target changed; reopen the actions menu".into(),
                 )];
             };
-            if !ctx.snap.repositories.contains_key(alias) {
-                return vec![];
-            }
-            return vec![Action::OpenModal(Box::new(Modal::rename_source(
-                alias,
-                &project.name,
-            )))];
+            let Some(repository) = ctx.snap.repositories.get(alias) else {
+                return vec![Action::Error("This source is not registered".into())];
+            };
+            return match command {
+                Command::Rename => vec![Action::OpenModal(Box::new(Modal::rename_source(
+                    alias,
+                    &project.name,
+                )))],
+                Command::Refresh if !self.refreshing.contains(alias) => {
+                    vec![Action::Spawn(Task::RefreshRepository(alias.clone()))]
+                }
+                Command::Check if !project.keys.is_empty() => vec![
+                    Action::Toast(format!(
+                        "checking {} installed skill(s)…",
+                        project.keys.len()
+                    )),
+                    Action::Spawn(Task::Check(project.keys.clone())),
+                ],
+                Command::Source => match skills::ops::install::InstallRef::from_source(
+                    &repository.source("", None),
+                ) {
+                    Ok(reference) => vec![Action::Spawn(Task::DiscoverRepository {
+                        label: repository.url.clone(),
+                        reference,
+                    })],
+                    Err(error) => vec![Action::Error(format!("discover {alias}: {error:#}"))],
+                },
+                Command::Remove => {
+                    match skills::ops::edit::RepositoryRemoveSummary::from_snapshot(ctx.snap, alias)
+                    {
+                        Ok(summary) => vec![Action::OpenModal(Box::new(Modal::remove_source(
+                            alias,
+                            &project.name,
+                            &summary,
+                        )))],
+                        Err(error) => {
+                            vec![Action::Error(format!("remove source {alias}: {error:#}"))]
+                        }
+                    }
+                }
+                _ => vec![Action::Error(
+                    "Action is no longer available; reopen the actions menu".into(),
+                )],
+            };
         }
         match self.skill_search.as_mut() {
             Some(view) => view.context_execute(target, command, ctx),
@@ -279,6 +494,12 @@ impl View for ReposView {
     }
 
     fn refresh(&mut self, ctx: &Ctx) {
+        // Inventory is computed against one concrete Library snapshot. Any new
+        // snapshot can change local hashes, installed paths, or source records,
+        // so never present the old comparison as current.
+        self.inventories.clear();
+        self.inventory_errors.clear();
+        self.refreshing.clear();
         let mut groups = std::collections::BTreeMap::<Option<String>, Project>::new();
         for repo in ctx.snap.repositories.values() {
             let kind = match repo.kind {
@@ -371,14 +592,20 @@ impl View for ReposView {
             return vec![];
         }
         match k.code {
-            KeyCode::Char('r') => {
-                if let Some(project) = self.selected()
-                    && let Some(alias) = project.alias.as_ref()
-                    && ctx.snap.repositories.contains_key(alias)
-                {
-                    return vec![Action::OpenModal(Box::new(
-                        crate::tui::modal::Modal::rename_source(alias, &project.name),
-                    ))];
+            KeyCode::Char('r')
+            | KeyCode::Char('f')
+            | KeyCode::Char('u')
+            | KeyCode::Char('i')
+            | KeyCode::Char('D') => {
+                if let Some(alias) = self.selected().and_then(|project| project.alias.clone()) {
+                    let command = match k.code {
+                        KeyCode::Char('r') => Command::Rename,
+                        KeyCode::Char('f') => Command::Refresh,
+                        KeyCode::Char('u') => Command::Check,
+                        KeyCode::Char('D') => Command::Remove,
+                        _ => Command::Source,
+                    };
+                    return self.context_execute(&Target::Repository(alias), command, ctx);
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1, ctx),
@@ -540,6 +767,10 @@ impl View for ReposView {
             ("↑↓", "sources"),
             ("Enter/→", "skills"),
             ("a", "actions"),
+            ("f", "refresh source"),
+            ("u", "check"),
+            ("i", "install more"),
+            ("D", "remove source"),
             ("/", "filter sources"),
             ("Esc/q", "clear/back"),
         ]
@@ -668,6 +899,58 @@ mod tests {
             .as_deref(),
             Some("archive Training Tools")
         );
+    }
+
+    #[test]
+    fn source_remove_is_enabled_with_installed_skills_and_opens_confirmation() {
+        let tmp = skills::ops::DownloadDir::new("repos-source-remove").unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let repository = Repository {
+            alias: "demo".into(),
+            name: Some("Demo skills".into()),
+            kind: skills::meta::SourceKind::Git,
+            url: "https://example.test/demo.git".into(),
+            branch: "main".into(),
+        };
+        repository.save(&ws).unwrap();
+        let key = "repos/demo/example";
+        std::fs::create_dir_all(ws.root.join(key)).unwrap();
+        std::fs::write(
+            ws.root.join(key).join("SKILL.md"),
+            "---\nname: example\ndescription: test\n---\nBody",
+        )
+        .unwrap();
+        ws.meta
+            .save(
+                key,
+                &skills::meta::SkillMeta {
+                    source: Some(repository.source("example", None)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut view = ReposView::default();
+        view.refresh(&ctx);
+        let request = view.actions_menu(&ctx).unwrap();
+        let remove = request
+            .items
+            .iter()
+            .find(|item| item.command == Command::Remove)
+            .unwrap();
+        assert_eq!(remove.label, "Remove local source and skills…");
+        assert!(remove.disabled.is_none());
+        assert!(matches!(
+            view.context_execute(&request.target, Command::Remove, &ctx)
+                .as_slice(),
+            [Action::OpenModal(_)]
+        ));
     }
 
     #[test]
@@ -920,5 +1203,72 @@ mod tests {
                 .panel_keys(&ctx)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn inventory_details_expose_paths_states_and_actions() {
+        let tmp = skills::ops::DownloadDir::new("repo-inventory-lines").unwrap();
+        let ws = skills::Workspace::open(tmp.path()).unwrap();
+        let repository = Repository {
+            name: None,
+            kind: skills::meta::SourceKind::Git,
+            alias: "demo".into(),
+            url: "https://example.com/demo.git".into(),
+            branch: "topic".into(),
+        };
+        repository.save(&ws).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut view = ReposView::default();
+        view.refresh(&ctx);
+        view.refreshing("demo");
+        let skill = skills::skill::SkillDoc {
+            key: "new".into(),
+            path: std::path::PathBuf::from("skills/new"),
+            name: "new".into(),
+            description: "New skill".into(),
+            body: String::new(),
+            external: false,
+        };
+        assert!(view.inventory_result(
+            "demo",
+            &Ok(RepositoryInventory {
+                entries: vec![skills::repository::RepositoryInventoryEntry {
+                    path: "skills/new".into(),
+                    skill: Some(skill),
+                    state: RepositoryInventoryState::Available,
+                }],
+            })
+        ));
+        let details = view
+            .detail_lines(&ctx)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(details.contains("skills/new"));
+        assert!(details.contains("available · i to install"));
+
+        let actions =
+            view.context_execute(&Target::Repository("demo".into()), Command::Source, &ctx);
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::Spawn(Task::DiscoverRepository {
+                reference: skills::ops::install::InstallRef::Git {
+                    branch: Some(branch),
+                    ..
+                },
+                ..
+            })] if branch == "topic"
+        ));
+
+        view.refresh(&ctx);
+        assert!(!view.inventories.contains_key("demo"));
+        assert!(!view.inventory_result("demo", &Ok(RepositoryInventory { entries: vec![] })));
     }
 }

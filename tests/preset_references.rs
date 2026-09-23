@@ -491,6 +491,86 @@ fn snapshot_indexes_fixed_members_including_missing_sources_and_refreshes_query_
 }
 
 #[test]
+fn removing_a_skill_removes_its_key_from_every_preset() {
+    let f = Fixture::new("remove-skill");
+    for (name, members) in [
+        ("daily", vec!["one", "two", "one"]),
+        ("weekly", vec!["one", "three"]),
+        ("untouched", vec!["two", "four"]),
+    ] {
+        f.ws.presets
+            .save(&Preset {
+                name: name.into(),
+                description: Some(format!("{name} description")),
+                skills: members.into_iter().map(String::from).collect(),
+                agents: vec!["a".into()],
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    let daily_path = f.ws.presets.path("daily");
+    let daily = std::fs::read_to_string(&daily_path).unwrap();
+    std::fs::write(
+        &daily_path,
+        format!("# keep this comment\ncustom = \"keep\"\n{daily}"),
+    )
+    .unwrap();
+    let untouched = std::fs::read(f.ws.presets.path("untouched")).unwrap();
+    let log = edit::remove(&f.ws, &f.ws.scan().unwrap(), "one", false).unwrap();
+
+    for name in ["daily", "weekly"] {
+        let preset = f.ws.presets.load(name).unwrap().unwrap();
+        assert!(!preset.skills.iter().any(|skill| skill == "one"));
+        assert_eq!(preset.description, Some(format!("{name} description")));
+        assert_eq!(preset.agents, ["a"]);
+        assert!(log.contains(&format!("updated preset {name}")));
+    }
+    assert_eq!(f.ws.presets.load("daily").unwrap().unwrap().skills, ["two"]);
+    let daily = std::fs::read_to_string(daily_path).unwrap();
+    assert!(daily.contains("# keep this comment"));
+    assert!(daily.contains("custom = \"keep\""));
+    assert_eq!(
+        f.ws.presets.load("weekly").unwrap().unwrap().skills,
+        ["three"]
+    );
+    assert_eq!(
+        f.ws.presets.load("untouched").unwrap().unwrap().skills,
+        ["four", "two"]
+    );
+    assert_eq!(
+        std::fs::read(f.ws.presets.path("untouched")).unwrap(),
+        untouched
+    );
+    assert!(!log.contains(&"updated preset untouched".to_string()));
+}
+
+#[test]
+fn keeping_metadata_keeps_group_membership_for_a_restorable_missing_skill() {
+    let f = Fixture::new("remove-skill-keep-meta");
+    f.ws.presets
+        .save(&Preset {
+            name: "daily".into(),
+            skills: vec!["one".into()],
+            ..Default::default()
+        })
+        .unwrap();
+
+    edit::remove(&f.ws, &f.ws.scan().unwrap(), "one", true).unwrap();
+
+    assert_eq!(f.ws.presets.load("daily").unwrap().unwrap().skills, ["one"]);
+    assert!(
+        Config::load(&f.ws.root)
+            .unwrap()
+            .skill_tags("one")
+            .contains(&"work".into())
+    );
+    let record = f.ws.scan().unwrap().get("one").unwrap().clone();
+    assert_eq!(record.status, skills::reconcile::SkillStatus::Missing);
+    assert_eq!(record.presets, ["daily"]);
+}
+
+#[test]
 fn coverage_is_a_set_intersection_and_includes_empty_or_uncovered_tags() {
     use skills::preset::{TagCoverage, tag_coverages, tag_members};
     let config = Config {

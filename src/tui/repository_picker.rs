@@ -26,6 +26,15 @@ pub struct InstallSelection {
     pub names: BTreeMap<String, String>,
 }
 
+fn needs_source_name(fetched: &FetchedRepository) -> bool {
+    fetched.repository.kind == SourceKind::Archive
+        && fetched
+            .repository
+            .name
+            .as_deref()
+            .is_none_or(|name| name.trim().is_empty())
+}
+
 pub struct RepositoryPicker {
     pub selection: InstallSelection,
     source_name: Input,
@@ -44,41 +53,21 @@ pub struct RepositoryPicker {
     preview: Overlay,
 }
 impl RepositoryPicker {
-    pub fn new(fetched: FetchedRepository, ctx: &Ctx) -> Self {
-        let installed = |path: &str| {
-            ctx.snap.skills.iter().any(|s| {
-                s.source
-                    .as_ref()
-                    .is_some_and(|source| fetched.repository.matches_source(source, path))
-            })
-        };
-        let paths = fetched
-            .choices
-            .iter()
-            .filter(|p| {
-                !installed(p)
-                    && !fetched.invalid.contains_key(*p)
-                    && !fetched
-                        .choices
-                        .iter()
-                        .any(|a| !fetched.invalid.contains_key(a) && overlaps(a, p))
-            })
-            .cloned()
-            .collect();
-        Self::restore(InstallSelection {
+    pub fn new(fetched: FetchedRepository, _ctx: &Ctx) -> Self {
+        let mut picker = Self::restore(InstallSelection {
             fetched,
-            paths,
+            paths: Vec::new(),
             names: BTreeMap::new(),
-        })
+        });
+        if !needs_source_name(&picker.selection.fetched) {
+            picker.focus = 2;
+        }
+        picker
     }
     pub fn restore(selection: InstallSelection) -> Self {
         let alias = Input::with_value(&selection.fetched.repository.alias);
         let repository = &selection.fetched.repository;
-        let needs_name = repository.kind == SourceKind::Archive
-            && repository
-                .name
-                .as_deref()
-                .is_none_or(|name| name.trim().is_empty());
+        let needs_name = needs_source_name(&selection.fetched);
         let source_name = Input::with_value(&if needs_name {
             String::new()
         } else {
@@ -253,17 +242,30 @@ impl RepositoryPicker {
             return Some("ancestor or descendant selected".into());
         }
         if ctx.snap.skills.iter().any(|s| {
-            s.source.as_ref().is_some_and(|source| {
-                self.selection
-                    .fetched
-                    .repository
-                    .matches_source(source, path)
-            })
+            s.status != skills::reconcile::SkillStatus::Missing
+                && s.source.as_ref().is_some_and(|source| {
+                    self.selection
+                        .fetched
+                        .repository
+                        .matches_source(source, path)
+                })
         }) {
             return Some("already installed".into());
         }
         None
     }
+    fn restores_missing(&self, path: &str, ctx: &Ctx) -> bool {
+        ctx.snap.skills.iter().any(|skill| {
+            skill.status == skills::reconcile::SkillStatus::Missing
+                && skill.source.as_ref().is_some_and(|source| {
+                    self.selection
+                        .fetched
+                        .repository
+                        .matches_source(source, path)
+                })
+        })
+    }
+
     fn toggle(&mut self, path: &str, ctx: &Ctx) -> Vec<Action> {
         if !self.selection.fetched.choices.iter().any(|p| p == path) {
             return vec![];
@@ -367,7 +369,7 @@ impl RepositoryPicker {
             2 => &[
                 ("Space", "select"),
                 ("v", "preview"),
-                ("Enter", "install"),
+                ("Enter", "install selected"),
                 ("n", "source name"),
                 ("a", "storage folder"),
                 ("e", "skill name"),
@@ -751,7 +753,13 @@ impl RepositoryPicker {
                     .get(path)
                     .and_then(|r| r.name.as_deref())
                     .unwrap_or(label);
-                let suffix = disabled.map(|s| format!("  ({s})")).unwrap_or_default();
+                let suffix = disabled
+                    .map(|s| format!("  ({s})"))
+                    .or_else(|| {
+                        (skill && self.restores_missing(path, ctx))
+                            .then(|| "  (missing locally — restore)".into())
+                    })
+                    .unwrap_or_default();
                 let style = if self.selection.fetched.invalid.contains_key(path) {
                     th.err()
                 } else if !skill || !suffix.is_empty() {
@@ -895,13 +903,16 @@ mod tests {
         };
         let mut picker = RepositoryPicker::new(fetched, &ctx);
         picker.configure(&ctx);
-        assert_eq!(picker.selection.paths, ["bundle/writer"]);
+        assert!(picker.selection.paths.is_empty());
         assert_eq!(
             picker.disabled("bundle/reader", &ctx).as_deref(),
             Some("already installed")
         );
         picker.toggle("bundle/writer", &ctx);
+        assert_eq!(picker.selection.paths, ["bundle/writer"]);
+        picker.toggle("bundle/writer", &ctx);
         assert_eq!(picker.disabled("bundle/writer", &ctx), None);
+        picker.focus = 1;
         picker.search_panel.input = Input::with_value("repo:sample/");
         picker.update_completion(&ctx);
         assert!(picker.search_panel.completion.active());
@@ -918,6 +929,54 @@ mod tests {
             .collect();
         assert!(text.contains("reader"));
         assert!(text.contains("writer"));
+    }
+
+    #[test]
+    fn missing_matching_skill_is_selectable_for_restore() {
+        let temp = skills::ops::DownloadDir::new("missing-restore-picker").unwrap();
+        let root = temp.path().join("library");
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let fetched = FetchedRepository {
+            repository: Repository {
+                name: None,
+                kind: skills::meta::SourceKind::Git,
+                alias: "sample".into(),
+                url: "https://example.com/sample.git".into(),
+                branch: "main".into(),
+            },
+            revision: "next".into(),
+            workdir: temp.path().join("download"),
+            choices: vec!["skills/reader".into()],
+            invalid: BTreeMap::new(),
+        };
+        let path = fetched.workdir.join("skills/reader");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("SKILL.md"),
+            "---\nname: reader\ndescription: Sample tool\n---\nBody\n",
+        )
+        .unwrap();
+        let mut snap = candidate_snapshot(&fetched);
+        snap.skills[0].key = "repos/sample/custom-reader".into();
+        snap.skills[0].status = SkillStatus::Missing;
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut picker = RepositoryPicker::new(fetched, &ctx);
+        picker.configure(&ctx);
+        assert_eq!(picker.disabled("skills/reader", &ctx), None);
+        assert!(picker.restores_missing("skills/reader", &ctx));
+        assert!(picker.toggle("skills/reader", &ctx).is_empty());
+        assert_eq!(picker.selection.paths, ["skills/reader"]);
     }
 
     #[test]
@@ -1003,6 +1062,7 @@ mod tests {
         press(&mut picker, KeyCode::Esc);
         assert_eq!(picker.source_name.value(), "Merlin Tools");
 
+        picker.toggle("reader", &ctx);
         press(&mut picker, KeyCode::Char('e'));
         picker.local_name = Input::with_value("project-reader");
         press(&mut picker, KeyCode::Enter);
@@ -1189,6 +1249,7 @@ mod tests {
             &ctx,
         );
         picker.configure(&ctx);
+        picker.focus = 1;
         picker.search_panel.input = Input::with_value("repo:sampl");
         picker.update_completion(&ctx);
         assert!(picker.search_panel.completion.active());
@@ -1369,7 +1430,8 @@ mod tests {
             .unwrap();
         }
         let mut picker = RepositoryPicker::new(fetched, &ctx);
-        assert_eq!(picker.selection.paths, vec!["tools", "other/printer"]);
+        assert!(picker.selection.paths.is_empty());
+        picker.toggle("tools", &ctx);
         assert!(!picker.toggle("tools/reader", &ctx).is_empty());
         picker.toggle("tools", &ctx);
         picker.toggle("tools/reader", &ctx);
@@ -1417,7 +1479,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(selection.paths, vec!["tools/reader", "tools/sibling/leaf"]);
-        assert!(picker.selection.paths.contains(&"other/printer".into()));
+        assert!(!picker.selection.paths.contains(&"other/printer".into()));
         picker.selection.paths = vec!["tools".into(), "other/printer".into()];
         // A tree ancestor retained solely for context is not an installation result.
         assert!(picker.shown.contains(&"tools".into()));

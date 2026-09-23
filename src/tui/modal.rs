@@ -56,6 +56,13 @@ pub enum Modal {
         scroll: u16,
         return_to: Option<Box<Modal>>,
     },
+    InstallComplete {
+        keys: Vec<String>,
+        message: String,
+        btn: usize,
+        btn_rects: Vec<Rect>,
+        rect: Rect,
+    },
     /// Preview of link changes with Apply / Cancel.
     Confirm {
         title: String,
@@ -78,6 +85,7 @@ pub enum Modal {
         scope: MutationScope,
         /// Set when this confirmation is a history step.
         then: Option<Step>,
+        apply_label: String,
         btn: usize,
         btn_rects: Vec<Rect>,
         rect: Rect,
@@ -104,7 +112,7 @@ pub enum Modal {
     },
     Resolve {
         prepared: Option<Prepared>,
-        files: Vec<(String, FileChange, Take)>,
+        files: Vec<(String, FileChange)>,
         list: ListNav,
         default_take: Take,
         btn: usize,
@@ -158,6 +166,15 @@ impl Modal {
             return_to: None,
         }
     }
+    pub fn install_complete(keys: Vec<String>, message: String) -> Self {
+        Modal::InstallComplete {
+            keys,
+            message,
+            btn: 0,
+            btn_rects: Vec::new(),
+            rect: Rect::default(),
+        }
+    }
     pub fn confirm(title: String, actions: Vec<deploy::Action>) -> Self {
         Self::confirm_then(title, actions, None)
     }
@@ -203,6 +220,7 @@ impl Modal {
             background: None,
             scope: MutationScope::Library,
             then: None,
+            apply_label: "Yes".into(),
             btn: 1,
             btn_rects: Vec::new(),
             rect: Rect::default(),
@@ -212,6 +230,13 @@ impl Modal {
     pub(crate) fn in_background(mut self, keys: Vec<String>) -> Self {
         if let Self::ConfirmWrite { background, .. } = &mut self {
             *background = Some(keys);
+        }
+        self
+    }
+
+    fn apply_label(mut self, label: &str) -> Self {
+        if let Self::ConfirmWrite { apply_label, .. } = &mut self {
+            *apply_label = label.to_string();
         }
         self
     }
@@ -263,7 +288,7 @@ impl Modal {
             title: " install a skill ".into(),
             input: Input::default(),
             kind: InputKind::Install,
-            hint: "owner/repo[/path] · Git or archive URL · local path\nEnter install · Esc cancel"
+            hint: "owner/repo[/path] · Git or archive URL · local path\nUse owner/repo#branch or a GitHub /tree/ URL · Enter discover · Esc cancel"
                 .into(),
             rect: Rect::default(),
         }
@@ -422,6 +447,58 @@ impl Modal {
             Box::new(move |ws| ws.presets.remove(&n).map(|_| format!("deleted preset {n}"))),
         )
     }
+    pub fn remove_source(alias: &str, name: &str, summary: &edit::RepositoryRemoveSummary) -> Self {
+        let alias = alias.to_string();
+        let mut lines = vec![
+            format!("Remove local source \"{name}\"?"),
+            String::new(),
+            "This will remove locally:".into(),
+            format!("• {} installed/recorded skill(s)", summary.keys.len()),
+            "• source registration, skill metadata, Tags and Preset references".into(),
+        ];
+        if summary.modified > 0 {
+            lines.push(String::new());
+            lines.push(format!(
+                "Warning: {} skill(s) have local modifications.",
+                summary.modified
+            ));
+        }
+        if summary.missing > 0 {
+            lines.push(format!(
+                "{} recorded skill(s) are already missing locally.",
+                summary.missing
+            ));
+        }
+        if summary.attention > 0 {
+            lines.push(format!(
+                "{} additional skill(s) need attention and will also be removed.",
+                summary.attention
+            ));
+        }
+        lines.push(String::new());
+        lines.push("Existing Global and Local deployment links will be left unchanged.".into());
+        lines.push(
+            "Links to removed skills will become broken; clean them explicitly in Agents or Health."
+                .into(),
+        );
+        lines.push(String::new());
+        lines.push("GitHub and the remote repository will not be changed.".into());
+        let keys = summary.keys.clone();
+        Self::confirm_write(
+            format!(" remove local source {name} "),
+            lines,
+            Box::new(move |ws| {
+                let report = edit::remove_repository(ws, &alias)?;
+                Ok(format!(
+                    "removed source {alias} and {} skill(s)",
+                    report.keys.len()
+                ))
+            }),
+        )
+        .apply_label("Remove source and skills")
+        .in_background(keys)
+    }
+
     pub fn remove(skill: &str) -> Self {
         let k = skill.to_string();
         Self::confirm_write(
@@ -543,14 +620,11 @@ impl Modal {
     }
 
     pub fn resolve(prepared: Prepared) -> Self {
-        let files: Vec<(String, FileChange, Take)> = prepared
+        let files: Vec<(String, FileChange)> = prepared
             .files
             .iter()
             .filter(|(_, c)| **c != FileChange::Unchanged)
-            .map(|(f, c)| {
-                let take = Take::Local;
-                (f.clone(), *c, take)
-            })
+            .map(|(f, c)| (f.clone(), *c))
             .collect();
         let mut list = ListNav::default();
         list.clamp(files.len());
@@ -602,6 +676,10 @@ impl Modal {
             Modal::Help { .. } | Modal::Message { .. } => {
                 &[("↑↓", "scroll"), ("PgUp/PgDn", "page"), ("Esc", "close")]
             }
+            Modal::InstallComplete { btn: 0, .. } => &[("Enter/Esc", "done"), ("←→", "buttons")],
+            Modal::InstallComplete { .. } => {
+                &[("Enter", "deploy now"), ("Esc", "done"), ("←→", "buttons")]
+            }
             Modal::Confirm { btn: 0, .. } | Modal::ConfirmWrite { btn: 0, .. } => {
                 &[("Enter/y", "apply"), ("Esc/n", "cancel"), ("←→", "buttons")]
             }
@@ -611,7 +689,7 @@ impl Modal {
             Modal::Input {
                 kind: InputKind::Install,
                 ..
-            } => &[("Enter", "install"), ("Esc", "cancel")],
+            } => &[("Enter", "discover"), ("Esc", "cancel")],
             Modal::Input { .. } => &[("Enter", "save"), ("Esc", "cancel")],
             Modal::Picker {
                 input_focus: true, ..
@@ -630,9 +708,9 @@ impl Modal {
                 ("Esc", "close"),
             ],
             Modal::Resolve { .. } => &[
-                ("Space", "toggle side"),
-                ("l/u", "keep local/use upstream"),
-                ("Enter", "apply"),
+                ("Space", "switch whole-skill choice"),
+                ("l/u", "keep whole skill/use upstream"),
+                ("Enter", "apply choice"),
                 ("Esc", "cancel"),
             ],
         }
@@ -700,6 +778,17 @@ impl Modal {
             {
                 vec![Action::CloseModal]
             }
+            Modal::InstallComplete { keys, btn, .. } => match k.code {
+                KeyCode::Enter if *btn == 1 => vec![Action::OpenModal(Box::new(
+                    Modal::batch_deploy(std::mem::take(keys), ctx),
+                ))],
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => vec![Action::CloseModal],
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l') => {
+                    *btn = 1 - *btn;
+                    vec![]
+                }
+                _ => vec![],
+            },
             Modal::Help { scroll } | Modal::Message { scroll, .. } => match k.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     *scroll = scroll.saturating_add(1);
@@ -902,22 +991,13 @@ impl Modal {
                     }
                     KeyCode::Char(' ') => {
                         *default_take = flip(*default_take);
-                        for f in files.iter_mut() {
-                            f.2 = *default_take;
-                        }
                         vec![]
                     }
                     KeyCode::Char('l') if !ctrl => {
-                        for f in files.iter_mut() {
-                            f.2 = Take::Local;
-                        }
                         *default_take = Take::Local;
                         vec![]
                     }
                     KeyCode::Char('u') if !ctrl => {
-                        for f in files.iter_mut() {
-                            f.2 = Take::Upstream;
-                        }
                         *default_take = Take::Upstream;
                         vec![]
                     }
@@ -977,6 +1057,25 @@ impl Modal {
             Modal::Batch(p) => p.mouse(m, ctx),
             Modal::Repository(p) => p.mouse(m, ctx),
             Modal::DeployTargets(p) => p.mouse(m, ctx),
+            Modal::InstallComplete {
+                keys,
+                btn_rects,
+                rect,
+                ..
+            } => {
+                if click {
+                    if btn_rects.first().is_some_and(|r| r.contains(at)) || !rect.contains(at) {
+                        return vec![Action::CloseModal];
+                    }
+                    if btn_rects.get(1).is_some_and(|r| r.contains(at)) {
+                        return vec![Action::OpenModal(Box::new(Modal::batch_deploy(
+                            std::mem::take(keys),
+                            ctx,
+                        )))];
+                    }
+                }
+                vec![]
+            }
             Modal::Help { scroll } | Modal::Message { scroll, .. } => {
                 if let Some(d) = wheel {
                     *scroll = (*scroll as i32 + d).max(0) as u16;
@@ -1115,14 +1214,7 @@ impl Modal {
                         let _ = default_take;
                         return vec![Action::CloseModal, Action::Toast("update cancelled".into())];
                     }
-                    if let Some((i, _)) = list.click(m.row, n)
-                        && files.get(i).is_some()
-                    {
-                        *default_take = flip(*default_take);
-                        for f in files.iter_mut() {
-                            f.2 = *default_take;
-                        }
-                    }
+                    let _ = list.click(m.row, n);
                 }
                 vec![]
             }
@@ -1242,6 +1334,34 @@ impl Modal {
                     r,
                 );
             }
+            Modal::InstallComplete {
+                message,
+                btn,
+                btn_rects,
+                rect,
+                ..
+            } => {
+                let body = Paragraph::new(message.as_str()).wrap(Wrap { trim: false });
+                let width = centered(area, 70, 5).width.saturating_sub(2);
+                let height = body
+                    .line_count(width)
+                    .saturating_add(4)
+                    .min(u16::MAX as usize) as u16;
+                let r = centered(area, 70, height);
+                *rect = r;
+                f.render_widget(Clear, r);
+                let block = th.block(" install complete ", true);
+                let inner = block.inner(r);
+                f.render_widget(block, r);
+                f.render_widget(
+                    body,
+                    Rect {
+                        height: inner.height.saturating_sub(2),
+                        ..inner
+                    },
+                );
+                *btn_rects = draw_buttons(f, inner, &[("Done", 0), ("Deploy now", 0)], *btn, th);
+            }
             Modal::Confirm {
                 title,
                 lines,
@@ -1274,6 +1394,7 @@ impl Modal {
             Modal::ConfirmWrite {
                 title,
                 lines,
+                apply_label,
                 btn,
                 btn_rects,
                 rect,
@@ -1299,7 +1420,13 @@ impl Modal {
                         ..inner
                     },
                 );
-                *btn_rects = draw_buttons(f, inner, &[("Yes", 0), ("Cancel", 0)], *btn, th);
+                *btn_rects = draw_buttons(
+                    f,
+                    inner,
+                    &[(apply_label.as_str(), 0), ("Cancel", 0)],
+                    *btn,
+                    th,
+                );
             }
             Modal::Input {
                 title,
@@ -1410,17 +1537,31 @@ impl Modal {
                 rect,
             } => {
                 let Some(p) = prepared.as_ref() else { return };
+                let modal_width = 100.min(area.width.saturating_sub(2)).max(1);
+                let content_width = modal_width.saturating_sub(2).max(1);
+                let new_skills = new_upstream_skills_text(&p.new_skills);
+                let new_skill_height = new_skills
+                    .as_ref()
+                    .map(|text| {
+                        Paragraph::new(text.as_str())
+                            .wrap(Wrap { trim: false })
+                            .line_count(content_width) as u16
+                    })
+                    .unwrap_or(0);
+                let head_height = 3 + new_skill_height;
                 let r = centered(
                     area,
                     100,
-                    (files.len() as u16 + 8).min(area.height.saturating_sub(2)),
+                    (files.len() as u16 + head_height + 6).min(area.height.saturating_sub(2)),
                 );
                 *rect = r;
                 f.render_widget(Clear, r);
                 let block = th.block(format!(" update {} ", p.skill), true);
                 let inner = block.inner(r);
                 f.render_widget(block, r);
-                let head = vec![
+
+                let choice = whole_skill_choice(*default_take);
+                let mut head = vec![
                     Line::from(vec![
                         Span::styled("revision ", th.dim()),
                         Span::raw(
@@ -1434,9 +1575,9 @@ impl Modal {
                         Span::raw(skills::meta::short_rev(&p.to_revision).to_string()),
                         Span::styled(
                             if p.needs_resolution() {
-                                "   modified locally — choose the whole skill"
+                                "   local changes detected"
                             } else {
-                                "   clean update"
+                                "   no local changes"
                             },
                             if p.needs_resolution() {
                                 th.warn()
@@ -1446,42 +1587,37 @@ impl Modal {
                         ),
                     ]),
                     Line::from(vec![
-                        Span::styled("whole skill  ", th.dim()),
-                        Span::styled(format!("{default_take:?}").to_lowercase(), th.accent()),
-                        Span::styled(
-                            if p.baseline_dir.is_some() {
-                                "   (three-way against the installed revision)"
-                            } else {
-                                "   (two-way: baseline revision unavailable)"
-                            },
-                            th.dim(),
-                        ),
+                        Span::styled("Whole-skill choice: ", th.dim()),
+                        Span::styled(choice, th.accent()),
                     ]),
-                    Line::from(if p.new_skills.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "New upstream skills (not installed): {}",
-                            p.new_skills.join(", ")
-                        )
-                    }),
+                    Line::from(Span::styled(
+                        if p.baseline_dir.is_some() {
+                            "File comparison: installed revision → local and upstream"
+                        } else {
+                            "File comparison: local ↔ upstream (installed revision unavailable)"
+                        },
+                        th.dim(),
+                    )),
                 ];
+                if let Some(text) = new_skills {
+                    head.push(Line::from(text));
+                }
                 f.render_widget(
-                    Paragraph::new(head),
+                    Paragraph::new(head).wrap(Wrap { trim: false }),
                     Rect {
-                        height: 3.min(inner.height),
+                        height: head_height.min(inner.height),
                         ..inner
                     },
                 );
                 let list_area = Rect {
-                    y: inner.y + 3,
-                    height: inner.height.saturating_sub(5),
+                    y: inner.y + head_height,
+                    height: inner.height.saturating_sub(head_height + 2),
                     ..inner
                 };
                 list.rows = list_area;
                 let items: Vec<ListItem> = files
                     .iter()
-                    .map(|(name, change, take)| {
+                    .map(|(name, change)| {
                         let (label, style) = match change {
                             FileChange::UpstreamChanged => ("upstream changed", th.accent()),
                             FileChange::LocalChanged => ("local changed   ", th.warn()),
@@ -1489,13 +1625,7 @@ impl Modal {
                             FileChange::Differs => ("differs         ", th.warn()),
                             FileChange::Unchanged => ("unchanged       ", th.dim()),
                         };
-                        let side = match take {
-                            Take::Local => Span::styled("[local   ]", th.warn()),
-                            Take::Upstream => Span::styled("[upstream]", th.accent()),
-                        };
                         ListItem::new(Line::from(vec![
-                            side,
-                            Span::raw(" "),
                             Span::styled(label, style),
                             Span::raw("  "),
                             Span::raw(name.clone()),
@@ -1507,12 +1637,28 @@ impl Modal {
                     .highlight_symbol("▸ ");
                 f.render_stateful_widget(w, list_area, &mut list.state);
                 if files.is_empty() {
-                    f.render_widget(Paragraph::new(Span::styled("No content diff to display. Local skips; upstream replaces the whole skill.", th.dim())), list_area);
+                    f.render_widget(
+                        Paragraph::new(Span::styled("No file changes to display.", th.dim())),
+                        list_area,
+                    );
                 }
-                *btn_rects = draw_buttons(f, inner, &[("Apply", 0), ("Cancel", 0)], *btn, th);
+                *btn_rects =
+                    draw_buttons(f, inner, &[("Apply choice", 0), ("Cancel", 0)], *btn, th);
             }
         }
     }
+}
+
+fn whole_skill_choice(take: Take) -> &'static str {
+    match take {
+        Take::Local => "Keep local whole skill (skip this update)",
+        Take::Upstream => "Use upstream whole skill (replace local content)",
+    }
+}
+
+fn new_upstream_skills_text(skills: &[String]) -> Option<String> {
+    (!skills.is_empty())
+        .then(|| format!("New upstream skills (not installed): {}", skills.join(", ")))
 }
 
 /// Narrow `shown` to the rows whose label or sublabel contains `query`.
@@ -1694,9 +1840,10 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
                         subpath: None,
                     })]
                 }
-                Ok(_) => vec![Action::Spawn(crate::tui::event::Task::DiscoverRepository(
-                    reference,
-                ))],
+                Ok(parsed) => vec![Action::Spawn(crate::tui::event::Task::DiscoverRepository {
+                    label: reference,
+                    reference: parsed,
+                })],
                 Err(e) => vec![Action::Error(format!("{e:#}"))],
             }
         }
@@ -2017,11 +2164,146 @@ mod picker_tests {
     use skills::{Workspace, config::Config, preset::Preset};
 
     #[test]
+    fn update_resolver_describes_only_whole_skill_choices() {
+        assert_eq!(
+            whole_skill_choice(Take::Local),
+            "Keep local whole skill (skip this update)"
+        );
+        assert_eq!(
+            whole_skill_choice(Take::Upstream),
+            "Use upstream whole skill (replace local content)"
+        );
+        let modal = Modal::Resolve {
+            prepared: None,
+            files: vec![],
+            list: ListNav::default(),
+            default_take: Take::Local,
+            btn: 0,
+            btn_rects: vec![],
+            rect: Rect::default(),
+        };
+        let hints = modal.hints();
+        assert!(hints.iter().any(|(_, hint)| hint.contains("whole skill")));
+        assert!(!hints.iter().any(|(_, hint)| hint.contains("toggle side")));
+    }
+
+    #[test]
+    fn new_upstream_skills_wrap_at_eighty_columns() {
+        let skills = (1..=8)
+            .map(|n| format!("new-upstream-skill-with-readable-name-{n}"))
+            .collect::<Vec<_>>();
+        let text = new_upstream_skills_text(&skills).unwrap();
+        for skill in &skills {
+            assert!(text.contains(skill));
+        }
+        let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+        assert!(paragraph.line_count(76) > 1);
+    }
+
+    #[test]
     fn startup_help_describes_read_only_explicit_repair() {
         assert!(HELP.contains("Startup scanning is read-only"));
         assert!(HELP.contains("analyze, review, and apply a repair"));
         assert!(!HELP.contains("repaired automatically"));
         assert!(!HELP.contains("are removed after"));
+    }
+
+    #[test]
+    fn source_removal_warns_about_local_scope_and_defaults_to_cancel() {
+        let tmp = skills::ops::DownloadDir::new("remove-source-modal").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let summary = edit::RepositoryRemoveSummary {
+            alias: "demo".into(),
+            keys: vec!["repos/demo/one".into(), "repos/demo/two".into()],
+            modified: 1,
+            missing: 1,
+            attention: 0,
+        };
+        let mut modal = Modal::remove_source("demo", "Demo source", &summary);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| modal.draw(frame, frame.area(), &ctx))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Remove source and skills"));
+        assert!(text.contains("Global and Local deployment links will be left unchanged"));
+        assert!(text.contains("become broken"));
+        assert!(text.contains("Agents or Health"));
+        assert!(!text.contains("agent deployment link(s)"));
+        assert!(text.contains("remote repository will not be changed"));
+        assert!(text.contains("local modifications"));
+        assert!(matches!(
+            modal
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx)
+                .as_slice(),
+            [Action::CloseModal]
+        ));
+    }
+
+    #[test]
+    fn install_complete_defaults_to_done_and_requires_explicit_deploy() {
+        let tmp = skills::ops::DownloadDir::new("install-complete").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+
+        let mut modal = Modal::install_complete(vec!["sample".into()], "Installed sample.".into());
+        assert!(matches!(
+            modal.handle_key(enter, &ctx).as_slice(),
+            [Action::CloseModal]
+        ));
+
+        let mut modal = Modal::install_complete(vec!["sample".into()], "Installed sample.".into());
+        assert!(modal.handle_key(right, &ctx).is_empty());
+        assert!(matches!(
+            modal.handle_key(enter, &ctx).as_slice(),
+            [Action::OpenModal(next)] if matches!(next.as_ref(), Modal::DeployTargets(_))
+        ));
+
+        let mut modal = Modal::install_complete(vec!["sample".into()], "Installed sample.".into());
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| modal.draw(f, f.area(), &ctx)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Done"));
+        assert!(text.contains("Deploy now"));
     }
 
     #[test]
@@ -2210,11 +2492,10 @@ mod picker_tests {
             terminal.draw(|f| modal.draw(f, f.area(), &ctx)).unwrap();
             let buffer = terminal.backend().buffer();
             let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
-            assert!(
-                text.contains("Enter install · Esc cancel"),
-                "{width}: {text}"
-            );
+            assert!(text.contains("discover · Esc"), "{width}: {text}");
+            assert!(text.contains("cancel"), "{width}: {text}");
             assert!(text.contains("owner/repo[/path]"));
+            assert!(text.contains("#branch") || text.contains("/tree/"));
             assert!(!text.contains("Esc c…"));
         }
         std::fs::remove_dir_all(root).unwrap();

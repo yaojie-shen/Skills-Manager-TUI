@@ -1,9 +1,10 @@
 use skills::{
     Workspace,
-    config::{AgentConfig, Config},
+    config::{AgentConfig, Config, TagConfig},
     ops::{deploy, edit, install, update},
-    reconcile::DeployState,
-    repository::{FetchedRepository, Repository},
+    preset::Preset,
+    reconcile::{DeployState, SkillStatus},
+    repository::{FetchedRepository, Repository, RepositoryInventoryState},
 };
 use std::{collections::BTreeMap, path::PathBuf, process::Command};
 
@@ -144,6 +145,196 @@ fn repository_deployment_preserves_skill_name_without_source_prefix() {
     );
     edit::remove(&f.ws, &snap, &keys[0], false).unwrap();
     assert!(!f.dir.join("agent").join(name).is_symlink());
+}
+
+#[test]
+fn reinstall_missing_repository_skill_restores_stable_key_and_metadata() {
+    let f = Fixture::new();
+    f.put("some/folder", "review", "review");
+    f.commit();
+    let first = f.fetch("first");
+    let key = first
+        .install(&f.ws, &["some/folder".into()], &BTreeMap::new())
+        .unwrap()
+        .pop()
+        .unwrap();
+    let mut meta = f.ws.meta.load(&key).unwrap().unwrap();
+    meta.note = Some("keep this note".into());
+    f.ws.meta.save(&key, &meta).unwrap();
+    Config::edit_tags(&f.ws.root, |tags| {
+        tags.push(TagConfig {
+            name: "keepers".into(),
+            skills: vec![key.clone()],
+            color: Some("blue".into()),
+            description: None,
+        });
+    })
+    .unwrap();
+    f.ws.presets
+        .save(&Preset {
+            name: "daily".into(),
+            skills: vec![key.clone()],
+            ..Default::default()
+        })
+        .unwrap();
+    std::fs::remove_dir_all(f.ws.skill_path(&key)).unwrap();
+    assert_eq!(
+        f.ws.scan().unwrap().get(&key).unwrap().status,
+        SkillStatus::Missing
+    );
+
+    let fetched = f.fetch("second");
+    let restored_keys = fetched
+        .install(&f.ws, &["some/folder".into()], &BTreeMap::new())
+        .unwrap();
+    assert_eq!(restored_keys.as_slice(), std::slice::from_ref(&key));
+
+    assert!(f.ws.skill_path(&key).join("SKILL.md").is_file());
+    let restored = f.ws.meta.load(&key).unwrap().unwrap();
+    assert_eq!(restored.note.as_deref(), Some("keep this note"));
+    assert_eq!(
+        Config::load(&f.ws.root).unwrap().skill_tags(&key),
+        ["keepers"]
+    );
+    assert_eq!(f.ws.presets.load("daily").unwrap().unwrap().skills, [key]);
+    assert_eq!(
+        f.ws.scan().unwrap().skills[0].status,
+        SkillStatus::Repository
+    );
+    first.cleanup();
+    fetched.cleanup();
+}
+
+#[test]
+fn removing_repository_cascades_local_skills_links_and_references_only() {
+    let f = Fixture::new();
+    f.put("skills/clean", "clean", "clean");
+    f.put("skills/modified", "modified", "base");
+    f.put("skills/missing", "missing", "missing");
+    f.commit();
+    let upstream_head = Command::new("git")
+        .args(["-C", f.repo.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap()
+        .stdout;
+    let fetched = f.fetch("cascade");
+    let keys = fetched
+        .install(
+            &f.ws,
+            &[
+                "skills/clean".into(),
+                "skills/modified".into(),
+                "skills/missing".into(),
+            ],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    fetched.cleanup();
+    let clean = keys.iter().find(|key| key.ends_with("/clean")).unwrap();
+    let modified = keys.iter().find(|key| key.ends_with("/modified")).unwrap();
+    let missing = keys.iter().find(|key| key.ends_with("/missing")).unwrap();
+    let snap = f.ws.scan().unwrap();
+    deploy::apply(
+        &deploy::plan_deploy(
+            &f.ws,
+            &snap,
+            std::slice::from_ref(clean),
+            &["sample".into()],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        f.ws.skill_path(modified).join("SKILL.md"),
+        "---\nname: modified\ndescription: Sample skill\n---\nlocal change\n",
+    )
+    .unwrap();
+    std::fs::remove_dir_all(f.ws.skill_path(missing)).unwrap();
+    Config::edit_tags(&f.ws.root, |tags| {
+        tags.push(TagConfig {
+            name: "source-members".into(),
+            skills: keys.clone(),
+            color: None,
+            description: None,
+        });
+    })
+    .unwrap();
+    f.ws.presets
+        .save(&Preset {
+            name: "source-members".into(),
+            skills: keys.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let summary =
+        edit::RepositoryRemoveSummary::from_snapshot(&f.ws.scan().unwrap(), "cascade").unwrap();
+    assert_eq!(summary.keys.len(), 3);
+    assert_eq!(summary.modified, 1);
+    assert_eq!(summary.missing, 1);
+
+    let report = edit::remove_repository(&f.ws, "cascade").unwrap();
+    assert_eq!(report.keys.len(), 3);
+    assert!(Repository::list(&f.ws.root).unwrap().is_empty());
+    assert!(!f.ws.root.join("repos/cascade").exists());
+    let link = f.dir.join("agent/clean");
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read_link(&link).unwrap(), f.ws.skill_path(clean));
+    assert!(
+        !link.exists(),
+        "the preserved deployment now has a missing target"
+    );
+    let after = f.ws.scan().unwrap();
+    assert!(after.skills.is_empty());
+    assert!(matches!(
+        after.agent("sample").unwrap().entries["clean"],
+        skills::reconcile::EntryState::Broken { .. }
+    ));
+    assert!(
+        Config::load(&f.ws.root)
+            .unwrap()
+            .skill_tags(clean)
+            .is_empty()
+    );
+    assert!(
+        f.ws.presets
+            .load("source-members")
+            .unwrap()
+            .unwrap()
+            .skills
+            .is_empty()
+    );
+    assert_eq!(
+        Command::new("git")
+            .args(["-C", f.repo.to_str().unwrap(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+        upstream_head
+    );
+}
+
+#[test]
+fn removing_an_empty_repository_uses_the_same_cascade_operation() {
+    let f = Fixture::new();
+    let repository = Repository {
+        alias: "empty-source".into(),
+        name: Some("Empty source".into()),
+        url: "https://example.test/empty.git".into(),
+        kind: skills::meta::SourceKind::Git,
+        branch: "main".into(),
+    };
+    repository.save(&f.ws).unwrap();
+
+    let report = edit::remove_repository(&f.ws, "empty-source").unwrap();
+
+    assert!(report.keys.is_empty());
+    assert!(Repository::list(&f.ws.root).unwrap().is_empty());
 }
 
 #[test]
@@ -672,6 +863,48 @@ fn updates_preserve_local_skill_and_deployment_when_upstream_identity_breaks() {
 }
 
 #[test]
+fn modified_skill_can_restore_upstream_at_the_same_revision() {
+    let f = Fixture::new();
+    f.put("tools/review", "review", "upstream");
+    f.commit();
+    let fetched = f.fetch("restore-current");
+    let key = fetched
+        .install(&f.ws, &["tools/review".into()], &BTreeMap::new())
+        .unwrap()
+        .remove(0);
+    fetched.cleanup();
+    std::fs::write(
+        f.ws.skill_path(&key).join("SKILL.md"),
+        "---\nname: review\ndescription: Sample skill\n---\nlocal drift\n",
+    )
+    .unwrap();
+    let snap = f.ws.scan().unwrap();
+    assert_eq!(
+        snap.get(&key).unwrap().status,
+        skills::reconcile::SkillStatus::Modified
+    );
+
+    let prepared = update::prepare(&f.ws, &snap, &key).unwrap();
+    assert_eq!(
+        prepared.from_revision.as_deref(),
+        Some(prepared.to_revision.as_str())
+    );
+    assert!(prepared.needs_resolution());
+    assert!(prepared.upstream_dir.join("SKILL.md").is_file());
+    update::apply(&f.ws, &prepared, update::Take::Upstream, &BTreeMap::new()).unwrap();
+
+    assert!(
+        std::fs::read_to_string(f.ws.skill_path(&key).join("SKILL.md"))
+            .unwrap()
+            .contains("upstream")
+    );
+    assert_eq!(
+        f.ws.scan().unwrap().get(&key).unwrap().status,
+        skills::reconcile::SkillStatus::Repository
+    );
+}
+
+#[test]
 fn update_rechecks_local_state_and_prepared_name_before_writing() {
     let f = Fixture::new();
     f.put("tools/review", "review", "original");
@@ -822,6 +1055,144 @@ fn local_name_changes_cannot_redefine_the_update_identity() {
     let before = f.ws.meta.load(&key).unwrap();
     assert!(update::prepare(&f.ws, &f.ws.scan().unwrap(), &key).is_err());
     assert_eq!(f.ws.meta.load(&key).unwrap(), before);
+}
+
+#[test]
+fn repository_inventory_is_read_only_and_classifies_source_changes() {
+    let f = Fixture::new();
+    f.put("same", "same", "same");
+    f.put("local", "local", "base");
+    f.put("upstream", "upstream", "base");
+    f.put("moved-from", "moved", "move");
+    f.put("gone", "gone", "gone");
+    f.commit();
+    let fetched = f.fetch("inventory");
+    fetched
+        .install(
+            &f.ws,
+            &[
+                "same".into(),
+                "local".into(),
+                "upstream".into(),
+                "moved-from".into(),
+                "gone".into(),
+            ],
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    fetched.cleanup();
+
+    std::fs::write(
+        f.ws.root.join("repos/inventory/local/SKILL.md"),
+        "---\nname: local\ndescription: Sample skill\n---\nchanged locally\n",
+    )
+    .unwrap();
+    std::fs::remove_dir_all(f.repo.join("moved-from")).unwrap();
+    std::fs::rename(f.repo.join("gone"), f.repo.join("moved-to")).unwrap();
+    f.put("upstream", "upstream", "changed upstream");
+    f.put("available", "available", "new");
+    std::fs::create_dir_all(f.repo.join("invalid")).unwrap();
+    std::fs::write(f.repo.join("invalid/SKILL.md"), "not frontmatter").unwrap();
+    f.commit();
+
+    let before = directory_fingerprint(&f.ws.root);
+    let fetched = f.fetch("inventory");
+    let inventory = fetched.inventory(&f.ws.scan().unwrap()).unwrap();
+    assert_eq!(directory_fingerprint(&f.ws.root), before);
+
+    let state = |path: &str| {
+        &inventory
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .unwrap()
+            .state
+    };
+    assert!(matches!(
+        state("same"),
+        RepositoryInventoryState::Installed { covered: false, .. }
+    ));
+    assert!(matches!(
+        state("local"),
+        RepositoryInventoryState::Changed {
+            update_available: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        state("upstream"),
+        RepositoryInventoryState::Update { .. }
+    ));
+    assert!(matches!(
+        state("available"),
+        RepositoryInventoryState::Available
+    ));
+    assert!(matches!(
+        state("invalid"),
+        RepositoryInventoryState::Invalid { .. }
+    ));
+    assert!(
+        matches!(state("moved-to"), RepositoryInventoryState::PossibleMove { from, .. } if from == "gone")
+    );
+    assert!(matches!(
+        state("gone"),
+        RepositoryInventoryState::MissingUpstream { .. }
+    ));
+    assert!(matches!(
+        state("moved-from"),
+        RepositoryInventoryState::MissingUpstream { .. }
+    ));
+    fetched.cleanup();
+}
+
+#[test]
+fn inventory_does_not_treat_two_missing_hashes_as_a_clean_update() {
+    let f = Fixture::new();
+    f.put("skill", "skill", "remote");
+    f.commit();
+    let fetched = f.fetch("missing-baseline");
+    let mut snapshot = f.ws.scan().unwrap();
+    snapshot.skills.push(skills::reconcile::SkillRecord {
+        key: "repos/missing-baseline/skill".into(),
+        path: f.ws.root.join("repos/missing-baseline/skill"),
+        status: skills::reconcile::SkillStatus::MissingBaseline,
+        name: Some("skill".into()),
+        description: Some("Sample skill".into()),
+        body: None,
+        external: false,
+        tags: vec![],
+        presets: vec![],
+        note: None,
+        source: Some(fetched.repository.source("skill", None)),
+        source_name: Some(fetched.repository.display_name()),
+        current_hash: None,
+        baseline_hash: None,
+        deploy: BTreeMap::new(),
+        meta: None,
+    });
+    let inventory = fetched.inventory(&snapshot).unwrap();
+    assert!(matches!(
+        inventory.entries[0].state,
+        RepositoryInventoryState::Changed { .. }
+    ));
+    fetched.cleanup();
+}
+
+fn directory_fingerprint(root: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| {
+            (
+                entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                std::fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
 }
 
 #[test]

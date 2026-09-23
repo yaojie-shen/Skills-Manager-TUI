@@ -34,7 +34,11 @@ pub enum Task {
     SyncDisable,
     Sync(super::sync_picker::Request),
     AutoSync(Vec<String>),
-    DiscoverRepository(String),
+    DiscoverRepository {
+        label: String,
+        reference: skills::ops::install::InstallRef,
+    },
+    RefreshRepository(String),
     InstallRepository(Box<super::repository_picker::InstallSelection>),
     Scan,
     PollRoot,
@@ -81,7 +85,8 @@ impl Task {
                 if request.dry_run { " (preview)" } else { "" }
             )),
             Self::AutoSync(_) => Some("Root sync".into()),
-            Self::DiscoverRepository(reference) => Some(format!("Fetch {reference}")),
+            Self::DiscoverRepository { label, .. } => Some(format!("Fetch {label}")),
+            Self::RefreshRepository(alias) => Some(format!("Refresh source {alias}")),
             Self::InstallRepository(selection) => Some(format!(
                 "Install {}",
                 selection.fetched.repository.display_name()
@@ -109,6 +114,7 @@ pub enum TaskOutput {
     AutoSync(std::result::Result<skills::ops::sync::Report, skills::ops::sync::AutoSyncFailure>),
     Batch(BatchOutcome),
     RepositoryFetched(String, Result<skills::repository::FetchedRepository>),
+    RepositoryRefreshed(String, Result<skills::repository::RepositoryInventory>),
     RepositoryInstalled(
         Box<super::repository_picker::InstallSelection>,
         Result<Vec<String>>,
@@ -259,17 +265,35 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                         &mut progress,
                     ))
                 }
-                Task::DiscoverRepository(reference) => {
-                    let result =
-                        skills::ops::install::parse_ref(&reference, None, None).and_then(|r| {
-                            skills::repository::FetchedRepository::fetch_with_progress(
-                                &ws,
-                                &r,
-                                None,
-                                &mut progress,
-                            )
-                        });
-                    TaskOutput::RepositoryFetched(reference, result)
+                Task::DiscoverRepository { label, reference } => {
+                    let result = skills::repository::FetchedRepository::fetch_with_progress(
+                        &ws,
+                        &reference,
+                        None,
+                        &mut progress,
+                    );
+                    TaskOutput::RepositoryFetched(label, result)
+                }
+                Task::RefreshRepository(alias) => {
+                    let result = (|| {
+                        let repository = skills::repository::Repository::list(&ws.root)?
+                            .into_iter()
+                            .find(|repository| repository.alias == alias)
+                            .ok_or_else(|| anyhow::anyhow!("source not found: {alias}"))?;
+                        let reference = skills::ops::install::InstallRef::from_source(
+                            &repository.source("", None),
+                        )?;
+                        let fetched = skills::repository::FetchedRepository::fetch_with_progress(
+                            &ws,
+                            &reference,
+                            Some(&alias),
+                            &mut progress,
+                        )?;
+                        let inventory = ws.scan().and_then(|snapshot| fetched.inventory(&snapshot));
+                        fetched.cleanup();
+                        inventory
+                    })();
+                    TaskOutput::RepositoryRefreshed(alias, result)
                 }
                 Task::InstallRepository(selection) => {
                     let result =

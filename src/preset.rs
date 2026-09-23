@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use toml_edit::DocumentMut;
 
 pub const PRESET_DIR: &str = "presets";
 
@@ -201,6 +202,26 @@ impl PresetStore {
         preset.skills = preset.members();
         let text = toml::to_string_pretty(&preset)?;
         write_atomic(&self.path(&preset.name), text.as_bytes())
+    }
+
+    /// Remove a fixed skill key without rewriting unrelated fields or comments.
+    pub fn remove_skill(&self, name: &str, key: &str) -> Result<bool> {
+        let path = self.path(name);
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let mut doc = text
+            .parse::<DocumentMut>()
+            .with_context(|| format!("invalid preset: {}", path.display()))?;
+        let Some(skills) = doc.get_mut("skills").and_then(|item| item.as_array_mut()) else {
+            return Ok(false);
+        };
+        let old_len = skills.len();
+        skills.retain(|value| value.as_str() != Some(key));
+        if skills.len() == old_len {
+            return Ok(false);
+        }
+        write_atomic(&path, doc.to_string().as_bytes())?;
+        Ok(true)
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {

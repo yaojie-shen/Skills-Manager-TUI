@@ -3,6 +3,8 @@ use crate::{
     Workspace,
     meta::{Source, SourceKind},
     ops::{DownloadDir, fresh_staging},
+    reconcile::{SkillStatus, Snapshot},
+    skill::SkillDoc,
     util::{valid_skill_key, write_atomic},
 };
 use anyhow::{Context, Result, bail};
@@ -124,6 +126,53 @@ impl Repository {
         Ok(repository)
     }
 
+    /// Unregister a source only after all of its installed skills are removed.
+    pub fn remove(ws: &Workspace, alias: &str) -> Result<()> {
+        anyhow::ensure!(
+            valid_skill_key(alias),
+            "invalid repository alias: {alias:?}"
+        );
+        let _lock = ws.meta.lock()?;
+        let repository = Self::list(&ws.root)?
+            .into_iter()
+            .find(|repository| repository.alias == alias)
+            .with_context(|| format!("source not found: {alias}"))?;
+        let path = Self::path(&ws.root, &repository.alias);
+        let doc = crate::meta::MetaStore::read(&path)?;
+        let has_metadata = match doc.get("skills") {
+            Some(skills) => !skills
+                .as_table()
+                .context("skills must be a table")?
+                .is_empty(),
+            None => false,
+        };
+        anyhow::ensure!(
+            !has_metadata,
+            "source {alias} still has installed skill metadata; remove its skills first"
+        );
+
+        let storage_root = ws.root.join("repos");
+        if storage_root.exists() || crate::util::is_symlink(&storage_root) {
+            let metadata = std::fs::symlink_metadata(&storage_root)?;
+            anyhow::ensure!(
+                metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+                "repository storage is not a real directory; refusing to unregister source"
+            );
+        }
+        let storage = storage_root.join(alias);
+        anyhow::ensure!(
+            !crate::util::is_symlink(&storage),
+            "repository storage is a symlink; refusing to unregister source"
+        );
+        if storage.exists() {
+            std::fs::remove_dir(&storage).with_context(|| {
+                format!("source {alias} still has installed content; remove its skills first")
+            })?;
+        }
+        std::fs::remove_file(&path)
+            .with_context(|| format!("removing source metadata: {}", path.display()))
+    }
+
     pub fn source(&self, path: &str, revision: Option<&str>) -> Source {
         let subpath = Some(path.to_string());
         let revision = revision.map(str::to_string);
@@ -157,8 +206,9 @@ impl Repository {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
-            if entry.path().extension().is_some_and(|e| e == "toml") {
-                let text = std::fs::read_to_string(entry.path())?;
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "toml") {
+                let text = std::fs::read_to_string(&path)?;
                 let doc: toml::Value = toml::from_str(&text)?;
                 if doc.get("url").is_none() {
                     continue;
@@ -166,6 +216,16 @@ impl Repository {
                 let repo: Self = doc.try_into()?;
                 if !valid_skill_key(&repo.alias) {
                     bail!("invalid repository alias")
+                }
+                let filename_alias = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .context("repository metadata filename is not valid UTF-8")?;
+                if filename_alias != repo.alias {
+                    bail!(
+                        "repository metadata filename {filename_alias:?} does not match alias {:?}",
+                        repo.alias
+                    )
                 }
                 if let Some(name) = &repo.name {
                     validate_name(name)?;
@@ -308,6 +368,49 @@ pub fn alias_of(key: &str) -> Option<&str> {
     key.strip_prefix("repos/")?.split('/').next()
 }
 
+/// Read-only comparison between one fetched source tree and installed skills.
+#[derive(Debug, Clone)]
+pub struct RepositoryInventory {
+    pub entries: Vec<RepositoryInventoryEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepositoryInventoryEntry {
+    /// Repository-relative path. The repository root is the empty string.
+    pub path: String,
+    pub skill: Option<SkillDoc>,
+    pub state: RepositoryInventoryState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryInventoryState {
+    Installed {
+        key: String,
+        /// An installed ancestor contains this nested skill boundary.
+        covered: bool,
+    },
+    Available,
+    Changed {
+        key: String,
+        update_available: bool,
+    },
+    Update {
+        key: String,
+    },
+    MissingUpstream {
+        key: String,
+    },
+    /// A unique missing/available pair with identical name and content.
+    /// Informational only: refresh never migrates metadata or files.
+    PossibleMove {
+        key: String,
+        from: String,
+    },
+    Invalid {
+        error: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct FetchedRepository {
     pub repository: Repository,
@@ -318,6 +421,171 @@ pub struct FetchedRepository {
     pub invalid: std::collections::BTreeMap<String, String>,
 }
 impl FetchedRepository {
+    /// Compare this fetched tree with a full, read-only Library snapshot.
+    pub fn inventory(&self, snapshot: &Snapshot) -> Result<RepositoryInventory> {
+        struct Candidate {
+            entry: RepositoryInventoryEntry,
+            hash: Option<String>,
+        }
+
+        let installed: Vec<_> = snapshot
+            .skills
+            .iter()
+            .filter(|skill| {
+                skill.source.as_ref().is_some_and(|source| {
+                    source.kind() == self.repository.kind.as_str()
+                        && source.url() == Some(self.repository.url.as_str())
+                        && source.branch().unwrap_or("") == self.repository.branch
+                })
+            })
+            .collect();
+        let mut candidates = Vec::with_capacity(self.choices.len());
+        for path in &self.choices {
+            let exact = installed.iter().find(|skill| {
+                skill
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| self.repository.matches_source(source, path))
+            });
+            let covered = installed.iter().find(|skill| {
+                skill.source.as_ref().is_some_and(|source| {
+                    overlaps(source.subpath().unwrap_or(""), path)
+                        && self
+                            .repository
+                            .matches_source(source, source.subpath().unwrap_or(""))
+                })
+            });
+            let loaded = SkillDoc::load(&self.workdir.join(path));
+            let candidate = match loaded {
+                Err(error) => Candidate {
+                    entry: RepositoryInventoryEntry {
+                        path: path.clone(),
+                        skill: None,
+                        state: RepositoryInventoryState::Invalid {
+                            error: format!("{error:#}"),
+                        },
+                    },
+                    hash: None,
+                },
+                Ok(skill) => {
+                    let hash = crate::hash::hash_directory(&self.workdir.join(path))?;
+                    let state = if let Some(installed) = exact {
+                        if installed.current_hash.as_ref() == Some(&hash) {
+                            RepositoryInventoryState::Installed {
+                                key: installed.key.clone(),
+                                covered: false,
+                            }
+                        } else if installed.current_hash.is_some()
+                            && installed.current_hash == installed.baseline_hash
+                        {
+                            RepositoryInventoryState::Update {
+                                key: installed.key.clone(),
+                            }
+                        } else {
+                            RepositoryInventoryState::Changed {
+                                key: installed.key.clone(),
+                                update_available: installed.baseline_hash.as_ref() != Some(&hash),
+                            }
+                        }
+                    } else if let Some(installed) = covered {
+                        RepositoryInventoryState::Installed {
+                            key: installed.key.clone(),
+                            covered: true,
+                        }
+                    } else {
+                        RepositoryInventoryState::Available
+                    };
+                    Candidate {
+                        entry: RepositoryInventoryEntry {
+                            path: path.clone(),
+                            skill: Some(skill),
+                            state,
+                        },
+                        hash: Some(hash),
+                    }
+                }
+            };
+            candidates.push(candidate);
+        }
+
+        let fetched_paths: BTreeSet<_> = self.choices.iter().map(String::as_str).collect();
+        let mut missing = Vec::new();
+        for skill in installed {
+            let path = skill
+                .source
+                .as_ref()
+                .and_then(Source::subpath)
+                .unwrap_or("");
+            if !fetched_paths.contains(path) {
+                missing.push((skill, path.to_string()));
+            }
+        }
+
+        // ponytail: exact name+hash and one-to-one pairing only; broaden if move
+        // suggestions prove too sparse without producing ambiguous migrations.
+        let possible_moves: Vec<_> = missing
+            .iter()
+            .enumerate()
+            .filter_map(|(missing_index, (skill, _))| {
+                let name = skill.name.as_deref()?;
+                if skill.current_hash.is_none() || skill.current_hash != skill.baseline_hash {
+                    return None;
+                }
+                let candidates: Vec<_> = candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| {
+                        candidate.entry.state == RepositoryInventoryState::Available
+                            && candidate
+                                .entry
+                                .skill
+                                .as_ref()
+                                .is_some_and(|doc| doc.name == name)
+                            && candidate.hash.as_ref() == skill.current_hash.as_ref()
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                (candidates.len() == 1).then(|| (missing_index, candidates[0]))
+            })
+            .collect();
+        for (missing_index, candidate_index) in possible_moves {
+            let (skill, old_path) = &missing[missing_index];
+            let unique = missing
+                .iter()
+                .filter(|(other, _)| {
+                    other.name == skill.name
+                        && other.current_hash == skill.current_hash
+                        && other.current_hash == other.baseline_hash
+                })
+                .count()
+                == 1;
+            if unique {
+                candidates[candidate_index].entry.state = RepositoryInventoryState::PossibleMove {
+                    key: skill.key.clone(),
+                    from: old_path.clone(),
+                };
+            }
+        }
+
+        candidates.extend(missing.into_iter().map(|(skill, path)| Candidate {
+            entry: RepositoryInventoryEntry {
+                path,
+                skill: None,
+                state: RepositoryInventoryState::MissingUpstream {
+                    key: skill.key.clone(),
+                },
+            },
+            hash: None,
+        }));
+        candidates.sort_by(|a, b| a.entry.path.cmp(&b.entry.path));
+        Ok(RepositoryInventory {
+            entries: candidates
+                .into_iter()
+                .map(|candidate| candidate.entry)
+                .collect(),
+        })
+    }
+
     pub fn cleanup(&self) {
         let _ = std::fs::remove_dir_all(&self.workdir);
     }
@@ -438,11 +706,26 @@ impl FetchedRepository {
     ) -> Result<BTreeMap<String, String>> {
         self.repository.validate(ws)?;
         let prefix = format!("repos/{}/", self.repository.alias);
+        let restorable_names: BTreeSet<String> = ws
+            .scan()?
+            .skills
+            .into_iter()
+            .filter(|record| record.status == SkillStatus::Missing)
+            .filter_map(|record| {
+                let source = record.source.as_ref()?;
+                paths
+                    .iter()
+                    .any(|path| self.repository.matches_source(source, path))
+                    .then(|| record.key.strip_prefix(&prefix).map(str::to_string))
+                    .flatten()
+            })
+            .collect();
         let mut occupied: BTreeSet<String> = ws
             .meta
             .list_keys()?
             .into_iter()
             .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
+            .filter(|name| !restorable_names.contains(name))
             .collect();
         let dir = ws.root.join("repos").join(&self.repository.alias);
         if dir.is_dir() {
@@ -489,18 +772,33 @@ impl FetchedRepository {
             bail!("select at least one skill")
         }
         let existing = ws.scan()?;
+        let mut restorations = BTreeMap::new();
         let paths: Vec<String> = paths
             .iter()
             .filter(|path| {
-                let installed = existing.skills.iter().any(|r| {
-                    r.source
+                let installed = existing.skills.iter().find(|record| {
+                    record
+                        .source
                         .as_ref()
                         .is_some_and(|source| self.repository.matches_source(source, path))
                 });
-                if installed {
-                    progress(&format!("Already installed: {path}; skipped"));
+                match installed {
+                    Some(record) if record.status == SkillStatus::Missing => {
+                        restorations.insert(
+                            (*path).clone(),
+                            (
+                                record.key.clone(),
+                                record.meta.clone().expect("missing skill metadata"),
+                            ),
+                        );
+                        true
+                    }
+                    Some(_) => {
+                        progress(&format!("Already installed: {path}; skipped"));
+                        false
+                    }
+                    None => true,
                 }
-                !installed
             })
             .cloned()
             .collect();
@@ -513,7 +811,24 @@ impl FetchedRepository {
             crate::skill::SkillDoc::load(&self.workdir.join(path))
                 .with_context(|| format!("invalid skill at {path}/SKILL.md"))?;
         }
-        let names = self.resolved_names(ws, paths, names)?;
+        let new_paths: Vec<_> = paths
+            .iter()
+            .filter(|path| !restorations.contains_key(*path))
+            .cloned()
+            .collect();
+        let mut resolved_names = self.resolved_names(ws, &new_paths, names)?;
+        for path in paths {
+            let Some((key, _)) = restorations.get(path) else {
+                continue;
+            };
+            let name = key.rsplit('/').next().expect("repository skill key");
+            anyhow::ensure!(
+                names.get(path).is_none_or(|requested| requested == name),
+                "missing repository skill {key} must be restored at its existing local name {name:?}"
+            );
+            resolved_names.insert(path.clone(), name.to_string());
+        }
+        let names = resolved_names;
 
         let mut keys = Vec::new();
         for path in paths {
@@ -532,12 +847,25 @@ impl FetchedRepository {
             if !valid_skill_key(name) {
                 bail!("invalid local skill name: {name:?}")
             }
-            let key = format!("repos/{}/{}", self.repository.alias, name);
+            let key = restorations
+                .get(path)
+                .map(|(key, _)| key.clone())
+                .unwrap_or_else(|| format!("repos/{}/{}", self.repository.alias, name));
             if keys.contains(&key) {
                 bail!("duplicate selection: {path}")
             }
             let dest = ws.skill_path(&key);
-            if dest.exists() || ws.meta.exists(&key) {
+            if restorations.contains_key(path) {
+                anyhow::ensure!(
+                    !dest.exists() && !crate::util::is_symlink(&dest),
+                    "{key} is no longer missing; refusing to overwrite"
+                );
+                let current = ws.meta.load(&key)?;
+                anyhow::ensure!(
+                    current.as_ref() == restorations.get(path).map(|(_, meta)| meta),
+                    "metadata for {key} changed since restoration was prepared; refresh and retry"
+                );
+            } else if dest.exists() || ws.meta.exists(&key) {
                 bail!("{key} is already installed")
             }
             for parent in dest.ancestors().skip(1).take_while(|p| *p != ws.root) {
@@ -578,24 +906,38 @@ impl FetchedRepository {
                 let staged = transaction.join(i.to_string());
                 crate::util::copy_dir(&self.workdir.join(path), &staged)?;
                 let _ = std::fs::remove_dir_all(staged.join(".git"));
-                metas.push(crate::meta::SkillMeta {
-                    installed_name: Some(crate::skill::SkillDoc::load(&staged)?.name),
-                    source: Some(self.repository.source(path, Some(&self.revision))),
-                    baseline: Some(crate::meta::Baseline {
-                        hash: crate::hash::hash_directory(&staged)?,
-                        hash_algo: crate::hash::HASH_ALGO,
-                    }),
-                    ..Default::default()
+                let mut meta = restorations
+                    .get(path)
+                    .map(|(_, meta)| meta.clone())
+                    .unwrap_or_default();
+                meta.installed_name = Some(crate::skill::SkillDoc::load(&staged)?.name);
+                meta.source = Some(self.repository.source(path, Some(&self.revision)));
+                meta.baseline = Some(crate::meta::Baseline {
+                    hash: crate::hash::hash_directory(&staged)?,
+                    hash_algo: crate::hash::HASH_ALGO,
                 });
+                metas.push(meta);
             }
-            self.repository.save(ws)?;
+            if paths.iter().any(|path| !restorations.contains_key(path)) {
+                self.repository.save(ws)?;
+            }
             let mut published = Vec::new();
             let publish = (|| {
                 for (i, key) in keys.iter().enumerate() {
                     progress(&format!("Save: {}/{} — {key}", i + 1, keys.len()));
                     let dest = ws.skill_path(key);
-                    if dest.exists() || crate::util::is_symlink(&dest) || ws.meta.exists(key) {
+                    let restoration = restorations.get(&paths[i]);
+                    if dest.exists() || crate::util::is_symlink(&dest) {
                         bail!("{key} appeared during installation; refusing to overwrite")
+                    }
+                    let current = ws.meta.load(key)?;
+                    match restoration {
+                        Some((_, original)) if current.as_ref() == Some(original) => {}
+                        Some(_) => bail!(
+                            "metadata for {key} changed during restoration; refusing to overwrite"
+                        ),
+                        None if current.is_none() => {}
+                        None => bail!("{key} appeared during installation; refusing to overwrite"),
                     }
                     std::fs::create_dir_all(dest.parent().context("skill parent missing")?)?;
                     std::fs::rename(transaction.join(i.to_string()), &dest)?;
@@ -607,7 +949,14 @@ impl FetchedRepository {
             if publish.is_err() {
                 for key in published {
                     let _ = std::fs::remove_dir_all(ws.skill_path(key));
-                    let _ = ws.meta.remove(key);
+                    if let Some((_, original)) = restorations
+                        .values()
+                        .find(|(restore_key, _)| restore_key == key)
+                    {
+                        let _ = ws.meta.save(key, original);
+                    } else {
+                        let _ = ws.meta.remove(key);
+                    }
                 }
             }
             publish
@@ -785,6 +1134,87 @@ mod tests {
             "Review tools",
             "an already-installed selection remains a no-op; renaming has its own operation"
         );
+    }
+
+    #[test]
+    fn list_rejects_filename_alias_mismatches_without_rewriting_metadata() {
+        let temp = DownloadDir::new("repository-filename-alias").unwrap();
+        let path = Repository::path(temp.path(), "renamed");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let metadata =
+            "# hand-edited\nalias = 'original'\nurl = 'https://example.com/repo'\ncustom = true\n";
+        std::fs::write(&path, metadata).unwrap();
+
+        let error = Repository::list(temp.path()).unwrap_err();
+
+        assert!(error.to_string().contains("does not match alias"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), metadata);
+    }
+
+    #[test]
+    fn remove_requires_an_empty_registered_source() {
+        let temp = DownloadDir::new("repository-remove").unwrap();
+        let ws = Workspace::open(temp.path()).unwrap();
+        let repo = Repository {
+            alias: "example".into(),
+            name: None,
+            url: "https://example.com/repo.git".into(),
+            kind: SourceKind::Git,
+            branch: "main".into(),
+        };
+        repo.save(&ws).unwrap();
+        let metadata_path = Repository::path(&ws.root, &repo.alias);
+        let storage = ws.root.join("repos/example");
+
+        let key = "repos/example/review";
+        ws.meta
+            .save(
+                key,
+                &crate::meta::SkillMeta {
+                    source: Some(repo.source("review", Some("revision"))),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(Repository::remove(&ws, &repo.alias).is_err());
+        assert!(metadata_path.is_file());
+        ws.meta.remove(key).unwrap();
+
+        std::fs::create_dir_all(storage.join("review")).unwrap();
+        assert!(Repository::remove(&ws, &repo.alias).is_err());
+        assert!(metadata_path.is_file());
+        std::fs::remove_dir(storage.join("review")).unwrap();
+
+        Repository::remove(&ws, &repo.alias).unwrap();
+        assert!(!metadata_path.exists());
+        assert!(!storage.exists());
+        assert!(Repository::list(&ws.root).unwrap().is_empty());
+        assert!(Repository::remove(&ws, &repo.alias).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_refuses_a_symlinked_repository_storage_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = DownloadDir::new("repository-remove-symlink").unwrap();
+        let ws = Workspace::open(temp.path()).unwrap();
+        let repo = Repository {
+            alias: "example".into(),
+            name: None,
+            url: "https://example.com/repo.git".into(),
+            kind: SourceKind::Git,
+            branch: "main".into(),
+        };
+        repo.save(&ws).unwrap();
+        let metadata_path = Repository::path(&ws.root, &repo.alias);
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(external.join("example")).unwrap();
+        symlink(&external, ws.root.join("repos")).unwrap();
+
+        assert!(Repository::remove(&ws, &repo.alias).is_err());
+        assert!(external.join("example").is_dir());
+        assert!(metadata_path.is_file());
     }
 
     #[test]

@@ -917,6 +917,40 @@ impl App {
             TaskOutput::RepositoryFetched(reference, Err(e)) => {
                 vec![Action::Error(format!("discover {reference}: {e:#}"))]
             }
+            TaskOutput::RepositoryRefreshed(alias, result) => {
+                if !self.repos.inventory_result(&alias, &result) {
+                    return Vec::new();
+                }
+                match result {
+                    Ok(inventory) => {
+                        let available = inventory
+                            .entries
+                            .iter()
+                            .filter(|entry| {
+                                matches!(
+                                    entry.state,
+                                    skills::repository::RepositoryInventoryState::Available
+                                        | skills::repository::RepositoryInventoryState::PossibleMove { .. }
+                                )
+                            })
+                            .count();
+                        let updates = inventory
+                            .entries
+                            .iter()
+                            .filter(|entry| {
+                                matches!(
+                                    entry.state,
+                                    skills::repository::RepositoryInventoryState::Update { .. }
+                                )
+                            })
+                            .count();
+                        vec![Action::Toast(format!(
+                            "refreshed {alias}: {available} available · {updates} updates"
+                        ))]
+                    }
+                    Err(error) => vec![Action::Error(format!("refresh {alias}: {error:#}"))],
+                }
+            }
             TaskOutput::RepositoryInstalled(selection, result) => match result {
                 Ok(keys) => {
                     let aliases: Vec<_> = selection
@@ -936,35 +970,28 @@ impl App {
                         .iter()
                         .map(|key| Action::Record(history::Intent::Install { skill: key.clone() }))
                         .collect();
+                    let message = format!(
+                        "Installed {} skills{}.",
+                        keys.len(),
+                        if aliases.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "; warning: folder aliases {} (declared names unchanged)",
+                                aliases.join(", ")
+                            )
+                        }
+                    );
                     actions.extend([
                         Action::LibraryChanged,
-                        Action::Toast(format!(
-                            "installed {} skills{} — choose destination agents",
-                            keys.len(),
-                            if aliases.is_empty() {
-                                String::new()
-                            } else {
-                                format!(
-                                    "; warning: folder aliases {} (declared names unchanged)",
-                                    aliases.join(", ")
-                                )
-                            }
-                        )),
                         Action::Search {
                             query: skills::search::source_query_token(
                                 &selection.fetched.repository.display_name(),
                             ),
                             focus_list: true,
                         },
+                        Action::OpenModal(Box::new(Modal::install_complete(keys, message))),
                     ]);
-                    actions.push(Action::OpenModal(Box::new(Modal::batch_deploy(
-                        keys,
-                        &Ctx {
-                            ws: &self.ws,
-                            snap: &self.snap,
-                            settings: &self.settings,
-                        },
-                    ))));
                     actions
                 }
                 Err(e) => vec![
@@ -1002,6 +1029,7 @@ impl App {
             }
             TaskOutput::Check(results) => {
                 self.search.remember_checks(&results);
+                self.repos.remember_checks(&results);
                 let ctx = Ctx {
                     ws: &self.ws,
                     snap: &self.snap,
@@ -1021,7 +1049,9 @@ impl App {
                 }
             }
             TaskOutput::Prepared(key, Ok(prepared)) => {
-                if prepared.from_revision.as_deref() == Some(prepared.to_revision.as_str()) {
+                if prepared.from_revision.as_deref() == Some(prepared.to_revision.as_str())
+                    && !prepared.needs_resolution()
+                {
                     prepared.cleanup();
                     return vec![Action::Toast(format!("{key} is up to date"))];
                 }
@@ -1030,29 +1060,31 @@ impl App {
             TaskOutput::Prepared(key, Err(e)) => {
                 vec![Action::Error(format!("update {key}: {e:#}"))]
             }
-            // Land on the new skill so the next thing to do, deploying it, is
-            // one key away.
+            // Land on the new skill and let deployment remain an explicit next step.
             TaskOutput::Installed(_, Ok(key)) => vec![
                 Action::Record(history::Intent::Install { skill: key.clone() }),
                 Action::LibraryChanged,
-                Action::Toast(format!("installed {key} — choose destination agents")),
                 Action::Search {
                     query: key.clone(),
                     focus_list: true,
                 },
-                Action::OpenModal(Box::new(Modal::batch_deploy(
-                    vec![key],
-                    &Ctx {
-                        ws: &self.ws,
-                        snap: &self.snap,
-                        settings: &self.settings,
-                    },
+                Action::OpenModal(Box::new(Modal::install_complete(
+                    vec![key.clone()],
+                    format!("Installed {key}."),
                 ))),
             ],
             // Multi-skill sources use the same repository picker as direct discovery.
             TaskOutput::Installed(reference, Err(e)) => {
                 match e.downcast_ref::<skills::ops::install::NotOneSkill>() {
-                    Some(_) => vec![Action::Spawn(Task::DiscoverRepository(reference))],
+                    Some(_) => match skills::ops::install::parse_ref(&reference, None, None) {
+                        Ok(parsed) => vec![Action::Spawn(Task::DiscoverRepository {
+                            label: reference,
+                            reference: parsed,
+                        })],
+                        Err(error) => {
+                            vec![Action::Error(format!("discover {reference}: {error:#}"))]
+                        }
+                    },
                     None => vec![Action::Error(format!("install {reference}: {e:#}"))],
                 }
             }
@@ -1602,7 +1634,12 @@ impl App {
             }
             Action::LibraryChanged => self.library_changed(),
             Action::Deployment(_) => unreachable!("deployment actions are unwrapped above"),
-            Action::Spawn(task) => self.spawn(task),
+            Action::Spawn(task) => {
+                if let Task::RefreshRepository(alias) = &task {
+                    self.repos.refreshing(alias);
+                }
+                self.spawn(task)
+            }
             Action::OpenModal(m) => {
                 self.context_menu = None;
                 self.command_palette = None;
@@ -3243,6 +3280,63 @@ mod matrix_key_tests {
 #[cfg(test)]
 mod scope_tests {
     use super::*;
+
+    #[test]
+    fn successful_repository_install_offers_deploy_without_opening_targets() {
+        let tmp = skills::ops::DownloadDir::new("repository-install-complete").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(tmp.path()).unwrap(), tx).unwrap();
+        let workdir = tmp.path().join("fetched");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let selection = super::super::repository_picker::InstallSelection {
+            fetched: skills::repository::FetchedRepository {
+                repository: skills::repository::Repository {
+                    alias: "demo".into(),
+                    name: None,
+                    kind: Default::default(),
+                    url: "https://example.test/demo.git".into(),
+                    branch: "main".into(),
+                },
+                revision: "0000000000000000000000000000000000000001".into(),
+                workdir,
+                choices: vec!["sample".into()],
+                invalid: Default::default(),
+            },
+            paths: vec!["sample".into()],
+            names: Default::default(),
+        };
+
+        let actions = app.on_task(TaskOutput::RepositoryInstalled(
+            Box::new(selection),
+            Ok(vec!["sample".into()]),
+        ));
+
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::LibraryChanged))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::Search { .. }))
+        );
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            Action::OpenModal(modal) if matches!(modal.as_ref(), Modal::InstallComplete { .. })
+        )));
+        assert!(!actions.iter().any(|action| matches!(
+            action,
+            Action::OpenModal(modal) if matches!(modal.as_ref(), Modal::DeployTargets(_))
+        )));
+    }
+
     #[test]
     fn deployment_scopes_do_not_switch_the_central_library() {
         let base = std::env::temp_dir().join(format!("skills-tui-scope-{}", std::process::id()));
@@ -4540,7 +4634,7 @@ mod context_menu_tests {
         assert_footer_exact(
             &mut app,
             "input install modal",
-            &[("Enter", "install"), ("Esc", "cancel")],
+            &[("Enter", "discover"), ("Esc", "cancel")],
         );
 
         let link = skills::ops::deploy::Action::Link {
