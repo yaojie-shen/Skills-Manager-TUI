@@ -2192,11 +2192,7 @@ impl App {
                 format!(" {} {} ", i + 1, t.title())
             };
             let style = if *t == self.tab {
-                if self.focus == AppFocus::Tabs {
-                    th.selected().add_modifier(Modifier::BOLD)
-                } else {
-                    th.bold()
-                }
+                th.selected()
             } else {
                 th.dim()
             };
@@ -3405,6 +3401,39 @@ mod panel_navigation_tests {
                 assert!(text.contains("Tab"), "{width}: {text}");
                 assert!(app.tab_rects.iter().all(|(rect, _)| rect.right() <= width));
             }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_tab_keeps_the_same_selection_highlight_for_page_and_tab_focus() {
+        let root =
+            std::env::temp_dir().join(format!("skills-tab-highlight-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
+        app.tab = Tab::Health;
+
+        let selected = app.settings.theme.selected();
+        for focus in [AppFocus::Page, AppFocus::Tabs] {
+            app.focus = focus;
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 1)).unwrap();
+            terminal.draw(|f| app.draw_header(f, f.area())).unwrap();
+            let rect = app
+                .tab_rects
+                .iter()
+                .find_map(|(rect, tab)| (*tab == Tab::Health).then_some(*rect))
+                .unwrap();
+            let cell = &terminal.backend().buffer()[(rect.x + 1, rect.y)];
+            assert_eq!(cell.bg, selected.bg.unwrap());
+            assert_eq!(cell.fg, selected.fg.unwrap());
         }
         std::fs::remove_dir_all(root).unwrap();
     }
