@@ -77,6 +77,24 @@ pub struct AutoSyncRequest {
     pub expected_changes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncActivity {
+    NotConfigured,
+    Ready,
+    Waiting,
+    Checking,
+    Syncing,
+    Retrying,
+    Attention,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncPresentation {
+    pub activity: SyncActivity,
+    pub automatic: bool,
+    pub detail: Option<String>,
+}
+
 pub struct SyncCoordinator {
     pub status: Option<Status>,
     pub error: Option<String>,
@@ -118,6 +136,41 @@ impl SyncCoordinator {
 
     pub fn switching(&self) -> bool {
         matches!(self.run, RunState::Reconciling { .. })
+    }
+
+    pub fn presentation(&self) -> SyncPresentation {
+        let configured = self.status.as_ref().is_some_and(|status| {
+            status.settings.url.is_some() && status.settings.branch.is_some()
+        });
+        let automatic = self
+            .status
+            .as_ref()
+            .is_some_and(|status| status.settings.enabled);
+        let activity = if !configured {
+            SyncActivity::NotConfigured
+        } else if !matches!(self.run, RunState::Idle) {
+            SyncActivity::Syncing
+        } else if self.probe.is_some() {
+            SyncActivity::Checking
+        } else {
+            match self.auto {
+                AutoState::RetryAfterProbe => SyncActivity::Retrying,
+                AutoState::PausedFatal(_) => SyncActivity::Attention,
+                AutoState::NeedsProbe | AutoState::Ready => SyncActivity::Waiting,
+                AutoState::Idle => {
+                    if self.status.as_ref().is_some_and(needs_sync) {
+                        SyncActivity::Waiting
+                    } else {
+                        SyncActivity::Ready
+                    }
+                }
+            }
+        };
+        SyncPresentation {
+            activity,
+            automatic,
+            detail: self.error.clone(),
+        }
     }
 
     #[cfg(test)]

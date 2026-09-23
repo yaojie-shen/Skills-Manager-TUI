@@ -660,6 +660,7 @@ impl App {
         match super::sync_picker::SyncPicker::with_status(
             &ctx,
             self.sync.status.clone(),
+            self.sync.presentation(),
             self.sync.probing() || check_remote,
             self.sync.error.clone(),
         ) {

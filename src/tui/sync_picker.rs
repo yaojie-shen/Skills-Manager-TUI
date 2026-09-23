@@ -3,7 +3,8 @@ use super::{
     app::{Action, Ctx, Hints},
     components::choice_footer::{self, ChoiceEvent, ChoiceFocus},
     event::Task,
-    widgets::{Input, ListNav, OverlayClear, centered, fit},
+    sync_coordinator::{SyncActivity, SyncPresentation},
+    widgets::{Input, ListNav, OverlayClear, centered, fit, width},
 };
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -40,6 +41,7 @@ enum Step {
 pub struct SyncPicker {
     settings: Settings,
     status: Option<skills::ops::sync::Status>,
+    presentation: SyncPresentation,
     checking: bool,
     error: Option<String>,
     step: Step,
@@ -51,12 +53,23 @@ pub struct SyncPicker {
 }
 impl SyncPicker {
     pub fn new(ctx: &Ctx) -> anyhow::Result<Self> {
-        Self::with_status(ctx, None, false, None)
+        Self::with_status(
+            ctx,
+            None,
+            SyncPresentation {
+                activity: SyncActivity::NotConfigured,
+                automatic: false,
+                detail: None,
+            },
+            false,
+            None,
+        )
     }
 
     pub fn with_status(
         ctx: &Ctx,
         status: Option<skills::ops::sync::Status>,
+        presentation: SyncPresentation,
         checking: bool,
         error: Option<String>,
     ) -> anyhow::Result<Self> {
@@ -64,9 +77,19 @@ impl SyncPicker {
             .as_ref()
             .map(|status| status.settings.clone())
             .unwrap_or(Settings::load(ctx.ws)?);
+        let mut presentation = presentation;
+        if status.is_none() {
+            presentation.automatic = settings.enabled;
+            presentation.activity = if settings.url.is_some() && settings.branch.is_some() {
+                SyncActivity::Ready
+            } else {
+                SyncActivity::NotConfigured
+            };
+        }
         let mut picker = Self {
             settings,
             status,
+            presentation,
             checking,
             error,
             step: Step::Overview,
@@ -89,6 +112,16 @@ impl SyncPicker {
 
     pub fn set_status(&mut self, status: skills::ops::sync::Status, error: Option<String>) {
         self.settings = status.settings.clone();
+        self.presentation.automatic = status.settings.enabled;
+        self.presentation.activity =
+            if status.settings.url.is_none() || status.settings.branch.is_none() {
+                SyncActivity::NotConfigured
+            } else if !status.changes.is_empty() || status.ahead > 0 || status.behind > 0 {
+                SyncActivity::Waiting
+            } else {
+                SyncActivity::Ready
+            };
+        self.presentation.detail = error.clone();
         self.status = Some(status);
         self.checking = false;
         self.error = error;
@@ -113,7 +146,7 @@ impl SyncPicker {
         if !self.configured() {
             vec![OverviewAction::Configure]
         } else {
-            let mut actions = vec![];
+            let mut actions = vec![OverviewAction::Sync(Mode::Sync)];
             if self
                 .status
                 .as_ref()
@@ -122,7 +155,6 @@ impl SyncPicker {
                 actions.push(OverviewAction::Changes);
             }
             actions.extend([
-                OverviewAction::Sync(Mode::Sync),
                 OverviewAction::Check,
                 OverviewAction::Sync(Mode::Push),
                 OverviewAction::Sync(Mode::Pull),
@@ -395,10 +427,10 @@ impl SyncPicker {
         let height = match self.step {
             Step::Configure { .. } => 17,
             Step::Preview { .. } | Step::Changes => 21,
-            Step::Overview => 25,
+            Step::Overview => 27,
             Step::Disable => 13,
         };
-        let area = centered(area, 82, height);
+        let area = centered(area, 118, height);
         self.rect = area;
         f.render_widget(OverlayClear, area);
         let title = match self.step {
@@ -426,92 +458,154 @@ impl SyncPicker {
         match &mut self.step {
             Step::Overview => {
                 let configured = self.configured();
-                let status = if self.settings.enabled {
-                    "● Automatic sync is on"
-                } else if configured {
-                    "○ Automatic sync is off"
+                let activity = if self.checking {
+                    SyncActivity::Checking
                 } else {
-                    "○ Backup is not configured"
+                    self.presentation.activity
                 };
+                let (hero_icon, hero, detail, hero_style) = match activity {
+                    SyncActivity::NotConfigured => {
+                        ("", "Set up backup", "Connect a Git remote", th.warn())
+                    }
+                    SyncActivity::Ready => ("", "Backed up", "Everything is current", th.ok()),
+                    SyncActivity::Waiting => {
+                        ("", "Sync pending", "Changes are waiting", th.warn())
+                    }
+                    SyncActivity::Checking => {
+                        ("", "Checking…", "Reading remote state", th.accent())
+                    }
+                    SyncActivity::Syncing => ("", "Syncing…", "Saving and merging", th.accent()),
+                    SyncActivity::Retrying => {
+                        ("", "Retrying", "Waiting for the next check", th.warn())
+                    }
+                    SyncActivity::Attention => {
+                        ("", "Needs attention", "Open Git to resolve", th.err())
+                    }
+                };
+                let badge = if !configured {
+                    " NOT CONFIGURED "
+                } else if self.presentation.automatic {
+                    "  AUTO ON "
+                } else {
+                    " AUTO OFF "
+                };
+                let badge_width = width(badge) as u16;
                 f.render_widget(
-                    Paragraph::new(status).style(if self.settings.enabled {
+                    Paragraph::new(Line::from(vec![Span::styled(
+                        format!("{hero_icon}  {hero}"),
+                        hero_style,
+                    )])),
+                    Rect::new(inner.x + 1, inner.y, inner.width - 2, 1),
+                );
+                f.render_widget(
+                    Paragraph::new(badge).style(if self.presentation.automatic {
                         th.ok()
                     } else {
                         th.warn()
                     }),
-                    Rect::new(inner.x + 1, inner.y, inner.width - 2, 1),
+                    Rect::new(
+                        inner.right().saturating_sub(badge_width + 1),
+                        inner.y,
+                        badge_width,
+                        1,
+                    ),
                 );
-                let details = if configured {
-                    format!(
-                        "Remote  {}\nBranch  {}",
-                        fit(
-                            self.settings.url.as_deref().unwrap_or_default(),
-                            inner.width.saturating_sub(10) as usize
-                        ),
-                        self.settings.branch.as_deref().unwrap_or("—")
-                    )
-                } else {
-                    "Set a remote repository and branch to back up this skills root.".into()
-                };
+                let detail = self.error.as_deref().unwrap_or(detail);
                 f.render_widget(
-                    Paragraph::new(details).style(th.dim()),
-                    Rect::new(inner.x + 1, inner.y + 2, inner.width - 2, 2),
+                    Paragraph::new(fit(detail, inner.width.saturating_sub(2) as usize))
+                        .style(th.description()),
+                    Rect::new(inner.x + 1, inner.y + 1, inner.width - 2, 1),
                 );
-                let repository = self.status.as_ref().map_or_else(
-                    || {
-                        if self.checking {
-                            "Working tree  checking…\nLocal commits  checking…\nRemote commits checking…"
-                                .into()
-                        } else {
-                            "Working tree  unknown\nLocal commits  unknown\nRemote commits unknown"
-                                .into()
-                        }
-                    },
-                    |status| {
-                        if !configured {
-                            return "Working tree  —\nLocal commits  —\nRemote commits —".into();
-                        }
-                        format!(
-                            "Working tree  {}\nLocal commits  {}\nRemote commits {}",
-                            if status.changes.is_empty() {
-                                "clean".into()
-                            } else {
-                                format!("{} changes", status.changes.len())
-                            },
-                            if status.ahead == 0 {
-                                "none waiting".into()
-                            } else {
-                                format!("{} not pushed", status.ahead)
-                            },
-                            if self.checking {
-                                "checking…".into()
-                            } else if status.remote_checked {
-                                if status.behind == 0 {
-                                    "none waiting".into()
-                                } else {
-                                    format!("{} not pulled", status.behind)
-                                }
-                            } else {
-                                "not checked".into()
-                            }
-                        )
-                    },
-                );
-                f.render_widget(
-                    Paragraph::new(repository).style(th.dim()),
-                    Rect::new(inner.x + 1, inner.y + 5, inner.width - 2, 3),
-                );
-                if let Some(error) = &self.error {
+
+                let status = self.status.as_ref();
+                let changes = status.map_or("○ unknown".into(), |status| {
+                    if status.changes.is_empty() {
+                        " clean".into()
+                    } else {
+                        format!(" {} changes", status.changes.len())
+                    }
+                });
+                let push = status.map_or(" unknown".into(), |status| {
+                    if status.ahead == 0 {
+                        " 0 to push".into()
+                    } else {
+                        format!(" {} to push", status.ahead)
+                    }
+                });
+                let pull = status.map_or(" unknown".into(), |status| {
+                    if self.checking {
+                        " checking…".into()
+                    } else if !status.remote_checked {
+                        "󰄱 not checked".into()
+                    } else {
+                        format!(" {} to pull", status.behind)
+                    }
+                });
+                let branch = self.settings.branch.as_deref().unwrap_or("—");
+                let remote = self.settings.url.as_deref().unwrap_or("No remote");
+                let summary_y = inner.y + 3;
+                if inner.width >= 100 {
+                    let gap = 5;
+                    let card_width = (inner.width.saturating_sub(gap + 2)) / 2;
+                    let local = Rect::new(inner.x + 1, summary_y, card_width, 5);
+                    let remote_card = Rect::new(local.right() + gap, summary_y, card_width, 5);
+                    let local_inner = super::components::layout::frame(f, local, false, false, th);
+                    let remote_inner =
+                        super::components::layout::frame(f, remote_card, false, false, th);
                     f.render_widget(
-                        Paragraph::new(format!("Last check failed · {}", fit(error, 52)))
-                            .style(th.warn()),
-                        Rect::new(inner.x + 1, inner.y + 8, inner.width - 2, 1),
+                        Paragraph::new(Line::from(vec![
+                            Span::styled("  LOCAL", th.bold()),
+                            Span::styled("  Library", th.description()),
+                        ])),
+                        Rect::new(local_inner.x, local_inner.y, local_inner.width, 1),
+                    );
+                    f.render_widget(
+                        Paragraph::new(format!("{changes}\n{push}")),
+                        Rect::new(local_inner.x, local_inner.y + 1, local_inner.width, 2),
+                    );
+                    f.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled("  REMOTE", th.bold()),
+                            Span::styled(format!("   {branch}"), th.description()),
+                        ])),
+                        Rect::new(remote_inner.x, remote_inner.y, remote_inner.width, 1),
+                    );
+                    f.render_widget(
+                        Paragraph::new(format!(
+                            "{}\n{pull}",
+                            fit(remote, remote_inner.width as usize)
+                        )),
+                        Rect::new(remote_inner.x, remote_inner.y + 1, remote_inner.width, 2),
+                    );
+                    f.render_widget(
+                        Paragraph::new("").style(th.accent()),
+                        Rect::new(local.right() + 2, summary_y + 2, 2, 1),
+                    );
+                } else {
+                    f.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(" LOCAL", th.bold()),
+                            Span::raw(format!("  {changes} · {push}")),
+                        ])),
+                        Rect::new(inner.x + 1, summary_y, inner.width - 2, 1),
+                    );
+                    f.render_widget(
+                        Paragraph::new("  ").style(th.accent()),
+                        Rect::new(inner.x + 1, summary_y + 1, inner.width - 2, 1),
+                    );
+                    f.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(" REMOTE", th.bold()),
+                            Span::raw(format!("   {branch} · {pull}")),
+                        ])),
+                        Rect::new(inner.x + 1, summary_y + 2, inner.width - 2, 1),
                     );
                 }
+
                 let actions = self.actions();
                 self.list.rows = Rect::new(
                     inner.x + 1,
-                    inner.y + 10,
+                    inner.y + 9,
                     inner.width - 2,
                     inner.height.saturating_sub(13),
                 );
@@ -520,33 +614,28 @@ impl SyncPicker {
                 let rows = actions
                     .iter()
                     .map(|action| {
-                        let (label, tail) = match action {
-                            OverviewAction::Changes => ("View local changes", "details"),
+                        let (icon, label, tail) = match action {
+                            OverviewAction::Changes => ("", "View changes", "local"),
                             OverviewAction::Check => (
+                                "",
                                 if self.checking {
-                                    "Checking remote…"
+                                    "Checking…"
                                 } else {
                                     "Check remote"
                                 },
-                                "status",
+                                "refresh",
                             ),
                             OverviewAction::Configure if configured => {
-                                ("Configure backup", "settings")
+                                ("", "Configure", "remote · branch")
                             }
-                            OverviewAction::Configure => ("Set up backup", "recommended"),
-                            OverviewAction::Sync(Mode::Sync) => ("Sync now", "recommended"),
-                            OverviewAction::Sync(Mode::Push) => {
-                                ("Push local changes only", "advanced")
-                            }
-                            OverviewAction::Sync(Mode::Pull) => {
-                                ("Pull remote changes only", "advanced")
-                            }
-                            OverviewAction::Disable => {
-                                ("Turn off automatic sync", "keeps Git history")
-                            }
+                            OverviewAction::Configure => ("", "Set up backup", "recommended"),
+                            OverviewAction::Sync(Mode::Sync) => ("", "Sync now", "recommended"),
+                            OverviewAction::Sync(Mode::Push) => ("", "Push only", "advanced"),
+                            OverviewAction::Sync(Mode::Pull) => ("", "Pull only", "advanced"),
+                            OverviewAction::Disable => ("", "Turn off auto sync", "keeps history"),
                         };
                         ListItem::new(Line::from(vec![
-                            Span::raw(format!("  {label}")),
+                            Span::raw(format!(" {icon}  {label}")),
                             Span::styled(format!("  {tail}"), th.description()),
                         ]))
                     })
@@ -561,10 +650,9 @@ impl SyncPicker {
                     &mut self.list.state,
                 );
                 f.render_widget(
-                    Paragraph::new("Sync saves local work, merges remote updates, then pushes. Conflicts stop without force/reset.")
-                        .wrap(Wrap { trim: true })
+                    Paragraph::new(" Commit · merge · push    Conflicts never force-reset")
                         .style(th.description()),
-                    Rect::new(inner.x + 1, inner.bottom() - 3, inner.width - 2, 2),
+                    Rect::new(inner.x + 1, inner.bottom() - 3, inner.width - 2, 1),
                 );
                 self.buttons = choice_footer::draw_with_labels(
                     f,
@@ -808,7 +896,7 @@ mod tests {
         let mut picker = SyncPicker::new(&ctx).unwrap();
         assert_eq!(picker.actions().len(), 1);
         let screen = render(&mut picker, &ctx, 100, 28);
-        assert!(screen.contains("Backup is not configured"));
+        assert!(screen.contains("NOT CONFIGURED"));
         assert!(screen.contains("Set up backup"));
         assert!(!screen.contains("Sync now"));
         for shortcut in ['s', 'p', 'P', 'd'] {
@@ -824,6 +912,33 @@ mod tests {
             picker.key(key(KeyCode::Esc), &ctx).as_slice(),
             [Action::CloseModal]
         ));
+    }
+
+    #[test]
+    fn startup_check_uses_local_auto_setting_before_status_arrives() {
+        let temp = skills::ops::DownloadDir::new("root-sync-startup-state").unwrap();
+        let ws = skills::Workspace::open(temp.path()).unwrap();
+        skills::ops::sync::configure(&ws, "/tmp/remote.git", "main").unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = context(&ws, &snap, &settings);
+        let mut picker = SyncPicker::with_status(
+            &ctx,
+            None,
+            SyncPresentation {
+                activity: SyncActivity::NotConfigured,
+                automatic: false,
+                detail: None,
+            },
+            true,
+            None,
+        )
+        .unwrap();
+
+        let screen = render(&mut picker, &ctx, 100, 28);
+        assert!(screen.contains("AUTO ON"), "{screen}");
+        assert!(!screen.contains("AUTO OFF"), "{screen}");
+        assert!(screen.contains("Checking"), "{screen}");
     }
 
     #[test]
@@ -844,10 +959,10 @@ mod tests {
         let screen = render(&mut picker, &ctx, 100, 28);
         for label in [
             "Sync now",
-            "Push local changes only",
-            "Pull remote changes only",
-            "Configure backup",
-            "Turn off automatic sync",
+            "Push only",
+            "Pull only",
+            "Configure",
+            "Turn off auto sync",
         ] {
             assert!(screen.contains(label), "{label}");
         }
