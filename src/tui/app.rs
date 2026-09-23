@@ -217,7 +217,7 @@ fn auto_sync_failure_action(
             Action::Error(format!("Root sync stopped: {detail}"))
         }
         skills::ops::sync::AutoSyncDisposition::WorkingTreeChanged => {
-            Action::Toast("Library changed externally; automatic sync paused".into())
+            Action::Toast("Library changed; automatic sync will recheck the latest state".into())
         }
     }
 }
@@ -5347,7 +5347,7 @@ mod root_sync_tests {
 
         assert!(matches!(
             auto_sync_failure_action(AutoSyncDisposition::WorkingTreeChanged, false, "ignored"),
-            Action::Toast(message) if message.contains("automatic sync paused")
+            Action::Toast(message) if message.contains("recheck the latest state")
         ));
     }
 

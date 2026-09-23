@@ -54,7 +54,6 @@ enum AutoState {
     Ready,
     RetryAfterProbe,
     PausedFatal(Option<Fingerprint>),
-    PausedExternal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -87,11 +86,8 @@ pub struct SyncCoordinator {
     probe_failures: usize,
     run: RunState,
     auto: AutoState,
-    app_dirty: bool,
     claimed_generation: Option<u64>,
     library_generation: u64,
-    external_dirty: bool,
-    baseline_known: bool,
 }
 
 impl Default for SyncCoordinator {
@@ -105,11 +101,8 @@ impl Default for SyncCoordinator {
             probe_failures: 0,
             run: RunState::Idle,
             auto: AutoState::Idle,
-            app_dirty: false,
             claimed_generation: None,
             library_generation: 0,
-            external_dirty: false,
-            baseline_known: false,
         }
     }
 }
@@ -171,13 +164,6 @@ impl SyncCoordinator {
                 if probe.remote {
                     self.next_remote_probe = Instant::now() + PROBE_INTERVAL;
                 }
-                let unexpected_changes = !status.changes.is_empty()
-                    && !self.app_dirty
-                    && (!self.baseline_known || matches!(self.auto, AutoState::Idle));
-                if unexpected_changes {
-                    self.external_dirty = true;
-                }
-                self.baseline_known = true;
                 if !needs_validation {
                     self.update_auto_state(&status, probe.reason);
                 }
@@ -205,39 +191,29 @@ impl SyncCoordinator {
             self.auto = AutoState::Idle;
             return;
         }
-        let validated = !self.external_dirty && (status.changes.is_empty() || self.app_dirty);
+        let next = if needs_sync(status) {
+            AutoState::Ready
+        } else {
+            AutoState::Idle
+        };
         self.auto = match &self.auto {
-            AutoState::NeedsProbe if validated => AutoState::Ready,
-            AutoState::NeedsProbe => AutoState::PausedExternal,
-            AutoState::RetryAfterProbe if probe_can_retry(reason) && validated => AutoState::Ready,
-            AutoState::RetryAfterProbe => AutoState::RetryAfterProbe,
+            AutoState::RetryAfterProbe if !probe_can_retry(reason) => AutoState::RetryAfterProbe,
             AutoState::PausedFatal(None) => AutoState::PausedFatal(Some(Fingerprint::from(status))),
-            AutoState::PausedFatal(Some(failed))
-                if failed != &Fingerprint::from(status) && validated =>
-            {
-                AutoState::Ready
-            }
+            AutoState::PausedFatal(Some(failed)) if failed != &Fingerprint::from(status) => next,
             AutoState::PausedFatal(_) => self.auto.clone(),
-            state => state.clone(),
+            _ => next,
         };
     }
 
     pub fn library_changed(&mut self) {
         self.library_generation = self.library_generation.wrapping_add(1);
-        self.app_dirty = true;
-        if !matches!(
-            self.auto,
-            AutoState::PausedExternal | AutoState::PausedFatal(_)
-        ) {
+        if !matches!(self.auto, AutoState::PausedFatal(_)) {
             self.auto = AutoState::NeedsProbe;
         }
     }
 
     pub fn external_changed(&mut self) {
-        if !matches!(self.auto, AutoState::PausedFatal(_)) {
-            self.external_dirty = true;
-            self.auto = AutoState::PausedExternal;
-        }
+        self.library_changed();
     }
 
     pub fn take_auto_sync(&mut self, safe: bool) -> Option<AutoSyncRequest> {
@@ -245,13 +221,12 @@ impl SyncCoordinator {
             return None;
         }
         let status = self.status.as_ref()?;
-        if !status.settings.enabled || self.external_dirty {
+        if !status.settings.enabled {
             return None;
         }
         let expected_changes = status.changes.clone();
         self.auto = AutoState::Idle;
         self.claimed_generation = Some(self.library_generation);
-        self.app_dirty = false;
         self.run = RunState::Reconciling { automatic: true };
         Some(AutoSyncRequest { expected_changes })
     }
@@ -267,22 +242,17 @@ impl SyncCoordinator {
         }
     }
 
-    pub fn finish_manual_sync(&mut self, success: bool) {
+    pub fn finish_manual_sync(&mut self, _success: bool) {
         self.run = RunState::Idle;
         let changed_during_run = self
             .claimed_generation
             .take()
             .is_some_and(|generation| generation != self.library_generation);
-        if success {
-            self.external_dirty = false;
-        }
-        if changed_during_run {
-            self.app_dirty = true;
-            self.auto = AutoState::NeedsProbe;
+        self.auto = if changed_during_run {
+            AutoState::NeedsProbe
         } else {
-            self.app_dirty = false;
-            self.auto = AutoState::Idle;
-        }
+            AutoState::Idle
+        };
     }
 
     pub fn finish_auto_sync(&mut self, result: std::result::Result<(), AutoSyncDisposition>) {
@@ -294,43 +264,38 @@ impl SyncCoordinator {
         if !was_automatic {
             return;
         }
+        let changed_during_run = self
+            .claimed_generation
+            .take()
+            .is_some_and(|generation| generation != self.library_generation);
         match result {
             Ok(()) => {
-                self.claimed_generation = None;
-                self.external_dirty = false;
-                if self.app_dirty {
-                    self.auto = AutoState::NeedsProbe;
+                self.auto = if changed_during_run {
+                    AutoState::NeedsProbe
                 } else {
-                    self.auto = AutoState::Idle;
-                }
+                    AutoState::Idle
+                };
             }
             Err(AutoSyncDisposition::Transient) => {
-                self.restore_claimed_changes();
                 self.auto = AutoState::RetryAfterProbe;
             }
-            Err(AutoSyncDisposition::Fatal | AutoSyncDisposition::WorkingTreeChanged) => {
-                self.restore_claimed_changes();
+            Err(AutoSyncDisposition::WorkingTreeChanged) => {
+                self.auto = AutoState::NeedsProbe;
+            }
+            Err(AutoSyncDisposition::Fatal) => {
                 self.auto = AutoState::PausedFatal(None);
             }
         }
     }
 
-    fn restore_claimed_changes(&mut self) {
-        if self.claimed_generation.take().is_some() {
-            self.app_dirty = true;
-        }
-    }
-
     pub fn disable(&mut self) {
         self.auto = AutoState::Idle;
-        self.app_dirty = false;
     }
 
     #[cfg(test)]
     pub fn set_status(&mut self, status: Status) {
         self.status = Some(status);
         self.probe = None;
-        self.baseline_known = true;
     }
 
     #[cfg(test)]
@@ -356,6 +321,10 @@ impl SyncCoordinator {
             RunState::Idle
         };
     }
+}
+
+fn needs_sync(status: &Status) -> bool {
+    !status.changes.is_empty() || status.ahead > 0 || status.behind > 0
 }
 
 fn probe_can_retry(reason: ProbeReason) -> bool {
@@ -392,29 +361,64 @@ mod tests {
     }
 
     #[test]
-    fn probes_only_observe_until_an_app_mutation_requests_sync() {
+    fn startup_probe_schedules_any_work_that_needs_convergence() {
+        for pending in [
+            status(true, &["?? changed"], "base", "base"),
+            status(true, &[], "local", "remote"),
+        ] {
+            let mut sync = SyncCoordinator::default();
+            probe(&mut sync, ProbeReason::Startup, pending);
+            assert!(sync.pending());
+            assert!(sync.take_auto_sync(true).is_some());
+        }
+
+        let mut clean = SyncCoordinator::default();
+        probe(
+            &mut clean,
+            ProbeReason::Startup,
+            status(true, &[], "base", "base"),
+        );
+        assert!(!clean.pending());
+    }
+
+    #[test]
+    fn observed_external_changes_are_reprobed_and_synced() {
         let mut sync = SyncCoordinator::default();
         probe(
             &mut sync,
             ProbeReason::Startup,
-            status(true, &[], "local", "remote"),
+            status(true, &[], "base", "base"),
         );
-        assert!(!sync.pending());
-
-        probe(
-            &mut sync,
-            ProbeReason::Periodic,
-            status(true, &[], "local", "remote-2"),
-        );
-        assert!(!sync.pending());
-
-        sync.library_changed();
-        probe(
-            &mut sync,
-            ProbeReason::Mutation,
-            status(true, &["?? changed"], "local", "remote-2"),
-        );
+        sync.external_changed();
         assert!(sync.pending());
+        assert!(sync.take_auto_sync(true).is_none());
+
+        probe(
+            &mut sync,
+            ProbeReason::ObservedChange,
+            status(true, &[" M skill"], "base", "base"),
+        );
+        assert!(sync.take_auto_sync(true).is_some());
+    }
+
+    #[test]
+    fn working_tree_change_during_automatic_sync_requeues_latest_input() {
+        let mut sync = SyncCoordinator::default();
+        probe(
+            &mut sync,
+            ProbeReason::Startup,
+            status(true, &[" M first"], "base", "base"),
+        );
+        sync.take_auto_sync(true).unwrap();
+        sync.finish_auto_sync(Err(AutoSyncDisposition::WorkingTreeChanged));
+        assert!(sync.pending());
+        assert!(sync.take_auto_sync(true).is_none());
+
+        probe(
+            &mut sync,
+            ProbeReason::ObservedChange,
+            status(true, &[" M first", "?? second"], "base", "base"),
+        );
         assert!(sync.take_auto_sync(true).is_some());
     }
 
