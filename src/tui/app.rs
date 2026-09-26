@@ -32,7 +32,7 @@ use skills::config::Config;
 use skills::history::{self, History, Plan};
 use skills::ops::{MutationScope, deploy};
 use skills::reconcile::Snapshot;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 
@@ -253,6 +253,8 @@ pub struct App {
     tasks_running: usize,
     sync: SyncCoordinator,
     next_task_id: u64,
+    latest_scan_task: Option<u64>,
+    repository_refresh_tasks: BTreeMap<String, u64>,
     spinner: usize,
     last_root_poll: std::time::Instant,
     root_stamp: Option<skills::reconcile::watch::Stamp>,
@@ -428,6 +430,8 @@ impl App {
             tasks_running: 0,
             sync: SyncCoordinator::default(),
             next_task_id: 0,
+            latest_scan_task: None,
+            repository_refresh_tasks: BTreeMap::new(),
             spinner: 0,
             last_root_poll: std::time::Instant::now(),
             root_stamp,
@@ -597,7 +601,7 @@ impl App {
             Msg::Task(id, out) => {
                 self.toasts.finish(id);
                 self.tasks_running = self.tasks_running.saturating_sub(1);
-                self.on_task(*out)
+                self.on_task(id, *out)
             }
             Msg::Paste(text) => self.on_paste(&text),
             Msg::Key(k) => self.on_key(k),
@@ -688,7 +692,7 @@ impl App {
             || (self.tab == Tab::Tags && self.tags.input_focused())
     }
 
-    fn on_task(&mut self, out: TaskOutput) -> Vec<Action> {
+    fn on_task(&mut self, id: u64, out: TaskOutput) -> Vec<Action> {
         match out {
             TaskOutput::RepairPlan(options, result) => match result {
                 Ok(plan) => vec![Action::OpenModal(Box::new(Modal::HealthRepair(Box::new(
@@ -726,6 +730,19 @@ impl App {
                         Action::Toast("Root auto-sync enabled".into()),
                     ],
                     Err(e) => vec![Action::Error(format!("Root sync setup: {e:#}"))],
+                }
+            }
+            TaskOutput::SyncEnabled(result) => {
+                self.batch_running = false;
+                match result {
+                    Ok(()) => vec![
+                        Action::RefreshSyncStatus {
+                            remote: false,
+                            reason: ProbeReason::Configuration,
+                        },
+                        Action::Toast("Automatic root sync enabled".into()),
+                    ],
+                    Err(e) => vec![Action::Error(format!("Enable root sync: {e:#}"))],
                 }
             }
             TaskOutput::SyncDisabled(result) => {
@@ -919,35 +936,47 @@ impl App {
                 vec![Action::Error(format!("discover {reference}: {e:#}"))]
             }
             TaskOutput::RepositoryRefreshed(alias, result) => {
+                if self.repository_refresh_tasks.get(&alias) != Some(&id) {
+                    return Vec::new();
+                }
+                self.repository_refresh_tasks.remove(&alias);
                 if !self.repos.inventory_result(&alias, &result) {
                     return Vec::new();
                 }
                 match result {
                     Ok(inventory) => {
-                        let available = inventory
-                            .entries
-                            .iter()
-                            .filter(|entry| {
-                                matches!(
-                                    entry.state,
-                                    skills::repository::RepositoryInventoryState::Available
-                                        | skills::repository::RepositoryInventoryState::PossibleMove { .. }
-                                )
-                            })
-                            .count();
-                        let updates = inventory
-                            .entries
-                            .iter()
-                            .filter(|entry| {
-                                matches!(
-                                    entry.state,
-                                    skills::repository::RepositoryInventoryState::Update { .. }
-                                )
-                            })
-                            .count();
-                        vec![Action::Toast(format!(
-                            "refreshed {alias}: {available} available · {updates} updates"
-                        ))]
+                        let mut updates = 0;
+                        let mut attention = 0;
+                        for entry in inventory.entries {
+                            match entry.state {
+                                skills::repository::RepositoryInventoryState::Update { .. } => {
+                                    updates += 1
+                                }
+                                skills::repository::RepositoryInventoryState::Changed {
+                                    ..
+                                }
+                                | skills::repository::RepositoryInventoryState::MissingUpstream {
+                                    ..
+                                }
+                                | skills::repository::RepositoryInventoryState::PossibleMove {
+                                    ..
+                                }
+                                | skills::repository::RepositoryInventoryState::Invalid {
+                                    key: Some(_),
+                                    ..
+                                } => attention += 1,
+                                _ => {}
+                            }
+                        }
+                        let message = match (updates, attention) {
+                            (0, 0) => format!("{alias} is current"),
+                            (updates, 0) => format!("{alias} · {updates} updates"),
+                            (0, attention) => format!("{alias} · {attention} attention"),
+                            (updates, attention) => {
+                                format!("{alias} · {updates} updates · {attention} attention")
+                            }
+                        };
+                        vec![Action::Toast(message)]
                     }
                     Err(error) => vec![Action::Error(format!("refresh {alias}: {error:#}"))],
                 }
@@ -1018,17 +1047,32 @@ impl App {
             // A move can temporarily remove a directory while it is being polled.
             // Keep the last good snapshot and retry; explicit rescans report errors.
             TaskOutput::RootStamp(Err(_)) => Vec::new(),
-            TaskOutput::Scan(Ok(snap), stamp) => {
+            TaskOutput::Scan(Ok(snap), stamp) if self.latest_scan_task == Some(id) => {
+                self.latest_scan_task = None;
                 self.root_stamp = stamp;
                 self.snap = snap;
                 self.on_snapshot();
                 Vec::new()
             }
-            TaskOutput::Scan(Err(e), _) => {
+            TaskOutput::Scan(Err(e), _) if self.latest_scan_task == Some(id) => {
+                self.latest_scan_task = None;
                 self.root_stamp = None;
                 vec![Action::Error(format!("scan failed: {e:#}"))]
             }
+            TaskOutput::Scan(..) => Vec::new(),
             TaskOutput::Check(results) => {
+                let results: Vec<_> = results
+                    .into_iter()
+                    .filter(|output| {
+                        self.snap
+                            .get(&output.key)
+                            .is_some_and(|record| output.matches(record))
+                    })
+                    .map(|output| (output.key, output.result))
+                    .collect();
+                if results.is_empty() {
+                    return Vec::new();
+                }
                 self.search.remember_checks(&results);
                 self.repos.remember_checks(&results);
                 let ctx = Ctx {
@@ -1635,12 +1679,7 @@ impl App {
             }
             Action::LibraryChanged => self.library_changed(),
             Action::Deployment(_) => unreachable!("deployment actions are unwrapped above"),
-            Action::Spawn(task) => {
-                if let Task::RefreshRepository(alias) = &task {
-                    self.repos.refreshing(alias);
-                }
-                self.spawn(task)
-            }
+            Action::Spawn(task) => self.spawn(task),
             Action::OpenModal(m) => {
                 self.context_menu = None;
                 self.command_palette = None;
@@ -2012,6 +2051,14 @@ impl App {
         self.tasks_running += 1;
         self.next_task_id += 1;
         let id = self.next_task_id;
+        match &task {
+            Task::Scan => self.latest_scan_task = Some(id),
+            Task::RefreshRepository(alias) => {
+                self.repository_refresh_tasks.insert(alias.clone(), id);
+                self.repos.refreshing(alias);
+            }
+            _ => {}
+        }
         let label = task.label();
         if let Some(label) = label {
             self.toasts.start(id, label);
@@ -2526,6 +2573,30 @@ mod matrix_key_tests {
         assert!(selected(&app).is_empty());
         app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
         assert!(selected(&app).is_empty());
+    }
+
+    #[test]
+    fn superseded_scan_result_cannot_replace_the_latest_snapshot() {
+        let tmp = skills::ops::DownloadDir::new("scan-generation").unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(tmp.path()).unwrap(), tx).unwrap();
+        let old = app.snap.clone();
+        std::fs::create_dir(tmp.path().join("latest")).unwrap();
+        std::fs::write(
+            tmp.path().join("latest/SKILL.md"),
+            "---\nname: latest\n---\nBody",
+        )
+        .unwrap();
+        let latest = app.ws.scan().unwrap();
+        app.latest_scan_task = Some(2);
+
+        app.on_task(2, TaskOutput::Scan(Ok(latest), None));
+        assert!(app.snap.get("latest").is_some());
+        app.on_task(1, TaskOutput::Scan(Ok(old), None));
+        assert!(
+            app.snap.get("latest").is_some(),
+            "an older scan must not overwrite the accepted latest result"
+        );
     }
 
     #[test]
@@ -3309,10 +3380,10 @@ mod scope_tests {
             names: Default::default(),
         };
 
-        let actions = app.on_task(TaskOutput::RepositoryInstalled(
-            Box::new(selection),
-            Ok(vec!["sample".into()]),
-        ));
+        let actions = app.on_task(
+            0,
+            TaskOutput::RepositoryInstalled(Box::new(selection), Ok(vec!["sample".into()])),
+        );
 
         assert!(
             actions

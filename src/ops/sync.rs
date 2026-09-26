@@ -516,6 +516,20 @@ pub fn configure(ws: &Workspace, url: &str, branch: &str) -> Result<()> {
     )?;
     Ok(())
 }
+pub fn enable(ws: &Workspace) -> Result<()> {
+    repository(&ws.root)?;
+    let settings = Settings::load(ws)?;
+    ensure!(
+        settings.url.is_some() && settings.branch.is_some(),
+        "root backup is not configured"
+    );
+    let _lock = MutationGuard::acquire(ws, "enable root sync")?;
+    git(
+        &["config", "--local", "skills.autosync", "true"],
+        Some(&ws.root),
+    )?;
+    Ok(())
+}
 pub fn disable(ws: &Workspace) -> Result<()> {
     repository(&ws.root)?;
     let _lock = MutationGuard::acquire(ws, "disable root sync")?;

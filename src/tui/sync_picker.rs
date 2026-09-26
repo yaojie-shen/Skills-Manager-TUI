@@ -27,6 +27,7 @@ enum OverviewAction {
     Configure,
     Check,
     Sync(Mode),
+    Enable,
     Disable,
 }
 
@@ -159,7 +160,11 @@ impl SyncPicker {
                 OverviewAction::Sync(Mode::Push),
                 OverviewAction::Sync(Mode::Pull),
                 OverviewAction::Configure,
-                OverviewAction::Disable,
+                if self.presentation.automatic {
+                    OverviewAction::Disable
+                } else {
+                    OverviewAction::Enable
+                },
             ]);
             actions
         }
@@ -257,6 +262,9 @@ impl SyncPicker {
             OverviewAction::Configure => {
                 self.configure();
                 vec![]
+            }
+            OverviewAction::Enable => {
+                vec![Action::CloseModal, Action::Spawn(Task::SyncEnable)]
             }
             OverviewAction::Disable => {
                 self.step = Step::Disable;
@@ -632,6 +640,7 @@ impl SyncPicker {
                             OverviewAction::Sync(Mode::Sync) => ("", "Sync now", "recommended"),
                             OverviewAction::Sync(Mode::Push) => ("", "Push only", "advanced"),
                             OverviewAction::Sync(Mode::Pull) => ("", "Pull only", "advanced"),
+                            OverviewAction::Enable => ("", "Turn on auto sync", "background"),
                             OverviewAction::Disable => ("", "Turn off auto sync", "keeps history"),
                         };
                         ListItem::new(Line::from(vec![
@@ -954,6 +963,7 @@ mod tests {
             branch: Some("main".into()),
             enabled: true,
         };
+        picker.presentation.automatic = true;
         picker.list.first(picker.actions().len());
 
         let screen = render(&mut picker, &ctx, 100, 28);
@@ -994,6 +1004,29 @@ mod tests {
                 ] if std::mem::discriminant(actual) == std::mem::discriminant(&mode)
             ));
         }
+    }
+
+    #[test]
+    fn configured_auto_off_offers_enable_instead_of_disable() {
+        let temp = skills::ops::DownloadDir::new("root-sync-enable-action").unwrap();
+        let ws = skills::Workspace::open(temp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = context(&ws, &snap, &settings);
+        let mut picker = SyncPicker::new(&ctx).unwrap();
+        picker.settings.url = Some("/tmp/remote.git".into());
+        picker.settings.branch = Some("main".into());
+        picker.presentation.automatic = false;
+        picker.list.select(Some(picker.actions().len() - 1));
+
+        let screen = render(&mut picker, &ctx, 100, 28);
+        assert!(screen.contains("AUTO OFF"), "{screen}");
+        assert!(screen.contains("Turn on auto sync"), "{screen}");
+        assert!(!screen.contains("Turn off auto sync"), "{screen}");
+        assert!(matches!(
+            picker.key(key(KeyCode::Enter), &ctx).as_slice(),
+            [Action::CloseModal, Action::Spawn(Task::SyncEnable)]
+        ));
     }
 
     #[test]

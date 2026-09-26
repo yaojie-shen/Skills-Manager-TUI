@@ -754,6 +754,18 @@ impl View for HealthView {
     }
 
     fn refresh(&mut self, ctx: &Ctx) {
+        self.checks.retain(|key, result| {
+            let Some(record) = ctx.snap.get(key) else {
+                return false;
+            };
+            match result {
+                Ok(check) => record.source.as_ref().is_some_and(|source| {
+                    source.same_location(&check.source)
+                        && source.revision() == check.source.revision()
+                }),
+                Err(_) => false,
+            }
+        });
         self.rebuild(ctx);
     }
 

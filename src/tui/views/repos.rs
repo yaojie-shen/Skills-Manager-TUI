@@ -4,6 +4,7 @@ use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::components::context_menu::{Command, Item, Request, Target};
 use crate::tui::components::layout::{frame, split_panes};
+use crate::tui::components::skill::SkillDecoration;
 use crate::tui::event::Task;
 use crate::tui::modal::Modal;
 use crate::tui::settings::LayoutScope;
@@ -25,6 +26,12 @@ struct Project {
     local: bool,
     source: String,
     keys: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RepositorySummary {
+    updates: usize,
+    attention: usize,
 }
 
 #[derive(Default)]
@@ -63,7 +70,9 @@ impl ReposView {
 
     pub fn refreshing(&mut self, alias: &str) {
         self.refreshing.insert(alias.to_string());
+        self.inventories.remove(alias);
         self.inventory_errors.remove(alias);
+        self.sync_decorations();
     }
 
     pub fn inventory_result(
@@ -82,6 +91,7 @@ impl ReposView {
                 self.inventories
                     .insert(alias.to_string(), inventory.clone());
                 self.inventory_errors.remove(alias);
+                self.sync_decorations();
             }
             Err(error) => {
                 self.inventory_errors
@@ -157,6 +167,7 @@ impl ReposView {
         } else if refresh && let Some(view) = self.skill_search.as_mut() {
             view.update_panel(keys, ctx);
         }
+        self.sync_decorations();
     }
 
     fn move_by(&mut self, delta: i32, ctx: &Ctx) {
@@ -164,75 +175,105 @@ impl ReposView {
         self.sync_panel(ctx, false);
     }
 
-    fn inventory_counts(&self, alias: &str) -> (usize, usize, usize) {
-        let Some(inventory) = self.inventories.get(alias) else {
-            return (0, 0, 0);
-        };
-        let mut available = 0;
-        let mut updates = 0;
-        let mut attention = 0;
+    fn inventory_presentation(
+        inventory: &RepositoryInventory,
+    ) -> (RepositorySummary, BTreeMap<String, SkillDecoration>) {
+        let mut summary = RepositorySummary::default();
+        let mut decorations = BTreeMap::new();
         for entry in &inventory.entries {
-            match entry.state {
-                RepositoryInventoryState::Available => available += 1,
-                RepositoryInventoryState::Update { .. } => updates += 1,
-                RepositoryInventoryState::PossibleMove { .. } => {
-                    available += 1;
-                    attention += 1;
+            match &entry.state {
+                RepositoryInventoryState::Update { key } => {
+                    summary.updates += 1;
+                    decorations.insert(key.clone(), SkillDecoration::Update);
                 }
-                RepositoryInventoryState::Changed { .. }
-                | RepositoryInventoryState::MissingUpstream { .. }
-                | RepositoryInventoryState::Invalid { .. } => attention += 1,
-                RepositoryInventoryState::Installed { .. } => {}
+                RepositoryInventoryState::Changed {
+                    key,
+                    update_available,
+                } => {
+                    summary.attention += 1;
+                    decorations.insert(
+                        key.clone(),
+                        SkillDecoration::Attention(if *update_available {
+                            "Local changes + update".into()
+                        } else {
+                            "Local changes".into()
+                        }),
+                    );
+                }
+                RepositoryInventoryState::MissingUpstream { key } => {
+                    summary.attention += 1;
+                    decorations.insert(
+                        key.clone(),
+                        SkillDecoration::Attention("Missing upstream".into()),
+                    );
+                }
+                RepositoryInventoryState::PossibleMove { key, .. } => {
+                    summary.attention += 1;
+                    decorations.insert(
+                        key.clone(),
+                        SkillDecoration::Attention("Possible move".into()),
+                    );
+                }
+                RepositoryInventoryState::Invalid { key: Some(key), .. } => {
+                    summary.attention += 1;
+                    decorations.insert(
+                        key.clone(),
+                        SkillDecoration::Attention("Invalid upstream".into()),
+                    );
+                }
+                RepositoryInventoryState::Installed { .. }
+                | RepositoryInventoryState::Available
+                | RepositoryInventoryState::Invalid { key: None, .. } => {}
             }
         }
-        (available, updates, attention)
+        (summary, decorations)
     }
 
-    fn inventory_line(entry: &skills::repository::RepositoryInventoryEntry) -> String {
-        let path = if entry.path.is_empty() {
-            "."
-        } else {
-            &entry.path
+    fn inventory_summary(&self, alias: &str) -> RepositorySummary {
+        self.inventories
+            .get(alias)
+            .map(Self::inventory_presentation)
+            .map(|(summary, _)| summary)
+            .unwrap_or_default()
+    }
+
+    fn sync_decorations(&mut self) {
+        let decorations = self
+            .selected()
+            .and_then(|project| project.alias.as_deref())
+            .and_then(|alias| self.inventories.get(alias))
+            .map(Self::inventory_presentation)
+            .map(|(_, decorations)| decorations);
+        if let Some(view) = self.skill_search.as_mut() {
+            match decorations {
+                Some(decorations) => view.set_decorations(decorations),
+                None => view.clear_decorations(),
+            }
+        }
+    }
+
+    fn repository_status(&self, project: &Project) -> String {
+        let Some(alias) = project.alias.as_deref() else {
+            return "Local".into();
         };
-        let name = entry
-            .skill
-            .as_ref()
-            .map(|skill| skill.name.as_str())
-            .filter(|name| *name != path)
-            .map(|name| format!(" · {name}"))
-            .unwrap_or_default();
-        let state = match &entry.state {
-            RepositoryInventoryState::Installed {
-                key,
-                covered: false,
-            } => {
-                format!("installed · {key}")
-            }
-            RepositoryInventoryState::Installed { key, covered: true } => {
-                format!("covered by {key}")
-            }
-            RepositoryInventoryState::Available => "available · i to install".into(),
-            RepositoryInventoryState::Update { key } => format!("update · {key} · u to check"),
-            RepositoryInventoryState::Changed {
-                key,
-                update_available,
-            } => format!(
-                "local changes{} · {key} · u to resolve",
-                if *update_available {
-                    " + upstream update"
-                } else {
-                    ""
-                }
-            ),
-            RepositoryInventoryState::MissingUpstream { key } => {
-                format!("missing upstream · {key} · review/remove locally")
-            }
-            RepositoryInventoryState::PossibleMove { key, from } => {
-                format!("possible move from {from} · {key} · review manually")
-            }
-            RepositoryInventoryState::Invalid { error } => format!("invalid · {error}"),
+        if self.refreshing.contains(alias) {
+            return " Refreshing…".into();
+        }
+        if self.inventory_errors.contains_key(alias) {
+            return " Refresh failed".into();
+        }
+        let Some(inventory) = self.inventories.get(alias) else {
+            return "Not checked".into();
         };
-        format!(" {path}{name}  [{state}]")
+        let (summary, _) = Self::inventory_presentation(inventory);
+        match (summary.updates, summary.attention) {
+            (0, 0) => " Current".into(),
+            (updates, 0) => format!(" {updates} updates"),
+            (0, attention) => format!(" {attention} attention"),
+            (updates, attention) => {
+                format!(" {updates} updates ·  {attention} attention")
+            }
+        }
     }
 
     fn source_icon<'a>(&self, project: &Project, ctx: &'a Ctx) -> &'a str {
@@ -314,23 +355,17 @@ impl ReposView {
                 field("Remote", "refreshing…".into());
             } else if let Some(error) = self.inventory_errors.get(&repo.alias) {
                 field("Remote", format!("error: {error}"));
-            } else if let Some(inventory) = self.inventories.get(&repo.alias) {
-                let (available, updates, attention) = self.inventory_counts(&repo.alias);
-                field(
-                    "Remote",
-                    format!("{available} available · {updates} updates · {attention} attention"),
-                );
-                lines.push(Line::styled(" Inventory", th.bold()));
-                if inventory.entries.is_empty() {
-                    lines.push(Line::styled(" (no skill boundaries found)", th.dim()));
-                } else {
-                    lines.extend(
-                        inventory
-                            .entries
-                            .iter()
-                            .map(|entry| Line::raw(Self::inventory_line(entry))),
-                    );
-                }
+            } else if self.inventories.contains_key(&repo.alias) {
+                let summary = self.inventory_summary(&repo.alias);
+                let remote = match (summary.updates, summary.attention) {
+                    (0, 0) => "Current".into(),
+                    (updates, 0) => format!("{updates} updates"),
+                    (0, attention) => format!("{attention} attention"),
+                    (updates, attention) => {
+                        format!("{updates} updates · {attention} attention")
+                    }
+                };
+                field("Remote", remote);
             } else {
                 field("Remote", "not checked · press f".into());
             }
@@ -682,13 +717,7 @@ impl View for ReposView {
             !self.focus_skills,
             ctx,
         );
-        self.nav.layout(
-            inner,
-            1,
-            crate::tui::components::group::card_height(None),
-            0,
-            self.projects.len(),
-        );
+        self.nav.layout(inner, 1, 4, 0, self.projects.len());
         for i in self.nav.visible() {
             let Some(cell) = self.nav.cell(i) else {
                 continue;
@@ -703,17 +732,21 @@ impl View for ReposView {
             );
             let columns = ci.width as usize;
             let count = fit(&format!("{} skills", project.keys.len()), columns);
+            let status = self.repository_status(project);
+            let icon = fit(&format!("{} ", self.source_icon(project, ctx)), columns);
             let room = columns.saturating_sub(width(&count) + 1);
-            let icon = fit(&format!("{} ", self.source_icon(project, ctx)), room);
             let name = fit(&project.name, room.saturating_sub(width(&icon)));
             let gap = columns.saturating_sub(width(&icon) + width(&name) + width(&count));
             f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(icon, th.source()),
-                    Span::styled(name, th.bold()),
-                    Span::raw(" ".repeat(gap)),
-                    Span::styled(count, th.skill_count()),
-                ])),
+                Paragraph::new(vec![
+                    Line::from(vec![
+                        Span::styled(icon, th.source()),
+                        Span::styled(name, th.bold()),
+                        Span::raw(" ".repeat(gap)),
+                        Span::styled(count, th.skill_count()),
+                    ]),
+                    Line::styled(fit(&format!("   {status}"), columns), th.description()),
+                ]),
                 ci,
             );
         }
@@ -1206,7 +1239,7 @@ mod tests {
     }
 
     #[test]
-    fn inventory_details_expose_paths_states_and_actions() {
+    fn refresh_hides_remote_only_candidates_and_keeps_install_more() {
         let tmp = skills::ops::DownloadDir::new("repo-inventory-lines").unwrap();
         let ws = skills::Workspace::open(tmp.path()).unwrap();
         let repository = Repository {
@@ -1251,8 +1284,9 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(details.contains("skills/new"));
-        assert!(details.contains("available · i to install"));
+        assert!(details.contains("Remote  Current"));
+        assert!(!details.contains("skills/new"));
+        assert!(!details.contains("available"));
 
         let actions =
             view.context_execute(&Target::Repository("demo".into()), Command::Source, &ctx);
@@ -1266,6 +1300,19 @@ mod tests {
                 ..
             })] if branch == "topic"
         ));
+
+        view.refreshing("demo");
+        assert!(!view.inventories.contains_key("demo"));
+        assert_eq!(
+            view.repository_status(view.selected().unwrap()),
+            " Refreshing…"
+        );
+        assert!(view.inventory_result("demo", &Err(anyhow::anyhow!("offline"))));
+        assert_eq!(
+            view.repository_status(view.selected().unwrap()),
+            " Refresh failed"
+        );
+        assert!(!view.inventories.contains_key("demo"));
 
         view.refresh(&ctx);
         assert!(!view.inventories.contains_key("demo"));

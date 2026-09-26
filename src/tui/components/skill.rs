@@ -99,11 +99,18 @@ pub struct SkillPresentation<'a> {
     warning: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillDecoration {
+    Update,
+    Attention(String),
+}
+
 /// Transient selection/search state. This is input to rendering, never a patch
 /// to its output. `checked: None` means ordinary single-selection mode.
 pub struct SkillRenderState<'a> {
     pub checked: Option<bool>,
     pub update_available: bool,
+    pub decoration: Option<&'a SkillDecoration>,
     pub excerpt: Option<&'a str>,
     pub terms: &'a [String],
     pub context: Option<&'a str>,
@@ -118,6 +125,7 @@ impl Default for SkillRenderState<'_> {
         Self {
             checked: None,
             update_available: false,
+            decoration: None,
             excerpt: None,
             terms: &[],
             context: None,
@@ -214,8 +222,16 @@ impl<'a> SkillPresentation<'a> {
                     th.dim()
                 },
             )
-        } else if state.update_available && self.warning.is_none() {
-            (" ↑  ".into(), th.accent())
+        } else if matches!(self.tone, Tone::Error) {
+            (format!(" {}  ", self.marker), self.tone.style(th))
+        } else if let Some(SkillDecoration::Attention(_)) = state.decoration {
+            ("   ".into(), th.warn())
+        } else if matches!(self.tone, Tone::Warning) {
+            (format!(" {}  ", self.marker), self.tone.style(th))
+        } else if state.update_available
+            || matches!(state.decoration, Some(SkillDecoration::Update))
+        {
+            ("   ".into(), th.accent())
         } else {
             (format!(" {}  ", self.marker), self.tone.style(th))
         };
@@ -227,20 +243,34 @@ impl<'a> SkillPresentation<'a> {
         let marker = self.marker(state, ctx);
         let mut head = vec![Span::styled(fit(&marker.content, columns), marker.style)];
         let available = columns.saturating_sub(ctx.settings.layout.marker_width);
-        let warning = state
-            .checked
-            .and(self.warning)
-            .map(|label| format!(" ! {label}"));
-        let warning = warning.filter(|warning| available > width(warning) + 8);
-        let name_width = available.saturating_sub(warning.as_deref().map(width).unwrap_or(0));
+        let status = if matches!(self.tone, Tone::Error) {
+            self.warning
+                .map(|label| (format!("! {label}"), self.tone.style(th)))
+        } else if let Some(SkillDecoration::Attention(label)) = state.decoration {
+            Some((label.clone(), th.warn()))
+        } else if matches!(self.tone, Tone::Warning) {
+            self.warning
+                .map(|label| (format!("! {label}"), self.tone.style(th)))
+        } else if state.update_available
+            || matches!(state.decoration, Some(SkillDecoration::Update))
+        {
+            Some(("Update".into(), th.accent()))
+        } else {
+            None
+        };
+        let status = status
+            .map(|(label, style)| (format!(" {label}"), style))
+            .filter(|(label, _)| available > width(label) + 8);
+        let name_width =
+            available.saturating_sub(status.as_ref().map(|(label, _)| width(label)).unwrap_or(0));
         head.extend(highlight_spans(
             &pad(self.name, name_width),
             state.terms,
             th.bold(),
             th,
         ));
-        if let Some(warning) = warning {
-            head.push(Span::styled(warning, self.tone.style(th)));
+        if let Some((label, style)) = status {
+            head.push(Span::styled(label, style));
         }
         head
     }
@@ -729,6 +759,72 @@ mod tests {
         ] {
             assert!(!lines.iter().any(|line| line.to_string().contains("events")));
         }
+    }
+
+    #[test]
+    fn repository_decorations_share_markers_and_preserve_local_priority() {
+        let root = skills::ops::DownloadDir::new("skill-repository-decorations").unwrap();
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+
+        let healthy = SkillPresentation::entry("healthy", None, Some(&EntryState::Deployed));
+        for (decoration, marker) in [
+            (SkillDecoration::Update, ""),
+            (SkillDecoration::Attention("Missing upstream".into()), ""),
+        ] {
+            let state = SkillRenderState {
+                decoration: Some(&decoration),
+                ..Default::default()
+            };
+            for lines in [
+                healthy.card(&ctx, 60, &state),
+                healthy.list(&ctx, 60, false, &state),
+                healthy.compact(&ctx, 60, false, &state),
+            ] {
+                assert!(lines[0].to_string().contains(marker));
+            }
+            let card = healthy.card(&ctx, 60, &state)[0].to_string();
+            assert!(card.contains(match decoration {
+                SkillDecoration::Update => "Update",
+                SkillDecoration::Attention(_) => "Missing upstream",
+            }));
+        }
+
+        let update = SkillDecoration::Update;
+        let shadow = EntryState::Shadow {
+            same_content: false,
+        };
+        let warning = SkillPresentation::entry("shadow", None, Some(&shadow));
+        let state = SkillRenderState {
+            decoration: Some(&update),
+            ..Default::default()
+        };
+        assert!(warning.card(&ctx, 60, &state)[0].to_string().contains('▪'));
+        assert!(!warning.card(&ctx, 60, &state)[0].to_string().contains(''));
+
+        let broken = EntryState::Broken {
+            target: root.path().join("gone"),
+        };
+        let error = SkillPresentation::entry("broken", None, Some(&broken));
+        assert!(error.card(&ctx, 60, &state)[0].to_string().contains('!'));
+        assert!(!error.card(&ctx, 60, &state)[0].to_string().contains(''));
+
+        let checked = SkillRenderState {
+            checked: Some(true),
+            decoration: Some(&update),
+            ..Default::default()
+        };
+        assert!(
+            healthy.card(&ctx, 60, &checked)[0]
+                .to_string()
+                .contains("[✓]")
+        );
     }
 
     #[test]

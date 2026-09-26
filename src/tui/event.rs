@@ -31,6 +31,7 @@ pub enum Task {
         url: String,
         branch: String,
     },
+    SyncEnable,
     SyncDisable,
     Sync(super::sync_picker::Request),
     AutoSync(Vec<String>),
@@ -57,7 +58,11 @@ impl Task {
     pub fn is_root_operation(&self) -> bool {
         matches!(
             self,
-            Self::SyncConfigure { .. } | Self::SyncDisable | Self::Sync(_) | Self::AutoSync(_)
+            Self::SyncConfigure { .. }
+                | Self::SyncEnable
+                | Self::SyncDisable
+                | Self::Sync(_)
+                | Self::AutoSync(_)
         )
     }
 
@@ -78,6 +83,7 @@ impl Task {
             Self::RepairPlan(_) => Some("Scan and preview health repairs".into()),
             Self::RepairApply(_) => Some("Apply health repairs".into()),
             Self::SyncConfigure { .. } => Some("Configure root backup".into()),
+            Self::SyncEnable => Some("Enable automatic root backup".into()),
             Self::SyncDisable => Some("Disable automatic root backup".into()),
             Self::Sync(request) => Some(format!(
                 "Root sync {:?}{}",
@@ -99,6 +105,24 @@ impl Task {
     }
 }
 
+pub struct CheckOutput {
+    pub key: String,
+    pub source: Option<skills::meta::Source>,
+    pub result: Result<CheckResult>,
+}
+
+impl CheckOutput {
+    pub fn matches(&self, record: &skills::reconcile::SkillRecord) -> bool {
+        match (&self.source, record.source.as_ref()) {
+            (Some(checked), Some(current)) => {
+                checked.same_location(current) && checked.revision() == current.revision()
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
 pub enum TaskOutput {
     RepairPlan(
         skills::ops::repair::Options,
@@ -106,6 +130,7 @@ pub enum TaskOutput {
     ),
     RepairApplied(Result<skills::ops::repair::Report>),
     SyncConfigured(Result<()>),
+    SyncEnabled(Result<()>),
     SyncDisabled(Result<()>),
     Sync(
         super::sync_picker::Request,
@@ -121,7 +146,7 @@ pub enum TaskOutput {
     ),
     Scan(Result<Snapshot>, Option<skills::reconcile::watch::Stamp>),
     RootStamp(Result<skills::reconcile::watch::Stamp>),
-    Check(Vec<(String, Result<CheckResult>)>),
+    Check(Vec<CheckOutput>),
     Prepared(String, Result<Prepared>),
     /// The reference asked for, and the key it landed under.
     Installed(String, Result<String>),
@@ -248,6 +273,7 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                 Task::SyncConfigure { url, branch } => {
                     TaskOutput::SyncConfigured(skills::ops::sync::configure(&ws, &url, &branch))
                 }
+                Task::SyncEnable => TaskOutput::SyncEnabled(skills::ops::sync::enable(&ws)),
                 Task::SyncDisable => TaskOutput::SyncDisabled(skills::ops::sync::disable(&ws)),
                 Task::Sync(request) => {
                     let result =
@@ -323,11 +349,21 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                     TaskOutput::Check(
                         keys.into_iter()
                             .enumerate()
-                            .map(|(done, k)| {
-                                progress(&format!("{done}/{total} complete · querying {k}…"));
-                                let r = session.check(&ws, &k, &mut progress);
+                            .map(|(done, key)| {
+                                progress(&format!("{done}/{total} complete · querying {key}…"));
+                                let source = ws
+                                    .meta
+                                    .load(&key)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|meta| meta.source);
+                                let result = session.check(&ws, &key, &mut progress);
                                 progress(&format!("{}/{total} complete", done + 1));
-                                (k, r)
+                                CheckOutput {
+                                    key,
+                                    source,
+                                    result,
+                                }
                             })
                             .collect(),
                     )

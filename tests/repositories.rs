@@ -388,6 +388,52 @@ fn reinstall_same_source_is_a_noop_even_with_another_alias() {
 }
 
 #[test]
+fn repository_inventory_is_scoped_to_its_stable_alias() {
+    let f = Fixture::new();
+    f.put("one", "one", "one-v1");
+    f.put("two", "two", "two-v1");
+    f.commit();
+
+    let first = f.fetch("first");
+    first
+        .install(&f.ws, &["one".into()], &BTreeMap::new())
+        .unwrap();
+    first.cleanup();
+    let second = f.fetch("second");
+    second
+        .install(&f.ws, &["two".into()], &BTreeMap::new())
+        .unwrap();
+    second.cleanup();
+
+    f.put("two", "two", "two-v2");
+    f.commit();
+    let snapshot = f.ws.scan().unwrap();
+    let first = f.fetch("first");
+    let first_inventory = first.inventory(&snapshot).unwrap();
+    assert!(first_inventory.entries.iter().all(|entry| {
+        !matches!(
+            &entry.state,
+            RepositoryInventoryState::Update { key }
+                | RepositoryInventoryState::Changed { key, .. }
+                | RepositoryInventoryState::MissingUpstream { key }
+                | RepositoryInventoryState::PossibleMove { key, .. }
+                if key.starts_with("repos/second/")
+        )
+    }));
+    first.cleanup();
+
+    let second = f.fetch("second");
+    let second_inventory = second.inventory(&snapshot).unwrap();
+    assert!(second_inventory.entries.iter().any(|entry| {
+        matches!(
+            &entry.state,
+            RepositoryInventoryState::Update { key } if key == "repos/second/two"
+        )
+    }));
+    second.cleanup();
+}
+
+#[test]
 fn repositories_preserve_sources_and_aliases_through_update_deployment_and_undo() {
     let mut f = Fixture::new();
     f.put("frontend/review", "review", "first");
@@ -1119,6 +1165,7 @@ fn repository_inventory_is_read_only_and_classifies_source_changes() {
     f.put("available", "available", "new");
     std::fs::create_dir_all(f.repo.join("invalid")).unwrap();
     std::fs::write(f.repo.join("invalid/SKILL.md"), "not frontmatter").unwrap();
+    std::fs::write(f.repo.join("same/SKILL.md"), "not frontmatter").unwrap();
     f.commit();
 
     let before = directory_fingerprint(&f.ws.root);
@@ -1136,7 +1183,8 @@ fn repository_inventory_is_read_only_and_classifies_source_changes() {
     };
     assert!(matches!(
         state("same"),
-        RepositoryInventoryState::Installed { covered: false, .. }
+        RepositoryInventoryState::Invalid { key: Some(key), .. }
+            if key == "repos/inventory/same"
     ));
     assert!(matches!(
         state("local"),
@@ -1155,15 +1203,15 @@ fn repository_inventory_is_read_only_and_classifies_source_changes() {
     ));
     assert!(matches!(
         state("invalid"),
-        RepositoryInventoryState::Invalid { .. }
+        RepositoryInventoryState::Invalid { key: None, .. }
     ));
     assert!(
         matches!(state("moved-to"), RepositoryInventoryState::PossibleMove { from, .. } if from == "gone")
     );
-    assert!(matches!(
-        state("gone"),
-        RepositoryInventoryState::MissingUpstream { .. }
-    ));
+    assert!(
+        inventory.entries.iter().all(|entry| entry.path != "gone"),
+        "a paired move must not also be reported as missing upstream"
+    );
     assert!(matches!(
         state("moved-from"),
         RepositoryInventoryState::MissingUpstream { .. }

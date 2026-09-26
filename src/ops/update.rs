@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckResult {
     pub skill: String,
+    #[serde(skip)]
+    pub source: Source,
     pub url: String,
     pub branch: Option<String>,
     pub installed: Option<String>,
@@ -123,6 +125,7 @@ impl UpdateSession {
         let remote = self.latest(&source, progress)?;
         Ok(CheckResult {
             skill: key.to_string(),
+            source,
             url,
             branch,
             update_available: revision.as_deref() != Some(remote.as_str()),

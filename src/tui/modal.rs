@@ -439,12 +439,12 @@ impl Modal {
     }
     pub fn delete_preset(name: &str) -> Self {
         let n = name.to_string();
-        Self::confirm_write(
+        Self::confirm_meta(
             format!(" delete preset {name} "),
             vec![format!(
                 "Delete preset \"{name}\"? Deployed links are left as they are."
             )],
-            Box::new(move |ws| ws.presets.remove(&n).map(|_| format!("deleted preset {n}"))),
+            Box::new(move |ws| history::preset_delete(ws, &n)),
         )
     }
     pub fn remove_source(alias: &str, name: &str, summary: &edit::RepositoryRemoveSummary) -> Self {

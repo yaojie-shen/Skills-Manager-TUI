@@ -407,6 +407,7 @@ pub enum RepositoryInventoryState {
         from: String,
     },
     Invalid {
+        key: Option<String>,
         error: String,
     },
 }
@@ -432,11 +433,12 @@ impl FetchedRepository {
             .skills
             .iter()
             .filter(|skill| {
-                skill.source.as_ref().is_some_and(|source| {
-                    source.kind() == self.repository.kind.as_str()
-                        && source.url() == Some(self.repository.url.as_str())
-                        && source.branch().unwrap_or("") == self.repository.branch
-                })
+                alias_of(&skill.key) == Some(self.repository.alias.as_str())
+                    && skill.source.as_ref().is_some_and(|source| {
+                        source.kind() == self.repository.kind.as_str()
+                            && source.url() == Some(self.repository.url.as_str())
+                            && source.branch().unwrap_or("") == self.repository.branch
+                    })
             })
             .collect();
         let mut candidates = Vec::with_capacity(self.choices.len());
@@ -462,6 +464,7 @@ impl FetchedRepository {
                         path: path.clone(),
                         skill: None,
                         state: RepositoryInventoryState::Invalid {
+                            key: exact.map(|installed| installed.key.clone()),
                             error: format!("{error:#}"),
                         },
                     },
@@ -548,6 +551,7 @@ impl FetchedRepository {
                 (candidates.len() == 1).then(|| (missing_index, candidates[0]))
             })
             .collect();
+        let mut paired_missing = BTreeSet::new();
         for (missing_index, candidate_index) in possible_moves {
             let (skill, old_path) = &missing[missing_index];
             let unique = missing
@@ -564,19 +568,26 @@ impl FetchedRepository {
                     key: skill.key.clone(),
                     from: old_path.clone(),
                 };
+                paired_missing.insert(missing_index);
             }
         }
 
-        candidates.extend(missing.into_iter().map(|(skill, path)| Candidate {
-            entry: RepositoryInventoryEntry {
-                path,
-                skill: None,
-                state: RepositoryInventoryState::MissingUpstream {
-                    key: skill.key.clone(),
-                },
-            },
-            hash: None,
-        }));
+        candidates.extend(
+            missing
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| !paired_missing.contains(index))
+                .map(|(_, (skill, path))| Candidate {
+                    entry: RepositoryInventoryEntry {
+                        path,
+                        skill: None,
+                        state: RepositoryInventoryState::MissingUpstream {
+                            key: skill.key.clone(),
+                        },
+                    },
+                    hash: None,
+                }),
+        );
         candidates.sort_by(|a, b| a.entry.path.cmp(&b.entry.path));
         Ok(RepositoryInventory {
             entries: candidates

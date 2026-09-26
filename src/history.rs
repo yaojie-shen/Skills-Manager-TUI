@@ -809,6 +809,22 @@ pub fn preset_create(ws: &Workspace, name: &str) -> Result<(String, Option<Inten
     ))
 }
 
+/// Delete a preset while retaining its complete definition for undo.
+pub fn preset_delete(ws: &Workspace, name: &str) -> Result<(String, Option<Intent>)> {
+    let preset = ws
+        .presets
+        .load(name)?
+        .with_context(|| format!("no such preset: {name}"))?;
+    ws.presets.remove(name)?;
+    Ok((
+        format!("deleted preset {name}"),
+        Some(Intent::Meta(vec![MetaChange::PresetExistence {
+            preset,
+            present: false,
+        }])),
+    ))
+}
+
 /// Change the membership of a preset, recording which skills went in and out.
 pub fn preset_edit(
     ws: &Workspace,
@@ -1368,6 +1384,36 @@ mod tests {
             Plan::Nothing(_)
         ));
         assert!(ws.presets.load("new").unwrap().is_some());
+    }
+
+    #[test]
+    fn preset_deletion_roundtrips_the_complete_definition() {
+        let tmp = crate::ops::DownloadDir::new("preset-delete-undo").unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let preset = crate::preset::Preset {
+            name: "daily".into(),
+            description: Some("Daily work".into()),
+            color: Some("blue".into()),
+            skills: vec!["alpha".into(), "beta".into()],
+            agents: vec!["claude".into()],
+        };
+        ws.presets.save(&preset).unwrap();
+
+        let (_, intent) = preset_delete(&ws, "daily").unwrap();
+        let intent = intent.unwrap();
+        assert!(ws.presets.load("daily").unwrap().is_none());
+        let Plan::Write { apply, .. } = undo_plan(&ws, &ws.scan().unwrap(), &intent).unwrap()
+        else {
+            panic!("undo deletion");
+        };
+        apply.apply(&ws).unwrap();
+        assert_eq!(ws.presets.load("daily").unwrap(), Some(preset.clone()));
+        let Plan::Write { apply, .. } = redo_plan(&ws, &ws.scan().unwrap(), &intent).unwrap()
+        else {
+            panic!("redo deletion");
+        };
+        apply.apply(&ws).unwrap();
+        assert!(ws.presets.load("daily").unwrap().is_none());
     }
 
     #[test]

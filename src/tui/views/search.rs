@@ -10,7 +10,7 @@ use crate::tui::components::group::Kind;
 use crate::tui::components::layout::split_panes;
 use crate::tui::components::layout::{cols_for, skill_frame};
 use crate::tui::components::search_panel::{PanelLayout, PanelStyle, SearchEvent, SearchPanel};
-use crate::tui::components::skill::{SkillPresentation, SkillRenderState};
+use crate::tui::components::skill::{SkillDecoration, SkillPresentation, SkillRenderState};
 use crate::tui::event::Task;
 use crate::tui::modal::Modal;
 use crate::tui::settings::LayoutScope;
@@ -86,7 +86,7 @@ pub struct SearchView {
     hidden_group: Option<(Kind, String)>,
     preset: Option<String>,
     /// The starting membership lets saves preserve unrelated concurrent edits.
-    preset_original: BTreeSet<String>,
+    picker_original: BTreeSet<String>,
     tag: Option<String>,
     target: Option<(
         skills::config::AgentConfig,
@@ -98,7 +98,8 @@ pub struct SearchView {
     checked: BTreeSet<String>,
     batch_buttons: Vec<(Rect, char)>,
     choice_focus: ChoiceFocus,
-    updates: BTreeMap<String, String>,
+    updates: BTreeMap<String, skills::ops::update::CheckResult>,
+    decorations: BTreeMap<String, SkillDecoration>,
 }
 
 impl Default for SearchView {
@@ -126,7 +127,7 @@ impl Default for SearchView {
             panel_active: true,
             hidden_group: None,
             preset: None,
-            preset_original: BTreeSet::new(),
+            picker_original: BTreeSet::new(),
             tag: None,
             target: None,
             area: Rect::default(),
@@ -135,6 +136,7 @@ impl Default for SearchView {
             batch_buttons: Vec::new(),
             choice_focus: ChoiceFocus::List,
             updates: BTreeMap::new(),
+            decorations: BTreeMap::new(),
         }
     }
 }
@@ -406,7 +408,7 @@ impl SearchView {
         view.multi = true;
         if let Ok(Some(p)) = ctx.ws.presets.load(preset) {
             view.checked = p.members().into_iter().collect();
-            view.preset_original = view.checked.clone();
+            view.picker_original = view.checked.clone();
         }
         view.focus_list();
         view
@@ -427,6 +429,7 @@ impl SearchView {
             .filter(|r| r.tags.iter().any(|t| t == tag))
             .map(|r| r.key.clone())
             .collect();
+        view.picker_original = view.checked.clone();
         view.focus_list();
         view
     }
@@ -436,12 +439,9 @@ impl SearchView {
             return !self.visible_checked(ctx).is_empty();
         }
         if self.tag.is_some() {
-            return self.hits.iter().any(|h| {
-                let r = &ctx.snap.skills[h.index];
-                self.checked.contains(&r.key) != r.tags.iter().any(|t| Some(t) == self.tag.as_ref())
-            });
+            return self.checked != self.picker_original;
         }
-        self.checked != self.preset_original
+        self.checked != self.picker_original
     }
     fn apply_preset(&self, ctx: &Ctx) -> Vec<Action> {
         if !self.can_apply(ctx) {
@@ -474,20 +474,28 @@ impl SearchView {
             ];
         }
         if let Some(tag) = self.tag.clone() {
-            let visible: BTreeSet<String> = self
-                .hits
-                .iter()
-                .map(|h| ctx.snap.skills[h.index].key.clone())
+            let added: Vec<_> = self
+                .checked
+                .difference(&self.picker_original)
+                .cloned()
                 .collect();
-            let desired = self.visible_checked(ctx);
-            let keys = visible.iter().cloned().collect();
+            let removed: BTreeSet<_> = self
+                .picker_original
+                .difference(&self.checked)
+                .cloned()
+                .collect();
+            let keys = self.checked.union(&self.picker_original).cloned().collect();
             return vec![Action::BatchMeta(
                 Box::new(move |ws| {
                     skills::history::tag_edit(ws, |ws| {
                         skills::config::Config::edit_tags(&ws.root, |tags| {
                             if let Some(group) = tags.iter_mut().find(|t| t.name == tag) {
-                                group.skills.retain(|k| !visible.contains(k));
-                                group.skills.extend(desired);
+                                group.skills.retain(|key| !removed.contains(key));
+                                for key in &added {
+                                    if !group.skills.contains(key) {
+                                        group.skills.push(key.clone());
+                                    }
+                                }
                             }
                         })?;
                         Ok(format!("updated members of {tag}"))
@@ -501,15 +509,15 @@ impl SearchView {
         };
         let added: Vec<_> = self
             .checked
-            .difference(&self.preset_original)
+            .difference(&self.picker_original)
             .cloned()
             .collect();
         let removed: BTreeSet<_> = self
-            .preset_original
+            .picker_original
             .difference(&self.checked)
             .cloned()
             .collect();
-        let keys = self.checked.union(&self.preset_original).cloned().collect();
+        let keys = self.checked.union(&self.picker_original).cloned().collect();
         vec![Action::BatchMeta(
             Box::new(move |ws| {
                 skills::history::preset_edit(ws, &preset, |members| {
@@ -601,6 +609,7 @@ impl SearchView {
         SkillRenderState {
             checked: self.multi.then(|| self.checked.contains(&r.key)),
             update_available: self.updates.contains_key(&r.key),
+            decoration: self.decorations.get(&r.key),
             excerpt: hit
                 .excerpt
                 .as_ref()
@@ -617,6 +626,14 @@ impl SearchView {
         }
     }
 
+    pub fn set_decorations(&mut self, decorations: BTreeMap<String, SkillDecoration>) {
+        self.decorations = decorations;
+    }
+
+    pub fn clear_decorations(&mut self) {
+        self.decorations.clear();
+    }
+
     pub fn remember_checks(
         &mut self,
         results: &[(String, anyhow::Result<skills::ops::update::CheckResult>)],
@@ -624,7 +641,7 @@ impl SearchView {
         for (key, result) in results {
             if let Ok(check) = result {
                 if check.update_available {
-                    self.updates.insert(key.clone(), check.remote.clone());
+                    self.updates.insert(key.clone(), check.clone());
                 } else {
                     self.updates.remove(key);
                 }
@@ -1204,10 +1221,13 @@ impl View for SearchView {
         if self.preset.is_none() {
             self.checked.retain(|key| ctx.snap.get(key).is_some());
         }
-        self.updates.retain(|key, remote| {
-            ctx.snap.get(key).is_some_and(|r| {
-                r.source.as_ref().is_some_and(|source| {
-                    source.is_remote() && source.revision() != Some(remote.as_str())
+        self.updates.retain(|key, check| {
+            ctx.snap.get(key).is_some_and(|record| {
+                record.source.as_ref().is_some_and(|source| {
+                    source.is_remote()
+                        && source.same_location(&check.source)
+                        && source.revision() == check.source.revision()
+                        && source.revision() != Some(check.remote.as_str())
                 })
             })
         });
@@ -1749,6 +1769,58 @@ mod tests {
     use crate::tui::widgets::width;
 
     #[test]
+    fn host_decorations_are_separate_from_update_check_results() {
+        let mut view = SearchView::default();
+        view.updates.insert(
+            "checked".into(),
+            skills::ops::update::CheckResult {
+                skill: "checked".into(),
+                source: skills::meta::Source::Git {
+                    url: "https://example.test/source.git".into(),
+                    subpath: Some("checked".into()),
+                    branch: Some("main".into()),
+                    revision: Some("old".into()),
+                },
+                url: "https://example.test/source.git".into(),
+                branch: Some("main".into()),
+                installed: Some("old".into()),
+                remote: "remote".into(),
+                update_available: true,
+            },
+        );
+        view.set_decorations(BTreeMap::from([
+            ("updated".into(), SkillDecoration::Update),
+            (
+                "attention".into(),
+                SkillDecoration::Attention("Missing upstream".into()),
+            ),
+        ]));
+        assert_eq!(
+            view.decorations.get("updated"),
+            Some(&SkillDecoration::Update)
+        );
+        assert!(matches!(
+            view.decorations.get("attention"),
+            Some(SkillDecoration::Attention(message)) if message == "Missing upstream"
+        ));
+        assert_eq!(
+            view.updates
+                .get("checked")
+                .map(|check| check.remote.as_str()),
+            Some("remote")
+        );
+
+        view.clear_decorations();
+        assert!(view.decorations.is_empty());
+        assert_eq!(
+            view.updates
+                .get("checked")
+                .map(|check| check.remote.as_str()),
+            Some("remote")
+        );
+    }
+
+    #[test]
     fn preset_picker_refreshes_indices_without_dropping_pending_members() {
         let root = skills::ops::DownloadDir::new("preset-picker-refresh").unwrap();
         skills::config::Config {
@@ -1854,6 +1926,59 @@ mod tests {
         assert_eq!(picker.focus, Focus::List);
         assert_eq!(picker.choice_focus, ChoiceFocus::List);
         assert!(picker.hints().iter().any(|(key, _)| *key == "Enter/Space"));
+    }
+
+    #[test]
+    fn tag_editor_applies_only_its_delta_to_concurrent_membership_changes() {
+        let root = skills::ops::DownloadDir::new("tag-delta-picker").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            tags: vec![skills::config::TagConfig {
+                name: "daily".into(),
+                skills: vec!["alpha".into()],
+                color: None,
+                description: None,
+            }],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            std::fs::create_dir_all(root.path().join(name)).unwrap();
+            std::fs::write(
+                root.path().join(name).join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name}\n---\nBody"),
+            )
+            .unwrap();
+        }
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut picker = SearchView::tag_members("daily", &ctx);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for name in ["alpha", "beta"] {
+            picker.set_query(name, &ctx);
+            picker.focus_list();
+            picker.handle_key(key(KeyCode::Char(' ')), &ctx);
+        }
+        skills::config::Config::edit_tags(&ws.root, |tags| {
+            tags[0].skills.push("gamma".into());
+        })
+        .unwrap();
+
+        let Action::BatchMeta(write, keys) = picker.apply_preset(&ctx).remove(0) else {
+            panic!("expected tag member edit");
+        };
+        assert_eq!(keys, ["alpha", "beta"]);
+        let (_, intent) = write(&ws).unwrap();
+        assert!(intent.is_some());
+        let config = skills::config::Config::load(&ws.root).unwrap();
+        assert_eq!(config.tags[0].skills, ["beta", "gamma"]);
     }
 
     #[test]
