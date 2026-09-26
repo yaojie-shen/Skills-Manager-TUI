@@ -98,6 +98,32 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn repository_root_source_discovers_nested_skills_without_an_empty_path_filter() {
+    let f = Fixture::new();
+    f.put("skills/one", "one", "one");
+    f.put("skills/two", "two", "two");
+    f.commit();
+
+    let repository = Repository {
+        alias: "nested".into(),
+        name: None,
+        kind: Default::default(),
+        url: format!("file://{}", f.repo.display()),
+        branch: "main".into(),
+    };
+    let source = repository.source("", None);
+    assert_eq!(source.subpath(), None);
+    assert_eq!(
+        repository.source("skills/one", None).subpath(),
+        Some("skills/one")
+    );
+    let reference = install::InstallRef::from_source(&source).unwrap();
+    let fetched = FetchedRepository::fetch(&f.ws, &reference, Some("nested")).unwrap();
+    assert_eq!(fetched.choices, ["skills/one", "skills/two"]);
+    fetched.cleanup();
+}
+
+#[test]
 fn repository_root_skill_uses_declared_name_instead_of_project_name() {
     let f = Fixture::new();
     f.put("", "review-article-architecture", "review");

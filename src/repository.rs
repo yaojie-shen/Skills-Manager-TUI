@@ -174,7 +174,7 @@ impl Repository {
     }
 
     pub fn source(&self, path: &str, revision: Option<&str>) -> Source {
-        let subpath = Some(path.to_string());
+        let subpath = (!path.is_empty()).then(|| path.to_string());
         let revision = revision.map(str::to_string);
         match self.kind {
             SourceKind::Git => Source::Git {
