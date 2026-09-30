@@ -8,8 +8,11 @@ use ratatui::buffer::CellWidth;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{ListState, Paragraph};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use ratatui::widgets::{
+    ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget,
+};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Clear an overlay without leaving half of a wide background character at its edge.
 pub struct OverlayClear;
@@ -39,6 +42,35 @@ impl ratatui::widgets::Widget for OverlayClear {
     }
 }
 
+/// Copy a clipped temporary buffer without leaving either half of a wide symbol.
+pub fn blit_clipped(
+    source: &ratatui::buffer::Buffer,
+    destination: &mut ratatui::buffer::Buffer,
+    clip: Rect,
+) {
+    let clip = clip
+        .intersection(*source.area())
+        .intersection(*destination.area());
+    if clip.is_empty() {
+        return;
+    }
+    OverlayClear.render(clip, destination);
+    for y in clip.top()..clip.bottom() {
+        let mut x = source.area().left();
+        while x < clip.right() {
+            let end = x
+                .saturating_add(source[(x, y)].cell_width().max(1))
+                .min(source.area().right());
+            if x >= clip.left() && end <= clip.right() {
+                for col in x..end {
+                    destination[(col, y)] = source[(col, y)].clone();
+                }
+            }
+            x = end;
+        }
+    }
+}
+
 // ---- text helpers ---------------------------------------------------------
 
 pub fn width(s: &str) -> usize {
@@ -55,12 +87,12 @@ pub fn fit(s: &str, max: usize) -> String {
     }
     let mut out = String::new();
     let mut w = 0;
-    for c in s.chars() {
-        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+    for grapheme in s.graphemes(true) {
+        let cw = width(grapheme);
         if w + cw > max - 1 {
             break;
         }
-        out.push(c);
+        out.push_str(grapheme);
         w += cw;
     }
     out.push('…');
@@ -90,11 +122,57 @@ pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+/// Reserve the rightmost column for a scrollbar so content never shares its cells.
+pub fn scrollbar_gutter(area: Rect) -> (Rect, Rect) {
+    let track_width = u16::from(area.width > 0);
+    (
+        Rect {
+            width: area.width.saturating_sub(track_width),
+            ..area
+        },
+        Rect::new(
+            area.right().saturating_sub(track_width),
+            area.y,
+            track_width,
+            area.height,
+        ),
+    )
+}
+
+/// Render a vertical scrollbar with total-content semantics in a dedicated gutter.
+pub fn render_vertical_scrollbar(
+    frame: &mut Frame,
+    track: Rect,
+    content_len: usize,
+    viewport_len: usize,
+    position: usize,
+    style: Style,
+) {
+    if track.is_empty() {
+        return;
+    }
+    OverlayClear.render(track, frame.buffer_mut());
+    if content_len <= viewport_len {
+        return;
+    }
+    let mut state = ScrollbarState::new(content_len)
+        .position(position)
+        .viewport_content_length(viewport_len);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .style(style),
+        track,
+        &mut state,
+    );
+}
+
 pub const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠇"];
 
 // ---- input ----------------------------------------------------------------
 
-/// Single-line text input with a char cursor and horizontal scrolling.
+/// Single-line text input with a grapheme cursor and horizontal scrolling.
 #[derive(Debug, Default, Clone)]
 pub struct Input {
     value: String,
@@ -108,7 +186,7 @@ impl Input {
     pub fn with_value(v: &str) -> Self {
         Self {
             value: v.to_string(),
-            cursor: v.chars().count(),
+            cursor: v.graphemes(true).count(),
             ..Default::default()
         }
     }
@@ -117,7 +195,7 @@ impl Input {
     }
     pub fn set(&mut self, v: &str) {
         self.value = v.to_string();
-        self.cursor = self.value.chars().count();
+        self.cursor = self.value.graphemes(true).count();
     }
     /// Cursor position as a byte boundary, for token-aware completion.
     pub fn cursor_byte(&self) -> usize {
@@ -128,7 +206,7 @@ impl Input {
     pub fn replace_range(&mut self, range: std::ops::Range<usize>, replacement: &str) {
         let cursor_byte = range.start + replacement.len();
         self.value.replace_range(range, replacement);
-        self.cursor = self.value[..cursor_byte].chars().count();
+        self.cursor = self.cursor_after(cursor_byte);
     }
 
     pub fn clear(&mut self) {
@@ -140,12 +218,21 @@ impl Input {
         self.value.is_empty()
     }
     fn len(&self) -> usize {
-        self.value.chars().count()
+        self.value.graphemes(true).count()
     }
-    fn byte_at(&self, ci: usize) -> usize {
+    // Use boundaries in the complete edited string: an edit can join graphemes
+    // on either side. Snap forward when the byte endpoint lies inside one.
+    fn cursor_after(&self, byte: usize) -> usize {
         self.value
-            .char_indices()
-            .nth(ci)
+            .grapheme_indices(true)
+            .take_while(|(i, _)| *i < byte)
+            .count()
+    }
+
+    fn byte_at(&self, gi: usize) -> usize {
+        self.value
+            .grapheme_indices(true)
+            .nth(gi)
             .map(|(i, _)| i)
             .unwrap_or(self.value.len())
     }
@@ -161,7 +248,7 @@ impl Input {
         }
         let at = self.cursor_byte();
         self.value.insert_str(at, text);
-        self.cursor += text.chars().count();
+        self.cursor = self.cursor_after(at + text.len());
         Ok(!text.is_empty())
     }
 
@@ -173,14 +260,16 @@ impl Input {
             KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
                 let i = self.byte_at(self.cursor);
                 self.value.insert(i, c);
-                self.cursor += 1;
+                self.cursor = self.cursor_after(i + c.len_utf8());
                 true
             }
             KeyCode::Backspace => {
                 if self.cursor > 0 {
+                    let end = self.byte_at(self.cursor);
                     self.cursor -= 1;
-                    let i = self.byte_at(self.cursor);
-                    self.value.remove(i);
+                    let start = self.byte_at(self.cursor);
+                    self.value.drain(start..end);
+                    self.cursor = self.cursor_after(start);
                     true
                 } else {
                     false
@@ -188,8 +277,10 @@ impl Input {
             }
             KeyCode::Delete => {
                 if self.cursor < self.len() {
-                    let i = self.byte_at(self.cursor);
-                    self.value.remove(i);
+                    let start = self.byte_at(self.cursor);
+                    let end = self.byte_at(self.cursor + 1);
+                    self.value.drain(start..end);
+                    self.cursor = self.cursor_after(start);
                     true
                 } else {
                     false
@@ -242,7 +333,7 @@ impl Input {
                 let start = self.prev_word();
                 let (a, b) = (self.byte_at(start), self.byte_at(self.cursor));
                 self.value.drain(a..b);
-                self.cursor = start;
+                self.cursor = self.cursor_after(a);
                 true
             }
             _ => false,
@@ -250,23 +341,23 @@ impl Input {
     }
 
     fn prev_word(&self) -> usize {
-        let chars: Vec<char> = self.value.chars().collect();
+        let graphemes: Vec<&str> = self.value.graphemes(true).collect();
         let mut i = self.cursor;
-        while i > 0 && chars[i - 1].is_whitespace() {
+        while i > 0 && graphemes[i - 1].chars().all(char::is_whitespace) {
             i -= 1;
         }
-        while i > 0 && !chars[i - 1].is_whitespace() {
+        while i > 0 && !graphemes[i - 1].chars().all(char::is_whitespace) {
             i -= 1;
         }
         i
     }
     fn next_word(&self) -> usize {
-        let chars: Vec<char> = self.value.chars().collect();
+        let graphemes: Vec<&str> = self.value.graphemes(true).collect();
         let mut i = self.cursor;
-        while i < chars.len() && !chars[i].is_whitespace() {
+        while i < graphemes.len() && !graphemes[i].chars().all(char::is_whitespace) {
             i += 1;
         }
-        while i < chars.len() && chars[i].is_whitespace() {
+        while i < graphemes.len() && graphemes[i].chars().all(char::is_whitespace) {
             i += 1;
         }
         i
@@ -281,8 +372,8 @@ impl Input {
         let target = (x - self.area.x) as usize;
         let mut col = 0;
         let mut idx = self.scroll;
-        for c in self.value.chars().skip(self.scroll) {
-            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        for grapheme in self.value.graphemes(true).skip(self.scroll) {
+            let cw = width(grapheme);
             if col + cw > target {
                 break;
             }
@@ -328,10 +419,10 @@ impl Input {
         // Keep the cursor visible.
         let cursor_col = |from: usize, to: usize| -> usize {
             self.value
-                .chars()
+                .graphemes(true)
                 .skip(from)
                 .take(to.saturating_sub(from))
-                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                .map(width)
                 .sum()
         };
         if self.cursor < self.scroll {
@@ -340,7 +431,7 @@ impl Input {
         while cursor_col(self.scroll, self.cursor) >= w.max(1) {
             self.scroll += 1;
         }
-        let visible: String = self.value.chars().skip(self.scroll).collect();
+        let visible: String = self.value.graphemes(true).skip(self.scroll).collect();
         let line = if self.value.is_empty() && !placeholder.is_empty() {
             Line::from(Span::styled(
                 fit(placeholder, w),
@@ -489,6 +580,105 @@ impl ScrollTrack {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn typed_scalars_keep_a_grapheme_cursor() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for text in ["e\u{301}", "👩‍💻", "❤️", "🇨🇳"] {
+            for suffix in ["", "tail"] {
+                let mut input = super::Input::with_value(suffix);
+                input.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+                for c in text.chars() {
+                    input.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                    assert!(input.cursor <= input.len());
+                }
+                assert_eq!(input.cursor, 1);
+                input.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+                assert_eq!(input.cursor, 0);
+                input.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+                input.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+                assert_eq!(input.value(), suffix);
+                for c in text.chars() {
+                    input.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+                }
+                input.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+                assert_eq!(input.value(), suffix);
+            }
+        }
+    }
+
+    #[test]
+    fn fit_keeps_extended_graphemes_intact() {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        for text in ["e\u{301}clair", "👩‍💻tools", "❤️health", "🇨🇳中文"] {
+            for columns in 0..=super::width(text) {
+                let fitted = super::fit(text, columns);
+                assert!(super::width(&fitted) <= columns);
+                let source = text.graphemes(true).collect::<Vec<_>>();
+                let body = fitted.strip_suffix('…').unwrap_or(&fitted);
+                assert!(
+                    source
+                        .iter()
+                        .scan(String::new(), |prefix, grapheme| {
+                            prefix.push_str(grapheme);
+                            Some(prefix.clone())
+                        })
+                        .any(|prefix| prefix == body)
+                        || body.is_empty()
+                        || fitted == text,
+                    "text={text:?}, columns={columns}, fitted={fitted:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scrollbar_gutter_isolates_wide_content_from_vertical_track() {
+        use ratatui::widgets::{Block, Borders};
+
+        let theme = super::Theme::default();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(16, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let block = Block::default().borders(Borders::ALL);
+                let inner = block.inner(area);
+                let (content, track) = super::scrollbar_gutter(inner);
+                frame.render_widget(block, area);
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new("中文❤️中文❤️".repeat(6))
+                        .wrap(ratatui::widgets::Wrap { trim: false }),
+                    content,
+                );
+                super::render_vertical_scrollbar(frame, track, 24, 6, 0, theme.dim());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 1..7 {
+            assert_eq!(buffer[(15, y)].symbol(), "│");
+            assert!(matches!(buffer[(14, y)].symbol(), "║" | "█" | " "));
+        }
+    }
+
+    #[test]
+    fn clipped_blit_drops_partial_wide_symbols_at_both_edges() {
+        use ratatui::buffer::Buffer;
+
+        let area = Rect::new(0, 0, 8, 1);
+        let mut source = Buffer::empty(area);
+        source.set_string(0, 0, "a中文b", Style::default());
+        let mut destination = Buffer::empty(area);
+        destination.set_string(0, 0, "🙂🙂🙂🙂", Style::default());
+
+        super::blit_clipped(&source, &mut destination, Rect::new(2, 0, 3, 1));
+        assert_eq!(destination[(1, 0)].symbol(), " ");
+        assert_eq!(destination[(2, 0)].symbol(), " ");
+        assert_eq!(destination[(3, 0)].symbol(), "文");
+        assert_eq!(destination[(4, 0)].symbol(), " ");
+        assert_eq!(destination[(5, 0)].symbol(), " ");
+    }
+
+    #[test]
     fn variable_cards_keep_selection_visible_and_hit_the_right_item() {
         use super::*;
         let mut grid = CardGrid::default();
@@ -529,6 +719,25 @@ mod tests {
         );
         assert_eq!(terminal.backend().buffer()[(9, 0)].symbol(), " ");
     }
+    #[test]
+    fn input_edits_and_moves_by_extended_grapheme() {
+        let key =
+            |code| crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        for grapheme in ["e\u{301}", "👩‍💻", "❤️", "🇨🇳"] {
+            let mut input = super::Input::with_value(&format!("a{grapheme}z"));
+            input.handle_key(key(crossterm::event::KeyCode::Left));
+            input.handle_key(key(crossterm::event::KeyCode::Backspace));
+            assert_eq!(input.value(), "az", "backspace split {grapheme:?}");
+
+            let mut input = super::Input::with_value(&format!("a{grapheme}z"));
+            input.handle_key(key(crossterm::event::KeyCode::Home));
+            input.handle_key(key(crossterm::event::KeyCode::Right));
+            input.handle_key(key(crossterm::event::KeyCode::Delete));
+            assert_eq!(input.value(), "az", "delete split {grapheme:?}");
+            assert_eq!(input.cursor_byte(), 1);
+        }
+    }
+
     #[test]
     fn paste_is_atomic_and_respects_unicode_cursor() {
         let mut input = super::Input::with_value("a尾");

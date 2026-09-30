@@ -16,7 +16,7 @@ use crate::tui::components::{
 };
 use crate::tui::modal::Modal;
 use crate::tui::settings::LayoutScope;
-use crate::tui::widgets::{CardGrid, fit, width};
+use crate::tui::widgets::{CardGrid, blit_clipped, fit, render_vertical_scrollbar, width};
 use anyhow::Context;
 #[cfg(test)]
 use crossterm::event::KeyModifiers;
@@ -25,7 +25,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget};
+use ratatui::widgets::{Paragraph, Widget};
 use skills::config::UiLayout;
 use skills::ops::deploy::{self, PresetStatus, preset_status};
 use skills::preset::{Preset, TagCoverage, tag_coverages};
@@ -1315,11 +1315,7 @@ impl AgentsView {
                         ),
                         &mut buffer,
                     );
-                for y in clipped.y..clipped.bottom() {
-                    for x in clipped.x..clipped.right() {
-                        f.buffer_mut()[(x, y)] = buffer[(x, y)].clone();
-                    }
-                }
+                blit_clipped(&buffer, f.buffer_mut(), clipped);
                 self.destination_rects.push((clipped, i));
                 x += w + 1;
             }
@@ -1560,16 +1556,13 @@ impl AgentsView {
         if self.entries.grid_rows() > vis && inner.height > 0 {
             let track = Rect::new(inner.right().saturating_sub(1), inner.y, 1, inner.height);
             self.entries_track = track;
-            let mut sb = ScrollbarState::new(self.entries.grid_rows())
-                .position(selected.unwrap_or(0) / self.entries.cols())
-                .viewport_content_length(vis);
-            f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(None)
-                    .end_symbol(None)
-                    .style(th.dim()),
+            render_vertical_scrollbar(
+                f,
                 track,
-                &mut sb,
+                self.entries.grid_rows(),
+                vis,
+                selected.unwrap_or(0) / self.entries.cols(),
+                th.dim(),
             );
         }
         if self.filter_editing {

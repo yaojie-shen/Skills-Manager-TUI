@@ -14,13 +14,15 @@ use crate::tui::components::skill::{SkillDecoration, SkillPresentation, SkillRen
 use crate::tui::event::Task;
 use crate::tui::modal::Modal;
 use crate::tui::settings::LayoutScope;
-use crate::tui::widgets::{CardGrid, Input, ScrollTrack};
+use crate::tui::widgets::{
+    CardGrid, Input, ScrollTrack, render_vertical_scrollbar, scrollbar_gutter,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use skills::config::UiLayout;
 use skills::ops::edit;
 use skills::reconcile::{SkillRecord, SkillStatus};
@@ -1111,15 +1113,13 @@ impl SearchView {
                 height: inner.height,
             };
             self.list_track.set(track);
-            let mut sb = ScrollbarState::new(self.grid.grid_rows())
-                .position(selected.unwrap_or(0) / self.grid.cols())
-                .viewport_content_length(vis);
-            f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(None)
-                    .end_symbol(None),
+            render_vertical_scrollbar(
+                f,
                 track,
-                &mut sb,
+                self.grid.grid_rows(),
+                vis,
+                selected.unwrap_or(0) / self.grid.cols(),
+                th.dim(),
             );
         } else {
             self.list_track.clear();
@@ -1130,40 +1130,34 @@ impl SearchView {
         let th = &ctx.settings.theme;
         let block = th.block(" preview ", self.focus == Focus::Preview);
         let inner = block.inner(area);
+        let (content, track) = scrollbar_gutter(inner);
         f.render_widget(block, area);
-        self.preview_height = inner.height;
+        self.preview_height = content.height;
         let Some(r) = self.selected(ctx) else {
             f.render_widget(
                 Paragraph::new(Span::styled("select a skill to preview", th.dim())),
-                inner,
+                content,
             );
             return;
         };
         let terms: Vec<String> = self.selected_terms().to_vec();
-        let lines = preview_lines(r, ctx, &terms, inner.width as usize);
+        let lines = preview_lines(r, ctx, &terms, content.width as usize);
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        self.preview_lines = paragraph.line_count(inner.width);
+        self.preview_lines = paragraph.line_count(content.width);
         let max = self
             .preview_lines
-            .saturating_sub(inner.height as usize)
+            .saturating_sub(content.height as usize)
             .min(u16::MAX as usize) as u16;
         self.preview_scroll = self.preview_scroll.min(max);
-        f.render_widget(paragraph.scroll((self.preview_scroll, 0)), inner);
-        if self.preview_lines > inner.height as usize {
-            let mut sb =
-                ScrollbarState::new(self.preview_lines.saturating_sub(inner.height as usize))
-                    .position(self.preview_scroll as usize);
-            f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(None)
-                    .end_symbol(None),
-                area.inner(ratatui::layout::Margin {
-                    vertical: 1,
-                    horizontal: 0,
-                }),
-                &mut sb,
-            );
-        }
+        f.render_widget(paragraph.scroll((self.preview_scroll, 0)), content);
+        render_vertical_scrollbar(
+            f,
+            track,
+            self.preview_lines,
+            content.height as usize,
+            self.preview_scroll as usize,
+            th.dim(),
+        );
     }
 }
 
@@ -1781,6 +1775,56 @@ impl View for SearchView {
 mod tests {
     use super::*;
     use crate::tui::widgets::width;
+
+    #[test]
+    fn split_preview_keeps_cjk_inside_the_internal_scrollbar_gutter() {
+        let root = skills::ops::DownloadDir::new("cjk-split-preview-boundaries").unwrap();
+        let skill = root.path().join("cjk");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: cjk\ndescription: {}\n---\n{}",
+                "中文❤️".repeat(40),
+                "中文中文❤️中文中文\n".repeat(80)
+            ),
+        )
+        .unwrap();
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let mut session = crate::tui::settings::SessionSettings::default();
+        session.set_layout(LayoutScope::Library, UiLayout::List);
+        let settings = crate::tui::settings::RuntimeSettings::resolve(&ws.config, &session);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut view = SearchView::default();
+        view.refresh(&ctx);
+        view.focus = Focus::Preview;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        for scroll in [0, u16::MAX] {
+            view.preview_scroll = scroll;
+            terminal
+                .draw(|frame| view.draw(frame, frame.area(), &ctx))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rect = view.preview_rect;
+            let track_x = rect.right() - 2;
+            for y in rect.y + 1..rect.bottom() - 1 {
+                assert_eq!(buffer[(rect.right() - 1, y)].symbol(), "│");
+                assert!(matches!(buffer[(track_x, y)].symbol(), "║" | "█" | " "));
+            }
+            assert!(
+                view.preview_scroll
+                    <= view
+                        .preview_lines
+                        .saturating_sub(view.preview_height as usize) as u16
+            );
+        }
+    }
 
     #[test]
     fn host_decorations_are_separate_from_update_check_results() {

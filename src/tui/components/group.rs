@@ -2,13 +2,13 @@
 
 use crate::tui::app::Ctx;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{CardGrid, ScrollTrack, fit, pad, width};
+use crate::tui::widgets::{CardGrid, ScrollTrack, fit, pad, render_vertical_scrollbar, width};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::{
     Frame,
     layout::{Margin, Rect},
-    widgets::{BorderType, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::BorderType,
 };
 use skills::preset::Preset;
 
@@ -419,16 +419,13 @@ pub fn draw_track(
             height: inner.height,
         };
         track.set(rect);
-        let mut sb = ScrollbarState::new(grid.grid_rows())
-            .position(selected.unwrap_or(0) / grid.cols())
-            .viewport_content_length(vis);
-        f.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .end_symbol(None)
-                .style(th.dim()),
+        render_vertical_scrollbar(
+            f,
             rect,
-            &mut sb,
+            grid.grid_rows(),
+            vis,
+            selected.unwrap_or(0) / grid.cols(),
+            th.dim(),
         );
     } else {
         track.clear();
