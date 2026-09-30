@@ -12,7 +12,7 @@ use crate::tui::components::search_panel::{PanelLayout, PanelStyle, SearchEvent,
 use crate::tui::components::skill::{SkillPresentation, SkillRenderState};
 use crate::tui::components::{
     group,
-    layout::{cols_for, skill_frame},
+    layout::{cols_for, skill_frame, skill_list_separator},
 };
 use crate::tui::modal::Modal;
 use crate::tui::settings::LayoutScope;
@@ -997,11 +997,26 @@ impl AgentsView {
             if self.left.contains(at) {
                 self.set_focus(Focus::Entries);
                 self.filter_editing = false;
+                if self.entry_layout == UiLayout::List
+                    && self
+                        .entries
+                        .hit(m.column, m.row)
+                        .and_then(|index| self.entries.cell(index))
+                        .is_some_and(|cell| m.row >= cell.y + 4)
+                {
+                    return vec![];
+                }
                 if let Some((index, double)) = self.entries.click(m.column, m.row) {
                     if self.entries.cell(index).is_some_and(|cell| {
                         let marker_y = cell.y + u16::from(self.entry_layout == UiLayout::Grid);
+                        let marker_x = cell.x
+                            + if self.entry_layout == UiLayout::List {
+                                1
+                            } else {
+                                2
+                            };
                         m.row == marker_y
-                            && (cell.x + 2..cell.x + 2 + ctx.settings.layout.marker_width as u16)
+                            && (marker_x..marker_x + ctx.settings.layout.marker_width as u16)
                                 .contains(&m.column)
                     }) {
                         let rows = self.rows(ctx);
@@ -1421,7 +1436,7 @@ impl AgentsView {
         let preferred = ctx.settings.layout_for(LayoutScope::Agents);
         let preferred_height = match preferred {
             UiLayout::Grid => ctx.settings.layout.card_height,
-            UiLayout::List => 4,
+            UiLayout::List => 5,
             UiLayout::Compact => 1,
         };
         self.entry_layout = if inner.height < preferred_height {
@@ -1446,7 +1461,7 @@ impl AgentsView {
         }
         let cell_h = match self.entry_layout {
             UiLayout::Grid => ctx.settings.layout.card_height,
-            UiLayout::List => 4,
+            UiLayout::List => 5,
             UiLayout::Compact => 1,
         };
         // One column is held back for the scrollbar so the column count does not
@@ -1519,7 +1534,18 @@ impl AgentsView {
                 } else {
                     presentation.compact(ctx, cell.width as usize, on, &render_state)
                 };
-                f.render_widget(Paragraph::new(lines).style(style), cell);
+                let content = if self.entry_layout == UiLayout::List {
+                    Rect {
+                        height: cell.height.min(4),
+                        ..cell
+                    }
+                } else {
+                    cell
+                };
+                f.render_widget(Paragraph::new(lines).style(style), content);
+                if self.entry_layout == UiLayout::List {
+                    skill_list_separator(f, cell, th);
+                }
             }
         }
 
@@ -1890,6 +1916,11 @@ impl View for AgentsView {
             return None;
         }
         let index = self.entries.hit(x, y)?;
+        if self.entry_layout == UiLayout::List
+            && self.entries.cell(index).is_some_and(|cell| y >= cell.y + 4)
+        {
+            return None;
+        }
         let data = self.scoped.clone();
         let scoped = data.as_ref().map(|d| Ctx {
             ws: &d.0,
@@ -2319,6 +2350,19 @@ mod overflow_tests {
             assert_eq!(view.entry_layout, layout);
             if layout != UiLayout::Compact {
                 assert!(text.contains("Print documents"));
+            }
+            if layout == UiLayout::List {
+                let cell = view.entries.cell(0).unwrap();
+                assert_eq!(cell.height, 5);
+                assert!(line.contains("▸  ●"), "{line}");
+                let separator = (cell.x..cell.right())
+                    .map(|x| buf[(x, cell.y + 4)].symbol())
+                    .collect::<String>();
+                assert_eq!(separator.matches('─').count(), cell.width as usize - 4);
+                assert!(
+                    (cell.x..cell.right())
+                        .all(|x| { buf[(x, cell.y + 4)].bg != ctx.settings.theme.selection_bg })
+                );
             }
             view.set_focus(Focus::Entries);
             let actions = view

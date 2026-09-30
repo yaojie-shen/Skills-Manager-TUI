@@ -663,6 +663,40 @@ mod tests {
     }
 
     #[test]
+    fn list_selector_keeps_normal_and_multi_select_names_aligned() {
+        let root = skills::ops::DownloadDir::new("skill-list-selector-alignment").unwrap();
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let mut settings = RuntimeSettings::new(&ws.config);
+        settings.ui.icons = skills::config::Icons::Text;
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let skill = SkillPresentation::entry("sample", None, Some(&EntryState::Deployed));
+        let state = SkillRenderState::default();
+        let idle = skill.list(&ctx, 80, false, &state)[0].to_string();
+        let selected = skill.list(&ctx, 80, true, &state)[0].to_string();
+
+        assert!(idle.starts_with("   ✓  sample"), "{idle:?}");
+        assert!(selected.starts_with("▸  ✓  sample"), "{selected:?}");
+
+        let unchecked = SkillRenderState {
+            checked: Some(false),
+            ..Default::default()
+        };
+        let multi = skill.list(&ctx, 80, true, &unchecked)[0].to_string();
+        assert!(multi.starts_with("▸ [ ] sample"), "{multi:?}");
+        for line in [&idle, &selected, &multi] {
+            assert_eq!(
+                width(&line[..line.find("sample").unwrap()]),
+                2 + ctx.settings.layout.marker_width
+            );
+        }
+    }
+
+    #[test]
     fn all_densities_share_source_tag_and_description_styles() {
         let root = skills::ops::DownloadDir::new("skill-presentation-styles").unwrap();
         let mut ws = skills::Workspace::open(root.path()).unwrap();

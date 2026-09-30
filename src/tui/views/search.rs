@@ -8,7 +8,7 @@ use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::components::group::Kind;
 use crate::tui::components::layout::split_panes;
-use crate::tui::components::layout::{cols_for, skill_frame};
+use crate::tui::components::layout::{cols_for, skill_frame, skill_list_separator};
 use crate::tui::components::search_panel::{PanelLayout, PanelStyle, SearchEvent, SearchPanel};
 use crate::tui::components::skill::{SkillDecoration, SkillPresentation, SkillRenderState};
 use crate::tui::event::Task;
@@ -984,7 +984,7 @@ impl SearchView {
         // something to say.
         let cell_h = match layout {
             UiLayout::Grid => ctx.settings.layout.card_height,
-            UiLayout::List => 4,
+            UiLayout::List => 5,
             UiLayout::Compact if searching && !short => 2,
             UiLayout::Compact => 1,
         };
@@ -1071,7 +1071,12 @@ impl SearchView {
                     on,
                     &render_state,
                 );
-                f.render_widget(Paragraph::new(lines).style(style), cell);
+                let content = Rect {
+                    height: cell.height.min(4),
+                    ..cell
+                };
+                f.render_widget(Paragraph::new(lines).style(style), content);
+                skill_list_separator(f, cell, th);
             } else {
                 let style = if on {
                     if self.focus == Focus::List && self.choice_focus == ChoiceFocus::List {
@@ -1634,13 +1639,22 @@ impl View for SearchView {
                 self.focus = Focus::Preview;
             } else if self.list_rect.contains(at) {
                 self.focus = Focus::List;
+                if self.rendered_layout == UiLayout::List
+                    && self
+                        .grid
+                        .hit(m.column, m.row)
+                        .and_then(|index| self.grid.cell(index))
+                        .is_some_and(|cell| m.row >= cell.y + 4)
+                {
+                    return vec![];
+                }
                 if let Some((index, double)) = self.grid.click(m.column, m.row) {
                     self.preview_scroll = 0;
                     let marker = self.grid.cell(index).is_some_and(|cell| {
-                        let (x, y) = if self.rendered_layout == UiLayout::Grid {
-                            (cell.x + 2, cell.y + 1)
-                        } else {
-                            (cell.x + 2, cell.y)
+                        let (x, y) = match self.rendered_layout {
+                            UiLayout::Grid => (cell.x + 2, cell.y + 1),
+                            UiLayout::List => (cell.x + 1, cell.y),
+                            UiLayout::Compact => (cell.x + 2, cell.y),
                         };
                         m.row == y
                             && m.column >= x
@@ -2253,8 +2267,29 @@ mod tests {
             .draw(|f| view.draw(f, Rect::new(0, 1, 120, 38), &ctx))
             .unwrap();
         assert_eq!(view.rendered_layout, UiLayout::List);
-        assert_eq!(view.grid.cell(3).unwrap().height, 4);
+        let cell = view.grid.cell(3).unwrap();
+        assert_eq!(cell.height, 5);
         assert_eq!(view.selected(&ctx).unwrap().key, selected);
+        let buffer = terminal.backend().buffer();
+        let title = (cell.y..cell.y + 4)
+            .find_map(|y| {
+                let line = (cell.x..cell.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>();
+                line.contains("printer-03").then_some(line)
+            })
+            .unwrap();
+        assert!(title.contains("▸  ●"), "{title:?}");
+        let separator = (cell.x..cell.right())
+            .map(|x| buffer[(x, cell.y + 4)].symbol())
+            .collect::<String>();
+        assert_eq!(separator.chars().take(2).collect::<String>(), "  ");
+        assert_eq!(separator.chars().rev().take(2).collect::<String>(), "  ");
+        assert_eq!(separator.matches('─').count(), cell.width as usize - 4);
+        assert!(
+            (cell.x..cell.right())
+                .all(|x| { buffer[(x, cell.y + 4)].bg != ctx.settings.theme.selection_bg })
+        );
 
         session.set_layout(LayoutScope::Library, UiLayout::Grid);
         let settings = crate::tui::settings::RuntimeSettings::resolve(&ws.config, &session);
