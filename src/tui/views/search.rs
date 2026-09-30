@@ -1756,7 +1756,7 @@ impl View for SearchView {
                 ("m", "multi-select"),
                 ("a", "actions"),
                 ("/", "search"),
-                ("v/V", "layout"),
+                ("v", "layout"),
             ],
             Focus::Preview => &[
                 ("j/k", "scroll"),
@@ -2135,14 +2135,19 @@ mod tests {
         assert_eq!(panel.layout(&ctx), UiLayout::List);
         assert_eq!(SearchView::default().layout(&ctx), UiLayout::Compact);
         panel.focus_list();
-        let actions = panel.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE), &ctx);
-        assert!(matches!(
-            actions.as_slice(),
-            [Action::SetLayout {
-                scope: LayoutScope::Tags,
-                layout: UiLayout::Compact
-            }]
-        ));
+        assert!(panel.hints().contains(&("v", "layout")));
+        assert!(!panel.hints().iter().any(|(key, _)| key.contains('V')));
+        for key in ['v', 'V'] {
+            let actions =
+                panel.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE), &ctx);
+            assert!(matches!(
+                actions.as_slice(),
+                [Action::SetLayout {
+                    scope: LayoutScope::Tags,
+                    layout: UiLayout::Compact
+                }]
+            ));
+        }
         // The supplied snapshot is authoritative until App resolves the action.
         assert_eq!(panel.layout(&ctx), UiLayout::List);
         session.set_layout(LayoutScope::Tags, UiLayout::Compact);
