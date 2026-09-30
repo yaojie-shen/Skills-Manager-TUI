@@ -109,6 +109,28 @@ impl Default for InteractionSettings {
     }
 }
 
+/// Resolved automatic-sync waits, shared by UI scheduling and sync policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncSettings {
+    pub quiet_window: Duration,
+    pub tui_idle_window: Duration,
+}
+
+impl From<skills::config::SyncConfig> for SyncSettings {
+    fn from(config: skills::config::SyncConfig) -> Self {
+        Self {
+            quiet_window: Duration::from_secs(config.quiet_seconds),
+            tui_idle_window: Duration::from_secs(config.tui_idle_seconds),
+        }
+    }
+}
+
+impl Default for SyncSettings {
+    fn default() -> Self {
+        skills::config::SyncConfig::default().into()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeSettings {
     pub theme: Theme,
@@ -117,6 +139,7 @@ pub struct RuntimeSettings {
     pub tags_enabled: bool,
     pub layout: LayoutMetrics,
     pub interaction: InteractionSettings,
+    pub sync: SyncSettings,
     layouts: [UiLayout; 5],
 }
 
@@ -139,6 +162,7 @@ impl RuntimeSettings {
             tags_enabled: config.tags_enabled,
             layout: LayoutMetrics::default(),
             interaction: InteractionSettings::default(),
+            sync: config.sync.into(),
             layouts: session
                 .layouts
                 .map(|layout| layout.unwrap_or(config.ui.layout)),
@@ -166,6 +190,27 @@ impl Default for RuntimeSettings {
 mod tests {
     use super::*;
     use skills::config::UiConfig;
+
+    #[test]
+    fn sync_waits_resolve_and_reload_from_config() {
+        let mut config = Config::default();
+        let session = SessionSettings::default();
+        let mut settings = RuntimeSettings::resolve(&config, &session);
+        assert_eq!(settings.sync.quiet_window, Duration::from_secs(120));
+        assert_eq!(settings.sync.tui_idle_window, Duration::from_secs(10));
+
+        config.sync.quiet_seconds = 45;
+        config.sync.tui_idle_seconds = 3;
+        settings.reload(&config, &session);
+        assert_eq!(settings.sync.quiet_window, Duration::from_secs(45));
+        assert_eq!(settings.sync.tui_idle_window, Duration::from_secs(3));
+
+        config.sync.quiet_seconds = 0;
+        config.sync.tui_idle_seconds = 0;
+        settings.reload(&config, &session);
+        assert_eq!(settings.sync.quiet_window, Duration::ZERO);
+        assert_eq!(settings.sync.tui_idle_window, Duration::ZERO);
+    }
 
     #[test]
     fn file_values_apply_to_every_scope_without_session_overrides() {

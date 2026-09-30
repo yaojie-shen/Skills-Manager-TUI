@@ -28,6 +28,25 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub sync: SyncConfig,
+}
+
+/// Waiting policy for automatic root sync in the TUI. Zero disables that wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SyncConfig {
+    pub quiet_seconds: u64,
+    pub tui_idle_seconds: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            quiet_seconds: 120,
+            tui_idle_seconds: 10,
+        }
+    }
 }
 
 /// Skill result density. The file supplies the startup default; page-scoped
@@ -282,12 +301,13 @@ impl Default for Config {
             tags_enabled: true,
             search: SearchConfig::default(),
             ui: UiConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 }
 
 impl Config {
-    /// Ignore the retired sync section only at the file boundary. It is not
+    /// Ignore the retired deploy section only at the file boundary. It is not
     /// represented in runtime configuration, and all other fields stay strict.
     fn parse(text: &str) -> Result<Self> {
         let mut doc: DocumentMut = text.parse()?;
@@ -521,5 +541,86 @@ impl Config {
 
     pub fn agent_keys(&self) -> Vec<String> {
         self.agents.iter().map(|a| a.key.clone()).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_waits_default_and_accept_nonnegative_seconds() {
+        assert_eq!(Config::parse("").unwrap().sync, SyncConfig::default());
+        assert_eq!(
+            Config::parse("[sync]\nquiet_seconds = 45").unwrap().sync,
+            SyncConfig {
+                quiet_seconds: 45,
+                tui_idle_seconds: 10,
+            }
+        );
+        let configured = Config::parse("[sync]\nquiet_seconds = 0\ntui_idle_seconds = 30").unwrap();
+        assert_eq!(configured.sync.quiet_seconds, 0);
+        assert_eq!(configured.sync.tui_idle_seconds, 30);
+        assert_eq!(
+            Config::parse("[sync]\ntui_idle_seconds = 0")
+                .unwrap()
+                .sync
+                .tui_idle_seconds,
+            0
+        );
+        for invalid in [
+            "quiet_seconds = -1",
+            "tui_idle_seconds = -1",
+            "quiet_seconds = 1.5",
+            "tui_idle_seconds = 'ten'",
+            "unknown_wait = 5",
+        ] {
+            assert!(Config::parse(&format!("[sync]\n{invalid}")).is_err());
+        }
+        let tmp = crate::ops::DownloadDir::new("sync-config-roundtrip").unwrap();
+        configured.save(tmp.path()).unwrap();
+        assert_eq!(Config::load(tmp.path()).unwrap().sync, configured.sync);
+    }
+
+    #[test]
+    fn local_config_edits_preserve_sync_values_comments_and_order() {
+        let tmp = crate::ops::DownloadDir::new("sync-config-preserve").unwrap();
+        let path = Config::path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let sync_section = "[sync] # automatic backup waits\nquiet_seconds = 42 # content\ntui_idle_seconds = 7 # activity\n\n";
+        std::fs::write(
+            &path,
+            format!("[[agents]]\nkey = 'existing'\nskills_dir = '~/.existing/skills'\n\n{sync_section}[ui]\nlayout = 'list'\n"),
+        )
+        .unwrap();
+        Config::edit_tags(tmp.path(), |tags| {
+            tags.push(TagConfig {
+                name: "example".into(),
+                skills: vec![],
+                color: None,
+                description: None,
+            });
+        })
+        .unwrap();
+        Config::add_agent(
+            tmp.path(),
+            &AgentConfig {
+                key: "example".into(),
+                name: "Example".into(),
+                skills_dir: "~/.example/skills".into(),
+            },
+            false,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains(sync_section));
+        assert!(text.find("[sync]").unwrap() < text.find("[ui]").unwrap());
+        assert_eq!(
+            Config::load(tmp.path()).unwrap().sync,
+            SyncConfig {
+                quiet_seconds: 42,
+                tui_idle_seconds: 7,
+            }
+        );
     }
 }
