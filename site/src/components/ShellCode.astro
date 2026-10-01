@@ -1,0 +1,21 @@
+---
+interface Props { code: string; output?: string; prompt?: boolean }
+const { code, output, prompt = true } = Astro.props;
+const escape = (text: string) => text.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const highlight = (line: string) => {
+  const tokens = line.match(/"[^"\n]*"|'[^'\n]*'|\|\||&&|\||\s+|[^\s|]+/g) ?? [];
+  let command = true;
+  return tokens.map(token => {
+    const safe = escape(token);
+    if (/^\s+$/.test(token)) return safe;
+    if (token === '|' || token === '||' || token === '&&') { command = true; return `<span class="shell-operator">${safe}</span>`; }
+    if (command) { command = false; return `<span class="shell-command">${safe}</span>`; }
+    if (token.startsWith('-')) return `<span class="shell-flag">${safe}</span>`;
+    if (/^['"]/.test(token)) return `<span class="shell-string">${safe}</span>`;
+    if (/^[A-Z_][A-Z0-9_]*=/.test(token) || token.includes('$')) return `<span class="shell-variable">${safe}</span>`;
+    if (/^(tag|preset|agent|repo|status|source):/.test(token)) return `<span class="shell-filter">${safe}</span>`;
+    return safe;
+  }).join('');
+};
+---
+<pre class:list={['shell-block', output && 'has-output']}><code>{code.split('\n').map((line,index) => <>{prompt && <span class="shell-prompt" aria-hidden="true">&gt; </span>}<span set:html={highlight(line)}/>{index < code.split('\n').length-1 && '\n'}</>)}</code>{output && <samp>{output}</samp>}</pre>

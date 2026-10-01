@@ -1,0 +1,92 @@
+---
+title: "健康检查与修复"
+description: "解读健康状态，并修复选定的部署链接。"
+---
+
+import DocsTuiCapture from '../../../../components/DocsTuiCapture.astro';
+
+## 检查状态
+
+```sh
+skills status
+skills agents status
+skills agents status claude
+```
+
+`skills status`（也可写为 `skills rescan`）会检查 Library 内容、元数据和 Agent 目录。它不会修复报告的问题，但加载旧版预设数据时，可能先创建备份，再迁移为当前格式。
+
+| 状态 | 处理方式 |
+| --- | --- |
+| `local`、`repository` | 无需处理；Library 条目正常。 |
+| `modified` | 审阅差异，再接受或更新。 |
+| `missing-baseline`、`missing-source` | 检查记录的来源和元数据。 |
+| `missing`、`renamed?` | 确认内容是否被移动或删除。 |
+| `invalid`、`corrupt-meta` | 修复报告中的 `SKILL.md` 或 TOML 错误。 |
+| `broken` | 修复或移除 Agent 链接。 |
+| `shadow` | 替换前比较 Agent 副本与 Library 技能。 |
+| `foreign`、`agent-only` | 除非准备接管或移除，否则保持不动。 |
+| Agent 目录缺失或只读 | 检查配置路径。“只读”是针对 Library 重叠、符号链接路径或非目录目标的安全分类，不是操作系统权限测试。 |
+
+部署状态与 Library 内容健康状态分别报告。
+
+<DocsTuiCapture frame="health" caption="Health 页面区分 Library 问题、部署异常和可用操作。" />
+
+## 修复受管理链接
+
+先查看预览：
+
+```sh
+skills repair
+```
+
+Repair 处理单技能断链和过期链接名。声明名只有一个匹配项时，它会成为修复候选；否则需要明确指定映射：
+
+```sh
+skills repair --deployment 'claude/review=repos/toolbox/review'
+skills repair --deployment 'claude/review=repos/toolbox/review' --apply
+```
+
+在这个示例中，将 `claude/review` 替换为报告中的 Agent 链接，并将 `repos/toolbox/review` 替换为对应的 Library key。执行修复时，程序会重新验证来源和目标，跳过已经失效的计划项，并报告无法修改的路径。Repair 不会恢复缺失的技能内容，也不会重写来源元数据或重命名 Library 条目。
+
+修复后再次检查：
+
+```sh
+skills status
+skills agents status claude
+```
+
+修复成功的条目不应再显示为 `broken`。
+
+## 清理 Agent 条目
+
+根据报告的状态选择操作，并先预览：
+
+**断链**
+
+```sh
+skills agents clean claude --dry-run
+```
+
+**外部链接**
+
+```sh
+skills agents remove-link claude external-skill --dry-run
+skills agents adopt-link claude external-skill --dry-run
+```
+
+**Agent-only 或 shadow 副本**
+
+```sh
+skills agents relink claude hello-skill --dry-run
+```
+
+执行所选操作时移除 `--dry-run`，并添加 `--yes`。
+
+| 命令 | 结果 |
+| --- | --- |
+| `clean` | 移除断链；不指定技能时，检查该 Agent 的全部断链。 |
+| `remove-link` | 移除外部符号链接，但不删除它的外部目标。 |
+| `adopt-link` | 将有效的外部技能复制到 Library，并重新指向链接；外部目标保留。 |
+| `relink` | 验证不会丢失不同内容后，将匹配的 Agent 副本替换为 Library 链接。 |
+
+Repair、cleanup 和 relink 会修改部署。Adopt-link 会修改 Library，并可能触发[根目录备份](../sync/)。接管或替换独立内容前，请先备份。

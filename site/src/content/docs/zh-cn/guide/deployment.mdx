@@ -1,0 +1,87 @@
+---
+title: "Agent 部署"
+description: "预览并管理 Library 到 Agent 目录的链接。"
+---
+
+import DocsTuiCapture from '../../../../components/DocsTuiCapture.astro';
+
+## 查看目标
+
+```sh
+skills agents catalog
+skills agents list
+```
+
+`skills agents catalog` 列出内置 Agent 路径；`skills agents list` 显示当前 Library 已配置的目标。默认配置包含 Claude 和 Codex。Agent 条目描述目标目录，并不表示对应的 Agent 已安装。
+
+需要时可注册自定义目标：
+
+```sh
+skills agents add cursor
+skills agents add custom --dir /path/to/skills
+```
+
+## 预览并部署
+
+部署命令使用 `skills list` 返回的 Library key。
+
+```sh
+skills deploy hello-skill --agent claude --dry-run
+```
+
+预览只报告计划创建的链接，不修改目标。以下输出表示计划没有冲突。如果已有其他 Library 技能使用相同的目标名称，dry run 会改为报告冲突：
+
+```text
+link   claude/hello-skill -> /path/to/library/hello-skill
+dry run: 1 change(s) not applied
+```
+
+执行部署：
+
+```sh
+skills deploy hello-skill --agent claude
+```
+
+```text
+link   claude/hello-skill -> /path/to/library/hello-skill
+applied 1 change(s)
+```
+
+部署时至少指定一个 `--agent`；也可以用 `--all-agents` 选择所有已配置的 Agent。尚未配置的 catalog 条目不会包含在内。
+
+删除受管理的链接，同时保留 Library 技能：
+
+```sh
+skills undeploy hello-skill --agent claude --dry-run
+skills undeploy hello-skill --agent claude
+```
+
+## `--local` 与 `--project` 如何改变作用域
+
+| 启动方式 | Library | 项目作用域 |
+| --- | --- | --- |
+| `skills` | 显式 root、环境变量或指针文件 | 当前目录提供部署上下文。 |
+| `skills --project /path/to/project` | 中心 Library | TUI 从指定项目发现作用域。 |
+| `skills --local` | 中心 Library | TUI 从当前目录发现作用域。 |
+| `skills --project /path/to/project list` | `<project>/.agents/skills` | CLI 使用独立的项目 store。 |
+| `skills --local init` | `<cwd>/.agents/skills` | CLI 创建该项目 store。 |
+
+### 默认项目路径
+
+使用 CLI 项目 store 时，Claude 默认部署到 `<project>/.claude/skills`；Codex 的默认目录 `.agents/skills` 就是 store 本身。
+
+### 限制
+
+项目路径即使经过已有符号链接的上级目录，也不得超出项目范围。`--root` 不能与 `--local` 或 `--project` 同时使用。
+
+<DocsTuiCapture frame="agents" caption="Agents 页面按 Agent 和作用域显示部署目标。" />
+
+## 链接直接引用 Library 内容
+
+部署名称取自 `SKILL.md` frontmatter，而不是 Library 目录名。如果两个技能声明了同一个名称，同一 Agent 目标中不能同时存在两者。预览会报告冲突；`--same-name replace` 只授权替换这项声明名冲突。
+
+部署会创建指向 Library 的实时链接。通过链接编辑会修改 Library 中的副本，Library 更新也会立即反映到已链接的 Agent。部署可以创建缺失的 Agent 目录。如果目标与 Library 重叠、路径经过符号链接解析，或目标不是目录，程序会将其归类为只读并跳过。这里的“只读”不检查操作系统写权限位。断链会一直保留，直到你明确清理或修复。
+
+在 TUI 的 Agents 页面中，依次选择 Agent、作用域和部署组。激活尚未部署或只部署了部分成员的组，会部署其中所有成员。激活已全部部署的组，则会取消所有成员的部署。`0/0` 不执行操作，展开 `+N` 只显示隐藏的组。
+
+只改变 Agent 部署状态不会触发根目录 Git 备份。[健康检查与修复](../health/)说明断链、副本遮挡和外部条目；[根目录备份与同步](../sync/)说明 Library 写入策略。

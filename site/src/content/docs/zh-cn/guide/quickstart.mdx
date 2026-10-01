@@ -1,0 +1,84 @@
+---
+title: "快速开始"
+description: "创建 Library，添加一个技能，再部署到 Agent。"
+---
+
+import DocsTuiCapture from '../../../../components/DocsTuiCapture.astro';
+
+## 1. 创建 Library
+
+```sh
+mkdir -p "$HOME/skills-library"
+export SKILLS_HOME="$HOME/skills-library"
+skills init
+```
+
+`init` 会在指定目录中创建 `.skills-meta/config.toml`。根目录必须已经存在，已有配置不会被覆盖。环境变量只在当前 shell 中生效；如需保留该设置，可将其写入 shell 配置，或将路径保存到 `~/.config/skills-tui/root`。
+
+根目录按 `--root DIR`、`SKILLS_HOME`、指针文件的顺序查找。[配置与路径](../configuration/)介绍全局路径和项目路径。
+
+## 2. 添加技能
+
+直接在 Library 中创建 `hello-skill`：
+
+```sh
+mkdir -p "$SKILLS_HOME/hello-skill"
+cat > "$SKILLS_HOME/hello-skill/SKILL.md" <<'EOF'
+---
+name: hello-skill
+description: 简要说明当前项目的用途。
+---
+阅读项目文档，概括项目目标及主要入口。
+EOF
+```
+
+确认 Library 已识别该技能：
+
+```sh
+skills list
+skills show hello-skill
+```
+
+`skills list` 会包含类似下面的一行：
+
+```text
+hello-skill  local                              简要说明当前项目的用途。
+```
+
+`skills show hello-skill` 会输出该技能的元数据和内容。本地技能不需要额外的元数据记录。声明名称必须为 1 至 64 个字符，可使用 ASCII 小写字母、数字和单个连字符。连字符不能位于首尾，也不能连续出现。
+
+## 3. 部署技能
+
+查看已配置的目标：
+
+```sh
+skills agents list
+```
+
+先预览链接，再执行部署：
+
+```sh
+skills deploy hello-skill --agent claude --dry-run
+skills deploy hello-skill --agent claude
+skills agents status claude
+```
+
+预览只报告目标位置，不修改文件。部署会在 Claude 配置的技能目录中创建 `hello-skill` 符号链接，但不会启动 Claude 或执行技能。Agent 条目只定义目标目录，不表示对应的 Agent 已安装。
+
+删除受管理的链接，同时保留 Library 中的技能：
+
+```sh
+skills undeploy hello-skill --agent claude
+```
+
+## 4. 打开 TUI
+
+```sh
+skills
+```
+
+<DocsTuiCapture frame="library" caption="Library 页面显示可用技能和当前选中项的详情。" />
+
+TUI 默认打开 Library。`Tab` 在 Library、Tags、Presets、Agents、Repos 和 Health 之间切换。焦点不在文本输入框时，`:` 打开命令面板，`a` 打开当前项目的操作菜单，`?` 打开帮助。`Esc` 逐级返回；位于顶部标签栏时，它会退出 TUI。
+
+根目录 Git 备份只有配置后才会启用。导入远程内容前，可运行 `skills install owner/repo --list` 检查可用技能；完整流程见 [Library 与来源](../library/)。

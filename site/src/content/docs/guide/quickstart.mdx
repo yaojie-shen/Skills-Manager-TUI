@@ -1,0 +1,84 @@
+---
+title: "Quick start"
+description: "Create a Library, add one skill, and deploy it to an Agent."
+---
+
+import DocsTuiCapture from '../../../components/DocsTuiCapture.astro';
+
+## 1. Create the Library
+
+```sh
+mkdir -p "$HOME/skills-library"
+export SKILLS_HOME="$HOME/skills-library"
+skills init
+```
+
+`init` creates `.skills-meta/config.toml` in the selected directory. The root directory must already exist, and `init` leaves an existing configuration unchanged. The export lasts for the current shell. To keep the setting, add it to your shell configuration or store the path in `~/.config/skills-tui/root`.
+
+Root lookup order is `--root DIR`, `SKILLS_HOME`, then the pointer file. [Configuration](../configuration/) covers global and project paths.
+
+## 2. Add a skill
+
+Create `hello-skill` directly in the Library:
+
+```sh
+mkdir -p "$SKILLS_HOME/hello-skill"
+cat > "$SKILLS_HOME/hello-skill/SKILL.md" <<'EOF'
+---
+name: hello-skill
+description: Explain the current project in a short summary.
+---
+Read the project documentation and summarize its purpose and entry points.
+EOF
+```
+
+Confirm that the Library recognizes it:
+
+```sh
+skills list
+skills show hello-skill
+```
+
+`skills list` includes a row like this:
+
+```text
+hello-skill  local                              Explain the current project in a short summary.
+```
+
+`skills show hello-skill` prints the skill's metadata and content. Local skills need no separate metadata record. A declared name must be 1 to 64 characters long and may contain lowercase ASCII letters, digits, and single hyphens. Hyphens cannot appear at either end or repeat consecutively.
+
+## 3. Deploy it
+
+Inspect the configured targets:
+
+```sh
+skills agents list
+```
+
+Preview the link, then apply it:
+
+```sh
+skills deploy hello-skill --agent claude --dry-run
+skills deploy hello-skill --agent claude
+skills agents status claude
+```
+
+The preview reports the destination without changing any files. Deployment creates a `hello-skill` symlink in Claude's configured skills directory. It does not launch Claude or run the skill. An Agent entry only defines a target directory; it does not confirm that the Agent is installed.
+
+Remove the managed link without deleting the Library copy:
+
+```sh
+skills undeploy hello-skill --agent claude
+```
+
+## 4. Open the TUI
+
+```sh
+skills
+```
+
+<DocsTuiCapture frame="library" caption="The Library view shows available skills and details for the current selection." />
+
+The TUI opens on Library. `Tab` moves between Library, Tags, Presets, Agents, Repos, and Health. When focus is outside a text input, `:` opens the command palette, `a` opens actions for the selected item, and `?` opens help. `Esc` moves back one level. From the tab strip, it exits the TUI.
+
+Root Git backup remains off until configured. To import remote content, inspect it first with `skills install owner/repo --list`; [Library and sources](../library/) covers the full flow.

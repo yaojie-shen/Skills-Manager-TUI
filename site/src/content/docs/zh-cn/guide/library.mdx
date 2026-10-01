@@ -1,0 +1,78 @@
+---
+title: "Library 与来源"
+description: "检查来源、选择要安装的技能，并了解技能的存储方式。"
+---
+
+import DocsTuiCapture from '../../../../components/DocsTuiCapture.astro';
+
+## 1. 检查来源
+
+```sh
+skills install owner/repo --list
+```
+
+`--list` 列出远程技能，但不安装。如果找到多个技能，需要明确选择要安装的项目。
+
+| 来源形式 | 说明 |
+| --- | --- |
+| `owner/repo[/subpath]` | GitHub 简写。 |
+| GitHub tree URL | 保留指定分支和路径。 |
+| Git URL | 使用 `--branch` 选择分支或标签。 |
+| 归档 URL | 首次安装需要来源名称；内部路径会保留。 |
+| 本地路径 | 直接复制内容；远程发现参数不适用。 |
+
+## 2. 选择并安装
+
+```sh
+skills install owner/repo --select skills/review --repo-alias toolbox
+skills repos
+skills list repo:toolbox
+```
+
+多次使用 `--select PATH` 可选择指定路径。`--select .` 选择来源根目录。`--all` 安装目录树各分支中有效的最外层技能，不会安装位于这些技能内部的嵌套技能。
+
+<DocsTuiCapture frame="repos" caption="Repos 页面显示每个来源及其已安装技能。" />
+
+## 安装后的名称
+
+上面的安装命令使用 `--repo-alias toolbox`，因此 Skills Manager 会把所选技能存放在 `repos/toolbox/` 下。安装完成后，输出中会显示后续命令要使用的完整 Library key。
+
+| 名称 | 用途 |
+| --- | --- |
+| 来源显示名 | 在界面中标记来源。通过 `--source-name NAME` 设置；Git 来源默认使用 `owner/repo`。新的归档 URL 必须提供名称。 |
+| Library key | 标识 Library 中存储的技能，由 `--repo-alias` 指定的存储别名和技能的本地存储名组成。 |
+| 技能声明名 | 来自 `SKILL.md` 的 `name` 字段，并用作 Agent 链接名。它可以与本地存储名不同。 |
+
+只选择一个技能时，`--name local-name` 设置本地存储名。选择多个技能时，可重复使用 `--local-name upstream/path=local-name`。这些选项不会修改 `SKILL.md` 中声明的名称，因此重复声明仍可能造成[部署冲突](../deployment/)。
+
+## 重命名来源或技能
+
+```sh
+skills repos rename toolbox "Team toolkit"
+skills rename repos/toolbox/review repos/toolbox/review-local
+```
+
+| 命令 | 结果 |
+| --- | --- |
+| `repos rename` | 只修改来源显示名。 |
+| `rename` | 移动 Library 技能，并更新元数据和受管理链接；frontmatter `name` 不变。 |
+
+Library key 变化后，检查预设成员。
+
+## 本地内容与元数据
+
+```sh
+skills install ./path/to/skill --name my-skill
+skills adopt ./path/to/skill
+```
+
+`install` 复制本地内容。`adopt` 将外部目录移入 Library。如果来源目录直接位于已配置的 Agent 目录中，原位置会变成链接。采用独立内容前先备份。
+
+远程元数据保存在 `.skills-meta/repos/<alias>.toml`；独立记录可能使用 `.skills-meta/repos/.root.toml`。记录包括来源、安装名称、revision、基线和可选备注。本地技能不保留这些单技能记录。
+
+```sh
+skills set-source KEY REFERENCE
+skills remove KEY --yes
+```
+
+`skills set-source` 只修改记录的来源，不替换内容，也不接受基线。`skills remove` 删除受管理的部署、内容和元数据。`--keep-meta` 保留元数据，但仍会删除内容。只需移除 Agent 链接时，使用[取消部署](../deployment/)保留技能。

@@ -1,0 +1,92 @@
+---
+title: "Health and repair"
+description: "Read health states and repair selected deployment links."
+---
+
+import DocsTuiCapture from '../../../components/DocsTuiCapture.astro';
+
+## Check health
+
+```sh
+skills status
+skills agents status
+skills agents status claude
+```
+
+`skills status` (also available as `skills rescan`) checks Library content, metadata, and Agent directories. It reports problems without repairing them. Loading legacy preset data can still create a backup and migrate the data to the current format.
+
+| State | Action |
+| --- | --- |
+| `local`, `repository` | No action; the Library entry is healthy. |
+| `modified` | Review the difference, then accept or update it. |
+| `missing-baseline`, `missing-source` | Check the recorded source and metadata. |
+| `missing`, `renamed?` | Confirm whether the content moved or was removed. |
+| `invalid`, `corrupt-meta` | Fix the reported `SKILL.md` or TOML error. |
+| `broken` | Repair or remove the Agent link. |
+| `shadow` | Compare the Agent copy with the Library skill before replacing it. |
+| `foreign`, `agent-only` | Leave it alone unless you intend to adopt or remove it. |
+| Missing or read-only Agent directory | Check the configured path. “Read-only” is a safety classification for Library overlap, a symlinked path, or a non-directory; it is not an operating-system permission test. |
+
+Deployment state and Library content health are reported separately.
+
+<DocsTuiCapture frame="health" caption="Health separates Library problems, deployment issues, and available actions." />
+
+## Repair a managed link
+
+Start with a preview:
+
+```sh
+skills repair
+```
+
+Repair covers broken per-skill links and outdated link names. A unique declared-name match becomes the repair candidate; otherwise, specify the mapping:
+
+```sh
+skills repair --deployment 'claude/review=repos/toolbox/review'
+skills repair --deployment 'claude/review=repos/toolbox/review' --apply
+```
+
+In this example, replace `claude/review` with the Agent link from the report and `repos/toolbox/review` with its Library key. When applied, the repair revalidates the source and destination. It skips stale plan entries and reports paths it cannot change. Repair does not restore missing skill content, rewrite source metadata, or rename Library entries.
+
+Run the checks again after applying repairs:
+
+```sh
+skills status
+skills agents status claude
+```
+
+The repaired entry should no longer appear as `broken`.
+
+## Clean up Agent entries
+
+Choose the operation that matches the reported state. Preview it before applying it:
+
+**Broken links**
+
+```sh
+skills agents clean claude --dry-run
+```
+
+**Foreign links**
+
+```sh
+skills agents remove-link claude external-skill --dry-run
+skills agents adopt-link claude external-skill --dry-run
+```
+
+**Agent-only or shadow copies**
+
+```sh
+skills agents relink claude hello-skill --dry-run
+```
+
+Remove `--dry-run` and add `--yes` to apply the selected operation.
+
+| Command | Result |
+| --- | --- |
+| `clean` | Removes broken links; without skill names, checks every broken entry for that Agent. |
+| `remove-link` | Removes a foreign symlink without deleting its external target. |
+| `adopt-link` | Copies a valid foreign skill into the Library and repoints the link; the external target remains. |
+| `relink` | Replaces a matching Agent copy with a Library link after validating that no differing content will be lost. |
+
+Repair, cleanup, and relink change deployments. Adopt-link changes Library content and can trigger a [root backup](../sync/). Back up independent content before you adopt or replace it.

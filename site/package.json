@@ -1,0 +1,29 @@
+{
+  "name": "skills-manager-site",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "fonts": "node scripts/fetch-fonts.mjs",
+    "predev": "npm run fonts",
+    "dev": "astro dev",
+    "prebuild": "npm run fonts",
+    "build": "astro build",
+    "preview": "astro preview",
+    "check": "astro check",
+    "test": "node --test scripts/*.test.mjs",
+    "test:links": "node scripts/check-links.mjs",
+    "check:links": "node scripts/check-links.mjs"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "0.42.3",
+    "astro": "7.3.4"
+  },
+  "devDependencies": {
+    "@astrojs/check": "0.9.9",
+    "typescript": "~5.9.3"
+  }
+}

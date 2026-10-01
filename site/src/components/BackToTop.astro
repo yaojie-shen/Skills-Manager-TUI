@@ -1,0 +1,101 @@
+---
+interface Props { locale: 'en' | 'zh-cn' }
+const { locale } = Astro.props;
+const label = locale === 'zh-cn' ? '返回顶部' : 'Back to top';
+---
+
+<button class="back-to-top print:hidden" type="button" aria-label={label} title={label} data-back-to-top>
+  <svg viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M5 11 12 4l7 7M12 4v16" />
+  </svg>
+  <span>{label}</span>
+</button>
+
+<script>
+  document.querySelectorAll<HTMLButtonElement>('[data-back-to-top]').forEach((button) => {
+    if (button.dataset.ready) return;
+    button.dataset.ready = 'true';
+    document.body.append(button);
+
+    const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
+    const update = () => button.toggleAttribute('data-visible', scrollY > Math.max(innerHeight * 0.75, 480));
+    const focusPageTitle = () => {
+      const title = document.querySelector<HTMLElement>('h1');
+      if (!title) return;
+      title.tabIndex = -1;
+      title.focus({ preventScroll: true });
+    };
+    const focusAtTop = () => {
+      const started = performance.now();
+      const check = () => {
+        if (scrollY <= 1) {
+          focusPageTitle();
+          return;
+        }
+        if (performance.now() - started < 3000) requestAnimationFrame(check);
+      };
+      requestAnimationFrame(check);
+    };
+
+    update();
+    document.addEventListener('scroll', update, { passive: true });
+    button.addEventListener('click', () => {
+      scrollTo({ top: 0, behavior: reduceMotion.matches ? 'auto' : 'smooth' });
+      focusAtTop();
+    });
+  });
+</script>
+
+<style>
+  .back-to-top {
+    position: fixed;
+    z-index: calc(var(--sl-z-index-navbar, 10) + 2);
+    right: clamp(1rem, 2.5vw, 2rem);
+    bottom: clamp(1rem, 2.5vw, 2rem);
+    display: inline-flex;
+    min-height: 2.5rem;
+    padding: .55rem .7rem;
+    align-items: center;
+    gap: .45rem;
+    border: 1px solid var(--rule);
+    border-radius: 0;
+    background: var(--paper, var(--sl-color-bg));
+    color: var(--ink, var(--sl-color-white));
+    box-shadow: .3rem .3rem 0 color-mix(in srgb, var(--accent, var(--sl-color-accent)) 28%, transparent);
+    font: 400 .58rem/1 var(--font-display);
+    letter-spacing: .025em;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(.75rem);
+    transition: opacity 160ms ease, transform 160ms ease, color 120ms ease, border-color 120ms ease;
+  }
+  .back-to-top[data-visible] {
+    opacity: 1;
+    pointer-events: auto;
+    transform: none;
+  }
+  .back-to-top:hover {
+    border-color: var(--accent, var(--sl-color-accent));
+    color: var(--accent, var(--sl-color-accent));
+  }
+  .back-to-top:active {
+    transform: translate(2px, 2px);
+    box-shadow: .15rem .15rem 0 color-mix(in srgb, var(--accent, var(--sl-color-accent)) 28%, transparent);
+  }
+  .back-to-top svg {
+    width: 1rem;
+    height: 1rem;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.75;
+    stroke-linecap: square;
+    stroke-linejoin: miter;
+  }
+  @media (max-width: 50rem) {
+    .back-to-top { right: 1rem; bottom: 1rem; width: 2.75rem; height: 2.75rem; padding: 0; justify-content: center; }
+    .back-to-top span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .back-to-top { transition: none; }
+  }
+</style>
