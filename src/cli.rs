@@ -808,7 +808,7 @@ fn cmd_init(root: &std::path::Path, json: bool, local: bool) -> Result<()> {
     } else {
         Config::default()
     };
-    cfg.save(root)?;
+    cfg.save_commented(root)?;
     if json {
         println!("{}", serde_json::json!({"created": Config::path(root)}));
     } else {
@@ -1862,6 +1862,23 @@ fn preset_links(ctx: &Ctx, name: &str, agents: &[String], dry_run: bool, on: boo
 mod tui_library_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn init_writes_a_commented_config_and_refuses_to_replace_it() {
+        let temp = skills::ops::DownloadDir::new("cli-commented-init").unwrap();
+        cmd_init(temp.path(), false, false).unwrap();
+        let path = skills::config::Config::path(temp.path());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# Skills Manager configuration"));
+        assert!(text.contains("[sync]"));
+        assert!(
+            cmd_init(temp.path(), false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("config already exists")
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), text);
+    }
 
     #[test]
     fn project_launch_selects_deployment_context_without_opening_a_second_library() {
