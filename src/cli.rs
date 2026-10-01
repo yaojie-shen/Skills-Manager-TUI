@@ -577,9 +577,10 @@ fn run_command(cli: Cli) -> Result<()> {
         )
     );
     let ws = cli.workspace(create)?;
-    if let Some(report) = &ws.preset_migration {
+    if let Some(report) = &ws.migration {
         eprintln!(
-            "Migrated {} presets to fixed members; original files: {}",
+            "Migrated {} Tags and {} presets; original files: {}",
+            report.migrated_tags.len(),
             report.migrated_names.len(),
             report.backup_dir.display()
         );

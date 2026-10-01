@@ -171,7 +171,16 @@ fn setting_a_colour_keeps_the_rest_of_the_file_as_written() {
     let after = fx.config_text();
     assert!(after.starts_with("# hand-written header\n"), "{after}");
     assert!(after.contains("# trailing note"), "{after}");
-    assert!(after.contains("keeps bytes"), "{after}");
+    assert!(
+        !after.contains("keeps bytes"),
+        "Tag data must leave config.toml"
+    );
+    assert!(
+        std::fs::read_dir(fx.root.join(".skills-meta/tags"))
+            .unwrap()
+            .count()
+            >= 2
+    );
 
     // Changing an existing entry edits it in place rather than adding another.
     Config::set_tag_color(&fx.root, "storage", Some("green")).unwrap();
@@ -214,8 +223,13 @@ fn a_colour_can_be_set_before_there_is_a_config_file() {
     std::fs::remove_file(Config::path(&fx.root)).unwrap();
     Config::set_tag_color(&fx.root, "paper", Some("cyan")).unwrap();
     let cfg = Config::load(&fx.root).unwrap();
-    assert_eq!(cfg.tags.len(), 1);
-    assert_eq!(cfg.tags[0].color.as_deref(), Some("cyan"));
+    assert_eq!(
+        cfg.tags
+            .iter()
+            .find(|tag| tag.name == "paper")
+            .and_then(|tag| tag.color.as_deref()),
+        Some("cyan")
+    );
     // The rest of the config is still the default, not an empty one.
     assert_eq!(cfg.agents.len(), 2);
 }

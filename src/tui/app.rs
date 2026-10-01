@@ -450,10 +450,11 @@ impl App {
         };
         app.on_snapshot();
         app.refresh_sync_status(true, ProbeReason::Startup);
-        if let Some(report) = &app.ws.preset_migration {
+        if let Some(report) = &app.ws.migration {
             app.toast(
                 format!(
-                    "Converted {} presets to fixed members · backup: {}",
+                    "Migrated {} Tags and {} presets · backup: {}",
+                    report.migrated_tags.len(),
                     report.migrated_names.len(),
                     report.backup_dir.display()
                 ),

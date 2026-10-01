@@ -8,6 +8,7 @@ pub mod dict;
 pub mod hash;
 pub mod history;
 pub mod meta;
+pub mod migration;
 pub mod ops;
 pub mod paths;
 pub mod preset;
@@ -15,6 +16,7 @@ pub mod reconcile;
 pub mod repository;
 pub mod search;
 pub mod skill;
+pub mod tag;
 pub mod util;
 
 use anyhow::Result;
@@ -30,8 +32,9 @@ pub struct Workspace {
     pub inventory_products: Option<std::collections::BTreeSet<String>>,
     pub config: config::Config,
     pub meta: meta::MetaStore,
+    pub tags: tag::TagStore,
     pub presets: preset::PresetStore,
-    pub preset_migration: Option<preset::MigrationReport>,
+    pub migration: Option<preset::MigrationReport>,
 }
 
 impl Workspace {
@@ -39,13 +42,38 @@ impl Workspace {
         // Library callers need the same canonical root as the CLI. In
         // particular, macOS /var and /private/var can name the same directory.
         let root = paths::resolve_root(Some(root))?;
-        let config = config::Config::load(&root)?;
+        let mut config = config::Config::load_legacy(&root)?;
         let presets = preset::PresetStore::new(&root);
-        let preset_migration = presets.migrate_legacy_tags(&config)?;
+        let tags = tag::TagStore::new(&root);
+        let loaded_tags = tags.entries()?;
+        let stored_tags = tag::TagStore::tags(&loaded_tags);
+        for stored in &stored_tags {
+            if let Some(legacy) = config.tags.iter().find(|tag| tag.name == stored.name) {
+                let mut legacy = legacy.clone();
+                let mut stored = stored.clone();
+                legacy.skills.sort();
+                legacy.skills.dedup();
+                stored.skills.sort();
+                stored.skills.dedup();
+                anyhow::ensure!(
+                    legacy == stored,
+                    "Tag {} differs between config.toml and the Tag store",
+                    legacy.name
+                );
+            } else {
+                config.tags.push(stored.clone());
+            }
+        }
+        let migration =
+            migration::migrate_legacy_tags(&root, &config, &tags, &loaded_tags, &presets)?;
+        if migration.is_some() {
+            config.tags = tags.list()?;
+        }
         Ok(Self {
             meta: meta::MetaStore::new(&root),
+            tags,
             presets,
-            preset_migration,
+            migration,
             root,
             project: None,
             inventory_project: None,
@@ -68,31 +96,66 @@ impl Workspace {
         let root = paths::resolve_root(Some(&root))?;
         let mut ws = Self {
             meta: meta::MetaStore::new(&root),
+            tags: tag::TagStore::new(&root),
             presets: preset::PresetStore::new(&root),
-            preset_migration: None,
+            migration: None,
             root,
             project: Some(project),
             inventory_project: None,
             inventory_products: None,
             config: config::Config::local_default(),
         };
+        ws.config = if config::Config::exists(&ws.root) {
+            config::Config::load_legacy(&ws.root)?
+        } else {
+            config::Config::local_default()
+        };
+        let loaded_tags = ws.tags.entries()?;
+        let stored_tags = tag::TagStore::tags(&loaded_tags);
+        for stored in &stored_tags {
+            if let Some(legacy) = ws.config.tags.iter().find(|tag| tag.name == stored.name) {
+                let mut legacy = legacy.clone();
+                let mut stored = stored.clone();
+                legacy.skills.sort();
+                legacy.skills.dedup();
+                stored.skills.sort();
+                stored.skills.dedup();
+                anyhow::ensure!(
+                    legacy == stored,
+                    "Tag {} differs between config.toml and the Tag store",
+                    legacy.name
+                );
+            } else {
+                ws.config.tags.push(stored.clone());
+            }
+        }
+        ws.migration = migration::migrate_legacy_tags(
+            &ws.root,
+            &ws.config,
+            &ws.tags,
+            &loaded_tags,
+            &ws.presets,
+        )?;
+        // Apply local path expansion and omitted-agent defaults exactly once
+        // after migration has finished with the raw project configuration.
         ws.config = ws.load_config()?;
-        ws.preset_migration = ws.presets.migrate_legacy_tags(&ws.config)?;
         Ok(ws)
     }
 
     pub fn load_config(&self) -> Result<config::Config> {
         let Some(project) = &self.project else {
-            let config = config::Config::load(&self.root)?;
-            return Ok(config);
+            return config::Config::load(&self.root);
         };
-        let mut config = if config::Config::exists(&self.root) {
+        let exists = config::Config::exists(&self.root);
+        let mut config = if exists {
             config::Config::load(&self.root)?
         } else {
-            config::Config::local_default()
+            let mut config = config::Config::local_default();
+            config.tags = self.tags.list()?;
+            config
         };
         // An omitted agents table also means local defaults.
-        if config::Config::exists(&self.root) {
+        if exists {
             let text = std::fs::read_to_string(config::Config::path(&self.root))?;
             let doc: toml::Value = toml::from_str(&text)?;
             if doc.get("agents").is_none() {

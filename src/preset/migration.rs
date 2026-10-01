@@ -8,7 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Serialize)]
 pub struct MigrationReport {
     pub backup_dir: PathBuf,
+    /// Presets converted from legacy Tag references.
     pub migrated_names: Vec<String>,
+    /// Tag definitions moved out of config.toml.
+    #[serde(default)]
+    pub migrated_tags: Vec<String>,
 }
 
 struct MigrationFile {
@@ -162,6 +166,7 @@ impl PresetStore {
         Ok(Some(MigrationReport {
             backup_dir,
             migrated_names: changes.into_iter().map(|change| change.name).collect(),
+            migrated_tags: Vec::new(),
         }))
     }
 }

@@ -232,7 +232,7 @@ fn legacy_migration_snapshots_members_once_and_keeps_exact_backups() {
     std::fs::write(f.ws.presets.path("modern"), modern).unwrap();
     assert!(f.ws.presets.load("daily").is_err());
     let mut ws = Workspace::open(&f.ws.root).unwrap();
-    let report = ws.preset_migration.as_ref().unwrap();
+    let report = ws.migration.as_ref().unwrap();
     assert_eq!(report.migrated_names, ["daily", "empty"]);
     assert!(
         report
@@ -267,13 +267,11 @@ fn legacy_migration_snapshots_members_once_and_keeps_exact_backups() {
         "migration must not deploy any members"
     );
     let backup_parent = report.backup_dir.parent().unwrap().to_path_buf();
+    assert!(Workspace::open(&ws.root).unwrap().migration.is_none());
     assert!(
-        Workspace::open(&ws.root)
-            .unwrap()
-            .preset_migration
-            .is_none()
+        std::fs::read_dir(backup_parent).unwrap().count() >= 1,
+        "Tag and Preset upgrades may have separate one-time backups"
     );
-    assert_eq!(std::fs::read_dir(backup_parent).unwrap().count(), 1);
     Config::edit_tags(&ws.root, |tags| tags.clear()).unwrap();
     ws.config = ws.load_config().unwrap();
     assert_eq!(ws.presets.load("daily").unwrap().unwrap(), fixed);
@@ -305,7 +303,13 @@ fn migration_preflights_every_file_before_changing_any_definition() {
             std::fs::read(f.ws.presets.path("z-bad")).unwrap(),
             invalid.as_bytes()
         );
-        assert!(!f.ws.root.join(".skills-meta/backups").exists());
+        // The fixture's old config Tags may already have been migrated and
+        // backed up; this failed Preset preflight must not add another backup.
+        let backups = f.ws.root.join(".skills-meta/backups");
+        let before = std::fs::read_dir(&backups)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert!(before <= 1);
     }
 }
 
@@ -333,7 +337,7 @@ fn local_migration_uses_only_the_project_tag_members() {
     );
     assert!(
         local
-            .preset_migration
+            .migration
             .unwrap()
             .backup_dir
             .starts_with(std::fs::canonicalize(root).unwrap())
@@ -369,7 +373,7 @@ fn cli_migration_reports_backups_on_stderr_without_polluting_json() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["skills"], serde_json::json!(["one", "two"]));
     assert!(value.get("tags").is_none());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("presets-before-fixed-members-"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("metadata-before-migration-"));
 }
 
 #[test]

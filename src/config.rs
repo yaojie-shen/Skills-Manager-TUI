@@ -6,6 +6,7 @@
 //! at load time.
 
 use crate::paths::{expand_tilde, meta_dir};
+pub use crate::tag::Tag as TagConfig;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -20,7 +21,9 @@ pub struct Config {
     pub schema: u32,
     #[serde(default = "default_agents")]
     pub agents: Vec<AgentConfig>,
-    #[serde(default)]
+    /// Runtime aggregate. Current init omits this field; legacy files and
+    /// internal fixtures may still serialize it for one-time migration.
+    #[serde(default, skip_serializing)]
     pub tags: Vec<TagConfig>,
     #[serde(default = "default_true")]
     pub tags_enabled: bool,
@@ -269,18 +272,6 @@ impl AgentConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TagConfig {
-    #[serde(default)]
-    pub skills: Vec<String>,
-    pub name: String,
-    #[serde(default)]
-    pub color: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
 fn comment_key(table: &mut Table, key: &str, prefix: &str) {
     if let Some(mut key) = table.key_mut(key) {
         key.leaf_decor_mut().set_prefix(prefix);
@@ -408,8 +399,36 @@ impl Config {
         meta_dir(root).join(CONFIG_FILE)
     }
 
-    /// Load the config, falling back to defaults when the file does not exist.
+    /// Load settings and the unified in-memory Tag view. Legacy config Tags
+    /// remain visible until Workspace's startup migration removes that item.
     pub fn load(root: &Path) -> Result<Self> {
+        let mut config = Self::load_legacy(root)?;
+        let stored = crate::tag::TagStore::new(root).list()?;
+        for tag in stored {
+            match config.tags.iter().find(|current| current.name == tag.name) {
+                Some(current) => {
+                    let mut current = current.clone();
+                    let mut stored = tag;
+                    current.skills.sort();
+                    current.skills.dedup();
+                    stored.skills.sort();
+                    stored.skills.dedup();
+                    anyhow::ensure!(
+                        current == stored,
+                        "Tag {} differs between config.toml and the Tag store",
+                        current.name
+                    );
+                }
+                None => config.tags.push(tag),
+            }
+        }
+        config
+            .tags
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(config)
+    }
+
+    pub(crate) fn load_legacy(root: &Path) -> Result<Self> {
         let path = Self::path(root);
         match std::fs::read_to_string(&path) {
             Ok(text) => {
@@ -430,7 +449,12 @@ impl Config {
         let path = Self::path(root);
         std::fs::create_dir_all(path.parent().unwrap())?;
         let text = toml::to_string_pretty(self)?;
-        crate::util::write_atomic(&path, text.as_bytes())
+        crate::util::write_atomic(&path, text.as_bytes())?;
+        if !self.tags.is_empty() {
+            let store = crate::tag::TagStore::new(root);
+            store.edit(|tags| *tags = self.tags.clone())?;
+        }
+        Ok(())
     }
 
     /// Write a complete, editable default configuration with the schema's
@@ -613,113 +637,77 @@ impl Config {
         Ok(())
     }
 
-    /// The `[[tags]]` entries of a document, created when there are none yet.
-    /// `save` writes an empty list as `tags = []`, and a hand-written file may
-    /// use inline tables; either is turned into `[[tags]]` tables first.
-    fn tag_tables(doc: &mut DocumentMut) -> Result<&mut ArrayOfTables> {
-        if let Some(arr) = doc.get("tags").and_then(Item::as_array) {
-            let mut tables = ArrayOfTables::new();
-            for v in arr.iter() {
-                let t = v
-                    .as_inline_table()
-                    .context("an entry of `tags` in config.toml is not a table")?;
-                tables.push(t.clone().into_table());
-            }
-            doc["tags"] = Item::ArrayOfTables(tables);
-        }
-        doc.entry("tags")
-            .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
-            .as_array_of_tables_mut()
-            .context("`tags` in config.toml is not a list of [[tags]] tables")
-    }
-
-    fn tag_index(tables: &ArrayOfTables, name: &str) -> Option<usize> {
-        tables
-            .iter()
-            .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
-    }
-
-    /// Give a tag a colour, adding its `[[tags]]` entry when it has none, or
-    /// take the colour away again with `None`. The value is written as given;
-    /// what counts as a colour is the caller's business.
-    pub fn set_tag_color(root: &Path, name: &str, color: Option<&str>) -> Result<()> {
-        Self::edit_document(root, |doc| {
-            let tables = Self::tag_tables(doc)?;
-            match (Self::tag_index(tables, name), color) {
-                (Some(i), Some(c)) => {
-                    tables.get_mut(i).context("tag entry vanished")?["color"] = value(c);
-                }
-                (Some(i), None) => {
-                    let t = tables.get_mut(i).context("tag entry vanished")?;
-                    if t.remove("color").is_none() {
-                        return Ok(false);
-                    }
-                    // An entry with nothing left but its name says nothing, so
-                    // it goes rather than accumulate.
-                    if t.len() == 1 {
-                        tables.remove(i);
-                    }
-                }
-                (None, Some(c)) => {
-                    let mut t = Table::new();
-                    t["name"] = value(name);
-                    t["color"] = value(c);
-                    tables.push(t);
-                }
-                (None, None) => return Ok(false),
-            }
-            Ok(true)
-        })
-    }
-
-    /// Carry a tag's `[[tags]]` entry over to its new name. When the new name
-    /// already has an entry of its own, that one wins and the old is dropped:
-    /// the tag is being merged into it, not replacing it.
-    pub fn rename_tag_entry(root: &Path, old: &str, new: &str) -> Result<()> {
-        Self::edit_document(root, |doc| {
-            let tables = Self::tag_tables(doc)?;
-            let Some(i) = Self::tag_index(tables, old) else {
-                return Ok(false);
-            };
-            if Self::tag_index(tables, new).is_some() {
-                tables.remove(i);
-            } else {
-                tables.get_mut(i).context("tag entry vanished")?["name"] = value(new);
-            }
-            Ok(true)
-        })
-    }
-
     pub fn skill_tags(&self, key: &str) -> Vec<String> {
         self.tags
             .iter()
-            .filter(|t| t.skills.iter().any(|s| s == key))
-            .map(|t| t.name.clone())
+            .filter(|tag| tag.skills.iter().any(|skill| skill == key))
+            .map(|tag| tag.name.clone())
             .collect()
     }
 
+    /// Compatibility entry point; first materialize any legacy config Tags,
+    /// then write definitions only through TagStore.
     pub fn edit_tags(root: &Path, edit: impl FnOnce(&mut Vec<TagConfig>)) -> Result<()> {
-        let _lock = crate::meta::MetaStore::new(root).lock()?;
-        Self::edit_document(root, |doc| {
-            let mut config = Self::parse(&doc.to_string())?;
-            edit(&mut config.tags);
-            for tag in &mut config.tags {
-                tag.skills.sort();
-                tag.skills.dedup();
+        // Workspace startup performs the only legacy migration. A direct write
+        // must never silently discard a conflicting old definition.
+        let legacy = Self::load_legacy(root)?.tags;
+        let store = crate::tag::TagStore::new(root);
+        if !legacy.is_empty() {
+            let existing = store.list()?;
+            for old in &legacy {
+                if let Some(current) = existing.iter().find(|tag| tag.name == old.name) {
+                    let mut current = current.clone();
+                    let mut old = old.clone();
+                    current.skills.sort();
+                    current.skills.dedup();
+                    old.skills.sort();
+                    old.skills.dedup();
+                    anyhow::ensure!(
+                        current == old,
+                        "Tag {} differs between config.toml and the Tag store; reopen the workspace to resolve migration",
+                        old.name
+                    );
+                }
             }
-            let updated = toml::to_string(&config)?.parse::<DocumentMut>()?;
-            let decor = doc.get("tags").and_then(|item| match item {
-                Item::Value(value) => Some(value.decor().clone()),
-                _ => None,
-            });
-            doc["tags"] = updated["tags"].clone();
-            if let Some(decor) = decor
-                && let Some(value) = doc["tags"].as_value_mut()
-            {
-                *value.decor_mut() = decor;
+            store.edit(|tags| {
+                for old in legacy {
+                    if !tags.iter().any(|tag| tag.name == old.name) {
+                        tags.push(old);
+                    }
+                }
+            })?;
+        }
+        store.edit(edit)?;
+        if Self::exists(root) {
+            Self::edit_document(root, |doc| Ok(doc.remove("tags").is_some()))?;
+        }
+        Ok(())
+    }
+
+    pub fn set_tag_color(root: &Path, name: &str, color: Option<&str>) -> Result<()> {
+        let name = name.to_owned();
+        let color = color.map(str::to_owned);
+        Self::edit_tags(root, |tags| {
+            match tags.iter_mut().find(|tag| tag.name == name) {
+                Some(tag) => {
+                    tag.color = color;
+                    if tag.skills.is_empty() && tag.color.is_none() && tag.description.is_none() {
+                        tags.retain(|current| current.name != name);
+                    }
+                }
+                None if color.is_some() => tags.push(TagConfig {
+                    name,
+                    skills: Vec::new(),
+                    color,
+                    description: None,
+                }),
+                None => {}
             }
-            Ok(true)
         })
+    }
+
+    pub fn rename_tag_entry(root: &Path, old: &str, new: &str) -> Result<()> {
+        crate::tag::TagStore::new(root).rename(old, new)
     }
 
     pub fn set_tags_enabled(root: &Path, enabled: bool) -> Result<()> {
@@ -730,16 +718,7 @@ impl Config {
     }
 
     pub fn rename_tag_skill(root: &Path, old: &str, new: Option<&str>) -> Result<()> {
-        Self::edit_tags(root, |tags| {
-            for tag in tags {
-                if tag.skills.iter().any(|s| s == old) {
-                    tag.skills.retain(|s| s != old);
-                    if let Some(new) = new {
-                        tag.skills.push(new.to_string());
-                    }
-                }
-            }
-        })
+        crate::tag::TagStore::new(root).remove_skill(old, new)
     }
 
     pub fn agent(&self, key: &str) -> Option<&AgentConfig> {
