@@ -1,0 +1,40 @@
+---
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const path = Astro.url.pathname.slice(base.length);
+const zh = path === '/zh-cn' || path.startsWith('/zh-cn/');
+---
+<a class="site-title" href={`${base}/${zh ? 'zh-cn/' : ''}`} aria-label={zh ? 'Skills Manager 首页' : 'Skills Manager home'}>
+  <span class="brand-name"><span class="brand-mark" aria-hidden="true">&gt;_</span> Skills Manager</span>
+  <span class="docs-word">/{zh ? '文档' : 'DOCS'}</span>
+</a>
+<style is:inline set:html={`
+  @font-face {
+    font-family: 'Docs Silkscreen';
+    src: url('${base}/fonts/Silkscreen-Regular.ttf') format('truetype');
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+  }
+`}/>
+<style>
+  .site-title {
+    display: inline-flex;
+    min-width: 0;
+    align-items: center;
+    gap: .55rem;
+    color: var(--sl-color-white);
+    text-decoration: none;
+  }
+  .brand-name {
+    white-space: nowrap;
+    font: 400 11.52px 'Docs Silkscreen', var(--font-display);
+  }
+  .brand-mark { color: var(--sl-color-accent); }
+  .docs-word {
+    color: var(--sl-color-gray-3);
+    font: 500 .72rem/1 var(--sl-font-mono);
+  }
+  @media (max-width: 450px) {
+    .docs-word { display: none; }
+  }
+</style>

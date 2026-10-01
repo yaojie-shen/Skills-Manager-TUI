@@ -1,0 +1,67 @@
+---
+import DefaultFooter from '@astrojs/starlight/components/Footer.astro';
+import BackToTop from './BackToTop.astro';
+
+const locale = Astro.locals.starlightRoute.locale === 'zh-cn' ? 'zh-cn' : 'en';
+---
+
+<DefaultFooter />
+<BackToTop locale={locale} />
+<p class="anchor-copy-status" aria-live="polite" aria-atomic="true"></p>
+
+<script>
+  const copyLabels = {
+    en: { idle: 'Copy link', copied: 'Link copied', failed: 'Could not copy link' },
+    'zh-cn': { idle: '复制链接', copied: '链接已复制', failed: '无法复制链接' },
+  } as const;
+
+  const copyText = async (value: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const initializeHeadingLinks = () => {
+    const locale = document.documentElement.lang.toLowerCase().startsWith('zh') ? 'zh-cn' : 'en';
+    const labels = copyLabels[locale];
+    const status = document.querySelector<HTMLElement>('.anchor-copy-status');
+
+    document.querySelectorAll<HTMLAnchorElement>('.sl-heading-wrapper:is(.level-h2, .level-h3) > .sl-anchor-link').forEach((anchor) => {
+      if (anchor.dataset.copyReady) return;
+      anchor.dataset.copyReady = 'true';
+      anchor.setAttribute('aria-label', labels.idle);
+      anchor.title = labels.idle;
+      anchor.addEventListener('click', async (event) => {
+        event.preventDefault();
+        const copied = await copyText(new URL(anchor.getAttribute('href') ?? '', location.href).href);
+        const feedback = copied ? labels.copied : labels.failed;
+        if (copied) anchor.dataset.copied = '';
+        anchor.setAttribute('aria-label', feedback);
+        anchor.title = feedback;
+        if (status) status.textContent = feedback;
+        window.setTimeout(() => {
+          delete anchor.dataset.copied;
+          anchor.setAttribute('aria-label', labels.idle);
+          anchor.title = labels.idle;
+          if (status) status.textContent = '';
+        }, 1600);
+      });
+    });
+  };
+
+  initializeHeadingLinks();
+  document.addEventListener('astro:page-load', initializeHeadingLinks);
+</script>
+
+<style>
+  .anchor-copy-status {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+  }
+</style>

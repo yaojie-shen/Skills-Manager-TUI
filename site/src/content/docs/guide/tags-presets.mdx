@@ -1,0 +1,65 @@
+---
+title: "Tags and presets"
+description: "Classify skills with tags and save fixed deployment sets as presets."
+---
+
+import DocsTuiCapture from '../../../components/DocsTuiCapture.astro';
+
+Tags classify skills. Presets save an explicit set of skills and deployment targets.
+
+## Classify skills with tags
+
+```sh
+skills tag add hello-skill writing example
+skills tag list hello-skill
+skills list tag:writing
+skills tag remove hello-skill example
+skills tag set hello-skill writing
+```
+
+`skills tag set` replaces every tag on the skill. `skills tag rename OLD NEW` merges members if `NEW` already exists. `skills tag delete NAME --yes` removes the classification and all memberships, but not the skills.
+
+<DocsTuiCapture frame="tags" caption="The Tags view groups Library skills by tag." />
+
+## Save a deployment set
+
+```sh
+skills preset create writing-kit --description "Writing helpers" --tag writing --agent claude
+skills preset show writing-kit
+skills preset add writing-kit hello-skill
+skills preset deploy writing-kit --dry-run
+skills preset deploy writing-kit
+```
+
+`--tag writing` copies the tag's current members once. Later changes to the tag do not update the preset. Use `skills preset add` or `skills preset remove` to change its members; both accept skill keys or `--tag`. `skills preset create` also accepts repeated `--skill KEY` options.
+
+<DocsTuiCapture frame="presets" caption="The Presets view shows each preset's fixed members and targets." />
+
+Target selection follows this order:
+
+1. `--agent` values on the command.
+2. Agents saved in the preset.
+3. Every configured Agent.
+
+Preview removal before applying it:
+
+```sh
+skills preset undeploy writing-kit --dry-run
+skills preset undeploy writing-kit
+```
+
+`preset delete NAME --yes` removes only the preset definition. It does not remove installed skills or existing deployment links.
+
+## Use Tags and Presets in the TUI
+
+Both pages show a group panel and a skill panel. `a` opens Actions; `m` enters multi-select; `Ctrl+A` adds the current results without clearing earlier selections.
+
+Tag-picker changes apply immediately, so `Esc` closes the picker without reverting them. Dialogs for staged membership changes provide Apply and Cancel. Preset tag coverage describes the saved members; it is not a live tag query.
+
+## Storage and migration
+
+Set `tags_enabled = false` to hide tag classification and disable tag commands without deleting tag or preset data. The TUI command palette and `Ctrl+O` expose the same confirmed toggle.
+
+Tags live in `.skills-meta/config.toml`. Presets live in `.skills-meta/presets/<name>.toml` and store their skills and Agents explicitly. Duplicate skill keys are deduplicated.
+
+Opening older tag-based preset data may migrate it to fixed members. Skills Manager reports the backup directory; keep that backup until the resulting membership is confirmed.

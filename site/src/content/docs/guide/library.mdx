@@ -1,0 +1,78 @@
+---
+title: "Library and sources"
+description: "Inspect a source, choose skills to install, and understand how they are stored."
+---
+
+import DocsTuiCapture from '../../../components/DocsTuiCapture.astro';
+
+## 1. Inspect a source
+
+```sh
+skills install owner/repo --list
+```
+
+`--list` shows the remote skills without installing them. If it finds more than one, you must choose which ones to install.
+
+| Reference | Notes |
+| --- | --- |
+| `owner/repo[/subpath]` | GitHub shorthand. |
+| GitHub tree URL | Retains the selected branch and path. |
+| Git URL | Use `--branch` for a branch or tag. |
+| Archive URL | Requires a source name on first install; internal paths are preserved. |
+| Local path | Copies content directly; remote discovery options do not apply. |
+
+## 2. Select and install
+
+```sh
+skills install owner/repo --select skills/review --repo-alias toolbox
+skills repos
+skills list repo:toolbox
+```
+
+Repeat `--select PATH` to choose specific paths. `--select .` chooses the source root. `--all` installs the valid outermost skills from separate branches of the directory tree; it does not install nested skills beneath them.
+
+<DocsTuiCapture frame="repos" caption="The Repos view shows each source and the skills installed from it." />
+
+## How installed skills are named
+
+The install command above uses `--repo-alias toolbox`, so Skills Manager stores the selected skill under `repos/toolbox/`. Installation prints the full Library key for use in later commands.
+
+| Name | How it is used |
+| --- | --- |
+| Source display name | Labels the source in the UI. Set it with `--source-name NAME`; Git sources default to `owner/repo`. A new archive URL requires a name. |
+| Library key | Identifies the stored skill. It contains the storage alias from `--repo-alias` and the skill's local storage name. |
+| Declared skill name | Comes from the `name` field in `SKILL.md` and becomes the Agent link name. It does not have to match the local storage name. |
+
+For one selected skill, `--name local-name` sets the local storage name. For multiple selections, repeat `--local-name upstream/path=local-name`. These options do not change the name declared in `SKILL.md`, so duplicate declarations can still cause a [deployment conflict](../deployment/).
+
+## Rename a source or stored skill
+
+```sh
+skills repos rename toolbox "Team toolkit"
+skills rename repos/toolbox/review repos/toolbox/review-local
+```
+
+| Command | Result |
+| --- | --- |
+| `repos rename` | Changes the source display name only. |
+| `rename` | Moves the Library skill and updates metadata and managed links; frontmatter `name` is unchanged. |
+
+Check preset membership after changing a Library key.
+
+## Local content and metadata
+
+```sh
+skills install ./path/to/skill --name my-skill
+skills adopt ./path/to/skill
+```
+
+`install` copies local content. `adopt` moves an external directory into the Library. If the source is directly inside a configured Agent directory, the original location becomes a link. Back up independent content before adoption.
+
+Remote metadata lives in `.skills-meta/repos/<alias>.toml`; standalone records may use `.skills-meta/repos/.root.toml`. Records include source, installed name, revision, baseline, and optional note. Local skills do not keep these per-skill records.
+
+```sh
+skills set-source KEY REFERENCE
+skills remove KEY --yes
+```
+
+`skills set-source` changes the recorded source without replacing content or accepting a baseline. `skills remove` deletes managed deployments, content, and metadata. `--keep-meta` preserves metadata but deletes the content. Use [undeploy](../deployment/) to remove an Agent link while retaining the skill.

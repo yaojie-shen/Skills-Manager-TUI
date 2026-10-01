@@ -1,0 +1,88 @@
+---
+const zh = Astro.currentLocale === 'zh-cn';
+const lightLabel = zh ? '切换到浅色主题' : 'Switch to light theme';
+const darkLabel = zh ? '切换到深色主题' : 'Switch to dark theme';
+---
+
+<button
+  class="docs-theme-toggle"
+  type="button"
+  aria-label={darkLabel}
+  title={darkLabel}
+  data-light-label={lightLabel}
+  data-dark-label={darkLabel}
+>
+  <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true">
+    <circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/>
+  </svg>
+  <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M20.2 15.3A8.5 8.5 0 0 1 8.7 3.8 8.5 8.5 0 1 0 20.2 15.3Z"/>
+  </svg>
+</button>
+
+<script>
+  function updateThemeButtons(theme: 'light' | 'dark') {
+    document.querySelectorAll<HTMLButtonElement>('.docs-theme-toggle').forEach((button) => {
+      const next = theme === 'light' ? 'dark' : 'light';
+      const label = button.dataset[`${next}Label`] || next;
+      button.ariaLabel = label;
+      button.title = label;
+    });
+  }
+
+  document.querySelectorAll<HTMLButtonElement>('.docs-theme-toggle').forEach((button) => {
+    if (button.dataset.ready) return;
+    button.dataset.ready = 'true';
+    updateThemeButtons(document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light');
+    button.addEventListener('click', (event) => {
+      const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+      const x = event.clientX || innerWidth / 2;
+      const y = event.clientY || 0;
+      const radius = Math.hypot(Math.max(x, innerWidth - x), Math.max(y, innerHeight - y));
+      const change = () => {
+        document.documentElement.dataset.theme = next;
+        localStorage.setItem('starlight-theme', next);
+        updateThemeButtons(next);
+      };
+      if (!document.startViewTransition || matchMedia('(prefers-reduced-motion: reduce)').matches) {
+        change();
+        return;
+      }
+      const transition = document.startViewTransition(change);
+      transition.ready.then(() => document.documentElement.animate(
+        { clipPath: [`circle(0 at ${x}px ${y}px)`, `circle(${radius}px at ${x}px ${y}px)`] },
+        { duration: 520, easing: 'cubic-bezier(.76,0,.24,1)', pseudoElement: '::view-transition-new(root)' },
+      )).catch(() => {});
+    });
+  });
+</script>
+
+<style>
+  .docs-theme-toggle {
+    display: grid;
+    width: 2rem;
+    height: 2rem;
+    flex: none;
+    padding: 0;
+    place-items: center;
+    border: 0;
+    background: transparent;
+    color: var(--sl-color-gray-2);
+  }
+  .docs-theme-toggle:hover { color: var(--sl-color-accent); }
+  .theme-icon {
+    width: 1rem;
+    height: 1rem;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: square;
+    stroke-linejoin: miter;
+  }
+  :global(:root[data-theme='light']) .theme-icon-moon,
+  :global(:root[data-theme='dark']) .theme-icon-sun { display: none; }
+  :global(::view-transition-old(root)),
+  :global(::view-transition-new(root)) { animation: none; mix-blend-mode: normal; }
+  :global(::view-transition-old(root)) { z-index: 1; }
+  :global(::view-transition-new(root)) { z-index: 2; }
+</style>

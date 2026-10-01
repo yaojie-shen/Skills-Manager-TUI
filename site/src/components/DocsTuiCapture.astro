@@ -1,0 +1,60 @@
+---
+import captures from '../generated/tui-captures.json';
+import { captureBackground, captureColor } from '../lib/capture-colors';
+
+interface Props {
+  frame: keyof typeof captures.frames;
+  caption: string;
+}
+
+const { frame: name, caption } = Astro.props;
+const frame = captures.frames[name];
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+<style is:inline set:html={`@font-face{font-family:'Docs JB Nerd Mono';src:url('${base}/fonts/JetBrainsMonoNerdFontMono-Regular.ttf') format('truetype');font-weight:400;font-display:swap}@font-face{font-family:'Docs JB Nerd Mono';src:url('${base}/fonts/JetBrainsMonoNerdFontMono-Bold.ttf') format('truetype');font-weight:700;font-display:swap}`} />
+<figure class="docs-tui">
+  <div class="docs-tui-scroll" role="region" tabindex="0" aria-label={caption}>
+    <pre aria-hidden="true">{frame.rows.map(row => <>{row.map(run => { const fg = captureColor(run.fg, run.text), bg = captureBackground(run.bg); return <span class:list={run.mods} style={`${fg ? `color:${fg};` : ''}${bg ? `background:${bg};` : ''}`}>{run.text}</span> })}{'\n'}</>)}</pre>
+  </div>
+  <figcaption>{caption}</figcaption>
+</figure>
+
+<style>
+  .docs-tui {
+    margin-block: 1.5rem;
+  }
+  .docs-tui-scroll {
+    max-width: 100%;
+    overflow-x: auto;
+    border: 1px solid var(--sl-color-hairline);
+    background: var(--terminal-bg);
+    container-type: inline-size;
+    scrollbar-color: var(--sl-color-accent) var(--terminal-bg);
+    scrollbar-width: thin;
+  }
+  pre {
+    width: max-content;
+    min-width: 100%;
+    margin: 0;
+    padding: clamp(7px, 1.7cqw, 12px);
+    white-space: pre;
+    background: transparent;
+    color: var(--terminal-ink);
+    font: 400 max(7.4px, 1.42cqw)/1.25 'Docs JB Nerd Mono', monospace;
+    font-variant-ligatures: none;
+    font-feature-settings: 'liga' 0, 'calt' 0;
+    font-synthesis: none;
+    letter-spacing: 0;
+  }
+  pre span { color: inherit; background: transparent; }
+  pre .bold { font-weight: 700; }
+  pre .dim { opacity: .68; }
+  pre .italic { font-style: italic; }
+  pre .underlined { text-decoration: underline; }
+  figcaption {
+    margin-top: .55rem;
+    color: var(--sl-color-gray-3);
+    font-size: .78rem;
+    line-height: 1.45;
+  }
+</style>

@@ -1,0 +1,87 @@
+---
+title: "Agent deployment"
+description: "Preview and manage Library links in Agent directories."
+---
+
+import DocsTuiCapture from '../../../components/DocsTuiCapture.astro';
+
+## Inspect targets
+
+```sh
+skills agents catalog
+skills agents list
+```
+
+`skills agents catalog` lists built-in Agent paths. `skills agents list` shows the targets currently configured for this Library. Claude and Codex are included in the default configuration; an entry describes a target directory, not whether the Agent is installed.
+
+Register a custom target when needed:
+
+```sh
+skills agents add cursor
+skills agents add custom --dir /path/to/skills
+```
+
+## Preview and deploy
+
+Deployment commands use the Library keys returned by `skills list`.
+
+```sh
+skills deploy hello-skill --agent claude --dry-run
+```
+
+A preview reports the planned link without changing the target. The following output shows a conflict-free plan. If another Library skill already uses the target name, the dry run reports a conflict instead:
+
+```text
+link   claude/hello-skill -> /path/to/library/hello-skill
+dry run: 1 change(s) not applied
+```
+
+Apply the plan:
+
+```sh
+skills deploy hello-skill --agent claude
+```
+
+```text
+link   claude/hello-skill -> /path/to/library/hello-skill
+applied 1 change(s)
+```
+
+Use at least one `--agent`, or use `--all-agents` for every configured Agent. Catalog entries that have not been configured are excluded.
+
+Remove a managed link without deleting the Library skill:
+
+```sh
+skills undeploy hello-skill --agent claude --dry-run
+skills undeploy hello-skill --agent claude
+```
+
+## How `--local` and `--project` change scope
+
+| Launch | Library | Project scope |
+| --- | --- | --- |
+| `skills` | Explicit root, environment, or pointer | Current directory supplies deployment context. |
+| `skills --project /path/to/project` | Central Library | TUI discovers scopes from that project. |
+| `skills --local` | Central Library | TUI discovers scopes from the current directory. |
+| `skills --project /path/to/project list` | `<project>/.agents/skills` | CLI uses an isolated project store. |
+| `skills --local init` | `<cwd>/.agents/skills` | CLI creates that project store. |
+
+### Default project paths
+
+For a CLI project store, Claude defaults to `<project>/.claude/skills`. Codex's default `.agents/skills` is the store itself.
+
+### Constraints
+
+Project paths must remain inside the project, including paths reached through existing symlink ancestors. `--root` conflicts with `--local` and `--project`.
+
+<DocsTuiCapture frame="agents" caption="The Agents view groups deployment targets by Agent and scope." />
+
+## Links reference Library content
+
+The deployment name comes from `SKILL.md` frontmatter, not the Library directory name. If two skills declare the same name, one Agent destination cannot expose both. Preview reports the conflict; `--same-name replace` authorizes replacement only for that declared-name conflict.
+
+A deployment is a live link to the Library. Edits made through the link change the Library copy, and Library updates appear immediately in linked Agents. Deployment may create a missing Agent directory. It skips targets classified as read-only because they overlap the Library, resolve through a symlinked path, or are not directories. This classification does not test operating-system write bits. Broken links remain until you clean up or repair them.
+
+On the TUI Agents page, select an Agent, a scope, and a deployment group. Activating an empty or partially deployed group deploys all its members. Activating a fully deployed group undeploys them. A `0/0` group does nothing, and expanding `+N` only reveals hidden groups.
+
+Agent-only deployment changes do not trigger root Git backup. [Health and repair](../health/) covers broken, shadow, and foreign entries; [root backup and sync](../sync/) covers Library mutations.

@@ -1,0 +1,1740 @@
+{
+  "schema_version": 1,
+  "width": 112,
+  "height": 32,
+  "provenance": {
+    "renderer": "ratatui::backend::TestBackend",
+    "component": "tui::app::App",
+    "fixture": "isolated-synthetic-hero-grid-v2",
+    "interaction": "Library rendered with UiLayout::Grid after the startup status probe settled",
+    "privacy": "all data is synthetic in a disposable directory; HOME, user libraries, Agent directories, network remotes, and sync operations are not used",
+    "layout": "grid"
+  },
+  "frame": {
+    "name": "library-card",
+    "hash": "sha256:51f6be41b4020936b79d542ad5ddc022add3d84231dfc92a46df5d2fab91edca",
+    "rows": [
+      [
+        {
+          "text": " skills ",
+          "cells": 8,
+          "fg": "cyan",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " 1 Library ",
+          "cells": 11,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": "  2 Tags   3 Presets   4 Agents   5 Repos   6 Health  ",
+          "cells": 54,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " Tab ↔ ",
+          "cells": 7,
+          "fg": "#8c8c8c",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "               ",
+          "cells": 15,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "[○ Set up backup]",
+          "cells": 17,
+          "fg": "yellow",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        }
+      ],
+      [
+        {
+          "text": "╭ 4/4 local · 0/0 repository installs ─────────────────────────────────────────────────────────────────────────╮",
+          "cells": 112,
+          "fg": "cyan",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│ › ",
+          "cells": 4,
+          "fg": "cyan",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "search skills…",
+          "cells": 14,
+          "fg": "#8c8c8c",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "   repo:owner/repo  tag:x  preset:y  agent:z  source:local  untagged",
+          "cells": 68,
+          "fg": "#b87e54",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                         ",
+          "cells": 25,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "cyan",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+          "cells": 112,
+          "fg": "cyan",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "╭ skills ──────────────────────────────────────────────────────────────────────────────────────────────────────╮",
+          "cells": 112,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "╭───────────────────────────────────────────────────╮",
+          "cells": 53,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "╭───────────────────────────────────────────────────╮",
+          "cells": 53,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "   ",
+          "cells": 3,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " ●  ",
+          "cells": 4,
+          "fg": "green",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "api-design                                   ",
+          "cells": 45,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " ●  ",
+          "cells": 4,
+          "fg": "green",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "docs-editor                                  ",
+          "cells": 45,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "   ",
+          "cells": 3,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "Design consistent HTTP and event APIs",
+          "cells": 37,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "             ",
+          "cells": 13,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "Review documentation for structure and clarity",
+          "cells": 46,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "    ",
+          "cells": 4,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "   ",
+          "cells": 3,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": "                                                   ",
+          "cells": 51,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "                                                   ",
+          "cells": 51,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "   ",
+          "cells": 3,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "󰉋 local",
+          "cells": 7,
+          "fg": "#9b89ac",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "        ",
+          "cells": 8,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "",
+          "cells": 1,
+          "fg": "#70a0e0",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " engineering ",
+          "cells": 13,
+          "fg": "#000000",
+          "bg": "#70a0e0",
+          "mods": []
+        },
+        {
+          "text": "",
+          "cells": 1,
+          "fg": "#70a0e0",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "",
+          "cells": 1,
+          "fg": "#70a0e0",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " Backend Launch ",
+          "cells": 16,
+          "fg": "#000000",
+          "bg": "#70a0e0",
+          "mods": []
+        },
+        {
+          "text": "",
+          "cells": 1,
+          "fg": "#70a0e0",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "󰉋 local",
+          "cells": 7,
+          "fg": "#9b89ac",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                               ",
+          "cells": 31,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "",
+          "cells": 1,
+          "fg": "#c090c8",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " writing ",
+          "cells": 9,
+          "fg": "#000000",
+          "bg": "#c090c8",
+          "mods": []
+        },
+        {
+          "text": "",
+          "cells": 1,
+          "fg": "#c090c8",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "   ",
+          "cells": 3,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "╰───────────────────────────────────────────────────╯",
+          "cells": 53,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "╰───────────────────────────────────────────────────╯",
+          "cells": 53,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "   ",
+          "cells": 3,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "╭───────────────────────────────────────────────────╮",
+          "cells": 53,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "╭───────────────────────────────────────────────────╮",
+          "cells": 53,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "   ",
+          "cells": 3,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " ●  ",
+          "cells": 4,
+          "fg": "green",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "incident-triage                              ",
+          "cells": 45,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " ●  ",
+          "cells": 4,
+          "fg": "green",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "release-notes                                ",
+          "cells": 45,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "   ",
+          "cells": 3,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "Triage production incidents with safe checklists",
+          "cells": 48,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "  ",
+          "cells": 2,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "Turn merged changes into concise release notes",
+          "cells": 46,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "    ",
+          "cells": 4,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "   ",
+          "cells": 3,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "                                                   ",
+          "cells": 51,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "                                                   ",
+          "cells": 51,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "   ",
+          "cells": 3,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "󰉋 local",
+          "cells": 7,
+          "fg": "#9b89ac",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                            ",
+          "cells": 28,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "",
+          "cells": 1,
+          "fg": "#e0b850",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " operations ",
+          "cells": 12,
+          "fg": "#000000",
+          "bg": "#e0b850",
+          "mods": []
+        },
+        {
+          "text": "",
+          "cells": 1,
+          "fg": "#e0b850",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "󰉋 local",
+          "cells": 7,
+          "fg": "#9b89ac",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "        ",
+          "cells": 8,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "",
+          "cells": 1,
+          "fg": "#70a0e0",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " engineering ",
+          "cells": 13,
+          "fg": "#000000",
+          "bg": "#70a0e0",
+          "mods": []
+        },
+        {
+          "text": "",
+          "cells": 1,
+          "fg": "#70a0e0",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "",
+          "cells": 1,
+          "fg": "#70a0e0",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " Backend Launch ",
+          "cells": 16,
+          "fg": "#000000",
+          "bg": "#70a0e0",
+          "mods": []
+        },
+        {
+          "text": "",
+          "cells": 1,
+          "fg": "#70a0e0",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "   ",
+          "cells": 3,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "╰───────────────────────────────────────────────────╯",
+          "cells": 53,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": " ",
+          "cells": 1,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "╰───────────────────────────────────────────────────╯",
+          "cells": 53,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": [
+            "dim"
+          ]
+        },
+        {
+          "text": "   ",
+          "cells": 3,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                                                                                                              ",
+          "cells": 110,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                                                                                                              ",
+          "cells": 110,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                                                                                                              ",
+          "cells": 110,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                                                                                                              ",
+          "cells": 110,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                                                                                                              ",
+          "cells": 110,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                                                                                                              ",
+          "cells": 110,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                                                                                                              ",
+          "cells": 110,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                                                                                                              ",
+          "cells": 110,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                                                                                                              ",
+          "cells": 110,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                                                                                                              ",
+          "cells": 110,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                                                                                                              ",
+          "cells": 110,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                                                                                                              ",
+          "cells": 110,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "                                                                                                              ",
+          "cells": 110,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "│",
+          "cells": 1,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "╰────────────────────────────────────────────────────────────────────────────────────────────────────",
+          "cells": 101,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": " 1–4 / 4 ",
+          "cells": 9,
+          "fg": "#9b89ac",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "─╯",
+          "cells": 2,
+          "fg": "dark-gray",
+          "bg": "reset",
+          "mods": []
+        }
+      ],
+      [
+        {
+          "text": "                                                              ",
+          "cells": 62,
+          "fg": "reset",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "↑↓",
+          "cells": 2,
+          "fg": "cyan",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " select  ",
+          "cells": 9,
+          "fg": "#8c8c8c",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "↓",
+          "cells": 1,
+          "fg": "cyan",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " list  ",
+          "cells": 7,
+          "fg": "#8c8c8c",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "Enter",
+          "cells": 5,
+          "fg": "cyan",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " list  ",
+          "cells": 7,
+          "fg": "#8c8c8c",
+          "bg": "reset",
+          "mods": []
+        },
+        {
+          "text": "Esc",
+          "cells": 3,
+          "fg": "cyan",
+          "bg": "reset",
+          "mods": [
+            "bold"
+          ]
+        },
+        {
+          "text": " clear/results  ",
+          "cells": 16,
+          "fg": "#8c8c8c",
+          "bg": "reset",
+          "mods": []
+        }
+      ]
+    ]
+  }
+}

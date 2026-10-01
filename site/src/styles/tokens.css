@@ -1,0 +1,82 @@
+@font-face {
+  font-family: 'Silkscreen';
+  src: url('../fonts/Silkscreen-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --font-display: 'Silkscreen', 'SFMono-Regular', Consolas, monospace;
+  --font-body: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-sans: var(--font-body);
+  --font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  --paper: #f3f2ec;
+  --panel: #fcfbf7;
+  --ink: #111214;
+  --muted: #5e615e;
+  --accent: #c92f24;
+  --accent-hover: #a91f18;
+  --button-text: #fff;
+  --rule: #b8bab4;
+  --selection: #f1c7c2;
+  --code-bg: #fcfbf7;
+  --warning: #a86800;
+  --inverse: #0d0f10;
+  --inverse-ink: #f2f1eb;
+  --inverse-muted: #aaaca7;
+  --inverse-rule: #3b3f41;
+  --dither-dot: rgba(17, 18, 20, .13);
+  --terminal-bg: #fff;
+  --terminal-ink: #111214;
+  --terminal-rule: #b8bab4;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --paper: #0d0f10;
+    --panel: #17191b;
+    --ink: #f2f1eb;
+    --muted: #aaaca7;
+    --accent: #ff5948;
+    --accent-hover: #ff806f;
+    --button-text: #111214;
+    --rule: #3b3f41;
+    --selection: #652b27;
+    --code-bg: #17191b;
+    --warning: #e9b94b;
+    --inverse: #f3f2ec;
+    --inverse-ink: #111214;
+    --inverse-muted: #5e615e;
+    --inverse-rule: #b8bab4;
+    --dither-dot: rgba(242, 241, 235, .12);
+    --terminal-bg: #11161b;
+    --terminal-ink: #e8edf2;
+    --terminal-rule: #465149;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme='dark'] {
+  --paper: #0d0f10;
+  --panel: #17191b;
+  --ink: #f2f1eb;
+  --muted: #aaaca7;
+  --accent: #ff5948;
+  --accent-hover: #ff806f;
+  --button-text: #111214;
+  --rule: #3b3f41;
+  --selection: #652b27;
+  --code-bg: #17191b;
+  --warning: #e9b94b;
+  --inverse: #f3f2ec;
+  --inverse-ink: #111214;
+  --inverse-muted: #5e615e;
+  --inverse-rule: #b8bab4;
+  --dither-dot: rgba(242, 241, 235, .12);
+  --terminal-bg: #11161b;
+  --terminal-ink: #e8edf2;
+  --terminal-rule: #465149;
+  color-scheme: dark;
+}
