@@ -313,7 +313,7 @@ fn comment_nested_table_value(
 }
 
 fn default_schema() -> u32 {
-    1
+    crate::schema::CONFIG
 }
 fn default_true() -> bool {
     true
@@ -326,7 +326,7 @@ pub fn default_agents() -> Vec<AgentConfig> {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            schema: 1,
+            schema: crate::schema::CONFIG,
             agents: default_agents(),
             tags: Vec::new(),
             tags_enabled: true,
@@ -338,12 +338,26 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Ignore the retired deploy section only at the file boundary. It is not
-    /// represented in runtime configuration, and all other fields stay strict.
-    fn parse(text: &str) -> Result<Self> {
+    /// Parse both the current format and the schema-1 migration source. Only
+    /// schema 1 may contain the retired deploy section and config-owned Tags.
+    fn parse_at(path: &Path, text: &str) -> Result<Self> {
         let mut doc: DocumentMut = text.parse()?;
-        doc.remove("deploy");
+        let schema = crate::schema::version(&doc, path, "config", crate::schema::CONFIG, 1)?;
+        if schema == 1 {
+            doc.remove("deploy");
+        } else {
+            anyhow::ensure!(
+                doc.get("tags").is_none() && doc.get("deploy").is_none(),
+                "config schema 2 no longer supports top-level tags or deploy in {}",
+                path.display()
+            );
+        }
+        doc["schema"] = value(schema as i64);
         Ok(toml::from_str(&doc.to_string())?)
+    }
+
+    fn parse(text: &str) -> Result<Self> {
+        Self::parse_at(Path::new("config.toml"), text)
     }
     pub fn local_default() -> Self {
         Self {
@@ -399,6 +413,23 @@ impl Config {
         meta_dir(root).join(CONFIG_FILE)
     }
 
+    fn validate_existing_write_target(path: &Path) -> Result<()> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match text.parse::<DocumentMut>() {
+                Ok(doc) => {
+                    crate::schema::require_current(&doc, path, "config", crate::schema::CONFIG, 1)
+                }
+                // A complete save is also the recovery path for an interrupted
+                // hand edit. Future schemas are protected whenever the TOML
+                // document is readable; malformed contents have no usable
+                // schema and may be replaced explicitly by the caller.
+                Err(_) => Ok(()),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
     /// Load settings and the unified in-memory Tag view. Legacy config Tags
     /// remain visible until Workspace's startup migration removes that item.
     pub fn load(root: &Path) -> Result<Self> {
@@ -431,9 +462,8 @@ impl Config {
     pub(crate) fn load_legacy(root: &Path) -> Result<Self> {
         let path = Self::path(root);
         match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                Self::parse(&text).with_context(|| format!("invalid config: {}", path.display()))
-            }
+            Ok(text) => Self::parse_at(&path, &text)
+                .with_context(|| format!("invalid config: {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
@@ -447,8 +477,11 @@ impl Config {
     /// use this; `init` writes the self-documenting form below.
     pub fn save(&self, root: &Path) -> Result<()> {
         let path = Self::path(root);
+        Self::validate_existing_write_target(&path)?;
         std::fs::create_dir_all(path.parent().unwrap())?;
-        let text = toml::to_string_pretty(self)?;
+        let mut current = self.clone();
+        current.schema = crate::schema::CONFIG;
+        let text = toml::to_string_pretty(&current)?;
         crate::util::write_atomic(&path, text.as_bytes())?;
         if !self.tags.is_empty() {
             let store = crate::tag::TagStore::new(root);
@@ -462,8 +495,11 @@ impl Config {
     /// generated guide cannot silently choose different defaults.
     pub fn save_commented(&self, root: &Path) -> Result<()> {
         let path = Self::path(root);
+        Self::validate_existing_write_target(&path)?;
         std::fs::create_dir_all(path.parent().unwrap())?;
-        let mut doc = toml::to_string_pretty(self)?.parse::<DocumentMut>()?;
+        let mut current = self.clone();
+        current.schema = crate::schema::CONFIG;
+        let mut doc = toml::to_string_pretty(&current)?.parse::<DocumentMut>()?;
         doc.as_table_mut().decor_mut().set_prefix(
             "# Skills Manager configuration\n\
              #\n\
@@ -476,7 +512,7 @@ impl Config {
         comment_key(
             doc.as_table_mut(),
             "schema",
-            "# Configuration schema version. Keep this at 1.\n",
+            "# Configuration schema version. Keep this at 2.\n",
         );
         comment_key(
             doc.as_table_mut(),
@@ -625,9 +661,13 @@ impl Config {
     ) -> Result<()> {
         let path = Self::path(root);
         let mut doc = match std::fs::read_to_string(&path) {
-            Ok(text) => text
-                .parse::<DocumentMut>()
-                .with_context(|| format!("invalid config: {}", path.display()))?,
+            Ok(text) => {
+                let doc = text
+                    .parse::<DocumentMut>()
+                    .with_context(|| format!("invalid config: {}", path.display()))?;
+                crate::schema::require_current(&doc, &path, "config", crate::schema::CONFIG, 1)?;
+                doc
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => DocumentMut::new(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
@@ -834,7 +874,7 @@ mod tests {
         let sync_section = "[sync] # automatic backup waits\nquiet_seconds = 42 # content\ntui_idle_seconds = 7 # activity\n\n";
         std::fs::write(
             &path,
-            format!("[[agents]]\nkey = 'existing'\nskills_dir = '~/.existing/skills'\n\n{sync_section}[ui]\nlayout = 'list'\n"),
+            format!("schema = 2\n\n[[agents]]\nkey = 'existing'\nskills_dir = '~/.existing/skills'\n\n{sync_section}[ui]\nlayout = 'list'\n"),
         )
         .unwrap();
         Config::edit_tags(tmp.path(), |tags| {

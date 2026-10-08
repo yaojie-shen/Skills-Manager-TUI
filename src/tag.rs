@@ -1,13 +1,13 @@
 //! Named skill groups stored independently under `<root>/.skills-meta/tags`.
 
-use crate::{meta::MetaStore, paths::meta_dir, util::write_atomic};
+use crate::{group_filename, meta::MetaStore, paths::meta_dir};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
+use toml_edit::{DocumentMut, value};
 
 pub const TAG_DIR: &str = "tags";
 
@@ -24,15 +24,17 @@ pub struct Tag {
 }
 
 impl Tag {
-    fn normalize(&mut self) {
+    fn normalize(&mut self) -> Result<()> {
+        self.name = group_filename::normalize_name(&self.name)?;
         self.skills.sort();
         self.skills.dedup();
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Entry {
-    pub id: String,
+    pub path: PathBuf,
     pub tag: Tag,
     pub bytes: Vec<u8>,
 }
@@ -51,22 +53,25 @@ impl TagStore {
         }
     }
 
-    pub(crate) fn path(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}.toml"))
+    pub(crate) fn path_for_stem(&self, stem: &str) -> PathBuf {
+        self.dir.join(format!("{stem}.toml"))
     }
 
-    fn default_id(name: &str) -> String {
-        let digest = Sha256::digest(name.as_bytes());
-        format!(
-            "tag-{}",
-            digest[..12]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        )
+    pub(crate) fn serialize(tag: &Tag) -> Result<Vec<u8>> {
+        let mut doc = toml::to_string_pretty(tag)?.parse::<DocumentMut>()?;
+        crate::schema::set(&mut doc, crate::schema::TAG);
+        Ok(doc.to_string().into_bytes())
     }
 
     pub(crate) fn entries(&self) -> Result<Vec<Entry>> {
+        self.entries_impl(false)
+    }
+
+    pub(crate) fn entries_for_migration(&self) -> Result<Vec<Entry>> {
+        self.entries_impl(true)
+    }
+
+    fn entries_impl(&self, allow_legacy_filename: bool) -> Result<Vec<Entry>> {
         let rd = match std::fs::read_dir(&self.dir) {
             Ok(rd) => rd,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -83,9 +88,13 @@ impl TagStore {
             );
             let path = entry.path();
             ensure!(
-                path.extension()
-                    .is_some_and(|extension| extension == "toml"),
+                path.extension().is_some_and(|e| e == "toml"),
                 "invalid Tag store entry: {}",
+                path.display()
+            );
+            ensure!(
+                path.file_name().and_then(|n| n.to_str()).is_some(),
+                "Tag filename is not valid UTF-8: {}",
                 path.display()
             );
             paths.push(path);
@@ -94,40 +103,50 @@ impl TagStore {
         let mut out = Vec::new();
         let mut names = BTreeSet::new();
         for path in paths {
-            let id = path
-                .file_stem()
-                .context("Tag filename missing")?
-                .to_string_lossy()
-                .into_owned();
-            ensure!(
-                crate::util::valid_skill_key(&id),
-                "invalid Tag storage id: {id}"
-            );
             let bytes =
                 std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
             let text = std::str::from_utf8(&bytes)
                 .with_context(|| format!("invalid UTF-8 in {}", path.display()))?;
-            let mut tag: Tag =
-                toml::from_str(text).with_context(|| format!("invalid Tag: {}", path.display()))?;
-            ensure!(
-                !tag.name.trim().is_empty(),
-                "empty Tag name in {}",
-                path.display()
-            );
-            tag.normalize();
+            let mut doc = text
+                .parse::<DocumentMut>()
+                .with_context(|| format!("invalid Tag: {}", path.display()))?;
+            let schema = crate::schema::version(&doc, &path, "Tag", crate::schema::TAG, 0)?;
+            if !allow_legacy_filename && schema < crate::schema::TAG {
+                bail!(
+                    "legacy Tag schema {schema} in {}; reopen the workspace to migrate it to schema {}",
+                    path.display(),
+                    crate::schema::TAG
+                );
+            }
+            doc.remove("schema");
+            let mut tag: Tag = toml::from_str(&doc.to_string())
+                .with_context(|| format!("invalid Tag: {}", path.display()))?;
+            tag.normalize()?;
             ensure!(
                 names.insert(tag.name.clone()),
                 "duplicate Tag name: {}",
                 tag.name
             );
-            out.push(Entry { id, tag, bytes });
+            out.push(Entry { path, tag, bytes });
+        }
+        let allocated = group_filename::allocate(out.iter().map(|entry| entry.tag.name.as_str()))?;
+        if !allow_legacy_filename {
+            for entry in &out {
+                let expected = self.path_for_stem(&allocated[&entry.tag.name]);
+                ensure!(
+                    entry.path == expected,
+                    "noncanonical Tag filename {}; reopen the workspace to migrate it to {}",
+                    entry.path.display(),
+                    expected.display()
+                );
+            }
         }
         Ok(out)
     }
 
     pub(crate) fn tags(entries: &[Entry]) -> Vec<Tag> {
         let mut tags: Vec<_> = entries.iter().map(|entry| entry.tag.clone()).collect();
-        tags.sort_by(|left, right| left.name.cmp(&right.name));
+        tags.sort_by(|a, b| a.name.cmp(&b.name));
         tags
     }
 
@@ -136,6 +155,7 @@ impl TagStore {
     }
 
     pub fn load(&self, name: &str) -> Result<Option<Tag>> {
+        let name = group_filename::normalize_name(name)?;
         Ok(self
             .entries()?
             .into_iter()
@@ -149,113 +169,93 @@ impl TagStore {
         mut tags: Vec<Tag>,
     ) -> Result<Vec<Entry>> {
         for tag in &mut tags {
-            tag.name = tag.name.trim().to_owned();
-            ensure!(!tag.name.is_empty(), "Tag name is empty");
-            tag.normalize();
+            tag.normalize()?;
         }
-        tags.sort_by(|left, right| left.name.cmp(&right.name));
+        tags.sort_by(|a, b| a.name.cmp(&b.name));
         ensure!(
             tags.windows(2).all(|pair| pair[0].name != pair[1].name),
             "duplicate Tag name"
         );
+        let allocation = group_filename::allocate(tags.iter().map(|tag| tag.name.as_str()))?;
         let existing: BTreeMap<_, _> = before
             .iter()
             .map(|entry| (entry.tag.name.clone(), entry))
             .collect();
-        let by_tag: Vec<_> = before.iter().collect();
-        let mut used = BTreeSet::new();
         let mut desired = Vec::new();
         for tag in tags {
-            let prior = existing.get(&tag.name).copied().or_else(|| {
-                // A rename preserves storage identity by matching the one old
-                // definition whose non-name content is unchanged.
-                let candidates: Vec<_> = by_tag
-                    .iter()
-                    .copied()
-                    .filter(|entry| {
-                        !used.contains(&entry.id)
-                            && entry.tag.skills == tag.skills
-                            && entry.tag.color == tag.color
-                            && entry.tag.description == tag.description
-                    })
-                    .collect();
-                if candidates.len() == 1 {
-                    Some(candidates[0])
-                } else {
-                    None
-                }
-            });
-            let base = prior
-                .map(|entry| entry.id.clone())
-                .unwrap_or_else(|| Self::default_id(&tag.name));
-            let mut id = base.clone();
-            let mut suffix = 2;
-            while !used.insert(id.clone()) || (prior.is_none() && self.path(&id).exists()) {
-                id = format!("{base}-{suffix}");
-                suffix += 1;
-            }
-            let bytes = if prior.is_some_and(|entry| entry.tag == tag) {
-                prior.unwrap().bytes.clone()
-            } else {
-                toml::to_string_pretty(&tag)?.into_bytes()
-            };
-            desired.push(Entry { id, tag, bytes });
+            let path = self.path_for_stem(&allocation[&tag.name]);
+            let bytes = existing
+                .get(&tag.name)
+                .filter(|old| old.tag == tag)
+                .map(|old| old.bytes.clone())
+                .unwrap_or(Self::serialize(&tag)?);
+            desired.push(Entry { path, tag, bytes });
         }
         Ok(desired)
     }
 
     pub(crate) fn apply_entries(&self, before: &[Entry], desired: &[Entry]) -> Result<()> {
-        // Revalidate every source before publishing any change.
         for entry in before {
             ensure!(
-                std::fs::read(self.path(&entry.id))? == entry.bytes,
+                std::fs::read(&entry.path)? == entry.bytes,
                 "Tag {} changed during this operation",
                 entry.tag.name
             );
         }
         std::fs::create_dir_all(&self.dir)?;
-        let before_by_id: BTreeMap<_, _> = before
-            .iter()
-            .map(|entry| (entry.id.as_str(), entry))
-            .collect();
-        let mut written: Vec<&Entry> = Vec::new();
+        let sources: BTreeSet<_> = before.iter().map(|entry| entry.path.clone()).collect();
+        let physical: Vec<_> = std::fs::read_dir(&self.dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<_>>()?;
         for entry in desired {
-            if before_by_id
-                .get(entry.id.as_str())
-                .is_some_and(|old| old.bytes == entry.bytes)
-            {
-                continue;
-            }
-            let path = self.path(&entry.id);
-            if !before_by_id.contains_key(entry.id.as_str()) {
-                ensure!(
-                    !path.exists(),
-                    "Tag destination {} appeared during this operation",
-                    path.display()
-                );
-            }
-            if let Err(error) = write_atomic(&path, &entry.bytes) {
-                for applied in written.into_iter().rev() {
-                    if let Some(old) = before_by_id.get(applied.id.as_str()) {
-                        let _ = write_atomic(&self.path(&old.id), &old.bytes);
-                    } else {
-                        let _ = std::fs::remove_file(self.path(&applied.id));
-                    }
-                }
-                return Err(error);
-            }
-            written.push(entry);
+            let destination_key = entry
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(group_filename::collision_key);
+            let external_collision = physical.iter().any(|path| {
+                !sources.contains(path)
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(group_filename::collision_key)
+                        == destination_key
+            });
+            let source_collision = before.iter().any(|source| {
+                source
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(group_filename::collision_key)
+                    == destination_key
+            });
+            ensure!(
+                !external_collision
+                    && (sources.contains(&entry.path) || source_collision || !entry.path.exists()),
+                "Tag destination {} appeared during this operation",
+                entry.path.display()
+            );
         }
-        let keep: BTreeSet<_> = desired.iter().map(|entry| entry.id.as_str()).collect();
-        for entry in before {
-            if !keep.contains(entry.id.as_str()) {
-                std::fs::remove_file(self.path(&entry.id))?;
-            }
-        }
-        Ok(())
+        crate::file_set::publish(
+            &self.dir,
+            &before
+                .iter()
+                .map(|entry| crate::file_set::File {
+                    path: &entry.path,
+                    bytes: &entry.bytes,
+                })
+                .collect::<Vec<_>>(),
+            &desired
+                .iter()
+                .map(|entry| crate::file_set::File {
+                    path: &entry.path,
+                    bytes: &entry.bytes,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .context("publishing Tag files")
     }
 
-    /// Update only changed definitions; untouched TOML bytes and comments remain exact.
     pub fn edit(&self, edit: impl FnOnce(&mut Vec<Tag>)) -> Result<()> {
         let _lock = MetaStore::new(&self.root).lock()?;
         let before = self.entries()?;
@@ -266,7 +266,8 @@ impl TagStore {
     }
 
     pub fn save(&self, tag: &Tag) -> Result<()> {
-        let tag = tag.clone();
+        let mut tag = tag.clone();
+        tag.normalize()?;
         self.edit(
             |tags| match tags.iter_mut().find(|current| current.name == tag.name) {
                 Some(current) => *current = tag,
@@ -276,6 +277,7 @@ impl TagStore {
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {
+        let name = group_filename::normalize_name(name)?;
         let mut found = false;
         self.edit(|tags| {
             tags.retain(|tag| {
@@ -289,11 +291,9 @@ impl TagStore {
         Ok(())
     }
 
-    /// Move a definition. If the target exists it wins unchanged, matching the
-    /// old config-entry history behavior.
     pub fn rename(&self, old: &str, new: &str) -> Result<()> {
-        let new = new.trim();
-        ensure!(!new.is_empty(), "new Tag name is empty");
+        let old = group_filename::normalize_name(old)?;
+        let new = group_filename::normalize_name(new)?;
         if old == new {
             return Ok(());
         }
@@ -302,21 +302,29 @@ impl TagStore {
         let Some(source) = before.iter().find(|entry| entry.tag.name == old) else {
             return Ok(());
         };
-        if before.iter().any(|entry| entry.tag.name == new) {
-            let desired: Vec<_> = before
-                .iter()
-                .filter(|entry| entry.id != source.id)
-                .cloned()
-                .collect();
-            return self.apply_entries(&before, &desired);
+        let mut tags = Self::tags(&before);
+        if let Some(target) = tags.iter_mut().find(|tag| tag.name == new) {
+            target.skills.extend(source.tag.skills.clone());
+            target.skills.sort();
+            target.skills.dedup();
+            if target.color.is_none() {
+                target.color = source.tag.color.clone();
+            }
+            if target.description.is_none() {
+                target.description = source.tag.description.clone();
+            }
+            tags.retain(|tag| tag.name != old);
+        } else {
+            tags.iter_mut().find(|tag| tag.name == old).unwrap().name = new.clone();
         }
-        let mut desired = before.clone();
-        let renamed = desired
-            .iter_mut()
-            .find(|entry| entry.id == source.id)
-            .context("Tag vanished during rename planning")?;
-        renamed.tag.name = new.to_owned();
-        renamed.bytes = toml::to_string_pretty(&renamed.tag)?.into_bytes();
+        let mut desired = self.choose_entries(&before, tags)?;
+        if let Some(renamed) = desired.iter_mut().find(|entry| entry.tag.name == new)
+            && before.iter().all(|entry| entry.tag.name != new)
+        {
+            let mut doc = std::str::from_utf8(&source.bytes)?.parse::<DocumentMut>()?;
+            doc["name"] = value(&new);
+            renamed.bytes = doc.to_string().into_bytes();
+        }
         self.apply_entries(&before, &desired)
     }
 
@@ -344,40 +352,30 @@ mod tests {
     use crate::ops::DownloadDir;
 
     #[test]
-    fn stores_unicode_names_under_safe_stable_ids_and_preserves_comments() {
+    fn stores_readable_names_and_renames_files_preserving_comments() {
         let temp = DownloadDir::new("tag-store").unwrap();
         let store = TagStore::new(temp.path());
         store
             .save(&Tag {
                 name: "工作 / Rust".into(),
-                skills: vec!["b".into(), "a".into(), "a".into()],
+                skills: vec!["b".into(), "a".into()],
                 color: None,
                 description: None,
             })
             .unwrap();
-        let path = std::fs::read_dir(&store.dir)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        assert!(!path.to_string_lossy().contains("工作"));
-        let mut text = std::fs::read_to_string(&path).unwrap();
+        let old = store.dir.join("工作 - Rust.toml");
+        assert!(old.exists());
+        let mut text = std::fs::read_to_string(&old).unwrap();
         text.insert_str(0, "# keep me\n");
-        std::fs::write(&path, &text).unwrap();
-        store.edit(|_| {}).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        std::fs::write(&old, text).unwrap();
         store.rename("工作 / Rust", "工作 / 系统").unwrap();
-        assert_eq!(
-            std::fs::read_dir(&store.dir)
+        let new = store.dir.join("工作 - 系统.toml");
+        assert!(new.exists());
+        assert!(
+            std::fs::read_to_string(new)
                 .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path(),
-            path
+                .starts_with("# keep me")
         );
-        assert_eq!(store.list().unwrap()[0].skills, ["a", "b"]);
     }
 
     #[test]
@@ -405,34 +403,24 @@ mod tests {
     }
 
     #[test]
-    fn existing_rename_target_wins_unchanged() {
-        let temp = DownloadDir::new("tag-rename-target").unwrap();
+    fn collision_group_all_get_digests() {
+        let temp = DownloadDir::new("tag-collision").unwrap();
         let store = TagStore::new(temp.path());
-        store
-            .save(&Tag {
-                name: "old".into(),
-                skills: vec!["a".into()],
-                color: Some("blue".into()),
-                description: None,
-            })
-            .unwrap();
-        store
-            .save(&Tag {
-                name: "target".into(),
-                skills: vec!["b".into()],
-                color: Some("red".into()),
-                description: None,
-            })
-            .unwrap();
-        store.rename("old", "target").unwrap();
-        assert_eq!(
-            store.list().unwrap(),
-            [Tag {
-                name: "target".into(),
-                skills: vec!["b".into()],
-                color: Some("red".into()),
-                description: None
-            }]
-        );
+        for name in ["A/B", "A-B"] {
+            store
+                .save(&Tag {
+                    name: name.into(),
+                    skills: vec![],
+                    color: None,
+                    description: None,
+                })
+                .unwrap();
+        }
+        let names: Vec<_> = std::fs::read_dir(&store.dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.iter().all(|name| name.starts_with("A-B--")));
     }
 }

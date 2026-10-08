@@ -177,6 +177,7 @@ fn old_registry_and_sync_config_have_no_effect() {
     std::fs::write(&path, legacy).unwrap();
     let config_path = Config::path(&ws.root);
     let mut config_text = std::fs::read_to_string(&config_path).unwrap();
+    config_text = config_text.replacen("schema = 2", "schema = 1", 1);
     config_text.push_str("\n[deploy]\nall_to_all = true\npresets = [\"missing-preset\"]\n");
     std::fs::write(&config_path, &config_text).unwrap();
     let project = f.0.join("project");
@@ -193,7 +194,9 @@ fn old_registry_and_sync_config_have_no_effect() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("root sync is not configured"));
     assert!(target.skills_path().join("sample").is_symlink());
-    assert_eq!(std::fs::read_to_string(config_path).unwrap(), config_text);
+    let migrated_config = std::fs::read_to_string(config_path).unwrap();
+    assert!(migrated_config.contains("schema = 2"));
+    assert!(!migrated_config.contains("[deploy]"));
 }
 
 #[test]

@@ -218,9 +218,19 @@ impl MetaStore {
     }
     pub(crate) fn read(path: &Path) -> Result<DocumentMut> {
         match std::fs::read_to_string(path) {
-            Ok(text) => text
-                .parse()
-                .with_context(|| format!("invalid metadata: {}", path.display())),
+            Ok(text) => {
+                let doc = text
+                    .parse()
+                    .with_context(|| format!("invalid metadata: {}", path.display()))?;
+                crate::schema::require_current(
+                    &doc,
+                    path,
+                    "repository metadata",
+                    crate::schema::REPOSITORY,
+                    0,
+                )?;
+                Ok(doc)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DocumentMut::new()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
@@ -313,6 +323,7 @@ impl MetaStore {
         Ok(keys)
     }
     fn put(doc: &mut DocumentMut, key: &str, meta: &SkillMeta) -> Result<()> {
+        crate::schema::set(doc, crate::schema::REPOSITORY);
         let mut item = toml::to_string(meta)?
             .parse::<DocumentMut>()?
             .as_table()
@@ -605,7 +616,7 @@ mod tests {
         let store = MetaStore::new(temp.path());
         let file = store.path("repos/demo/one");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, "alias = 'demo'\nurl = 'https://example.com/repo'\nbranch = 'main'\n[skills.one.source]\ntype = 'git'\nsubpath = 'one'\nrevision = 'abcdef'\n").unwrap();
+        std::fs::write(&file, "schema = 1\nalias = 'demo'\nurl = 'https://example.com/repo'\nbranch = 'main'\n[skills.one.source]\ntype = 'git'\nsubpath = 'one'\nrevision = 'abcdef'\n").unwrap();
         let source = store
             .load("repos/demo/one")
             .unwrap()
@@ -691,7 +702,7 @@ mod tests {
         let store = MetaStore::new(&tmp);
         std::fs::write(
             store.path("foo"),
-            "# hand written comment\n[skills.foo]\nnote = \"hi\"\n",
+            "# hand written comment\nschema = 1\n[skills.foo]\nnote = \"hi\"\n",
         )
         .unwrap();
         let mut doc = MetaStore::read(&store.path("foo")).unwrap();

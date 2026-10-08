@@ -285,11 +285,7 @@ fn catalog_needs_no_root_and_agent_registration_preserves_global_config() {
     );
     let root = f.0.join("global");
     std::fs::create_dir_all(root.join(".skills-meta")).unwrap();
-    std::fs::write(
-        Config::path(&root),
-        "# keep my comment\n[deploy]\nall_to_all = false\n",
-    )
-    .unwrap();
+    std::fs::write(Config::path(&root), "# keep my comment\nschema = 2\n").unwrap();
     Config::add_agent(&root, &skills::agents::BUILTINS[2].config(false), false).unwrap();
     let text = std::fs::read_to_string(Config::path(&root)).unwrap();
     assert!(text.starts_with("# keep my comment\n"));

@@ -226,7 +226,7 @@ fn legacy_migration_snapshots_members_once_and_keeps_exact_backups() {
     std::fs::create_dir_all(&f.ws.presets.dir).unwrap();
     let original = "# keep the original format for recovery\nname = 'daily'\ndescription = 'Daily tools'\ncolor = '#b87e54'\nskills = ['extra', 'one', 'extra', 'missing']\ntags = ['work', 'study', 'work']\nagents = ['a']\n";
     let empty = "name = 'empty'\ntags = []\nskills = ['two', 'two']\n";
-    let modern = "# A fixed preset must not be inferred or rewritten\nname = 'modern'\nskills = ['two', 'one', 'one']\n";
+    let modern = "# A fixed preset must not be inferred or rewritten\nschema = 1\nname = 'modern'\nskills = ['two', 'one', 'one']\n";
     std::fs::write(f.ws.presets.path("daily"), original).unwrap();
     std::fs::write(f.ws.presets.path("empty"), empty).unwrap();
     std::fs::write(f.ws.presets.path("modern"), modern).unwrap();
@@ -240,11 +240,11 @@ fn legacy_migration_snapshots_members_once_and_keeps_exact_backups() {
             .starts_with(f.ws.root.join(".skills-meta/backups"))
     );
     assert_eq!(
-        std::fs::read(report.backup_dir.join("daily.toml")).unwrap(),
+        std::fs::read(report.backup_dir.join("presets/daily.toml")).unwrap(),
         original.as_bytes()
     );
     assert_eq!(
-        std::fs::read(report.backup_dir.join("empty.toml")).unwrap(),
+        std::fs::read(report.backup_dir.join("presets/empty.toml")).unwrap(),
         empty.as_bytes()
     );
     assert_eq!(
@@ -294,7 +294,7 @@ fn migration_preflights_every_file_before_changing_any_definition() {
         std::fs::write(f.ws.presets.path("daily"), original).unwrap();
         std::fs::write(f.ws.presets.path("z-bad"), invalid).unwrap();
         let error = Workspace::open(&f.ws.root).unwrap_err();
-        assert!(format!("{error:#}").contains("z-bad.toml"));
+        assert!(format!("{error:#}").contains("z-bad.toml"), "{error:#}");
         assert_eq!(
             std::fs::read(f.ws.presets.path("daily")).unwrap(),
             original.as_bytes()
@@ -373,7 +373,7 @@ fn cli_migration_reports_backups_on_stderr_without_polluting_json() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["skills"], serde_json::json!(["one", "two"]));
     assert!(value.get("tags").is_none());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("metadata-before-migration-"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("metadata-before-schema-migration-"));
 }
 
 #[test]

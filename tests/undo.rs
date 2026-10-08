@@ -771,7 +771,7 @@ fn tag_case_only_rename_preserves_style_members_and_history() {
 }
 
 #[test]
-fn renaming_a_preset_leaves_legacy_deploy_config_untouched() {
+fn renaming_a_preset_uses_migrated_config_without_legacy_deploy() {
     let fx = Fixture::new("preset-rename");
     config_by_hand(&fx);
     let ws = fx.ws();
@@ -794,10 +794,8 @@ fn renaming_a_preset_leaves_legacy_deploy_config_untouched() {
     assert_eq!(moved.skills, ["bicycle"]);
     assert!(ws.presets.load("commute").unwrap().is_none());
     let text = std::fs::read_to_string(Config::path(&fx.root)).unwrap();
-    assert!(
-        text.contains("# the everyday set\npresets = [\"commute\"] # goes first"),
-        "legacy deployment config is ignored and remains unchanged: {text}"
-    );
+    assert!(text.contains("schema = 2"), "{text}");
+    assert!(!text.contains("[deploy]"), "{text}");
 
     // Back: the file and the config entry both return to the old name.
     let message = step(&ws, &mut log, true);

@@ -5,6 +5,8 @@
 pub mod agents;
 pub mod config;
 pub mod dict;
+mod file_set;
+pub(crate) mod group_filename;
 pub mod hash;
 pub mod history;
 pub mod meta;
@@ -14,6 +16,7 @@ pub mod paths;
 pub mod preset;
 pub mod reconcile;
 pub mod repository;
+pub(crate) mod schema;
 pub mod search;
 pub mod skill;
 pub mod tag;
@@ -34,7 +37,7 @@ pub struct Workspace {
     pub meta: meta::MetaStore,
     pub tags: tag::TagStore,
     pub presets: preset::PresetStore,
-    pub migration: Option<preset::MigrationReport>,
+    pub migration: Option<migration::MigrationReport>,
 }
 
 impl Workspace {
@@ -45,7 +48,7 @@ impl Workspace {
         let mut config = config::Config::load_legacy(&root)?;
         let presets = preset::PresetStore::new(&root);
         let tags = tag::TagStore::new(&root);
-        let loaded_tags = tags.entries()?;
+        let loaded_tags = tags.entries_for_migration()?;
         let stored_tags = tag::TagStore::tags(&loaded_tags);
         for stored in &stored_tags {
             if let Some(legacy) = config.tags.iter().find(|tag| tag.name == stored.name) {
@@ -64,8 +67,7 @@ impl Workspace {
                 config.tags.push(stored.clone());
             }
         }
-        let migration =
-            migration::migrate_legacy_tags(&root, &config, &tags, &loaded_tags, &presets)?;
+        let migration = migration::migrate_metadata(&root, &config, &tags, &loaded_tags, &presets)?;
         if migration.is_some() {
             config.tags = tags.list()?;
         }
@@ -110,7 +112,7 @@ impl Workspace {
         } else {
             config::Config::local_default()
         };
-        let loaded_tags = ws.tags.entries()?;
+        let loaded_tags = ws.tags.entries_for_migration()?;
         let stored_tags = tag::TagStore::tags(&loaded_tags);
         for stored in &stored_tags {
             if let Some(legacy) = ws.config.tags.iter().find(|tag| tag.name == stored.name) {
@@ -129,13 +131,8 @@ impl Workspace {
                 ws.config.tags.push(stored.clone());
             }
         }
-        ws.migration = migration::migrate_legacy_tags(
-            &ws.root,
-            &ws.config,
-            &ws.tags,
-            &loaded_tags,
-            &ws.presets,
-        )?;
+        ws.migration =
+            migration::migrate_metadata(&ws.root, &ws.config, &ws.tags, &loaded_tags, &ws.presets)?;
         // Apply local path expansion and omitted-agent defaults exactly once
         // after migration has finished with the raw project configuration.
         ws.config = ws.load_config()?;

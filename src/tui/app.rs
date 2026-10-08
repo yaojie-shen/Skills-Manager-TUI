@@ -453,9 +453,11 @@ impl App {
         if let Some(report) = &app.ws.migration {
             app.toast(
                 format!(
-                    "Migrated {} Tags and {} presets · backup: {}",
+                    "Migrated config: {}, {} Tags, {} presets, {} repositories · backup: {}",
+                    report.config_migrated,
                     report.migrated_tags.len(),
                     report.migrated_names.len(),
+                    report.migrated_repositories.len(),
                     report.backup_dir.display()
                 ),
                 Level::Info,
@@ -3248,17 +3250,14 @@ mod matrix_key_tests {
             ));
         }
         assert_eq!(app.pending_task_ui.len(), 2);
-        app.handle(key(KeyCode::Enter)); // Invalid preset name: keep editing.
-        assert!(matches!(&app.modal, Some(Modal::Input { .. })));
-        assert_eq!(app.pending_task_ui.len(), 2);
         app.handle(key(KeyCode::Char('b')));
         let Some(Modal::Input { input, .. }) = &app.modal else {
             panic!("lost input")
         };
         assert_eq!(input.value(), "ab/");
-        app.handle(key(KeyCode::Delete));
-        app.handle(key(KeyCode::Enter)); // Save; only the first task may appear.
-        assert!(app.ws.presets.load("ab").unwrap().is_some());
+        app.handle(key(KeyCode::Enter)); // Save with a normalized safe filename.
+        assert!(app.ws.presets.load("ab/").unwrap().is_some());
+        assert!(app.ws.presets.dir.join("ab.toml").exists());
         let Some(Modal::Repository(picker)) = &app.modal else {
             panic!("expected first result")
         };

@@ -30,6 +30,8 @@ tar = { version = "0.4.46", default-features = false }
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 bzip2 = "0.6.1"
 lzma-rust2 = { version = "0.20.1", default-features = false, features = ["std", "xz", "optimization"] }
+unicode-normalization = "0.1.25"
+unicode-casefold = "0.2.0"
 
 [dev-dependencies]
 lzma-rust2 = { version = "0.20.1", default-features = false, features = ["encoder"] }
