@@ -209,3 +209,55 @@ fn restoring_backup_and_removing_declaration_reruns_detection() {
     Workspace::open(&root).unwrap();
     assert_eq!(tree(&root), expected);
 }
+
+#[test]
+fn legacy_documents_under_a_declaration_point_to_reupgrading() {
+    let (root, first, _) = run_case("v1-current", false);
+    first.unwrap();
+    let meta = root.join(".skills-meta");
+    // A legacy document arriving later, e.g. through root sync from an older build.
+    fs::create_dir_all(meta.join("tags")).unwrap();
+    fs::write(
+        meta.join("tags/synced.toml"),
+        "name = 'synced'\nskills = ['one']\n",
+    )
+    .unwrap();
+    let error = format!("{:#}", Workspace::open(&root).unwrap_err());
+    assert!(
+        error.contains("uses legacy Tag schema 0, but this Skills Manager expects Tag schema 1"),
+        "{error}"
+    );
+    assert!(
+        error.contains("delete .skills-meta/format.toml if it exists and reopen"),
+        "{error}"
+    );
+    assert!(!error.contains("declares layout"), "{error}");
+    assert!(!error.contains("copy the originals"), "{error}");
+
+    fs::remove_file(migration::version::path(&root)).unwrap();
+    let reopened = Workspace::open(&root).unwrap();
+    assert!(reopened.migration.unwrap().backup_dir.is_dir());
+    assert!(reopened.tags.load("synced").unwrap().is_some());
+    assert_fixed_point(&root, "re-upgraded");
+}
+
+#[test]
+fn legacy_config_error_names_the_expected_schema_and_the_file_once() {
+    let (root, first, _) = run_case("v1-current", false);
+    first.unwrap();
+    let config = root.join(".skills-meta/config.toml");
+    fs::write(&config, "schema = 1\n").unwrap();
+    let error = format!("{:#}", Workspace::open(&root).unwrap_err());
+    assert!(
+        error.contains(
+            "uses legacy config schema 1, but this Skills Manager expects config schema 2"
+        ),
+        "{error}"
+    );
+    assert!(error.contains("delete .skills-meta/format.toml"), "{error}");
+    assert_eq!(
+        error.matches(&config.display().to_string()).count(),
+        1,
+        "{error}"
+    );
+}

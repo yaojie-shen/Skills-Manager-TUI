@@ -83,12 +83,8 @@ impl Workspace {
     }
 
     pub fn load_config(&self) -> Result<config::Config> {
-        if let Some(layout) = migration::version::read(&self.root)? {
-            anyhow::ensure!(
-                layout <= migration::CURRENT_LAYOUT,
-                "Skill Home layout {layout} requires a newer version of Skills Manager"
-            );
-        }
+        // Rejects a layout newer than this build, e.g. after a root-sync pull.
+        migration::version::read(&self.root)?;
         let Some(project) = &self.project else {
             return config::Config::load(&self.root);
         };

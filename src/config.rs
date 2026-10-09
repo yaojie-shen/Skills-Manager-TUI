@@ -340,21 +340,20 @@ impl Default for Config {
 impl Config {
     /// Parse the current configuration format.
     fn parse_at(path: &Path, text: &str) -> Result<Self> {
-        let doc: DocumentMut = text.parse()?;
+        let invalid = || format!("invalid config: {}", path.display());
+        let doc: DocumentMut = text.parse().with_context(invalid)?;
         crate::schema::require_current(&doc, path, "config", crate::schema::CONFIG, 1)?;
         anyhow::ensure!(
             doc.get("tags").is_none() && doc.get("deploy").is_none(),
             "config schema 2 no longer supports top-level tags or deploy in {}",
             path.display()
         );
-        Ok(toml::from_str(&doc.to_string())?)
+        toml::from_str(&doc.to_string()).with_context(invalid)
     }
 
     /// Validate config text with the current codec, as [`Config::load`] would.
     pub(crate) fn validate_text(path: &Path, text: &str) -> Result<()> {
-        Self::parse_at(path, text)
-            .map(drop)
-            .with_context(|| format!("invalid config: {}", path.display()))
+        Self::parse_at(path, text).map(drop)
     }
 
     fn parse(text: &str) -> Result<Self> {
@@ -435,8 +434,8 @@ impl Config {
     pub fn load(root: &Path) -> Result<Self> {
         let path = Self::path(root);
         let mut config = match std::fs::read_to_string(&path) {
-            Ok(text) => Self::parse_at(&path, &text)
-                .with_context(|| format!("invalid config: {}", path.display()))?,
+            // Every parse error already names the file.
+            Ok(text) => Self::parse_at(&path, &text)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };

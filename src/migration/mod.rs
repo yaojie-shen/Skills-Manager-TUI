@@ -54,7 +54,8 @@ impl MigrationReport {
             "Original files were backed up to:".into(),
             self.backup_dir.display().to_string(),
             "This backup holds only the original files this migration changed; it is not a full snapshot.".into(),
-            "To recover, copy the original files you need back into .skills-meta, then delete .skills-meta/format.toml and reopen to re-run migration.".into(),
+            "To recover, copy the original files you need back into .skills-meta.".into(),
+            "Copy format.toml too if this backup has one; otherwise delete .skills-meta/format.toml. Then reopen to re-run migration.".into(),
             format!(
                 "Configuration: {}",
                 if self.config_migrated { "migrated" } else { "unchanged" }
@@ -113,16 +114,10 @@ impl std::error::Error for MigrationError {
     }
 }
 pub fn ensure_current(root: &Path) -> Result<Option<MigrationReport>, MigrationError> {
+    // `version::read` already rejects layouts newer than this build.
     let declared = version::read(root).map_err(preflight)?;
-    if let Some(layout) = declared {
-        if layout == CURRENT_LAYOUT {
-            return Ok(None);
-        }
-        if layout > CURRENT_LAYOUT {
-            return Err(preflight(anyhow::anyhow!(
-                "Skill Home layout {layout} requires a newer version of Skills Manager"
-            )));
-        }
+    if declared == Some(CURRENT_LAYOUT) {
+        return Ok(None);
     }
     let from_layout = declared.unwrap_or(0);
     let snapshot = snapshot::HomeSnapshot::read(root).map_err(preflight)?;
@@ -147,12 +142,10 @@ pub fn ensure_current(root: &Path) -> Result<Option<MigrationReport>, MigrationE
     let plan = plan::diff(&snapshot, &view);
     let declaration_only = plan.ops.len() == 1 && plan.ops[0].phase == Phase::Declaration;
     if declaration_only {
-        if let Err(error) = runner::declare_current(root)
-            && version::read(root)
-                .map_err(preflight)?
-                .is_some_and(|layout| layout > CURRENT_LAYOUT)
-        {
-            return Err(error);
+        // Declaring is best effort, but a declaration published concurrently
+        // must still be one this build understands.
+        if runner::declare_current(root).is_err() {
+            version::read(root).map_err(preflight)?;
         }
         return Ok(None);
     }
@@ -278,6 +271,7 @@ mod tests {
         for expected in [
             "only the original files this migration changed",
             "not a full snapshot",
+            "Copy format.toml too if this backup has one",
             "delete .skills-meta/format.toml",
             "Configuration: migrated",
             "Tags: 1 (work)",

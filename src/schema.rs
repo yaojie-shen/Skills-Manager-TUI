@@ -47,11 +47,18 @@ pub fn require_current(
     let found = version(doc, path, kind, current, missing)?;
     if found < current {
         bail!(
-            "{} uses legacy {kind} schema {found}, but this Skill Home declares layout 1; restore the file from .skills-meta/backups, or delete .skills-meta/format.toml and reopen to re-run migration",
-            path.display()
+            "{} uses legacy {kind} schema {found}, but this Skills Manager expects {kind} schema {current}; {}",
+            path.display(),
+            legacy_advice()
         );
     }
     Ok(())
+}
+
+/// Recovery advice for a legacy document found where the current layout is
+/// expected, e.g. one that arrived through root sync from an older build.
+pub fn legacy_advice() -> &'static str {
+    "delete .skills-meta/format.toml if it exists and reopen: Skills Manager backs up the current files and upgrades them again"
 }
 
 pub fn set(doc: &mut DocumentMut, schema: u32) {
