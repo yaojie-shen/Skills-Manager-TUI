@@ -23,7 +23,6 @@ pub(crate) enum FailureKind {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct PublishError {
     pub kind: FailureKind,
     message: String,
@@ -797,11 +796,17 @@ mod tests {
         Tags,
         Presets,
         Rename,
+        Migration,
     }
 
     #[test]
     fn all_four_callers_use_transaction_for_every_failure_position() {
-        for caller in [Caller::Tags, Caller::Presets, Caller::Rename] {
+        for caller in [
+            Caller::Tags,
+            Caller::Presets,
+            Caller::Rename,
+            Caller::Migration,
+        ] {
             for step in [
                 Step::Create,
                 Step::Write,
@@ -835,6 +840,11 @@ mod tests {
                                     ..Preset::default()
                                 })
                                 .unwrap(),
+                            Caller::Migration => fs::write(
+                                dir.join(format!("{name}.toml")),
+                                format!("# original {name}\nname = '{name}'\n"),
+                            )
+                            .unwrap(),
                         }
                     }
                     let original = snapshot(dir);
@@ -864,6 +874,9 @@ mod tests {
                                 ..Preset::default()
                             }),
                             Caller::Rename => presets.rename("a", "d").map(|_| ()),
+                            Caller::Migration => crate::migration::ensure_current(temp.path())
+                                .map(|_| ())
+                                .map_err(anyhow::Error::from),
                         },
                     )
                     .unwrap_err();

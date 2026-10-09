@@ -373,7 +373,7 @@ fn cli_migration_reports_backups_on_stderr_without_polluting_json() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["skills"], serde_json::json!(["one", "two"]));
     assert!(value.get("tags").is_none());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("metadata-before-schema-migration-"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("metadata-before-layout-v0-to-v1-"));
 }
 
 #[test]

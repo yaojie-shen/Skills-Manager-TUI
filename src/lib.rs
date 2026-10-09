@@ -42,46 +42,9 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn open(root: &Path) -> Result<Self> {
-        // Library callers need the same canonical root as the CLI. In
-        // particular, macOS /var and /private/var can name the same directory.
         let root = paths::resolve_root(Some(root))?;
-        let mut config = config::Config::load_legacy(&root)?;
-        let presets = preset::PresetStore::new(&root);
-        let tags = tag::TagStore::new(&root);
-        let loaded_tags = tags.entries_for_migration()?;
-        let stored_tags = tag::TagStore::tags(&loaded_tags);
-        for stored in &stored_tags {
-            if let Some(legacy) = config.tags.iter().find(|tag| tag.name == stored.name) {
-                let mut legacy = legacy.clone();
-                let mut stored = stored.clone();
-                legacy.skills.sort();
-                legacy.skills.dedup();
-                stored.skills.sort();
-                stored.skills.dedup();
-                anyhow::ensure!(
-                    legacy == stored,
-                    "Tag {} differs between config.toml and the Tag store",
-                    legacy.name
-                );
-            } else {
-                config.tags.push(stored.clone());
-            }
-        }
-        let migration = migration::migrate_metadata(&root, &config, &tags, &loaded_tags, &presets)?;
-        if migration.is_some() {
-            config.tags = tags.list()?;
-        }
-        Ok(Self {
-            meta: meta::MetaStore::new(&root),
-            tags,
-            presets,
-            migration,
-            root,
-            project: None,
-            inventory_project: None,
-            inventory_products: None,
-            config,
-        })
+        let migration = migration::ensure_current(&root)?;
+        Self::load_current(root, None, migration)
     }
 
     /// Open an isolated project store; never consult the global root pointer.
@@ -94,47 +57,27 @@ impl Workspace {
         if create {
             std::fs::create_dir_all(&root)?;
         }
-        // Do not load global defaults even when no local config exists yet.
         let root = paths::resolve_root(Some(&root))?;
+        let migration = migration::ensure_current(&root)?;
+        Self::load_current(root, Some(project), migration)
+    }
+
+    fn load_current(
+        root: PathBuf,
+        project: Option<PathBuf>,
+        migration: Option<migration::MigrationReport>,
+    ) -> Result<Self> {
         let mut ws = Self {
             meta: meta::MetaStore::new(&root),
             tags: tag::TagStore::new(&root),
             presets: preset::PresetStore::new(&root),
-            migration: None,
+            migration,
             root,
-            project: Some(project),
+            project,
             inventory_project: None,
             inventory_products: None,
-            config: config::Config::local_default(),
+            config: config::Config::default(),
         };
-        ws.config = if config::Config::exists(&ws.root) {
-            config::Config::load_legacy(&ws.root)?
-        } else {
-            config::Config::local_default()
-        };
-        let loaded_tags = ws.tags.entries_for_migration()?;
-        let stored_tags = tag::TagStore::tags(&loaded_tags);
-        for stored in &stored_tags {
-            if let Some(legacy) = ws.config.tags.iter().find(|tag| tag.name == stored.name) {
-                let mut legacy = legacy.clone();
-                let mut stored = stored.clone();
-                legacy.skills.sort();
-                legacy.skills.dedup();
-                stored.skills.sort();
-                stored.skills.dedup();
-                anyhow::ensure!(
-                    legacy == stored,
-                    "Tag {} differs between config.toml and the Tag store",
-                    legacy.name
-                );
-            } else {
-                ws.config.tags.push(stored.clone());
-            }
-        }
-        ws.migration =
-            migration::migrate_metadata(&ws.root, &ws.config, &ws.tags, &loaded_tags, &ws.presets)?;
-        // Apply local path expansion and omitted-agent defaults exactly once
-        // after migration has finished with the raw project configuration.
         ws.config = ws.load_config()?;
         Ok(ws)
     }

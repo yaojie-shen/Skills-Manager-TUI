@@ -64,14 +64,6 @@ impl TagStore {
     }
 
     pub(crate) fn entries(&self) -> Result<Vec<Entry>> {
-        self.entries_impl(false)
-    }
-
-    pub(crate) fn entries_for_migration(&self) -> Result<Vec<Entry>> {
-        self.entries_impl(true)
-    }
-
-    fn entries_impl(&self, allow_legacy_filename: bool) -> Result<Vec<Entry>> {
         let rd = match std::fs::read_dir(&self.dir) {
             Ok(rd) => rd,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -110,7 +102,7 @@ impl TagStore {
                 .parse::<DocumentMut>()
                 .with_context(|| format!("invalid Tag: {}", path.display()))?;
             let schema = crate::schema::version(&doc, &path, "Tag", crate::schema::TAG, 0)?;
-            if !allow_legacy_filename && schema < crate::schema::TAG {
+            if schema < crate::schema::TAG {
                 bail!(
                     "legacy Tag schema {schema} in {}; reopen the workspace to migrate it to schema {}",
                     path.display(),
@@ -129,16 +121,14 @@ impl TagStore {
             out.push(Entry { path, tag, bytes });
         }
         let allocated = group_filename::allocate(out.iter().map(|entry| entry.tag.name.as_str()))?;
-        if !allow_legacy_filename {
-            for entry in &out {
-                let expected = self.path_for_stem(&allocated[&entry.tag.name]);
-                ensure!(
-                    entry.path == expected,
-                    "noncanonical Tag filename {}; reopen the workspace to migrate it to {}",
-                    entry.path.display(),
-                    expected.display()
-                );
-            }
+        for entry in &out {
+            let expected = self.path_for_stem(&allocated[&entry.tag.name]);
+            ensure!(
+                entry.path == expected,
+                "noncanonical Tag filename {}; reopen the workspace to migrate it to {}",
+                entry.path.display(),
+                expected.display()
+            );
         }
         Ok(out)
     }

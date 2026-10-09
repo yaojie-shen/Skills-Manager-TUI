@@ -95,6 +95,13 @@ pub(crate) fn is_store_document_name(name: &std::ffi::OsStr) -> bool {
     !name.starts_with(b".") && name.ends_with(b".toml")
 }
 
+/// Whether a `repos/` entry name is a repository metadata document: a store
+/// document name, or the hidden `.root.toml` for standalone remote skills.
+/// Every reader of `repos/` uses this, so they agree on what they ignore.
+pub(crate) fn is_repository_document_name(name: &std::ffi::OsStr) -> bool {
+    is_store_document_name(name) || name == ".root.toml"
+}
+
 /// Reject debris left by an interrupted metadata file-set transaction.
 pub(crate) fn reject_interrupted_transaction(
     path: &Path,

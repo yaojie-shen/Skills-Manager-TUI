@@ -338,21 +338,15 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Parse both the current format and the schema-1 migration source. Only
-    /// schema 1 may contain the retired deploy section and config-owned Tags.
+    /// Parse the current configuration format.
     fn parse_at(path: &Path, text: &str) -> Result<Self> {
-        let mut doc: DocumentMut = text.parse()?;
-        let schema = crate::schema::version(&doc, path, "config", crate::schema::CONFIG, 1)?;
-        if schema == 1 {
-            doc.remove("deploy");
-        } else {
-            anyhow::ensure!(
-                doc.get("tags").is_none() && doc.get("deploy").is_none(),
-                "config schema 2 no longer supports top-level tags or deploy in {}",
-                path.display()
-            );
-        }
-        doc["schema"] = value(schema as i64);
+        let doc: DocumentMut = text.parse()?;
+        crate::schema::require_current(&doc, path, "config", crate::schema::CONFIG, 1)?;
+        anyhow::ensure!(
+            doc.get("tags").is_none() && doc.get("deploy").is_none(),
+            "config schema 2 no longer supports top-level tags or deploy in {}",
+            path.display()
+        );
         Ok(toml::from_str(&doc.to_string())?)
     }
 
@@ -430,43 +424,17 @@ impl Config {
         }
     }
 
-    /// Load settings and the unified in-memory Tag view. Legacy config Tags
-    /// remain visible until Workspace's startup migration removes that item.
+    /// Load current settings and the unified in-memory Tag view.
     pub fn load(root: &Path) -> Result<Self> {
-        let mut config = Self::load_legacy(root)?;
-        let stored = crate::tag::TagStore::new(root).list()?;
-        for tag in stored {
-            match config.tags.iter().find(|current| current.name == tag.name) {
-                Some(current) => {
-                    let mut current = current.clone();
-                    let mut stored = tag;
-                    current.skills.sort();
-                    current.skills.dedup();
-                    stored.skills.sort();
-                    stored.skills.dedup();
-                    anyhow::ensure!(
-                        current == stored,
-                        "Tag {} differs between config.toml and the Tag store",
-                        current.name
-                    );
-                }
-                None => config.tags.push(tag),
-            }
-        }
-        config
-            .tags
-            .sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(config)
-    }
-
-    pub(crate) fn load_legacy(root: &Path) -> Result<Self> {
         let path = Self::path(root);
-        match std::fs::read_to_string(&path) {
+        let mut config = match std::fs::read_to_string(&path) {
             Ok(text) => Self::parse_at(&path, &text)
-                .with_context(|| format!("invalid config: {}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-        }
+                .with_context(|| format!("invalid config: {}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        config.tags = crate::tag::TagStore::new(root).list()?;
+        Ok(config)
     }
 
     pub fn exists(root: &Path) -> bool {
@@ -668,7 +636,11 @@ impl Config {
                 crate::schema::require_current(&doc, &path, "config", crate::schema::CONFIG, 1)?;
                 doc
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => DocumentMut::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut doc = DocumentMut::new();
+                crate::schema::set(&mut doc, crate::schema::CONFIG);
+                doc
+            }
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
         if edit(&mut doc)? {
@@ -685,43 +657,9 @@ impl Config {
             .collect()
     }
 
-    /// Compatibility entry point; first materialize any legacy config Tags,
-    /// then write definitions only through TagStore.
+    /// Change Tag definitions through their owning store.
     pub fn edit_tags(root: &Path, edit: impl FnOnce(&mut Vec<TagConfig>)) -> Result<()> {
-        // Workspace startup performs the only legacy migration. A direct write
-        // must never silently discard a conflicting old definition.
-        let legacy = Self::load_legacy(root)?.tags;
-        let store = crate::tag::TagStore::new(root);
-        if !legacy.is_empty() {
-            let existing = store.list()?;
-            for old in &legacy {
-                if let Some(current) = existing.iter().find(|tag| tag.name == old.name) {
-                    let mut current = current.clone();
-                    let mut old = old.clone();
-                    current.skills.sort();
-                    current.skills.dedup();
-                    old.skills.sort();
-                    old.skills.dedup();
-                    anyhow::ensure!(
-                        current == old,
-                        "Tag {} differs between config.toml and the Tag store; reopen the workspace to resolve migration",
-                        old.name
-                    );
-                }
-            }
-            store.edit(|tags| {
-                for old in legacy {
-                    if !tags.iter().any(|tag| tag.name == old.name) {
-                        tags.push(old);
-                    }
-                }
-            })?;
-        }
-        store.edit(edit)?;
-        if Self::exists(root) {
-            Self::edit_document(root, |doc| Ok(doc.remove("tags").is_some()))?;
-        }
-        Ok(())
+        crate::tag::TagStore::new(root).edit(edit)
     }
 
     pub fn set_tag_color(root: &Path, name: &str, color: Option<&str>) -> Result<()> {
@@ -834,19 +772,25 @@ mod tests {
 
     #[test]
     fn sync_waits_default_and_accept_nonnegative_seconds() {
-        assert_eq!(Config::parse("").unwrap().sync, SyncConfig::default());
         assert_eq!(
-            Config::parse("[sync]\nquiet_seconds = 45").unwrap().sync,
+            Config::parse("schema = 2").unwrap().sync,
+            SyncConfig::default()
+        );
+        assert_eq!(
+            Config::parse("schema = 2\n[sync]\nquiet_seconds = 45")
+                .unwrap()
+                .sync,
             SyncConfig {
                 quiet_seconds: 45,
                 tui_idle_seconds: 10,
             }
         );
-        let configured = Config::parse("[sync]\nquiet_seconds = 0\ntui_idle_seconds = 30").unwrap();
+        let configured =
+            Config::parse("schema = 2\n[sync]\nquiet_seconds = 0\ntui_idle_seconds = 30").unwrap();
         assert_eq!(configured.sync.quiet_seconds, 0);
         assert_eq!(configured.sync.tui_idle_seconds, 30);
         assert_eq!(
-            Config::parse("[sync]\ntui_idle_seconds = 0")
+            Config::parse("schema = 2\n[sync]\ntui_idle_seconds = 0")
                 .unwrap()
                 .sync
                 .tui_idle_seconds,
@@ -859,7 +803,7 @@ mod tests {
             "tui_idle_seconds = 'ten'",
             "unknown_wait = 5",
         ] {
-            assert!(Config::parse(&format!("[sync]\n{invalid}")).is_err());
+            assert!(Config::parse(&format!("schema = 2\n[sync]\n{invalid}")).is_err());
         }
         let tmp = crate::ops::DownloadDir::new("sync-config-roundtrip").unwrap();
         configured.save(tmp.path()).unwrap();

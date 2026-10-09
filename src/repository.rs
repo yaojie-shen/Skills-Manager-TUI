@@ -207,7 +207,7 @@ impl Repository {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "toml") {
+            if crate::util::is_repository_document_name(&entry.file_name()) {
                 let document = crate::meta::MetaStore::read(&path)?;
                 let doc: toml::Value = toml::from_str(&document.to_string())?;
                 if path.file_name().is_some_and(|name| name == ".root.toml") {

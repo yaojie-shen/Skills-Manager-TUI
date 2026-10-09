@@ -1041,7 +1041,11 @@ pub struct MutationGuard {
 
 impl MutationGuard {
     pub fn acquire(ws: &Workspace, operation: &str) -> Result<Self> {
-        let git_dir = ws.root.join(".git");
+        Self::acquire_root(&ws.root, operation)
+    }
+
+    pub(crate) fn acquire_root(root: &Path, operation: &str) -> Result<Self> {
+        let git_dir = root.join(".git");
         if !git_dir.is_dir() {
             return Ok(Self {
                 _guard: FileGuard(None),
