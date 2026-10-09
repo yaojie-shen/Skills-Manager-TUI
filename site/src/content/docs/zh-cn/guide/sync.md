@@ -28,7 +28,7 @@ skills sync configure git@github.com:YOUR-ACCOUNT/YOUR-BACKUP.git --branch main
 
 已有 `origin` 指向其他 URL 时，程序不会静默替换。分支默认为 `main`；root 当前检出的分支必须通过验证。
 
-设置保存在 root 的 `.git/config` 中：`remote.origin.url`、`skills.sync-branch`、`skills.autosync`。每份克隆都需要单独配置。旧的单技能备份仓库不会自动转换。
+设置保存在 root 的 `.git/config` 中：`remote.origin.url`、`skills.sync-branch`、`skills.autosync`。每份克隆都需要单独配置。这些设置放在 `.git/config` 而不是 `config.toml`，是因为 `.skills-meta/config.toml` 本身也会被同步：写在里面的远程或开关会随拉取传到每台机器，在一台机器上关闭自动同步，其他机器也会跟着关闭。旧的单技能备份仓库不会自动转换。
 
 ## 手动命令
 

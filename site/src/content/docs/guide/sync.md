@@ -28,7 +28,7 @@ skills sync configure git@github.com:YOUR-ACCOUNT/YOUR-BACKUP.git --branch main
 
 An existing `origin` with another URL is not silently replaced. The branch defaults to `main`, and the checked-out root branch must pass validation.
 
-Settings live in the root's `.git/config` as `remote.origin.url`, `skills.sync-branch`, and `skills.autosync`. Configure each clone separately. Legacy per-skill backup repositories are not converted automatically.
+Settings live in the root's `.git/config` as `remote.origin.url`, `skills.sync-branch`, and `skills.autosync`. Configure each clone separately. These settings stay in `.git/config` because `.skills-meta/config.toml` is itself synced: a remote or on/off switch stored there would follow every pull to every machine, so turning automatic sync off on one machine would turn it off everywhere. Legacy per-skill backup repositories are not converted automatically.
 
 ## Manual commands
 
