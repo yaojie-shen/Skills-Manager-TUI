@@ -39,6 +39,48 @@ fn parse_tag(path: &Path, bytes: &[u8]) -> Result<(Tag, DocumentMut)> {
 type StoredTag = (RelPath, Vec<u8>, Tag, DocumentMut);
 type DesiredTag = (Option<RelPath>, Vec<u8>, Tag);
 
+fn merge_optional_field(
+    tag_name: &str,
+    field: &str,
+    current: &mut Option<String>,
+    incoming: Option<String>,
+) -> Result<()> {
+    let incoming = incoming.filter(|value| !value.is_empty());
+    let existing = current.as_ref().filter(|value| !value.is_empty());
+    if let (Some(existing), Some(incoming)) = (existing, incoming.as_ref()) {
+        ensure!(
+            existing == incoming,
+            "Tag {tag_name} has conflicting {field} values: {existing}, {incoming}"
+        );
+    }
+    if current.as_ref().is_none_or(String::is_empty) {
+        *current = incoming;
+    }
+    Ok(())
+}
+
+fn merge_inline_tags(inline: &[Tag]) -> Result<Vec<Tag>> {
+    let mut merged: Vec<Tag> = Vec::new();
+    for tag in inline {
+        let tag = normalize(tag.clone())?;
+        if let Some(current) = merged.iter_mut().find(|current| current.name == tag.name) {
+            current.skills.extend(tag.skills);
+            current.skills.sort();
+            current.skills.dedup();
+            merge_optional_field(&current.name, "color", &mut current.color, tag.color)?;
+            merge_optional_field(
+                &current.name,
+                "description",
+                &mut current.description,
+                tag.description,
+            )?;
+        } else {
+            merged.push(tag);
+        }
+    }
+    Ok(merged)
+}
+
 fn merge_tags(stored: Vec<StoredTag>, inline: &[Tag]) -> Result<Vec<DesiredTag>> {
     let mut out = Vec::new();
     let mut names = BTreeSet::new();
@@ -57,20 +99,20 @@ fn merge_tags(stored: Vec<StoredTag>, inline: &[Tag]) -> Result<Vec<DesiredTag>>
             out.push((Some(path), bytes, tag));
         }
     }
-    for tag in inline {
-        let tag = normalize(tag.clone())?;
+    for tag in merge_inline_tags(inline)? {
         if stored_names.contains(&tag.name) {
             let current = &out
                 .iter()
                 .find(|(_, _, current)| current.name == tag.name)
-                .unwrap()
+                .expect("stored Tag name was indexed")
                 .2;
             ensure!(
                 current == &tag,
                 "Tag {} differs between config.toml and the Tag store",
                 tag.name
             );
-        } else if names.insert(tag.name.clone()) {
+        } else {
+            names.insert(tag.name.clone());
             out.push((None, crate::tag::TagStore::serialize(&tag)?, tag));
         }
     }

@@ -1,0 +1,11 @@
+schema = 1
+
+[[tags]]
+name = "shared"
+skills = ["one", "two"]
+color = "blue"
+
+[[tags]]
+name = "shared"
+skills = ["two", "three"]
+description = "Merged definition"

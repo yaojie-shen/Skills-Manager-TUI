@@ -95,7 +95,7 @@ fn fixture_matrix_matches_global_and_local_results() {
         let mut outcomes = Vec::new();
         for local in [false, true] {
             let (root, result, before) = run_case(case, local);
-            if case == "v2-future" {
+            if matches!(case, "v2-future" | "v0-duplicate-tags-conflict") {
                 let expected = fs::read_to_string(
                     Path::new(env!("CARGO_MANIFEST_DIR"))
                         .join("tests/fixtures/migrations")
