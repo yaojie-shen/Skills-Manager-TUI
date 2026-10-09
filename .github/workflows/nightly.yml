@@ -1,0 +1,138 @@
+name: Nightly
+
+# Rolling prerelease of the latest main under the fixed tag `nightly`.
+# It is always a prerelease and never "latest", so /releases/latest stays stable.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - 'install.sh'
+      - 'src/cli.rs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Compute nightly version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      build_version: ${{ steps.version.outputs.build_version }}
+      sha7: ${{ steps.version.outputs.sha7 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Derive version from Cargo.toml and commit
+        id: version
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          with open("Cargo.toml", "rb") as f:
+              version = tomllib.load(f)["package"]["version"]
+          sha7 = os.environ["COMMIT_SHA"][:7]
+          build_version = f"{version.split('+', 1)[0]}+nightly.{sha7}"
+          print(f"Nightly build version: {build_version}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"build_version={build_version}\nsha7={sha7}\n")
+          PY
+
+  build:
+    name: Build
+    needs: version
+    permissions:
+      contents: read
+    concurrency:
+      group: nightly-build-${{ github.ref }}
+      cancel-in-progress: true
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ github.sha }}
+      build_version: ${{ needs.version.outputs.build_version }}
+
+  publish:
+    name: Publish nightly prerelease
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: nightly-publish
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      COMMIT_SHA: ${{ github.sha }}
+      SHA7: ${{ needs.version.outputs.sha7 }}
+      BUILD_VERSION: ${{ needs.version.outputs.build_version }}
+      SERVER_URL: ${{ github.server_url }}
+    steps:
+      - name: Skip unless this commit is still the head of main
+        id: head
+        shell: bash
+        run: |
+          # A re-run of an older run must not move nightly backwards.
+          head=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)
+          if [[ "$head" == "$COMMIT_SHA" ]]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::main is now at $head; not publishing $COMMIT_SHA"
+          fi
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: steps.head.outputs.current == 'true'
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        if: steps.head.outputs.current == 'true'
+        working-directory: dist
+        run: sha256sum ./*.tar.gz > SHA256SUMS
+      - name: Move nightly tag to this commit
+        if: steps.head.outputs.current == 'true'
+        shell: bash
+        run: |
+          if gh api "repos/$GH_REPO/git/ref/tags/nightly" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/nightly" -f sha="$COMMIT_SHA" -F force=true > /dev/null
+          else
+            gh api -X POST "repos/$GH_REPO/git/refs" -f ref=refs/tags/nightly -f sha="$COMMIT_SHA" > /dev/null
+          fi
+          echo "nightly -> $COMMIT_SHA"
+      - name: Create or update nightly release and upload assets
+        if: steps.head.outputs.current == 'true'
+        shell: bash
+        run: |
+          title="Nightly (main @ $SHA7)"
+          build_date=$(date -u '+%Y-%m-%d %H:%M UTC')
+          cat > notes.md <<EOF
+          Rolling prerelease of the latest main. It is replaced on every push to main and is not a stable release.
+
+          Version: $BUILD_VERSION
+          Commit: $COMMIT_SHA
+          Built: $build_date
+          Source: $SERVER_URL/$GH_REPO/commit/$COMMIT_SHA
+
+          Install:
+
+              curl -fsSL https://github.com/yaojie-shen/Skills-Manager-TUI/raw/main/install.sh | sh -s -- --channel nightly
+          EOF
+          if ! gh release view nightly > /dev/null 2>&1; then
+            gh release create nightly --verify-tag --prerelease --latest=false --title "$title" --notes-file notes.md
+          fi
+          # Archives first, checksums last, so SHA256SUMS never describes missing archives.
+          gh release upload nightly dist/*.tar.gz --clobber
+          gh release upload nightly dist/SHA256SUMS --clobber
+          # Update the description last so it never names a commit whose files are not uploaded yet.
+          gh release edit nightly --draft=false --prerelease --latest=false --title "$title" --notes-file notes.md

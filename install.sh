@@ -4,7 +4,11 @@
 # Quick start:
 #   curl -fsSL https://raw.githubusercontent.com/yaojie-shen/Skills-Manager-TUI/main/install.sh | sh
 #
+# Install the latest main build (prerelease tag "nightly") instead:
+#   curl -fsSL https://raw.githubusercontent.com/yaojie-shen/Skills-Manager-TUI/main/install.sh | sh -s -- --channel nightly
+#
 # Optional environment variables:
+#   SKILLS_CHANNEL     stable (default) or nightly, the latest main build
 #   SKILLS_VERSION     Release tag; default: GitHub's latest stable release
 #   SKILLS_TARGET      Rust target triple, for example aarch64-apple-darwin
 #   SKILLS_INSTALL_DIR Destination directory (default: ~/.local/bin)
@@ -19,6 +23,7 @@ set -eu
 }
 
 REPO=${SKILLS_REPO:-yaojie-shen/Skills-Manager-TUI}
+CHANNEL=${SKILLS_CHANNEL:-stable}
 VERSION=${SKILLS_VERSION:-}
 TARGET=${SKILLS_TARGET:-}
 BIN_DIR=${SKILLS_INSTALL_DIR:-$HOME/.local/bin}
@@ -33,9 +38,15 @@ usage() {
 Install the prebuilt skills binary from GitHub Releases.
 
 Usage:
-  install.sh [--version TAG] [--target TRIPLE] [--install-dir DIR]
+  install.sh [--channel CHANNEL] [--version TAG] [--target TRIPLE] [--install-dir DIR]
+
+Channels:
+  stable  Latest stable release, or the release named by --version (default)
+  nightly    Prerelease rebuilt from every push to main; cannot be combined
+          with --version
 
 Environment overrides:
+  SKILLS_CHANNEL       stable (default) or nightly
   SKILLS_VERSION       Release tag; default: GitHub's latest stable release
   SKILLS_TARGET        Rust target triple, for example aarch64-apple-darwin
   SKILLS_INSTALL_DIR   Destination directory (default: ~/.local/bin)
@@ -49,6 +60,15 @@ while [ "$#" -gt 0 ]; do
         -h|--help)
             usage
             exit 0
+            ;;
+        --channel)
+            [ "$#" -ge 2 ] || die "--channel needs a value (stable or nightly)"
+            CHANNEL=$2
+            shift 2
+            ;;
+        --channel=*)
+            CHANNEL=${1#*=}
+            shift
             ;;
         --version)
             [ "$#" -ge 2 ] || die "--version needs a release tag"
@@ -221,6 +241,14 @@ ensure_path() {
     PATH_ACTION=added
 }
 
+case "$CHANNEL" in
+    stable|nightly) ;;
+    *) die "invalid channel: '$CHANNEL' (expected stable or nightly)" ;;
+esac
+if [ "$CHANNEL" = nightly ] && [ -n "$VERSION" ]; then
+    die "--channel nightly cannot be combined with --version/SKILLS_VERSION ($VERSION); drop one of them"
+fi
+
 case "$VERSION" in
     '') ;;
     v*) ;;
@@ -250,7 +278,12 @@ trap cleanup 0 1 2 15
 
 ASSET="skills-$TARGET"
 ARCHIVE_NAME="$ASSET.tar.gz"
-if [ -n "$VERSION" ]; then
+if [ "$CHANNEL" = nightly ]; then
+    # The nightly prerelease keeps a fixed tag and has its assets replaced on
+    # every push to main.
+    BASE_URL="https://github.com/$REPO/releases/download/nightly"
+    RELEASE_LABEL='nightly build (latest main)'
+elif [ -n "$VERSION" ]; then
     BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
     RELEASE_LABEL=$VERSION
 else
@@ -262,18 +295,42 @@ fi
 ARCHIVE="$TMP_DIR/$ARCHIVE_NAME"
 CHECKSUMS="$TMP_DIR/SHA256SUMS"
 
-printf '%s\n' "skills installer: downloading $REPO $RELEASE_LABEL ($TARGET)" >&2
-fetch "$BASE_URL/$ARCHIVE_NAME" "$ARCHIVE" \
-    || die "no release asset for $RELEASE_LABEL/$TARGET"
-fetch "$BASE_URL/SHA256SUMS" "$CHECKSUMS" \
-    || die "release $RELEASE_LABEL has no SHA256SUMS asset"
+NIGHTLY_HINT='the nightly build may not be published yet or is being republished; retry in a few minutes'
 
-EXPECTED=$(awk -v name="$ARCHIVE_NAME" '
-    { file = $2; sub(/^\*/, "", file); sub(/^\.\//, "", file); if (file == name) { print $1; exit } }
-' "$CHECKSUMS")
-[ -n "$EXPECTED" ] || die "SHA256SUMS does not contain $ARCHIVE_NAME"
-ACTUAL=$(sha256_file "$ARCHIVE")
-[ "$ACTUAL" = "$EXPECTED" ] || die "checksum mismatch for $ARCHIVE_NAME"
+download_assets() {
+    if ! fetch "$BASE_URL/$ARCHIVE_NAME" "$ARCHIVE"; then
+        [ "$CHANNEL" != nightly ] || die "could not download $ARCHIVE_NAME from the nightly release: $NIGHTLY_HINT"
+        die "no release asset for $RELEASE_LABEL/$TARGET"
+    fi
+    if ! fetch "$BASE_URL/SHA256SUMS" "$CHECKSUMS"; then
+        [ "$CHANNEL" != nightly ] || die "could not download SHA256SUMS from the nightly release: $NIGHTLY_HINT"
+        die "release $RELEASE_LABEL has no SHA256SUMS asset"
+    fi
+}
+
+# Returns nonzero on a checksum mismatch; dies on any other problem.
+archive_matches_checksum() {
+    EXPECTED=$(awk -v name="$ARCHIVE_NAME" '
+        { file = $2; sub(/^\*/, "", file); sub(/^\.\//, "", file); if (file == name) { print $1; exit } }
+    ' "$CHECKSUMS")
+    [ -n "$EXPECTED" ] || die "SHA256SUMS does not contain $ARCHIVE_NAME"
+    # Callers run this in a condition, where set -e is suspended, so a
+    # failing sha256_file must abort explicitly.
+    ACTUAL=$(sha256_file "$ARCHIVE") || exit 1
+    [ "$ACTUAL" = "$EXPECTED" ]
+}
+
+printf '%s\n' "skills installer: downloading $REPO $RELEASE_LABEL ($TARGET)" >&2
+download_assets
+if ! archive_matches_checksum; then
+    [ "$CHANNEL" = nightly ] || die "checksum mismatch for $ARCHIVE_NAME"
+    # The nightly release replaces assets in place, so the archive and
+    # SHA256SUMS can briefly come from different builds. Refetch both once.
+    printf '%s\n' "skills installer: checksum mismatch for $ARCHIVE_NAME on the nightly build; refetching once" >&2
+    download_assets
+    archive_matches_checksum \
+        || die "checksum mismatch for $ARCHIVE_NAME on the nightly build: $NIGHTLY_HINT"
+fi
 
 tar -xzf "$ARCHIVE" -C "$TMP_DIR" \
     || die "could not unpack $ARCHIVE_NAME"
