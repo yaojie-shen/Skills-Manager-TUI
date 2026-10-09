@@ -17,6 +17,14 @@ Install a specific release:
 curl -fsSL https://github.com/yaojie-shen/Skills-Manager-TUI/raw/main/install.sh | sh -s -- --version TAG
 ```
 
+Install the latest `main` build:
+
+```sh
+curl -fsSL https://github.com/yaojie-shen/Skills-Manager-TUI/raw/main/install.sh | sh -s -- --channel nightly
+```
+
+This is a prerelease rebuilt on every push to `main`, intended for testing.
+
 The installer checks the archive against the release's `SHA256SUMS`. It stops when the platform is unsupported or the release asset is missing.
 
 Confirm the installation:
@@ -47,6 +55,7 @@ Available overrides:
 
 | Option | Environment variable | Purpose |
 | --- | --- | --- |
+| `--channel CHANNEL` | `SKILLS_CHANNEL` | `stable` (default) or `nightly`, the latest `main` build. |
 | `--version TAG` | `SKILLS_VERSION` | Install a specific release. |
 | `--target TRIPLE` | `SKILLS_TARGET` | Select a release target. |
 | `--install-dir DIR` | `SKILLS_INSTALL_DIR` | Change the install directory. |

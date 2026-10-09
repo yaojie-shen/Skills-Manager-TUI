@@ -17,6 +17,14 @@ curl -fsSL https://github.com/yaojie-shen/Skills-Manager-TUI/raw/main/install.sh
 curl -fsSL https://github.com/yaojie-shen/Skills-Manager-TUI/raw/main/install.sh | sh -s -- --version TAG
 ```
 
+安装 `main` 分支的最新构建：
+
+```sh
+curl -fsSL https://github.com/yaojie-shen/Skills-Manager-TUI/raw/main/install.sh | sh -s -- --channel nightly
+```
+
+这是一个预发布版，每次推送到 `main` 时都会重新构建，用于测试。
+
 安装器会根据发布版中的 `SHA256SUMS` 校验归档文件。如果平台不受支持或缺少对应资产，安装会停止。
 
 确认安装结果：
@@ -47,6 +55,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 | 参数 | 环境变量 | 用途 |
 | --- | --- | --- |
+| `--channel CHANNEL` | `SKILLS_CHANNEL` | `stable`（默认）或 `nightly`，即 `main` 分支的最新构建。 |
 | `--version TAG` | `SKILLS_VERSION` | 安装指定版本。 |
 | `--target TRIPLE` | `SKILLS_TARGET` | 选择发布 target。 |
 | `--install-dir DIR` | `SKILLS_INSTALL_DIR` | 更改安装目录。 |

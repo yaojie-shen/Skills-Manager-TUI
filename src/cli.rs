@@ -14,10 +14,16 @@ use skills::{Workspace, paths};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// Version printed by `--version`. Prerelease builds set `SKILLS_BUILD_VERSION` at compile time.
+const VERSION: &str = match option_env!("SKILLS_BUILD_VERSION") {
+    Some(version) if !version.is_empty() => version,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Parser, Debug)]
 #[command(
     name = "skills",
-    version,
+    version = VERSION,
     about = "Manage agent skills from the terminal"
 )]
 pub struct Cli {
