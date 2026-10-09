@@ -193,7 +193,7 @@ impl PresetStore {
             crate::schema::require_current(&doc, &path, "preset", crate::schema::PRESET, 0)?;
             anyhow::ensure!(
                 doc.get("tags").is_none(),
-                "legacy Tag references in {}; reopen the workspace to migrate this preset",
+                "{} uses legacy preset Tag references, but this Skill Home declares layout 1; restore the file from .skills-meta/backups, or delete .skills-meta/format.toml and reopen to re-run migration",
                 path.display()
             );
             doc.remove("schema");
@@ -217,7 +217,7 @@ impl PresetStore {
             let expected = self.path_for_stem(&allocation[&entry.preset.name]);
             anyhow::ensure!(
                 entry.path == expected,
-                "noncanonical preset filename {}; reopen the workspace to migrate it to {}",
+                "noncanonical preset filename {} for layout 1 (expected {}); restore the file from .skills-meta/backups, or delete .skills-meta/format.toml and reopen to re-run migration",
                 entry.path.display(),
                 expected.display()
             );

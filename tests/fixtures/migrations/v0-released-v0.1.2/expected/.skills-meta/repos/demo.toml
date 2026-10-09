@@ -1,0 +1,6 @@
+# preserved repository comment
+alias = "demo"
+url = "https://example.com/demo"
+schema = 1
+[skills.one]
+note = "keep"

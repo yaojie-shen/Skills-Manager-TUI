@@ -44,18 +44,20 @@ impl HomeSnapshot {
     pub fn read(root: &Path) -> Result<Self> {
         let meta = crate::paths::meta_dir(root);
         let mut files = BTreeMap::new();
-        let config = meta.join("config.toml");
-        match std::fs::symlink_metadata(&config) {
-            Ok(metadata) => {
-                ensure!(
-                    metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-                    "invalid metadata entry: {}",
-                    config.display()
-                );
-                read_one(&config, RelPath::new("config.toml")?, &mut files)?;
+        for filename in ["format.toml", "config.toml"] {
+            let config = meta.join(filename);
+            match std::fs::symlink_metadata(&config) {
+                Ok(metadata) => {
+                    ensure!(
+                        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+                        "invalid metadata entry: {}",
+                        config.display()
+                    );
+                    read_one(&config, RelPath::new(filename)?, &mut files)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
         }
         for name in ["tags", "presets", "repos"] {
             let dir = meta.join(name);

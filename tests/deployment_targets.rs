@@ -180,6 +180,8 @@ fn old_registry_and_sync_config_have_no_effect() {
     config_text = config_text.replacen("schema = 2", "schema = 1", 1);
     config_text.push_str("\n[deploy]\nall_to_all = true\npresets = [\"missing-preset\"]\n");
     std::fs::write(&config_path, &config_text).unwrap();
+    // Restoring a legacy document requires removing the current-layout declaration.
+    std::fs::remove_file(skills::migration::version::path(&ws.root)).unwrap();
     let project = f.0.join("project");
     let reopened = f.ws();
     let target = targets::candidates(&reopened, Some(&project))

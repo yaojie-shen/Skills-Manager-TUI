@@ -104,9 +104,8 @@ impl TagStore {
             let schema = crate::schema::version(&doc, &path, "Tag", crate::schema::TAG, 0)?;
             if schema < crate::schema::TAG {
                 bail!(
-                    "legacy Tag schema {schema} in {}; reopen the workspace to migrate it to schema {}",
-                    path.display(),
-                    crate::schema::TAG
+                    "{} uses legacy Tag schema {schema}, but this Skill Home declares layout 1; restore the file from .skills-meta/backups, or delete .skills-meta/format.toml and reopen to re-run migration",
+                    path.display()
                 );
             }
             doc.remove("schema");
@@ -125,7 +124,7 @@ impl TagStore {
             let expected = self.path_for_stem(&allocated[&entry.tag.name]);
             ensure!(
                 entry.path == expected,
-                "noncanonical Tag filename {}; reopen the workspace to migrate it to {}",
+                "noncanonical Tag filename {} for layout 1 (expected {}); restore the file from .skills-meta/backups, or delete .skills-meta/format.toml and reopen to re-run migration",
                 entry.path.display(),
                 expected.display()
             );

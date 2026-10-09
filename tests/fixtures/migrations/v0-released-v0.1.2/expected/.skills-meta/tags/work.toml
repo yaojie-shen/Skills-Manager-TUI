@@ -1,0 +1,8 @@
+skills = [
+    "one",
+    "two",
+]
+name = "work"
+color = "blue"
+description = "Work tools"
+schema = 1

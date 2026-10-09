@@ -4,6 +4,7 @@ pub mod plan;
 mod runner;
 pub mod snapshot;
 mod steps;
+pub mod version;
 use serde::Serialize;
 use std::{
     fmt,
@@ -68,22 +69,59 @@ impl std::error::Error for MigrationError {
     }
 }
 pub fn ensure_current(root: &Path) -> Result<Option<MigrationReport>, MigrationError> {
+    let declared = version::read(root).map_err(preflight)?;
+    if let Some(layout) = declared {
+        if layout == CURRENT_LAYOUT {
+            return Ok(None);
+        }
+        if layout > CURRENT_LAYOUT {
+            return Err(preflight(anyhow::anyhow!(
+                "Skill Home layout {layout} requires a newer version of Skills Manager"
+            )));
+        }
+    }
+    let from_layout = declared.unwrap_or(0);
     let snapshot = snapshot::HomeSnapshot::read(root).map_err(preflight)?;
+    if snapshot
+        .files()
+        .keys()
+        .all(|path| path.as_path() == Path::new("format.toml"))
+    {
+        return Ok(None);
+    }
     let mut view = snapshot.view();
-    let (_, upgrade) = steps::STEPS[0];
-    let notes = upgrade(&mut view).map_err(preflight)?;
+    let mut notes = steps::StepNotes::default();
+    for (_, upgrade) in steps::STEPS
+        .iter()
+        .filter(|(layout, _)| *layout >= from_layout)
+    {
+        notes.merge(upgrade(&mut view).map_err(preflight)?);
+    }
+    view.insert("format.toml", version::content())
+        .map_err(preflight)?;
     let plan = plan::diff(&snapshot, &view);
+    let declaration_only = plan.ops.len() == 1 && plan.ops[0].phase == Phase::Declaration;
+    if declaration_only {
+        if let Err(error) = runner::declare_current(root)
+            && version::read(root)
+                .map_err(preflight)?
+                .is_some_and(|layout| layout > CURRENT_LAYOUT)
+        {
+            return Err(error);
+        }
+        return Ok(None);
+    }
     if plan.is_empty() {
         return Ok(None);
     }
-    let backup_dir = runner::execute(root, &snapshot, &plan, 0, CURRENT_LAYOUT)?;
+    let backup_dir = runner::execute(root, &snapshot, &plan, from_layout, CURRENT_LAYOUT)?;
     Ok(Some(MigrationReport {
         backup_dir,
         migrated_names: notes.migrated_names,
         migrated_tags: notes.migrated_tags,
         config_migrated: notes.config_migrated,
         migrated_repositories: notes.migrated_repositories,
-        from_layout: 0,
+        from_layout,
         to_layout: CURRENT_LAYOUT,
     }))
 }
@@ -142,6 +180,17 @@ mod tests {
     }
 
     #[test]
+    fn steps_cover_every_layout_contiguously() {
+        assert_eq!(steps::STEPS.len(), CURRENT_LAYOUT as usize);
+        assert!(
+            steps::STEPS
+                .iter()
+                .enumerate()
+                .all(|(index, (layout, _))| *layout == index as u32)
+        );
+    }
+
+    #[test]
     fn planning_is_read_only_and_creates_no_lock() {
         let temp = fixture("migration-plan-read-only");
         let before = business_tree(temp.path());
@@ -165,6 +214,55 @@ mod tests {
             !crate::paths::meta_dir(temp.path())
                 .join(".metadata.lock")
                 .exists()
+        );
+    }
+
+    #[test]
+    fn declaration_publication_ignores_foreign_temp_files() {
+        let temp = DownloadDir::new("migration-declaration-temp").unwrap();
+        let meta = crate::paths::meta_dir(temp.path());
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(meta.join("config.toml"), "schema = 2\n").unwrap();
+        std::fs::write(meta.join(".format.toml.tmp-garbage"), "partial").unwrap();
+
+        assert!(ensure_current(temp.path()).unwrap().is_none());
+        assert_eq!(
+            std::fs::read(version::path(temp.path())).unwrap(),
+            version::content()
+        );
+        assert_eq!(
+            std::fs::read(meta.join(".format.toml.tmp-garbage")).unwrap(),
+            b"partial"
+        );
+    }
+
+    #[test]
+    fn declaration_race_accepts_current_layout() {
+        let temp = DownloadDir::new("migration-declaration-race").unwrap();
+        let meta = crate::paths::meta_dir(temp.path());
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(meta.join("config.toml"), "schema = 2\n").unwrap();
+        std::fs::write(version::path(temp.path()), version::content()).unwrap();
+
+        assert!(!runner::declare_current(temp.path()).unwrap());
+        assert_eq!(
+            std::fs::read(version::path(temp.path())).unwrap(),
+            version::content()
+        );
+    }
+
+    #[test]
+    fn declare_only_lock_error_does_not_fail_open() {
+        let temp = DownloadDir::new("migration-declaration-lock-error").unwrap();
+        let meta = crate::paths::meta_dir(temp.path());
+        std::fs::create_dir_all(meta.join(".metadata.lock")).unwrap();
+        std::fs::write(meta.join("config.toml"), "schema = 2\n").unwrap();
+
+        // The metadata lock is best effort, so the declaration is still written.
+        assert!(ensure_current(temp.path()).unwrap().is_none());
+        assert_eq!(
+            std::fs::read(version::path(temp.path())).unwrap(),
+            version::content()
         );
     }
 
@@ -276,6 +374,7 @@ mod tests {
         let snapshot = snapshot::HomeSnapshot::read(temp.path()).unwrap();
         let mut view = snapshot.view();
         steps::v0_to_v1::upgrade(&mut view).unwrap();
+        view.insert("format.toml", version::content()).unwrap();
         let plan = plan::diff(&snapshot, &view);
         std::fs::write(
             &tag,
@@ -284,6 +383,7 @@ mod tests {
         .unwrap();
         let error = runner::execute(temp.path(), &snapshot, &plan, 0, CURRENT_LAYOUT).unwrap_err();
         assert!(format!("{error:#}").contains("metadata changed during migration"));
+        assert!(!version::path(temp.path()).exists());
         assert!(!crate::paths::meta_dir(temp.path()).join("backups").exists());
     }
 

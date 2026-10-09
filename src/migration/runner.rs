@@ -3,7 +3,12 @@ use super::{
     plan::{Phase, Plan},
 };
 use anyhow::{Context, Result, ensure};
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 #[cfg(test)]
 type Hook = Box<dyn FnMut(Phase) -> Result<()>>;
@@ -147,7 +152,7 @@ fn apply_phase(root: &Path, plan: &Plan, phase: Phase) -> std::result::Result<bo
                     }
                 }
             }
-            Phase::Repos | Phase::Config => {
+            Phase::Repos | Phase::Config | Phase::Declaration => {
                 for (index, operation) in operations.into_iter().enumerate() {
                     let path = meta.join(operation.path.as_path());
                     operation_checkpoint(phase, index, &path)?;
@@ -262,5 +267,113 @@ pub(crate) fn execute(
             recovery,
             source,
         }
+    })
+}
+
+fn link_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EPERM
+                | libc::EACCES
+                | libc::ENOTSUP
+                | libc::EXDEV
+                | libc::ENOSYS
+                | libc::EMLINK
+                | libc::EROFS
+        )
+    )
+}
+
+fn accept_existing_declaration(root: &Path) -> Result<bool> {
+    let layout = super::version::read(root)?.with_context(|| {
+        format!(
+            "Skill Home declaration vanished: {}",
+            super::version::path(root).display()
+        )
+    })?;
+    ensure!(
+        layout == super::CURRENT_LAYOUT,
+        "Skill Home layout {layout} requires a newer version of Skills Manager"
+    );
+    Ok(false)
+}
+
+fn publish_declaration(root: &Path) -> Result<bool> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = super::version::path(root);
+    let directory = path
+        .parent()
+        .context("Skill Home declaration has no parent")?;
+    fs::create_dir_all(directory)?;
+    let temp = loop {
+        let candidate = directory.join(format!(
+            ".format.toml.tmp-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                let staged = file
+                    .write_all(&super::version::content())
+                    .and_then(|()| file.sync_all());
+                if let Err(error) = staged {
+                    let _ = fs::remove_file(&candidate);
+                    return Err(error.into());
+                }
+                break candidate;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let publish = match fs::hard_link(&temp, &path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            accept_existing_declaration(root)
+        }
+        Err(error) if link_unsupported(&error) => match fs::symlink_metadata(&path) {
+            Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => {
+                match fs::rename(&temp, &path) {
+                    Ok(()) => return Ok(true),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        accept_existing_declaration(root)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            Err(error) => Err(error.into()),
+            Ok(_) => accept_existing_declaration(root),
+        },
+        Err(error) => Err(error.into()),
+    };
+    let cleanup = fs::remove_file(&temp);
+    match (publish, cleanup) {
+        (Ok(wrote), Ok(())) => Ok(wrote),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+    }
+}
+
+/// Best-effort declaration for an already-current but undeclared Home.
+pub(crate) fn declare_current(root: &Path) -> std::result::Result<bool, MigrationError> {
+    let result = (|| -> Result<bool> {
+        let Some(_guard) =
+            crate::ops::sync::MutationGuard::try_acquire_root(root, "declare home layout")?
+        else {
+            return Ok(false);
+        };
+        let _lock = crate::meta::MetaStore::new(root).lock()?;
+        publish_declaration(root)
+    })();
+    result.map_err(|source| MigrationError {
+        backup_dir: None,
+        committed: Vec::new(),
+        recovery: Recovery::NothingWritten,
+        source,
     })
 }

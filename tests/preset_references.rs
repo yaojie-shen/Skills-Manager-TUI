@@ -230,6 +230,7 @@ fn legacy_migration_snapshots_members_once_and_keeps_exact_backups() {
     std::fs::write(f.ws.presets.path("daily"), original).unwrap();
     std::fs::write(f.ws.presets.path("empty"), empty).unwrap();
     std::fs::write(f.ws.presets.path("modern"), modern).unwrap();
+    std::fs::remove_file(skills::migration::version::path(&f.ws.root)).unwrap();
     assert!(f.ws.presets.load("daily").is_err());
     let mut ws = Workspace::open(&f.ws.root).unwrap();
     let report = ws.migration.as_ref().unwrap();
@@ -293,6 +294,7 @@ fn migration_preflights_every_file_before_changing_any_definition() {
         let original = "name = 'daily'\ntags = ['work']\n";
         std::fs::write(f.ws.presets.path("daily"), original).unwrap();
         std::fs::write(f.ws.presets.path("z-bad"), invalid).unwrap();
+        std::fs::remove_file(skills::migration::version::path(&f.ws.root)).unwrap();
         let error = Workspace::open(&f.ws.root).unwrap_err();
         assert!(format!("{error:#}").contains("z-bad.toml"), "{error:#}");
         assert_eq!(
@@ -330,6 +332,7 @@ fn local_migration_uses_only_the_project_tag_members() {
     std::fs::create_dir_all(&store.dir).unwrap();
     let original = "name = 'daily'\ntags = ['work']\n";
     std::fs::write(store.path("daily"), original).unwrap();
+    let _ = std::fs::remove_file(skills::migration::version::path(&root));
     let local = Workspace::open_local(&project, false).unwrap();
     assert_eq!(
         local.presets.load("daily").unwrap().unwrap().skills,
@@ -354,6 +357,7 @@ fn cli_migration_reports_backups_on_stderr_without_polluting_json() {
         "name = 'daily'\ntags = ['work']\n",
     )
     .unwrap();
+    std::fs::remove_file(skills::migration::version::path(&f.ws.root)).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_skills"))
         .args([
             "--root",

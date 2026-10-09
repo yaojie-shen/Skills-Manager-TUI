@@ -9,9 +9,16 @@ pub enum Phase {
     Presets,
     Repos,
     Config,
+    Declaration,
 }
 impl Phase {
-    pub(crate) const ORDERED: [Self; 4] = [Self::Tags, Self::Presets, Self::Repos, Self::Config];
+    pub(crate) const ORDERED: [Self; 5] = [
+        Self::Tags,
+        Self::Presets,
+        Self::Repos,
+        Self::Config,
+        Self::Declaration,
+    ];
 }
 #[derive(Clone, Debug)]
 pub struct FileOp {
@@ -42,6 +49,7 @@ fn phase(path: &RelPath) -> Phase {
         Some("tags") => Phase::Tags,
         Some("presets") => Phase::Presets,
         Some("repos") => Phase::Repos,
+        Some("format.toml") => Phase::Declaration,
         _ => Phase::Config,
     }
 }

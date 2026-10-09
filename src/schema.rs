@@ -47,7 +47,7 @@ pub fn require_current(
     let found = version(doc, path, kind, current, missing)?;
     if found < current {
         bail!(
-            "legacy {kind} schema {found} in {}; reopen the workspace to migrate it to schema {current}",
+            "{} uses legacy {kind} schema {found}, but this Skill Home declares layout 1; restore the file from .skills-meta/backups, or delete .skills-meta/format.toml and reopen to re-run migration",
             path.display()
         );
     }
