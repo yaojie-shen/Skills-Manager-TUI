@@ -81,17 +81,16 @@ impl TagStore {
         for entry in rd {
             let entry = entry?;
             let ty = entry.file_type()?;
+            crate::util::reject_interrupted_transaction(&entry.path(), &ty)?;
+            if !crate::util::is_store_document_name(&entry.file_name()) {
+                continue;
+            }
             ensure!(
                 ty.is_file() && !ty.is_symlink(),
                 "invalid Tag store entry: {}",
                 entry.path().display()
             );
             let path = entry.path();
-            ensure!(
-                path.extension().is_some_and(|e| e == "toml"),
-                "invalid Tag store entry: {}",
-                path.display()
-            );
             ensure!(
                 path.file_name().and_then(|n| n.to_str()).is_some(),
                 "Tag filename is not valid UTF-8: {}",
@@ -400,6 +399,51 @@ mod tests {
         store.rename("work", " work ").unwrap();
         assert_eq!(std::fs::read(path).unwrap(), bytes);
         assert_eq!(store.list().unwrap()[0].name, "work");
+    }
+
+    const STRAYS: [&str; 4] = [".DS_Store", "work.toml~", "README", ".work.toml.swp"];
+
+    #[test]
+    fn stray_store_files_are_ignored_and_left_alone() {
+        let temp = DownloadDir::new("tag-strays").unwrap();
+        let store = TagStore::new(temp.path());
+        std::fs::create_dir_all(store.dir.join("notes")).unwrap();
+        for name in STRAYS {
+            std::fs::write(store.dir.join(name), b"stray").unwrap();
+        }
+        store
+            .save(&Tag {
+                name: "work".into(),
+                skills: vec!["one".into()],
+                color: None,
+                description: None,
+            })
+            .unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert!(store.load("work").unwrap().is_some());
+        store.rename("work", "play").unwrap();
+        store.remove("play").unwrap();
+        assert!(store.list().unwrap().is_empty());
+        for name in STRAYS {
+            assert_eq!(std::fs::read(store.dir.join(name)).unwrap(), b"stray");
+        }
+        assert!(store.dir.join("notes").is_dir());
+    }
+
+    #[test]
+    fn toml_symlink_and_directory_entries_are_still_rejected() {
+        let temp = DownloadDir::new("tag-invalid-entries").unwrap();
+        let store = TagStore::new(temp.path());
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let target = temp.path().join("elsewhere.toml");
+        std::fs::write(&target, "schema = 1\nname = 'linked'\n").unwrap();
+        std::os::unix::fs::symlink(&target, store.dir.join("linked.toml")).unwrap();
+        let error = store.list().unwrap_err();
+        assert!(format!("{error:#}").contains("invalid Tag store entry"));
+        std::fs::remove_file(store.dir.join("linked.toml")).unwrap();
+        std::fs::create_dir(store.dir.join("folder.toml")).unwrap();
+        let error = store.list().unwrap_err();
+        assert!(format!("{error:#}").contains("invalid Tag store entry"));
     }
 
     #[test]

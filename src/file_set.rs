@@ -3,14 +3,44 @@
 //! Stage everything before moving originals. The journal records only successful
 //! filesystem operations, so a failed hold must never delete an untouched source.
 //! This is not crash-atomic and does not coordinate unrelated metadata stores.
+//! Publication retains a check-then-rename race; cooperating writers are serialized
+//! by the metadata lock. Rollback claims entries before checking inode ownership.
 
 use anyhow::{Context, Result, ensure};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
+    os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FailureKind {
+    RolledBack,
+    Committed { leftovers: Vec<PathBuf> },
+    ManualRecovery { paths: Vec<PathBuf> },
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct PublishError {
+    pub kind: FailureKind,
+    message: String,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PublishError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
 
 pub(crate) struct File<'a> {
     pub path: &'a Path,
@@ -27,7 +57,9 @@ pub(crate) enum Step {
     Publish,
     Cleanup,
     RemovePublished,
+    RestoreClaim,
     Restore,
+    Link,
     RemoveStage,
 }
 
@@ -75,7 +107,9 @@ fn transaction_dir(dir: &Path) -> Result<PathBuf> {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        match fs::create_dir(&path) {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        match builder.create(&path) {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
@@ -83,6 +117,124 @@ fn transaction_dir(dir: &Path) -> Result<PathBuf> {
                     .with_context(|| format!("creating transaction directory {}", path.display()));
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryType {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Identity {
+    device: u64,
+    inode: u64,
+    entry_type: EntryType,
+}
+
+fn identity(metadata: &fs::Metadata) -> Identity {
+    let kind = metadata.file_type();
+    Identity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        entry_type: if kind.is_file() {
+            EntryType::File
+        } else if kind.is_dir() {
+            EntryType::Directory
+        } else if kind.is_symlink() {
+            EntryType::Symlink
+        } else {
+            EntryType::Other
+        },
+    }
+}
+
+fn link_unsupported(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::EPERM
+                | libc::EACCES
+                | libc::ENOTSUP
+                | libc::EXDEV
+                | libc::ENOSYS
+                | libc::EMLINK
+                | libc::EROFS
+        )
+    )
+}
+
+/// Move `source` into an absent `destination` without clobbering. Hard links
+/// provide the atomic no-clobber operation. Filesystems that reject links use
+/// check-then-rename, retaining that unavoidable compatibility race.
+fn restore_no_clobber(source: &Path, destination: &Path, index: usize) -> std::io::Result<()> {
+    let linked = checkpoint(Step::Link, index, destination)
+        .and_then(|()| fs::hard_link(source, destination));
+    match linked {
+        Ok(()) => fs::remove_file(source),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "restore destination is occupied",
+            ))
+        }
+        Err(error) if link_unsupported(&error) => {
+            match fs::symlink_metadata(destination) {
+                Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => {}
+                Err(other) => return Err(other),
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "restore destination is occupied",
+                    ));
+                }
+            }
+            fs::rename(source, destination)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn unique_claim_dir(work: &Path, index: usize) -> std::io::Result<PathBuf> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let path = work.join(format!(
+            "claim-{index}-{}",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn has_identity(path: &Path, expected: Identity) -> std::io::Result<bool> {
+    fs::symlink_metadata(path).map(|metadata| identity(&metadata) == expected)
+}
+
+fn claim_no_clobber(source: &Path, claim: &Path) -> std::io::Result<()> {
+    match fs::hard_link(source, claim) {
+        Ok(()) => fs::remove_file(source),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(error),
+        Err(error) if link_unsupported(&error) => {
+            match fs::symlink_metadata(claim) {
+                Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "claim destination is occupied",
+                    ));
+                }
+            }
+            fs::rename(source, claim)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -99,8 +251,31 @@ fn unchanged(file: &File<'_>) -> Result<()> {
 /// Callers validate names/destinations and create `dir` before entering here.
 /// Originals are revalidated after staging, then again immediately before each
 /// hold. A cleanup error means the new files ARE committed; never roll them back.
-pub(crate) fn publish(dir: &Path, before: &[File<'_>], desired: &[File<'_>]) -> Result<()> {
-    let work = transaction_dir(dir)?;
+///
+/// The transaction directory is mode 0700. Same-user processes that can still
+/// write there are detected by inode/type identity checks where publication or
+/// cleanup would otherwise trust a transaction pathname.
+pub(crate) fn publish(
+    dir: &Path,
+    before: &[File<'_>],
+    desired: &[File<'_>],
+) -> std::result::Result<(), PublishError> {
+    struct Stage {
+        path: PathBuf,
+        _handle: fs::File,
+        identity: Identity,
+    }
+    struct Published<'a> {
+        index: usize,
+        path: &'a Path,
+        identity: Identity,
+    }
+
+    let work = transaction_dir(dir).map_err(|source| PublishError {
+        kind: FailureKind::RolledBack,
+        message: "file-set publication failed before staging".into(),
+        source,
+    })?;
     let mut stages = Vec::new();
     let mut held: Vec<(PathBuf, &Path)> = Vec::new();
     let mut published = Vec::new();
@@ -108,18 +283,25 @@ pub(crate) fn publish(dir: &Path, before: &[File<'_>], desired: &[File<'_>]) -> 
         for (index, file) in desired.iter().enumerate() {
             let stage = work.join(format!("stage-{index}"));
             checkpoint(Step::Create, index, &stage)?;
-            let mut writer = OpenOptions::new()
+            let writer = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&stage)
                 .with_context(|| format!("creating stage {}", stage.display()))?;
-            // Journal before writing: even a partially written stage is ours.
-            stages.push(stage.clone());
-            checkpoint(Step::Write, index, &stage)?;
+            let stage_identity = identity(&writer.metadata()?);
+            // Journal immediately after creation, while retaining the open handle
+            // to prevent its inode from being reused during rollback.
+            stages.push(Stage {
+                path: stage,
+                _handle: writer,
+                identity: stage_identity,
+            });
+            let stage = stages.last_mut().expect("stage was just pushed");
+            checkpoint(Step::Write, index, &stage.path)?;
             let split = file.bytes.len() / 2;
-            writer.write_all(&file.bytes[..split])?;
-            checkpoint(Step::WriteRemainder, index, &stage)?;
-            writer.write_all(&file.bytes[split..])?;
+            stage._handle.write_all(&file.bytes[..split])?;
+            checkpoint(Step::WriteRemainder, index, &stage.path)?;
+            stage._handle.write_all(&file.bytes[split..])?;
         }
         checkpoint(Step::Revalidate, 0, &work)?;
         for file in before {
@@ -136,6 +318,11 @@ pub(crate) fn publish(dir: &Path, before: &[File<'_>], desired: &[File<'_>]) -> 
         }
         for (index, (stage, file)) in stages.iter().zip(desired).enumerate() {
             checkpoint(Step::Publish, index, file.path)?;
+            ensure!(
+                has_identity(&stage.path, stage.identity)?,
+                "staged file identity changed at {}",
+                stage.path.display()
+            );
             match fs::symlink_metadata(file.path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -144,33 +331,77 @@ pub(crate) fn publish(dir: &Path, before: &[File<'_>], desired: &[File<'_>]) -> 
                     file.path.display()
                 ),
             }
-            fs::rename(stage, file.path)
+            fs::rename(&stage.path, file.path)
                 .with_context(|| format!("publishing {}", file.path.display()))?;
-            published.push(file.path);
+            published.push(Published {
+                index,
+                path: file.path,
+                identity: stage.identity,
+            });
         }
         Ok(())
     })();
 
     if let Err(error) = result {
         let mut recovery = Vec::new();
-        for (index, path) in published.iter().enumerate().rev() {
-            if let Err(error) =
-                checkpoint(Step::RemovePublished, index, path).and_then(|()| fs::remove_file(path))
+        for publication in published.iter().rev() {
+            let index = publication.index;
+            let path = publication.path;
+            let claim = unique_claim_dir(&work, index).map(|directory| directory.join("entry"));
+            let claimed = match &claim {
+                Ok(claim) => checkpoint(Step::RemovePublished, index, path)
+                    .and_then(|()| claim_no_clobber(path, claim)),
+                Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+            };
+            let claim =
+                claim.unwrap_or_else(|_| work.join(format!("claim-{index}-unavailable/entry")));
+            match claimed {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => recovery.push(format!(
+                    "claim published {} at {}: {error}",
+                    path.display(),
+                    claim.display()
+                )),
+                Ok(()) => match fs::symlink_metadata(&claim) {
+                    Ok(metadata) if identity(&metadata) == publication.identity => {
+                        if let Err(error) = fs::remove_file(&claim) {
+                            recovery.push(format!(
+                                "remove published claim {}: {error}",
+                                claim.display()
+                            ));
+                        }
+                    }
+                    Ok(_) => {
+                        let restored = checkpoint(Step::RestoreClaim, index, path)
+                            .and_then(|()| restore_no_clobber(&claim, path, index));
+                        if let Err(error) = restored {
+                            recovery.push(format!(
+                                "restore foreign {} from {}: {error}",
+                                path.display(),
+                                claim.display()
+                            ));
+                        }
+                    }
+                    Err(error) => recovery.push(format!(
+                        "inspect published claim {} for {}: {error}",
+                        claim.display(),
+                        path.display()
+                    )),
+                },
+            }
+            if let Some(directory) = claim.parent()
+                && let Err(error) = fs::remove_dir(directory)
+                && error.kind() != std::io::ErrorKind::NotFound
             {
-                recovery.push(format!("remove published {}: {error}", path.display()));
+                recovery.push(format!(
+                    "remove claim directory {}: {error}",
+                    directory.display()
+                ));
             }
         }
         for (index, (hold, original)) in held.iter().enumerate().rev() {
-            let restore = (|| -> std::io::Result<()> {
-                checkpoint(Step::Restore, index, hold)?;
-                // Do not overwrite a new external file or a failed removal.
-                match fs::symlink_metadata(original) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                    Ok(_) => return Err(std::io::Error::other("restore destination is occupied")),
-                }
-                fs::rename(hold, original)
-            })();
+            let restore = checkpoint(Step::Restore, index, hold)
+                .and_then(|()| restore_no_clobber(hold, original, index));
             if let Err(error) = restore {
                 recovery.push(format!(
                     "restore {} from {}: {error}",
@@ -180,11 +411,20 @@ pub(crate) fn publish(dir: &Path, before: &[File<'_>], desired: &[File<'_>]) -> 
             }
         }
         for (index, stage) in stages.iter().enumerate() {
-            if let Err(error) =
-                checkpoint(Step::RemoveStage, index, stage).and_then(|()| fs::remove_file(stage))
+            let removal =
+                checkpoint(Step::RemoveStage, index, &stage.path).and_then(
+                    |()| match has_identity(&stage.path, stage.identity) {
+                        Ok(true) => fs::remove_file(&stage.path),
+                        Ok(false) => Err(std::io::Error::other(
+                            "staged file identity changed; foreign entry retained",
+                        )),
+                        Err(error) => Err(error),
+                    },
+                );
+            if let Err(error) = removal
                 && error.kind() != std::io::ErrorKind::NotFound
             {
-                recovery.push(format!("remove stage {}: {error}", stage.display()));
+                recovery.push(format!("remove stage {}: {error}", stage.path.display()));
             }
         }
         if let Err(error) = fs::remove_dir(&work) {
@@ -193,15 +433,27 @@ pub(crate) fn publish(dir: &Path, before: &[File<'_>], desired: &[File<'_>]) -> 
                 work.display()
             ));
         }
-        return Err(error).with_context(|| {
-            if recovery.is_empty() {
-                "file-set publication failed; held originals restored and stages removed".to_owned()
-            } else {
+        let (kind, message) = if recovery.is_empty() {
+            (
+                FailureKind::RolledBack,
+                "file-set publication failed; held originals restored and stages removed"
+                    .to_owned(),
+            )
+        } else {
+            (
+                FailureKind::ManualRecovery {
+                    paths: vec![work.clone()],
+                },
                 format!(
                     "file-set publication failed; manual recovery required: {}",
                     recovery.join("; ")
-                )
-            }
+                ),
+            )
+        };
+        return Err(PublishError {
+            kind,
+            message,
+            source: error,
         });
     }
 
@@ -218,12 +470,20 @@ pub(crate) fn publish(dir: &Path, before: &[File<'_>], desired: &[File<'_>]) -> 
     if let Err(error) = fs::remove_dir(&work) {
         cleanup.push(format!("{}: {error}", work.display()));
     }
-    ensure!(
-        cleanup.is_empty(),
-        "file-set outputs were published, but old transaction files could not be removed (remove manually): {}",
-        cleanup.join("; ")
-    );
-    Ok(())
+    if cleanup.is_empty() {
+        Ok(())
+    } else {
+        Err(PublishError {
+            kind: FailureKind::Committed {
+                leftovers: vec![work.clone()],
+            },
+            message: format!(
+                "file-set outputs were published, but old transaction files could not be removed (remove manually): {}",
+                cleanup.join("; ")
+            ),
+            source: anyhow::anyhow!("transaction cleanup failed"),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +495,10 @@ mod tests {
         tag::{Tag, TagStore},
     };
     use std::collections::BTreeMap;
+
+    fn error_chain(error: &PublishError) -> String {
+        format!("{error}: {:#}", error.source)
+    }
 
     fn files<'a>(paths: &'a [PathBuf], bytes: &'a [Vec<u8>]) -> Vec<File<'a>> {
         paths
@@ -270,6 +534,27 @@ mod tests {
     }
 
     #[test]
+    fn publish_error_chain_prints_the_cause_once() {
+        let temp = DownloadDir::new("file-set-error-chain").unwrap();
+        let destination = temp.path().join("destination");
+        let error = with_hook(failure(Step::Create, 0), || {
+            publish(
+                temp.path(),
+                &[],
+                &[File {
+                    path: &destination,
+                    bytes: b"new",
+                }],
+            )
+        })
+        .unwrap_err();
+        let error: anyhow::Error = error.into();
+        let error = error.context("publishing test files");
+        let text = format!("{error:#}");
+        assert_eq!(text.matches("injected Create 0").count(), 1, "{text}");
+    }
+
+    #[test]
     fn every_stage_hold_and_publish_failure_restores_exact_file_set() {
         for step in [
             Step::Create,
@@ -298,7 +583,7 @@ mod tests {
                     publish(temp.path(), &files(&paths, &old), &files(&paths, &new))
                 })
                 .unwrap_err();
-                assert!(format!("{error:#}").contains("injected"));
+                assert!(error_chain(&error).contains("injected"));
                 assert_eq!(snapshot(temp.path()), original, "{step:?} at {index}");
             }
         }
@@ -332,7 +617,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(fs::read(&*captured.borrow()).unwrap(), b"foreign");
         assert!(!destination.exists());
-        assert!(format!("{error:#}").contains("manual recovery"));
+        assert!(error_chain(&error).contains("manual recovery"));
     }
 
     #[test]
@@ -400,8 +685,8 @@ mod tests {
                 snapshot(&work),
                 BTreeMap::from([(format!("original-{index}").into(), b"old".to_vec())])
             );
-            assert!(format!("{error:#}").contains("outputs were published"));
-            assert!(format!("{error:#}").contains(&work.display().to_string()));
+            assert!(error_chain(&error).contains("outputs were published"));
+            assert!(error_chain(&error).contains(&work.display().to_string()));
         }
     }
 
@@ -440,7 +725,7 @@ mod tests {
         assert_eq!(fs::read(&paths[2]).unwrap(), b"old");
         let hold = seen.borrow()[1].1.clone();
         assert_eq!(fs::read(&hold).unwrap(), b"old");
-        let message = format!("{error:#}");
+        let message = error_chain(&error);
         assert!(message.contains(&hold.display().to_string()));
         assert!(message.contains(&paths[1].display().to_string()));
         assert!(message.contains("manual recovery"));
@@ -478,7 +763,7 @@ mod tests {
             .path();
         let stage = work.join("stage-0");
         assert_eq!(fs::read(&stage).unwrap(), b"part");
-        assert!(format!("{error:#}").contains(&stage.display().to_string()));
+        assert!(error_chain(&error).contains(&stage.display().to_string()));
         assert!(!target.exists());
     }
 
@@ -500,7 +785,7 @@ mod tests {
             || publish(temp.path(), &files(&paths, &old), &files(&paths, &old)),
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("changed during"));
+        assert!(error_chain(&error).contains("changed during"));
         assert_eq!(fs::read(&paths[0]).unwrap(), b"old");
         assert_eq!(fs::read(&paths[1]).unwrap(), b"external");
         assert_eq!(fs::read(&paths[2]).unwrap(), b"old");
@@ -512,17 +797,11 @@ mod tests {
         Tags,
         Presets,
         Rename,
-        Migration,
     }
 
     #[test]
     fn all_four_callers_use_transaction_for_every_failure_position() {
-        for caller in [
-            Caller::Tags,
-            Caller::Presets,
-            Caller::Rename,
-            Caller::Migration,
-        ] {
+        for caller in [Caller::Tags, Caller::Presets, Caller::Rename] {
             for step in [
                 Step::Create,
                 Step::Write,
@@ -556,11 +835,6 @@ mod tests {
                                     ..Preset::default()
                                 })
                                 .unwrap(),
-                            Caller::Migration => fs::write(
-                                dir.join(format!("{name}.toml")),
-                                format!("# original {name}\nname = '{name}'\n"),
-                            )
-                            .unwrap(),
                         }
                     }
                     let original = snapshot(dir);
@@ -590,18 +864,6 @@ mod tests {
                                 ..Preset::default()
                             }),
                             Caller::Rename => presets.rename("a", "d").map(|_| ()),
-                            Caller::Migration => {
-                                let config =
-                                    crate::config::Config::load_legacy(temp.path()).unwrap();
-                                crate::migration::migrate_metadata(
-                                    temp.path(),
-                                    &config,
-                                    &tags,
-                                    &[],
-                                    &presets,
-                                )
-                                .map(|_| ())
-                            }
                         },
                     )
                     .unwrap_err();
@@ -650,11 +912,406 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("appeared during publication"));
+        assert!(error_chain(&error).contains("appeared during publication"));
         assert_eq!(fs::read(&source).unwrap(), b"old");
         assert_eq!(fs::read(&external).unwrap(), b"external");
         assert!(!first.exists());
         assert_eq!(snapshot(temp.path()).len(), 2);
+    }
+
+    #[test]
+    fn replacement_of_new_published_destination_survives_rollback() {
+        let temp = DownloadDir::new("file-set-foreign-new").unwrap();
+        let paths = [temp.path().join("first"), temp.path().join("second")];
+        let error = with_hook(
+            Box::new({
+                let first = paths[0].clone();
+                move |step, index, _| {
+                    if (step, index) == (Step::Publish, 1) {
+                        fs::remove_file(&first)?;
+                        fs::write(&first, b"external exact bytes")?;
+                        return Err(std::io::Error::other("stop after replacement"));
+                    }
+                    Ok(())
+                }
+            }),
+            || {
+                publish(
+                    temp.path(),
+                    &[],
+                    &[
+                        File {
+                            path: &paths[0],
+                            bytes: b"ours",
+                        },
+                        File {
+                            path: &paths[1],
+                            bytes: b"later",
+                        },
+                    ],
+                )
+            },
+        )
+        .unwrap_err();
+        assert!(error_chain(&error).contains("stop after replacement"));
+        assert_eq!(fs::read(&paths[0]).unwrap(), b"external exact bytes");
+        assert!(!paths[1].exists());
+        assert_eq!(snapshot(temp.path()).len(), 1);
+    }
+
+    #[test]
+    fn replacement_of_existing_destination_preserves_foreign_and_held_original() {
+        let temp = DownloadDir::new("file-set-foreign-existing").unwrap();
+        let paths = [temp.path().join("first"), temp.path().join("second")];
+        fs::write(&paths[0], b"original").unwrap();
+        let error = with_hook(
+            Box::new({
+                let first = paths[0].clone();
+                move |step, index, _| {
+                    if (step, index) == (Step::Publish, 1) {
+                        fs::remove_file(&first)?;
+                        fs::write(&first, b"external")?;
+                        return Err(std::io::Error::other("stop after replacement"));
+                    }
+                    Ok(())
+                }
+            }),
+            || {
+                publish(
+                    temp.path(),
+                    &[File {
+                        path: &paths[0],
+                        bytes: b"original",
+                    }],
+                    &[
+                        File {
+                            path: &paths[0],
+                            bytes: b"ours",
+                        },
+                        File {
+                            path: &paths[1],
+                            bytes: b"later",
+                        },
+                    ],
+                )
+            },
+        )
+        .unwrap_err();
+        assert_eq!(fs::read(&paths[0]).unwrap(), b"external");
+        let work = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .unwrap();
+        assert_eq!(fs::read(work.join("original-0")).unwrap(), b"original");
+        let message = error_chain(&error);
+        assert!(message.contains("manual recovery required"));
+        assert!(message.contains(&paths[0].display().to_string()));
+        assert!(message.contains(&work.join("original-0").display().to_string()));
+    }
+
+    #[test]
+    fn identical_byte_replacement_is_foreign_by_inode() {
+        let temp = DownloadDir::new("file-set-foreign-inode").unwrap();
+        let paths = [temp.path().join("first"), temp.path().join("second")];
+        let _error = with_hook(
+            Box::new({
+                let first = paths[0].clone();
+                move |step, index, _| {
+                    if (step, index) == (Step::Publish, 1) {
+                        fs::remove_file(&first)?;
+                        fs::write(&first, b"same")?;
+                        return Err(std::io::Error::other("stop"));
+                    }
+                    Ok(())
+                }
+            }),
+            || {
+                publish(
+                    temp.path(),
+                    &[],
+                    &[
+                        File {
+                            path: &paths[0],
+                            bytes: b"same",
+                        },
+                        File {
+                            path: &paths[1],
+                            bytes: b"later",
+                        },
+                    ],
+                )
+            },
+        )
+        .unwrap_err();
+        assert_eq!(fs::read(&paths[0]).unwrap(), b"same");
+        assert_eq!(snapshot(temp.path()).len(), 1);
+    }
+
+    #[test]
+    fn symlink_and_directory_replacements_are_preserved() {
+        use std::os::unix::fs::symlink;
+
+        for directory in [false, true] {
+            let temp = DownloadDir::new("file-set-foreign-kind").unwrap();
+            let paths = [temp.path().join("first"), temp.path().join("second")];
+            let link_target = temp.path().join("link-target");
+            fs::write(&link_target, b"target").unwrap();
+            with_hook(
+                Box::new({
+                    let first = paths[0].clone();
+                    let link_target = link_target.clone();
+                    move |step, index, _| {
+                        if (step, index) == (Step::Publish, 1) {
+                            fs::remove_file(&first)?;
+                            if directory {
+                                fs::create_dir(&first)?;
+                            } else {
+                                symlink(&link_target, &first)?;
+                            }
+                            return Err(std::io::Error::other("stop"));
+                        }
+                        Ok(())
+                    }
+                }),
+                || {
+                    publish(
+                        temp.path(),
+                        &[],
+                        &[
+                            File {
+                                path: &paths[0],
+                                bytes: b"ours",
+                            },
+                            File {
+                                path: &paths[1],
+                                bytes: b"later",
+                            },
+                        ],
+                    )
+                },
+            )
+            .unwrap_err();
+            let metadata = fs::symlink_metadata(&paths[0]).unwrap();
+            assert_eq!(metadata.file_type().is_dir(), directory);
+            assert_eq!(metadata.file_type().is_symlink(), !directory);
+        }
+    }
+
+    #[test]
+    fn missing_destination_at_claim_time_needs_no_recovery() {
+        let temp = DownloadDir::new("file-set-missing-claim").unwrap();
+        let paths = [temp.path().join("first"), temp.path().join("second")];
+        let error = with_hook(
+            Box::new(|step, index, path| {
+                if (step, index) == (Step::Publish, 1) {
+                    return Err(std::io::Error::other("stop"));
+                }
+                if (step, index) == (Step::RemovePublished, 0) {
+                    fs::remove_file(path)?;
+                }
+                Ok(())
+            }),
+            || {
+                publish(
+                    temp.path(),
+                    &[],
+                    &[
+                        File {
+                            path: &paths[0],
+                            bytes: b"ours",
+                        },
+                        File {
+                            path: &paths[1],
+                            bytes: b"later",
+                        },
+                    ],
+                )
+            },
+        )
+        .unwrap_err();
+        assert!(!error_chain(&error).contains("manual recovery required"));
+        assert!(snapshot(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn foreign_precreated_claim_name_is_preserved() {
+        let temp = DownloadDir::new("file-set-foreign-claim").unwrap();
+        let paths = [temp.path().join("first"), temp.path().join("second")];
+        let foreign = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let captured = foreign.clone();
+        let error = with_hook(
+            Box::new(move |step, index, path| {
+                if (step, index) == (Step::Publish, 1) {
+                    let work = path.parent().unwrap();
+                    let occupied = work.join("claimed-0");
+                    fs::write(&occupied, b"foreign claim")?;
+                    *captured.borrow_mut() = Some(occupied);
+                    return Err(std::io::Error::other("stop"));
+                }
+                Ok(())
+            }),
+            || {
+                publish(
+                    temp.path(),
+                    &[],
+                    &[
+                        File {
+                            path: &paths[0],
+                            bytes: b"ours",
+                        },
+                        File {
+                            path: &paths[1],
+                            bytes: b"later",
+                        },
+                    ],
+                )
+            },
+        )
+        .unwrap_err();
+        let foreign = foreign.borrow().clone().unwrap();
+        assert_eq!(fs::read(&foreign).unwrap(), b"foreign claim");
+        assert!(error_chain(&error).contains("stop"));
+    }
+
+    #[test]
+    fn foreign_stage_swap_is_neither_published_nor_deleted() {
+        let temp = DownloadDir::new("file-set-stage-swap").unwrap();
+        let destination = temp.path().join("destination");
+        let swapped = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let captured = swapped.clone();
+        let work = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+        let observed_work = work.clone();
+        let error = with_hook(
+            Box::new(move |step, index, path| {
+                if step == Step::Revalidate {
+                    *observed_work.borrow_mut() = Some(path.to_path_buf());
+                }
+                if (step, index) == (Step::Publish, 0) {
+                    let stage = observed_work.borrow().as_ref().unwrap().join("stage-0");
+                    fs::remove_file(&stage)?;
+                    fs::write(&stage, b"foreign stage")?;
+                    *captured.borrow_mut() = Some(stage);
+                }
+                Ok(())
+            }),
+            || {
+                publish(
+                    temp.path(),
+                    &[],
+                    &[File {
+                        path: &destination,
+                        bytes: b"ours",
+                    }],
+                )
+            },
+        )
+        .unwrap_err();
+        let stage = swapped.borrow().clone().unwrap();
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&stage).unwrap(), b"foreign stage");
+        assert!(error_chain(&error).contains("staged file identity changed"));
+    }
+
+    #[test]
+    fn destination_reoccupied_after_claim_retains_both_files_and_paths() {
+        let temp = DownloadDir::new("file-set-reoccupied").unwrap();
+        let paths = [temp.path().join("first"), temp.path().join("second")];
+        let error = with_hook(
+            Box::new({
+                let first = paths[0].clone();
+                move |step, index, path| {
+                    if (step, index) == (Step::Publish, 1) {
+                        fs::remove_file(&first)?;
+                        fs::write(&first, b"external claimed")?;
+                        return Err(std::io::Error::other("stop"));
+                    }
+                    if (step, index) == (Step::RestoreClaim, 0) {
+                        fs::write(path, b"external reoccupied")?;
+                    }
+                    Ok(())
+                }
+            }),
+            || {
+                publish(
+                    temp.path(),
+                    &[],
+                    &[
+                        File {
+                            path: &paths[0],
+                            bytes: b"ours",
+                        },
+                        File {
+                            path: &paths[1],
+                            bytes: b"later",
+                        },
+                    ],
+                )
+            },
+        )
+        .unwrap_err();
+        assert_eq!(fs::read(&paths[0]).unwrap(), b"external reoccupied");
+        let work = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.is_dir())
+            .unwrap();
+        let claim = fs::read_dir(&work)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("claim-0-")
+            })
+            .unwrap()
+            .join("entry");
+        assert_eq!(fs::read(&claim).unwrap(), b"external claimed");
+        let message = error_chain(&error);
+        assert!(message.contains(&paths[0].display().to_string()));
+        assert!(message.contains(&claim.display().to_string()));
+    }
+
+    #[test]
+    fn unsupported_hard_links_fall_back_to_restoring_originals() {
+        let temp = DownloadDir::new("file-set-link-fallback").unwrap();
+        let paths = [temp.path().join("first"), temp.path().join("second")];
+        fs::write(&paths[0], b"original").unwrap();
+        let error = with_hook(
+            Box::new(|step, index, _| {
+                if (step, index) == (Step::Publish, 1) {
+                    return Err(std::io::Error::other("stop"));
+                }
+                if step == Step::Link {
+                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                }
+                Ok(())
+            }),
+            || {
+                publish(
+                    temp.path(),
+                    &[File {
+                        path: &paths[0],
+                        bytes: b"original",
+                    }],
+                    &[
+                        File {
+                            path: &paths[0],
+                            bytes: b"new",
+                        },
+                        File {
+                            path: &paths[1],
+                            bytes: b"later",
+                        },
+                    ],
+                )
+            },
+        )
+        .unwrap_err();
+        assert!(error_chain(&error).contains("stop"));
+        assert_eq!(fs::read(&paths[0]).unwrap(), b"original");
+        assert_eq!(snapshot(temp.path()).len(), 1);
     }
 
     #[test]
@@ -685,8 +1342,8 @@ mod tests {
         assert_eq!(fs::read(work.join("original-0")).unwrap(), b"old");
         assert_eq!(fs::read(&paths[0]).unwrap(), b"new");
         assert_eq!(fs::read(&paths[1]).unwrap(), b"old");
-        assert!(format!("{error:#}").contains("restore destination is occupied"));
-        assert!(format!("{error:#}").contains(&work.join("original-0").display().to_string()));
+        assert!(error_chain(&error).contains("restore destination is occupied"));
+        assert!(error_chain(&error).contains(&work.join("original-0").display().to_string()));
     }
 
     #[test]
@@ -706,7 +1363,7 @@ mod tests {
             }],
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("changed during"));
+        assert!(error_chain(&error).contains("changed during"));
         assert_eq!(fs::read(&source).unwrap(), b"external");
         assert_eq!(snapshot(temp.path()).len(), 1);
     }

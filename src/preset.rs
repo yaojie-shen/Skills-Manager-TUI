@@ -164,17 +164,16 @@ impl PresetStore {
         for entry in rd {
             let entry = entry?;
             let ty = entry.file_type()?;
+            crate::util::reject_interrupted_transaction(&entry.path(), &ty)?;
+            if !crate::util::is_store_document_name(&entry.file_name()) {
+                continue;
+            }
             anyhow::ensure!(
                 ty.is_file() && !ty.is_symlink(),
                 "invalid preset store entry: {}",
                 entry.path().display()
             );
             let path = entry.path();
-            anyhow::ensure!(
-                path.extension().is_some_and(|e| e == "toml"),
-                "invalid preset store entry: {}",
-                path.display()
-            );
             anyhow::ensure!(
                 path.file_name().and_then(|n| n.to_str()).is_some(),
                 "preset filename is not valid UTF-8: {}",
@@ -442,5 +441,51 @@ impl PresetStore {
         // Keep the prepared document (including hand-edited comments).
         self.apply_entries(&before, &desired)?;
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::DownloadDir;
+
+    #[test]
+    fn stray_store_files_are_ignored_and_left_alone() {
+        let temp = DownloadDir::new("preset-strays").unwrap();
+        let store = PresetStore::new(temp.path());
+        std::fs::create_dir_all(store.dir.join("notes")).unwrap();
+        let strays = [".DS_Store", "daily.toml~", "README", ".daily.toml.tmp-1"];
+        for name in strays {
+            std::fs::write(store.dir.join(name), b"stray").unwrap();
+        }
+        store
+            .save(&Preset {
+                name: "daily".into(),
+                skills: vec!["one".into()],
+                ..Preset::default()
+            })
+            .unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert!(store.load("daily").unwrap().is_some());
+        assert!(store.remove_skill("daily", "one").unwrap());
+        store.rename("daily", "weekly").unwrap();
+        store.remove("weekly").unwrap();
+        assert!(store.list().unwrap().is_empty());
+        for name in strays {
+            assert_eq!(std::fs::read(store.dir.join(name)).unwrap(), b"stray");
+        }
+        assert!(store.dir.join("notes").is_dir());
+    }
+
+    #[test]
+    fn toml_symlink_entries_are_still_rejected() {
+        let temp = DownloadDir::new("preset-symlink").unwrap();
+        let store = PresetStore::new(temp.path());
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let target = temp.path().join("elsewhere.toml");
+        std::fs::write(&target, "schema = 1\nname = 'linked'\n").unwrap();
+        std::os::unix::fs::symlink(&target, store.dir.join("linked.toml")).unwrap();
+        let error = store.list().unwrap_err();
+        assert!(format!("{error:#}").contains("invalid preset store entry"));
     }
 }

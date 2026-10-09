@@ -18,10 +18,11 @@ pub fn normalize_name(name: &str) -> Result<String> {
 
 fn digest(name: &str, digits: usize) -> String {
     let hash = Sha256::digest(name.as_bytes());
-    hash.iter()
+    let hex = hash
+        .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()[..digits]
-        .to_owned()
+        .collect::<String>();
+    hex[..digits.min(hex.len())].to_owned()
 }
 
 fn windows_device(stem: &str) -> bool {
@@ -120,19 +121,37 @@ pub fn allocate<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<BTreeMap
             out.insert(name, base.clone());
             continue;
         }
-        let mut digits = 8;
-        loop {
+        let mut allocated = None;
+        for digits in (8..=64).step_by(2) {
             let suffix = digest(&name, digits);
             let stem = format!(
                 "{}--{suffix}",
                 truncate_utf8(base, MAX_STEM_BYTES - suffix.len() - 2)
             );
             if used.insert(collision_key(&stem)) {
-                out.insert(name, stem);
+                allocated = Some(stem);
                 break;
             }
-            digits += 2;
         }
+        if allocated.is_none() {
+            let suffix = digest(&name, 64);
+            for counter in 1..=used.len() + 1 {
+                let tail = format!("--{suffix}-{counter}");
+                let stem = format!(
+                    "{}{}",
+                    truncate_utf8(base, MAX_STEM_BYTES - tail.len()),
+                    tail
+                );
+                if used.insert(collision_key(&stem)) {
+                    allocated = Some(stem);
+                    break;
+                }
+            }
+        }
+        out.insert(
+            name,
+            allocated.expect("used.len() + 1 fallback candidates guarantee a free stem"),
+        );
     }
     Ok(out)
 }
@@ -151,6 +170,43 @@ mod tests {
         assert!(names["Work"].starts_with("Work--"));
         assert!(names["work"].starts_with("work--"));
         assert_ne!(collision_key(&names["Work"]), collision_key(&names["work"]));
+    }
+
+    #[test]
+    fn adversarial_digest_shaped_names_exhaust_prefixes_without_panicking() {
+        let hash = digest("A/B", 64);
+        let mut names = vec!["A-B".to_owned(), "A/B".to_owned()];
+        names.extend(
+            (8..=64)
+                .step_by(2)
+                .map(|digits| format!("A-B--{}", &hash[..digits])),
+        );
+
+        let first = allocate(names.iter().map(String::as_str)).unwrap();
+        let second = allocate(names.iter().rev().map(String::as_str)).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), names.len());
+        assert!(first.values().all(|stem| stem.len() <= MAX_STEM_BYTES));
+        assert_eq!(
+            first
+                .values()
+                .map(|stem| collision_key(stem))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            names.len()
+        );
+    }
+
+    #[test]
+    fn common_allocations_remain_canonical() {
+        assert_eq!(
+            allocate(["Work", "A/B", "A-B"]).unwrap(),
+            BTreeMap::from([
+                ("A-B".to_owned(), "A-B--77101aaa".to_owned()),
+                ("A/B".to_owned(), "A-B--998d3ed8".to_owned()),
+                ("Work".to_owned(), "Work".to_owned()),
+            ])
+        );
     }
 
     #[test]
