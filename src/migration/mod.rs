@@ -21,6 +21,32 @@ pub struct MigrationReport {
     pub from_layout: u32,
     pub to_layout: u32,
 }
+impl MigrationReport {
+    /// Human-readable recovery instructions followed by a migration summary.
+    pub fn recovery_lines(&self) -> Vec<String> {
+        fn changed(label: &str, names: &[String]) -> String {
+            if names.is_empty() {
+                format!("{label}: 0")
+            } else {
+                format!("{label}: {} ({})", names.len(), names.join(", "))
+            }
+        }
+
+        vec![
+            "Original files were backed up to:".into(),
+            self.backup_dir.display().to_string(),
+            "This backup holds only the original files this migration changed; it is not a full snapshot.".into(),
+            "To recover, copy the original files you need back into .skills-meta, then delete .skills-meta/format.toml and reopen to re-run migration.".into(),
+            format!(
+                "Configuration: {}",
+                if self.config_migrated { "migrated" } else { "unchanged" }
+            ),
+            changed("Tags", &self.migrated_tags),
+            changed("Presets", &self.migrated_names),
+            changed("Repository documents", &self.migrated_repositories),
+        ]
+    }
+}
 pub use plan::Phase;
 #[derive(Debug)]
 pub enum Recovery {
@@ -177,6 +203,54 @@ mod tests {
             .into_iter()
             .map(|(path, bytes)| (path.as_path().to_path_buf(), bytes))
             .collect()
+    }
+
+    #[test]
+    fn recovery_lines_label_backup_and_describe_every_category() {
+        let report = MigrationReport {
+            backup_dir: PathBuf::from("/tmp/home/.skills-meta/backups/originals"),
+            migrated_names: vec!["daily".into(), "focus".into()],
+            migrated_tags: vec!["work".into()],
+            config_migrated: true,
+            migrated_repositories: vec!["demo.toml".into(), ".root.toml".into()],
+            from_layout: 0,
+            to_layout: 1,
+        };
+        let lines = report.recovery_lines();
+        assert_eq!(lines[0], "Original files were backed up to:");
+        assert_eq!(lines[1], report.backup_dir.display().to_string());
+        let text = lines.join("\n");
+        for expected in [
+            "only the original files this migration changed",
+            "not a full snapshot",
+            "delete .skills-meta/format.toml",
+            "Configuration: migrated",
+            "Tags: 1 (work)",
+            "Presets: 2 (daily, focus)",
+            "Repository documents: 2 (demo.toml, .root.toml)",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} from {text}");
+        }
+        assert!(!text.contains("true"));
+    }
+
+    #[test]
+    fn recovery_lines_report_unchanged_and_empty_categories_without_booleans() {
+        let report = MigrationReport {
+            backup_dir: PathBuf::from("backup"),
+            migrated_names: vec![],
+            migrated_tags: vec![],
+            config_migrated: false,
+            migrated_repositories: vec![],
+            from_layout: 0,
+            to_layout: 1,
+        };
+        let text = report.recovery_lines().join("\n");
+        assert!(text.contains("Configuration: unchanged"));
+        assert!(text.contains("Tags: 0"));
+        assert!(text.contains("Presets: 0"));
+        assert!(text.contains("Repository documents: 0"));
+        assert!(!text.contains("false"));
     }
 
     #[test]

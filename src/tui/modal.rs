@@ -39,6 +39,13 @@ pub enum InputKind {
     SetSource { skill: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    Normal,
+    RepairResults,
+    MigrationRecovery,
+}
+
 pub enum Modal {
     DeploymentChoices(Box<super::name_choices::NameChoices>),
     HealthRepair(Box<super::views::health::RepairDialog>),
@@ -51,6 +58,7 @@ pub enum Modal {
         scroll: u16,
     },
     Message {
+        kind: MessageKind,
         title: String,
         lines: Vec<String>,
         scroll: u16,
@@ -160,8 +168,27 @@ impl Modal {
     }
     pub fn message(title: impl Into<String>, lines: Vec<String>) -> Self {
         Modal::Message {
+            kind: MessageKind::Normal,
             title: title.into(),
             lines,
+            scroll: 0,
+            return_to: None,
+        }
+    }
+    pub fn repair_results(lines: Vec<String>) -> Self {
+        Modal::Message {
+            kind: MessageKind::RepairResults,
+            title: "Repair results".into(),
+            lines,
+            scroll: 0,
+            return_to: None,
+        }
+    }
+    pub fn migration_recovery(report: &skills::migration::MigrationReport) -> Self {
+        Modal::Message {
+            kind: MessageKind::MigrationRecovery,
+            title: "Metadata migrated".into(),
+            lines: report.recovery_lines(),
             scroll: 0,
             return_to: None,
         }
@@ -668,7 +695,10 @@ impl Modal {
                 ("PgUp/PgDn", "page"),
                 ("Esc", "back to selection"),
             ],
-            Modal::Message { title, .. } if title.trim() == "Repair results" => &[
+            Modal::Message {
+                kind: MessageKind::RepairResults | MessageKind::MigrationRecovery,
+                ..
+            } => &[
                 ("↑↓", "scroll"),
                 ("PgUp/PgDn", "page"),
                 ("Enter/Esc", "close"),
@@ -767,11 +797,10 @@ impl Modal {
             Modal::Repository(p) => p.key(k, ctx),
             Modal::DeployTargets(p) => p.key(k, ctx),
             Modal::Message {
-                title,
+                kind: MessageKind::RepairResults | MessageKind::MigrationRecovery,
                 return_to: None,
                 ..
-            } if title.trim() == "Repair results"
-                && k.code == KeyCode::Enter
+            } if k.code == KeyCode::Enter
                 && !k.modifiers.intersects(
                     KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                 ) =>
@@ -1274,12 +1303,17 @@ impl Modal {
                 );
             }
             Modal::Message {
+                kind,
                 title,
                 lines,
                 scroll,
                 return_to,
             } => {
-                let repair_result = title.trim() == "Repair results";
+                let repair_result = *kind == MessageKind::RepairResults;
+                let expanded = matches!(
+                    kind,
+                    MessageKind::RepairResults | MessageKind::MigrationRecovery
+                );
                 let mut ls: Vec<Line> = lines
                     .iter()
                     .map(|line| {
@@ -1294,14 +1328,14 @@ impl Modal {
                 ls.push(Line::from(Span::styled(
                     if return_to.is_some() {
                         "Esc returns to your selection; fix the error and apply again."
-                    } else if title.trim() == "Repair results" {
+                    } else if expanded {
                         "↑↓ scroll · PgUp/PgDn page · Enter/Esc close"
                     } else {
                         "↑↓ scroll · PgUp/PgDn page · Esc close"
                     },
                     th.dim(),
                 )));
-                let wanted_width = if repair_result {
+                let wanted_width = if expanded {
                     area.width.saturating_sub(8).min(112)
                 } else {
                     84
@@ -1313,12 +1347,12 @@ impl Modal {
                 let content_height = paragraph
                     .line_count(content_width.max(1))
                     .min(u16::MAX as usize) as u16;
-                let wanted_height = if repair_result {
+                let wanted_height = if expanded {
                     content_height.saturating_add(2).max(16)
                 } else {
                     content_height.saturating_add(2)
                 };
-                let height = wanted_height.min(if repair_result {
+                let height = wanted_height.min(if expanded {
                     area.height.saturating_sub(4)
                 } else {
                     area.height.saturating_sub(2)
@@ -2323,7 +2357,7 @@ mod picker_tests {
             snap: &snap,
             settings: &settings,
         };
-        let mut modal = Modal::message("Repair results", vec!["1 repaired".into()]);
+        let mut modal = Modal::repair_results(vec!["1 repaired".into()]);
         assert!(modal.hints().contains(&("Enter/Esc", "close")));
         for width in [60, 140] {
             let mut terminal = Terminal::new(TestBackend::new(width, 42)).unwrap();
@@ -2338,17 +2372,14 @@ mod picker_tests {
             assert!(text.contains("Enter/Esc close"));
             assert!(!text.contains("page · Esc close"));
         }
-        let mut narrow = Modal::message(
-            "Repair results",
-            vec![
-                "1 repaired · 0 unchanged · 0 failed".into(),
-                format!(
-                    "REPAIRED  shared/{} → Library/repos/example/{}",
-                    "long-skill-name-".repeat(4),
-                    "long-skill-name-".repeat(4)
-                ),
-            ],
-        );
+        let mut narrow = Modal::repair_results(vec![
+            "1 repaired · 0 unchanged · 0 failed".into(),
+            format!(
+                "REPAIRED  shared/{} → Library/repos/example/{}",
+                "long-skill-name-".repeat(4),
+                "long-skill-name-".repeat(4)
+            ),
+        ]);
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
         terminal.draw(|f| narrow.draw(f, f.area(), &ctx)).unwrap();
         let text: String = terminal
@@ -2395,6 +2426,7 @@ mod picker_tests {
             Modal::help(),
             Modal::message("Other results", vec![]),
             Modal::Message {
+                kind: MessageKind::Normal,
                 title: "Repair results".into(),
                 lines: vec![],
                 scroll: 0,
@@ -2411,6 +2443,86 @@ mod picker_tests {
                 other
                     .handle_key(KeyEvent::from(KeyCode::Esc), &ctx)
                     .as_slice(),
+                [Action::CloseModal]
+            ));
+        }
+    }
+
+    #[test]
+    fn migration_recovery_path_is_reachable_at_multiple_widths_and_closes() {
+        let tmp = skills::ops::DownloadDir::new("migration-recovery-modal").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let backup = PathBuf::from("/tmp/claude-1000")
+            .join("deep component with spaces")
+            .join("迁移备份")
+            .join("another-extraordinarily-long-component");
+        let report = skills::migration::MigrationReport {
+            backup_dir: backup.clone(),
+            migrated_names: vec!["daily".into()],
+            migrated_tags: vec!["work".into()],
+            config_migrated: true,
+            migrated_repositories: vec![".root.toml".into()],
+            from_layout: 0,
+            to_layout: 1,
+        };
+        for width in [60, 80, 120] {
+            let mut modal = Modal::migration_recovery(&report);
+            let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+            let mut rendered = String::new();
+            let mut title_rendered = false;
+            for _ in 0..30 {
+                terminal.draw(|f| modal.draw(f, f.area(), &ctx)).unwrap();
+                title_rendered |= terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .contains("Metadata migrated");
+                let modal_width = width.saturating_sub(8).min(112);
+                let x = (width - modal_width) / 2;
+                let buffer = terminal.backend().buffer();
+                for row in 3..13 {
+                    for column in x + 1..x + modal_width - 1 {
+                        rendered.push_str(buffer[(column, row)].symbol());
+                    }
+                }
+                modal.handle_key(KeyEvent::from(KeyCode::Down), &ctx);
+            }
+            assert!(title_rendered);
+            let compact_rendered: String =
+                rendered.chars().filter(|ch| !ch.is_whitespace()).collect();
+            for segment in backup
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .filter(|part| !part.is_empty())
+            {
+                let compact_segment: String =
+                    segment.chars().filter(|ch| !ch.is_whitespace()).collect();
+                assert!(
+                    compact_rendered.contains(&compact_segment),
+                    "width {width} omitted {segment:?}"
+                );
+            }
+        }
+        for code in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('q')] {
+            let mut modal = Modal::migration_recovery(&report);
+            assert!(matches!(
+                modal.handle_key(KeyEvent::from(code), &ctx).as_slice(),
                 [Action::CloseModal]
             ));
         }

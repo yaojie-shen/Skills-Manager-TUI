@@ -14,6 +14,7 @@ pub enum Command {
     Install,
     Repositories,
     Repair,
+    MigrationReport,
     RootSync,
     ToggleTags,
     Undo,
@@ -60,6 +61,12 @@ const ENTRIES: &[Entry] = &[
         label: "Repair health issues",
         detail: "Preview root repairs before applying",
         keywords: "health fix missing broken",
+    },
+    Entry {
+        command: Command::MigrationReport,
+        label: "Show metadata migration report",
+        detail: "Review recovery instructions from library opening",
+        keywords: "migration report recovery upgrade format",
     },
     Entry {
         command: Command::RootSync,
@@ -349,5 +356,18 @@ mod tests {
             palette.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Event::Execute(Command::RootSync)
         );
+    }
+
+    #[test]
+    fn documented_upgrade_wording_finds_the_migration_report() {
+        for query in ["upgrade", "format"] {
+            let mut palette = CommandPalette::default();
+            palette.paste(query).unwrap();
+            assert_eq!(
+                palette.selected(),
+                Some(Command::MigrationReport),
+                "{query}"
+            );
+        }
     }
 }
