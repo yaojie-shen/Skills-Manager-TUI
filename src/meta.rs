@@ -311,22 +311,24 @@ impl MetaStore {
     }
     pub(crate) fn read(path: &Path) -> Result<DocumentMut> {
         match std::fs::read_to_string(path) {
-            Ok(text) => {
-                let doc = text
-                    .parse()
-                    .with_context(|| format!("invalid metadata: {}", path.display()))?;
-                crate::schema::require_current(
-                    &doc,
-                    path,
-                    "repository metadata",
-                    crate::schema::REPOSITORY,
-                    0,
-                )?;
-                Ok(doc)
-            }
+            Ok(text) => Self::parse_document(path, &text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DocumentMut::new()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
+    }
+    /// Parse one current repository metadata document.
+    pub(crate) fn parse_document(path: &Path, text: &str) -> Result<DocumentMut> {
+        let doc = text
+            .parse()
+            .with_context(|| format!("invalid metadata: {}", path.display()))?;
+        crate::schema::require_current(
+            &doc,
+            path,
+            "repository metadata",
+            crate::schema::REPOSITORY,
+            0,
+        )?;
+        Ok(doc)
     }
     pub fn exists(&self, key: &str) -> bool {
         self.load(key).map(|m| m.is_some()).unwrap_or(true)

@@ -182,10 +182,24 @@ impl PresetStore {
             paths.push(path);
         }
         paths.sort();
-        let mut out = Vec::new();
-        let mut names = BTreeSet::new();
+        let mut files = Vec::new();
         for path in paths {
             let bytes = std::fs::read(&path)?;
+            files.push((path, bytes));
+        }
+        self.parse_entries(files)
+    }
+
+    /// Validate preset documents already read from this store's directory,
+    /// including the canonical filename check.
+    pub(crate) fn validate_documents(&self, files: Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
+        self.parse_entries(files).map(drop)
+    }
+
+    fn parse_entries(&self, files: Vec<(PathBuf, Vec<u8>)>) -> Result<Vec<StoredPreset>> {
+        let mut out = Vec::new();
+        let mut names = BTreeSet::new();
+        for (path, bytes) in files {
             let text = std::str::from_utf8(&bytes)?;
             let mut doc: DocumentMut = text
                 .parse()

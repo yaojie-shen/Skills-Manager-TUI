@@ -350,6 +350,13 @@ impl Config {
         Ok(toml::from_str(&doc.to_string())?)
     }
 
+    /// Validate config text with the current codec, as [`Config::load`] would.
+    pub(crate) fn validate_text(path: &Path, text: &str) -> Result<()> {
+        Self::parse_at(path, text)
+            .map(drop)
+            .with_context(|| format!("invalid config: {}", path.display()))
+    }
+
     fn parse(text: &str) -> Result<Self> {
         Self::parse_at(Path::new("config.toml"), text)
     }

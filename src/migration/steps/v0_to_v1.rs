@@ -1,20 +1,45 @@
 //! Frozen and idempotent layout-0 to layout-1 metadata transformation.
+//!
+//! The source format (layout 0) is described by the step-local legacy types
+//! below; the target format comes only from `layouts::v1`.
 
 use super::StepNotes;
-use crate::{
-    config::Config,
-    migration::snapshot::{HomeView, RelPath},
-    tag::Tag,
+use crate::migration::{
+    layouts::v1::{self, PresetV1, SCHEMAS, TagV1 as Tag},
+    snapshot::{HomeView, RelPath},
 };
 use anyhow::{Context, Result, ensure};
+use serde::Deserialize;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
 };
 use toml_edit::{Document, DocumentMut, Item};
 
+/// The only part of a layout-0 `config.toml` this step consumes. Every other
+/// setting is carried over verbatim and validated by the engine afterwards.
+#[derive(Default, Deserialize)]
+struct LegacyConfig {
+    #[serde(default)]
+    tags: Vec<Tag>,
+}
+
+/// Expand layout-0 preset Tag references against the merged Tag definitions.
+fn expand_legacy_tags(tags: &[Tag], names: &[String]) -> Result<Vec<String>> {
+    let mut members = BTreeSet::new();
+    for name in names {
+        let mut found = false;
+        for tag in tags.iter().filter(|tag| &tag.name == name) {
+            found = true;
+            members.extend(tag.skills.iter().cloned());
+        }
+        ensure!(found, "no such tag: {name}");
+    }
+    Ok(members.into_iter().collect())
+}
+
 fn normalize(mut tag: Tag) -> Result<Tag> {
-    tag.name = crate::group_filename::normalize_name(&tag.name)?;
+    tag.name = v1::normalize_name(&tag.name)?;
     tag.skills.sort();
     tag.skills.dedup();
     Ok(tag)
@@ -25,7 +50,7 @@ fn parse_tag(path: &Path, bytes: &[u8]) -> Result<(Tag, DocumentMut)> {
     let mut doc = text
         .parse::<DocumentMut>()
         .with_context(|| format!("invalid Tag: {}", path.display()))?;
-    crate::schema::version(&doc, path, "Tag", crate::schema::TAG, 0)?;
+    v1::schema(&doc, path, "Tag", SCHEMAS.tag, 0)?;
     let domain = doc.clone();
     doc.remove("schema");
     Ok((
@@ -93,7 +118,7 @@ fn merge_tags(stored: Vec<StoredTag>, inline: &[Tag]) -> Result<Vec<DesiredTag>>
         );
         stored_names.insert(tag.name.clone());
         if original.get("schema").is_none() {
-            crate::schema::set(&mut original, crate::schema::TAG);
+            v1::set_schema(&mut original, SCHEMAS.tag);
             out.push((Some(path), original.to_string().into_bytes(), tag));
         } else {
             out.push((Some(path), bytes, tag));
@@ -101,24 +126,27 @@ fn merge_tags(stored: Vec<StoredTag>, inline: &[Tag]) -> Result<Vec<DesiredTag>>
     }
     for tag in merge_inline_tags(inline)? {
         if stored_names.contains(&tag.name) {
-            let current = &out
+            let (stored_path, _, current) = out
                 .iter()
                 .find(|(_, _, current)| current.name == tag.name)
-                .expect("stored Tag name was indexed")
-                .2;
+                .expect("stored Tag name was indexed");
+            let stored_path = stored_path.as_ref().map_or_else(
+                || "tags/".into(),
+                |path| path.as_path().display().to_string(),
+            );
             ensure!(
                 current == &tag,
-                "Tag {} differs between config.toml and the Tag store",
+                "Tag {} is defined differently in .skills-meta/config.toml (its tags list) and in .skills-meta/{stored_path}; make the two definitions match, or remove the config.toml tags entry you do not want, then reopen",
                 tag.name
             );
         } else {
             names.insert(tag.name.clone());
-            out.push((None, crate::tag::TagStore::serialize(&tag)?, tag));
+            out.push((None, v1::serialize_tag(&tag)?, tag));
         }
     }
     Ok(out)
 }
-fn config_without_tags(text: &str) -> Result<DocumentMut> {
+fn config_without_tags(text: &str, schema: u32) -> Result<DocumentMut> {
     let parsed = Document::parse(text.to_owned())?;
     let prefix = parsed
         .as_table()
@@ -130,8 +158,10 @@ fn config_without_tags(text: &str) -> Result<DocumentMut> {
         .to_owned();
     let mut doc = parsed.into_mut();
     doc.remove("tags");
-    doc.remove("deploy");
-    crate::schema::set(&mut doc, crate::schema::CONFIG);
+    if schema == 1 {
+        doc.remove("deploy");
+    }
+    v1::set_schema(&mut doc, SCHEMAS.config);
     if !prefix.is_empty() {
         let next = doc.iter().next().map(|(k, _)| k.to_owned());
         if let Some(key) = next {
@@ -166,27 +196,16 @@ fn paths(view: &HomeView, prefix: &str) -> Vec<RelPath> {
 pub fn upgrade(view: &mut HomeView) -> Result<StepNotes> {
     let mut notes = StepNotes::default();
     let config_bytes = view.get("config.toml").map(<[u8]>::to_vec);
-    let mut config = Config::default();
+    let mut config = LegacyConfig::default();
     let mut config_change = None;
     if let Some(bytes) = &config_bytes {
         let text = std::str::from_utf8(bytes)?;
-        let mut doc = text.parse::<DocumentMut>()?;
-        let schema = crate::schema::version(
-            &doc,
-            Path::new("config.toml"),
-            "config",
-            crate::schema::CONFIG,
-            1,
-        )?;
+        let doc = text.parse::<DocumentMut>()?;
+        let schema = v1::schema(&doc, Path::new("config.toml"), "config", SCHEMAS.config, 1)?;
         let has = doc.get("tags").is_some();
-        if schema == 1 {
-            doc.remove("deploy");
-        }
-        let mut parse = doc.clone();
-        parse["schema"] = toml_edit::value(schema as i64);
-        config = toml::from_str(&parse.to_string())?;
-        if schema < crate::schema::CONFIG || has {
-            config_change = Some(config_without_tags(text)?.to_string().into_bytes());
+        config = toml::from_str(&doc.to_string())?;
+        if schema < SCHEMAS.config || has {
+            config_change = Some(config_without_tags(text, schema)?.to_string().into_bytes());
             notes.config_migrated = true;
         }
     }
@@ -197,8 +216,7 @@ pub fn upgrade(view: &mut HomeView) -> Result<StepNotes> {
         stored.push((rel, bytes, tag, doc));
     }
     let desired = merge_tags(stored.clone(), &config.tags)?;
-    let allocation =
-        crate::group_filename::allocate(desired.iter().map(|(_, _, t)| t.name.as_str()))?;
+    let allocation = v1::allocate(desired.iter().map(|(_, _, t)| t.name.as_str()))?;
     for (old, _, _, _) in &stored {
         view.remove(old);
     }
@@ -228,14 +246,13 @@ pub fn upgrade(view: &mut HomeView) -> Result<StepNotes> {
         let mut doc = text
             .parse::<DocumentMut>()
             .with_context(|| format!("invalid preset: {}", rel.as_path().display()))?;
-        let schema =
-            crate::schema::version(&doc, rel.as_path(), "preset", crate::schema::PRESET, 0)?;
+        let schema = v1::schema(&doc, rel.as_path(), "preset", SCHEMAS.preset, 0)?;
         let legacy = doc.remove("tags");
         let had = legacy.is_some();
         let mut domain = doc.clone();
         domain.remove("schema");
-        let preset: crate::preset::Preset = toml::from_str(&domain.to_string())?;
-        let name = crate::group_filename::normalize_name(&preset.name)?;
+        let preset: PresetV1 = toml::from_str(&domain.to_string())?;
+        let name = v1::normalize_name(&preset.name)?;
         if let Some(legacy) = legacy {
             let names = legacy
                 .as_array()
@@ -253,7 +270,7 @@ pub fn upgrade(view: &mut HomeView) -> Result<StepNotes> {
                         .context("legacy preset tag must be a string")
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let expanded = crate::preset::tag_members(&config, &names).with_context(|| {
+            let expanded = expand_legacy_tags(&config.tags, &names).with_context(|| {
                 format!(
                     "cannot migrate {}; original presets were left unchanged",
                     rel.as_path().display()
@@ -274,18 +291,18 @@ pub fn upgrade(view: &mut HomeView) -> Result<StepNotes> {
                 }
             }
         }
-        if schema < crate::schema::PRESET {
-            crate::schema::set(&mut doc, crate::schema::PRESET)
+        if schema < SCHEMAS.preset {
+            v1::set_schema(&mut doc, SCHEMAS.preset)
         }
         planned.push((rel.clone(), doc.to_string().into_bytes(), name, had, schema));
     }
-    let alloc = crate::group_filename::allocate(planned.iter().map(|entry| entry.2.as_str()))?;
+    let alloc = v1::allocate(planned.iter().map(|entry| entry.2.as_str()))?;
     for rel in &preset_paths {
         view.remove(rel);
     }
     for (old, bytes, name, had, schema) in planned {
         let target = PathBuf::from("presets").join(format!("{}.toml", alloc[&name]));
-        if schema < crate::schema::PRESET || had || old.as_path() != target {
+        if schema < SCHEMAS.preset || had || old.as_path() != target {
             notes.migrated_names.push(name);
         }
         view.insert(target, bytes)?;
@@ -296,16 +313,15 @@ pub fn upgrade(view: &mut HomeView) -> Result<StepNotes> {
         let mut doc = text
             .parse::<DocumentMut>()
             .with_context(|| format!("invalid repository metadata: {}", rel.as_path().display()))?;
-        let schema = crate::schema::version(
+        let schema = v1::schema(
             &doc,
             rel.as_path(),
             "repository metadata",
-            crate::schema::REPOSITORY,
+            SCHEMAS.repository,
             0,
         )?;
-        crate::meta::validate_repository_document(rel.as_path(), &doc)?;
-        if schema < crate::schema::REPOSITORY {
-            crate::schema::set(&mut doc, crate::schema::REPOSITORY);
+        if schema < SCHEMAS.repository {
+            v1::set_schema(&mut doc, SCHEMAS.repository);
             view.insert(rel.as_path(), doc.to_string().into_bytes())?;
             notes.migrated_repositories.push(
                 rel.as_path()

@@ -1,5 +1,23 @@
 //! Ordered, versioned migrations for the filesystem-backed Skill Home.
+//!
+//! Two version layers: `format.toml` declares the Home `layout`, and each
+//! document carries its own `schema` (`crate::schema`). A layout fixes one
+//! schema per document kind plus the filename rules.
+//!
+//! Pipeline: read the declared layout ([`version`]), capture a bounded
+//! [`snapshot`], run the frozen `steps` in memory, validate the result with
+//! the current program codecs, diff it into a [`plan`], then the runner locks,
+//! revalidates, backs up, and publishes by phase, writing `format.toml` last.
+//!
+//! Adding layout N:
+//! 1. add frozen definitions in `layouts/vN.rs` and register them in `layouts::LAYOUTS`;
+//! 2. add `steps/v{N-1}_to_vN.rs` and register it in `steps::STEPS`;
+//! 3. bump `CURRENT_LAYOUT` and the `crate::schema` constants, then update the live stores;
+//! 4. add fixtures under `tests/fixtures/migrations/`;
+//! 5. for a new metadata directory, extend `snapshot.rs`, the `plan.rs` phase
+//!    mapping, and `validate_current`.
 mod backup;
+mod layouts;
 pub mod plan;
 mod runner;
 pub mod snapshot;
@@ -125,6 +143,7 @@ pub fn ensure_current(root: &Path) -> Result<Option<MigrationReport>, MigrationE
     }
     view.insert("format.toml", version::content())
         .map_err(preflight)?;
+    validate_current(root, &view).map_err(preflight)?;
     let plan = plan::diff(&snapshot, &view);
     let declaration_only = plan.ops.len() == 1 && plan.ops[0].phase == Phase::Declaration;
     if declaration_only {
@@ -150,6 +169,42 @@ pub fn ensure_current(root: &Path) -> Result<Option<MigrationReport>, MigrationE
         from_layout,
         to_layout: CURRENT_LAYOUT,
     }))
+}
+/// Check the migrated tree with the current program codecs before any write.
+/// Steps only know frozen layouts; producing a tree this build can load is the
+/// engine's job, so the engine alone consults live definitions.
+fn validate_current(root: &Path, view: &snapshot::HomeView) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let meta = crate::paths::meta_dir(root);
+    let mut tags = Vec::new();
+    let mut presets = Vec::new();
+    for (rel, bytes) in view.files() {
+        let rel = rel.as_path();
+        let path = meta.join(rel);
+        let text = || {
+            std::str::from_utf8(bytes)
+                .with_context(|| format!("invalid UTF-8 in {}", path.display()))
+        };
+        match rel.parent().and_then(Path::to_str) {
+            Some("") if rel == Path::new("format.toml") => {}
+            Some("") if rel == Path::new(crate::config::CONFIG_FILE) => {
+                crate::config::Config::validate_text(&path, text()?)?
+            }
+            Some(crate::tag::TAG_DIR) => tags.push((path, bytes.clone())),
+            Some(crate::preset::PRESET_DIR) => presets.push((path, bytes.clone())),
+            Some("repos") => {
+                let doc = crate::meta::MetaStore::parse_document(&path, text()?)?;
+                crate::meta::validate_repository_document(&path, &doc)?;
+            }
+            _ => anyhow::bail!(
+                "no current codec validates migrated metadata {}",
+                path.display()
+            ),
+        }
+    }
+    crate::tag::TagStore::new(root).parse_entries(tags)?;
+    crate::preset::PresetStore::new(root).validate_documents(presets)?;
+    Ok(())
 }
 fn preflight(source: anyhow::Error) -> MigrationError {
     MigrationError {
@@ -462,6 +517,30 @@ mod tests {
     }
 
     #[test]
+    fn final_validation_rejects_invalid_current_documents_before_any_write() {
+        for (config, expected) in [
+            (
+                "schema = 2\n[[tags]]\nname = 'work'\n[deploy]\nlegacy = true\n",
+                "no longer supports top-level tags or deploy",
+            ),
+            ("schema = 1\nunknown_setting = true\n", "unknown field"),
+        ] {
+            let temp = DownloadDir::new("migration-final-validation").unwrap();
+            let meta = crate::paths::meta_dir(temp.path());
+            std::fs::create_dir_all(&meta).unwrap();
+            std::fs::write(meta.join("config.toml"), config).unwrap();
+            let before = business_tree(temp.path());
+            let error = ensure_current(temp.path()).unwrap_err();
+            assert!(matches!(error.recovery, Recovery::NothingWritten));
+            let message = format!("{:#}", error.source);
+            assert!(message.contains(expected), "{message}");
+            assert_eq!(business_tree(temp.path()), before);
+            assert!(!meta.join(".metadata.lock").exists());
+            assert!(!version::path(temp.path()).exists());
+        }
+    }
+
+    #[test]
     fn interrupted_transaction_has_actionable_errors() {
         let temp = DownloadDir::new("migration-transaction-debris").unwrap();
         let debris = crate::paths::meta_dir(temp.path()).join("tags/.file-set-leftover");
@@ -531,6 +610,31 @@ mod tests {
             std::fs::read_to_string(&hidden).unwrap(),
             "[skills.one]\nnote = 'hidden'\n"
         );
+    }
+
+    #[test]
+    fn tag_defined_differently_inline_and_in_the_store_says_what_to_do() {
+        let temp = DownloadDir::new("migration-tag-differs").unwrap();
+        let meta = crate::paths::meta_dir(temp.path());
+        std::fs::create_dir_all(meta.join("tags")).unwrap();
+        std::fs::write(
+            meta.join("config.toml"),
+            "schema = 2\ntags = [{ name = 'work', skills = ['one'] }]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            meta.join("tags/work.toml"),
+            "schema = 1\nname = 'work'\nskills = ['two']\n",
+        )
+        .unwrap();
+        let error = format!("{:#}", ensure_current(temp.path()).unwrap_err());
+        for expected in [
+            "Tag work is defined differently in .skills-meta/config.toml",
+            "in .skills-meta/tags/work.toml",
+            "make the two definitions match, or remove the config.toml tags entry you do not want, then reopen",
+        ] {
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]

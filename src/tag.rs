@@ -91,11 +91,21 @@ impl TagStore {
             paths.push(path);
         }
         paths.sort();
-        let mut out = Vec::new();
-        let mut names = BTreeSet::new();
+        let mut files = Vec::new();
         for path in paths {
             let bytes =
                 std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            files.push((path, bytes));
+        }
+        self.parse_entries(files)
+    }
+
+    /// Parse and validate Tag documents already read from this store's
+    /// directory, including the canonical filename check.
+    pub(crate) fn parse_entries(&self, files: Vec<(PathBuf, Vec<u8>)>) -> Result<Vec<Entry>> {
+        let mut out = Vec::new();
+        let mut names = BTreeSet::new();
+        for (path, bytes) in files {
             let text = std::str::from_utf8(&bytes)
                 .with_context(|| format!("invalid UTF-8 in {}", path.display()))?;
             let mut doc = text
