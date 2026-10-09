@@ -54,7 +54,7 @@ Settings live in the root's `.git/config` as `remote.origin.url`, `skills.sync-b
 
 The TUI probes status at startup and periodically, whether or not automatic sync is enabled. Probes update cached dirty, ahead, and behind state only. Remote comparison may use a separate cache under `.git`.
 
-Automatic sync follows the command's declared mutation scope, not the final diff. A successful Library-scoped command can trigger it even when no files changed. The sync stages every current non-ignored root change, including pre-existing external files. Startup, reads, previews, and Agent-only deployment changes do not trigger automatic sync.
+Automatic sync follows the command's declared mutation scope, not the final diff. A successful Library-scoped command can trigger it even when no files changed. The sync stages every current non-ignored root change, including pre-existing external files. Startup, reads, previews, and Agent-only deployment changes do not trigger automatic sync. In the TUI, automatic sync also waits until root changes stop changing and input pauses; the `[sync]` table in [configuration](../configuration/) sets both waits.
 
 ## Failure behavior
 

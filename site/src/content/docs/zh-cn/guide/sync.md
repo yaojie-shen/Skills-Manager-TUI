@@ -54,7 +54,7 @@ skills sync configure git@github.com:YOUR-ACCOUNT/YOUR-BACKUP.git --branch main
 
 无论自动同步是否启用，TUI 都会在启动时及后续定期探测状态。探测只更新缓存中的 dirty、ahead、behind 状态；比较远程时可能使用 `.git` 下的独立缓存。
 
-自动同步依据命令声明的 mutation scope，而不是最终 diff。Library 作用域命令成功后，即使文件没有变化，也可能触发同步。同步会暂存 root 中全部未忽略改动，包括此前由外部产生的文件。启动、读取、预览和仅修改 Agent 部署的操作不会触发自动同步。
+自动同步依据命令声明的 mutation scope，而不是最终 diff。Library 作用域命令成功后，即使文件没有变化，也可能触发同步。同步会暂存 root 中全部未忽略改动，包括此前由外部产生的文件。启动、读取、预览和仅修改 Agent 部署的操作不会触发自动同步。在 TUI 中，自动同步还会等 root 改动不再变化、输入暂停之后才执行；两项等待时间由[配置](../configuration/)中的 `[sync]` 表设置。
 
 ## 失败行为
 
