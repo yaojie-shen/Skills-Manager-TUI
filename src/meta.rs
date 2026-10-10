@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use toml_edit::{DocumentMut, Item, Table, value};
 
+#[cfg(test)]
+thread_local! {
+    static TEST_LOCK_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SkillMeta {
     #[serde(default)]
@@ -186,15 +191,30 @@ impl MetaStore {
             key
         }
     }
-    pub(crate) fn lock(&self) -> Result<std::fs::File> {
+    /// Takes the metadata lock as a best-effort guard.
+    ///
+    /// If the lock file cannot be opened or locked, for example on storage without file-lock
+    /// support, metadata writes continue without the lock and concurrent writers are not
+    /// coordinated.
+    pub(crate) fn lock(&self) -> Result<Option<std::fs::File>> {
         std::fs::create_dir_all(&self.dir)?;
-        let file = std::fs::OpenOptions::new()
+        let Ok(file) = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(self.dir.join(".metadata.lock"))?;
-        file.lock()?;
-        Ok(file)
+            .open(self.dir.join(".metadata.lock"))
+        else {
+            return Ok(None);
+        };
+        #[cfg(test)]
+        let locked = if TEST_LOCK_FAILS.get() {
+            Err(std::io::Error::other("injected lock failure"))
+        } else {
+            file.lock()
+        };
+        #[cfg(not(test))]
+        let locked = file.lock();
+        Ok(locked.ok().map(|()| file))
     }
     pub(crate) fn read(path: &Path) -> Result<DocumentMut> {
         match std::fs::read_to_string(path) {
@@ -423,6 +443,46 @@ impl MetaStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_meta() -> SkillMeta {
+        SkillMeta {
+            note: Some("persisted without a lock".into()),
+            source: Some(Source::Git {
+                url: "https://example.com/repo".into(),
+                branch: None,
+                subpath: None,
+                revision: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn failed_lock_still_allows_metadata_write() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_LOCK_FAILS.set(false);
+            }
+        }
+        let temp = crate::ops::DownloadDir::new("metadata-lock-fails").unwrap();
+        let store = MetaStore::new(temp.path());
+        TEST_LOCK_FAILS.set(true);
+        let _reset = Reset;
+        store.save("fallback-test", &sample_meta()).unwrap();
+        let saved = store.load("fallback-test").unwrap().unwrap();
+        assert_eq!(saved.note.as_deref(), Some("persisted without a lock"));
+    }
+
+    #[test]
+    fn unopenable_lock_file_still_allows_metadata_write() {
+        let temp = crate::ops::DownloadDir::new("metadata-lock-unopenable").unwrap();
+        let store = MetaStore::new(temp.path());
+        std::fs::create_dir_all(store.dir.join(".metadata.lock")).unwrap();
+        store.save("fallback-test", &sample_meta()).unwrap();
+        let saved = store.load("fallback-test").unwrap().unwrap();
+        assert_eq!(saved.note.as_deref(), Some("persisted without a lock"));
+    }
 
     #[test]
     fn shared_file_preserves_siblings_and_serializes_concurrent_writes() {
