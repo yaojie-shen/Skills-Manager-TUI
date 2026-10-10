@@ -60,41 +60,27 @@ impl HomeSnapshot {
             }
         }
         for name in ["tags", "presets", "repos"] {
-            let dir = meta.join(name);
-            let rd = match std::fs::read_dir(&dir) {
-                Ok(rd) => rd,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            let mut entries = rd.collect::<std::io::Result<Vec<_>>>()?;
-            entries.sort_by_key(|entry| entry.file_name());
-            for entry in entries {
-                let ty = entry.file_type()?;
-                crate::util::reject_interrupted_transaction(&entry.path(), &ty)?;
-                // Stray files are never read, moved, or deleted by a migration.
-                let document = crate::util::is_store_document_name(&entry.file_name())
-                    || (name == "repos" && entry.file_name() == ".root.toml");
-                if !document {
-                    continue;
+            // Stray files are never read, moved, or deleted by a migration.
+            let is_document = |file: &std::ffi::OsStr| {
+                if name == "repos" {
+                    crate::util::is_repository_document_name(file)
+                } else {
+                    crate::util::is_store_document_name(file)
                 }
-                ensure!(
-                    ty.is_file() && !ty.is_symlink(),
-                    "invalid {} store entry: {}",
-                    store_label(name),
-                    entry.path().display()
-                );
-                let filename = entry.file_name();
-                let filename = filename.to_str().with_context(|| {
-                    format!(
-                        "metadata filename is not valid UTF-8: {}",
-                        entry.path().display()
-                    )
-                })?;
-                read_one(
-                    &entry.path(),
-                    RelPath::new(PathBuf::from(name).join(filename))?,
-                    &mut files,
-                )?;
+            };
+            let documents = crate::file_set::read_store(
+                &meta,
+                name,
+                store_label(name),
+                &is_document,
+                &mut |path, len, read| admit(&files, path, len, read),
+            )?;
+            for (path, bytes) in documents {
+                let filename = path
+                    .file_name()
+                    .and_then(|filename| filename.to_str())
+                    .context("metadata filename is not valid UTF-8")?;
+                files.insert(RelPath::new(PathBuf::from(name).join(filename))?, bytes);
             }
         }
         Ok(Self { files })
@@ -116,17 +102,27 @@ fn store_label(name: &str) -> &str {
         _ => "metadata",
     }
 }
-fn read_one(path: &Path, rel: RelPath, files: &mut BTreeMap<RelPath, Vec<u8>>) -> Result<()> {
-    ensure!(files.len() < MAX_FILES, "metadata contains too many files");
+/// Bound the snapshot before reading a file of `len` bytes, counting what is
+/// already captured plus `pending` documents read for the current store.
+fn admit(
+    files: &BTreeMap<RelPath, Vec<u8>>,
+    path: &Path,
+    len: u64,
+    pending: &[(PathBuf, Vec<u8>)],
+) -> Result<()> {
     ensure!(
-        std::fs::metadata(path)?.len() <= MAX_FILE_BYTES,
+        files.len() + pending.len() < MAX_FILES,
+        "metadata contains too many files"
+    );
+    ensure!(
+        len <= MAX_FILE_BYTES,
         "metadata file is too large: {}",
         path.display()
     );
-    let bytes = std::fs::read(path)?;
     let total = files
         .values()
-        .try_fold(bytes.len(), |total, current| {
+        .chain(pending.iter().map(|(_, bytes)| bytes))
+        .try_fold(len as usize, |total, current| {
             total.checked_add(current.len())
         })
         .context("metadata snapshot byte count overflow")?;
@@ -134,6 +130,13 @@ fn read_one(path: &Path, rel: RelPath, files: &mut BTreeMap<RelPath, Vec<u8>>) -
         total <= MAX_TOTAL_BYTES,
         "metadata snapshot exceeds the 64 MiB total byte limit"
     );
+    Ok(())
+}
+
+fn read_one(path: &Path, rel: RelPath, files: &mut BTreeMap<RelPath, Vec<u8>>) -> Result<()> {
+    admit(files, path, std::fs::metadata(path)?.len(), &[])?;
+    let bytes = std::fs::read(path)?;
+    admit(files, path, bytes.len() as u64, &[])?;
     files.insert(rel, bytes);
     Ok(())
 }

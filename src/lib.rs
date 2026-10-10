@@ -21,6 +21,7 @@ pub mod search;
 pub mod skill;
 pub mod tag;
 pub mod util;
+pub mod warnings;
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};

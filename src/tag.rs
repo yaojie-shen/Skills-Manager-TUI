@@ -64,39 +64,13 @@ impl TagStore {
     }
 
     pub(crate) fn entries(&self) -> Result<Vec<Entry>> {
-        let rd = match std::fs::read_dir(&self.dir) {
-            Ok(rd) => rd,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
-        };
-        let mut paths = Vec::new();
-        for entry in rd {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            crate::util::reject_interrupted_transaction(&entry.path(), &ty)?;
-            if !crate::util::is_store_document_name(&entry.file_name()) {
-                continue;
-            }
-            ensure!(
-                ty.is_file() && !ty.is_symlink(),
-                "invalid Tag store entry: {}",
-                entry.path().display()
-            );
-            let path = entry.path();
-            ensure!(
-                path.file_name().and_then(|n| n.to_str()).is_some(),
-                "Tag filename is not valid UTF-8: {}",
-                path.display()
-            );
-            paths.push(path);
-        }
-        paths.sort();
-        let mut files = Vec::new();
-        for path in paths {
-            let bytes =
-                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            files.push((path, bytes));
-        }
+        let files = crate::file_set::read_store(
+            &meta_dir(&self.root),
+            TAG_DIR,
+            "Tag",
+            &crate::util::is_store_document_name,
+            &mut |_, _, _| Ok(()),
+        )?;
         self.parse_entries(files)
     }
 
@@ -250,8 +224,8 @@ impl TagStore {
                 entry.path.display()
             );
         }
-        crate::file_set::publish(
-            &self.dir,
+        crate::file_set::publish_changes(
+            &crate::file_set::Target::store(&meta_dir(&self.root), TAG_DIR),
             &before
                 .iter()
                 .map(|entry| crate::file_set::File {

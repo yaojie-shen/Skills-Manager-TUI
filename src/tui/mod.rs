@@ -73,8 +73,12 @@ pub fn run(ws: skills::Workspace, launch_dir: Option<&std::path::Path>) -> Resul
                     break;
                 }
             }
+            // On quit, main prints any remaining warnings after the terminal is restored.
             if app.should_quit() {
                 return Ok(());
+            }
+            for warning in skills::warnings::take() {
+                app.toast(warning, app::Level::Info);
             }
         }
     })();

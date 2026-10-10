@@ -17,6 +17,9 @@ fn main() {
     } else {
         cli::run(args)
     };
+    for warning in skills::warnings::take() {
+        eprintln!("warning: {warning}");
+    }
     if let Err(e) = result {
         if json {
             eprintln!("{}", serde_json::json!({"error": format!("{e:#}")}));

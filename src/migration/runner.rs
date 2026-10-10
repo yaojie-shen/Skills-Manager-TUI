@@ -116,11 +116,14 @@ fn apply_phase(root: &Path, plan: &Plan, phase: Phase) -> std::result::Result<bo
         }
         match phase {
             Phase::Tags | Phase::Presets => {
-                let dir = meta.join(match phase {
-                    Phase::Tags => "tags",
-                    _ => "presets",
-                });
-                std::fs::create_dir_all(&dir)?;
+                let target = crate::file_set::Target::store(
+                    &meta,
+                    match phase {
+                        Phase::Tags => "tags",
+                        _ => "presets",
+                    },
+                );
+                std::fs::create_dir_all(&target.store)?;
                 let before_paths: Vec<_> = operations
                     .iter()
                     .filter(|operation| operation.before.is_some())
@@ -143,7 +146,7 @@ fn apply_phase(root: &Path, plan: &Plan, phase: Phase) -> std::result::Result<bo
                     .zip(&after_paths)
                     .map(|(bytes, path)| crate::file_set::File { path, bytes })
                     .collect();
-                match crate::file_set::publish(&dir, &before_files, &after_files) {
+                match crate::file_set::publish(&target, &before_files, &after_files) {
                     Ok(()) => wrote = true,
                     Err(error) => {
                         wrote =

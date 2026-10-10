@@ -155,38 +155,13 @@ impl PresetStore {
     }
 
     fn entries(&self) -> Result<Vec<StoredPreset>> {
-        let rd = match std::fs::read_dir(&self.dir) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
-        };
-        let mut paths = Vec::new();
-        for entry in rd {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            crate::util::reject_interrupted_transaction(&entry.path(), &ty)?;
-            if !crate::util::is_store_document_name(&entry.file_name()) {
-                continue;
-            }
-            anyhow::ensure!(
-                ty.is_file() && !ty.is_symlink(),
-                "invalid preset store entry: {}",
-                entry.path().display()
-            );
-            let path = entry.path();
-            anyhow::ensure!(
-                path.file_name().and_then(|n| n.to_str()).is_some(),
-                "preset filename is not valid UTF-8: {}",
-                path.display()
-            );
-            paths.push(path);
-        }
-        paths.sort();
-        let mut files = Vec::new();
-        for path in paths {
-            let bytes = std::fs::read(&path)?;
-            files.push((path, bytes));
-        }
+        let files = crate::file_set::read_store(
+            &meta_dir(&self.root),
+            PRESET_DIR,
+            "preset",
+            &crate::util::is_store_document_name,
+            &mut |_, _, _| Ok(()),
+        )?;
         self.parse_entries(files)
     }
 
@@ -329,8 +304,8 @@ impl PresetStore {
                 entry.path.display()
             );
         }
-        crate::file_set::publish(
-            &self.dir,
+        crate::file_set::publish_changes(
+            &crate::file_set::Target::store(&meta_dir(&self.root), PRESET_DIR),
             &before
                 .iter()
                 .map(|entry| crate::file_set::File {
