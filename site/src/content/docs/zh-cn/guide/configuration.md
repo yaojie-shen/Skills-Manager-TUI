@@ -19,7 +19,7 @@ printf '%s\n' "$HOME/skills-library" > "$HOME/.config/skills-tui/root"
 skills init
 ```
 
-未设置 `--root` 或 `SKILLS_HOME` 时，程序读取指针文件。`init` 创建 `.skills-meta/config.toml`，且不会覆盖已有配置。环境变量和指针文件中的路径可以用 `~` 开头。在 shell 的 `--root` 参数中，应使用 `"$HOME/path"`，不要引用波浪号字面量。
+未设置 `--root` 或 `SKILLS_HOME` 时，程序读取指针文件。`init` 创建带注释说明默认值的 `.skills-meta/config.toml`，且不会覆盖已有配置。环境变量和指针文件中的路径可以用 `~` 开头。在 shell 的 `--root` 参数中，应使用 `"$HOME/path"`，不要引用波浪号字面量。
 
 在 CLI 中，`--local` 和 `--project DIR` 将 `<project>/.agents/skills` 作为独立项目 store。Init、install 和 Agent 注册可以创建这个目录，读取命令则要求它已经存在。在 TUI 中，同名参数只选择部署上下文，程序仍使用中心 Library。作用域规则见 [Agent 部署](../deployment/)。
 
@@ -90,4 +90,19 @@ dictionary = true
 | heading | 1.5 |
 | body | 1 |
 
-词典权重为 tech 0.7、common 0.4、user 1。受支持表中的未知字段会导致验证失败。根目录同步不使用 `[sync]` 表。请按[根目录备份](../sync/)所述，通过 `skills sync configure` 配置。
+词典权重为 tech 0.7、common 0.4、user 1。受支持表中的未知字段会导致验证失败。
+
+## 自动同步等待
+
+```toml
+[sync]
+quiet_seconds = 120
+tui_idle_seconds = 10
+```
+
+| 设置 | 行为 |
+| --- | --- |
+| `quiet_seconds` | 等 root 中未提交的改动保持不变达到这么多秒。默认 120。 |
+| `tui_idle_seconds` | 最后一次键盘、粘贴、鼠标或窗口大小变化后再等这么多秒。默认 10。 |
+
+取值为整数秒。设为 `0` 只关闭对应的等待，安全检查仍然生效。这些等待只作用于 TUI 中的自动同步，手动同步会立即执行。远程、分支和启用状态不在这里设置，请按[根目录备份](../sync/)所述，通过 `skills sync configure` 配置。

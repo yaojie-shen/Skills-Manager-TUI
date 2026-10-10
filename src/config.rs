@@ -28,6 +28,25 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub sync: SyncConfig,
+}
+
+/// Waiting policy for automatic root sync in the TUI. Zero disables that wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SyncConfig {
+    pub quiet_seconds: u64,
+    pub tui_idle_seconds: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            quiet_seconds: 120,
+            tui_idle_seconds: 10,
+        }
+    }
 }
 
 /// Skill result density. The file supplies the startup default; page-scoped
@@ -262,6 +281,46 @@ pub struct TagConfig {
     pub description: Option<String>,
 }
 
+fn comment_key(table: &mut Table, key: &str, prefix: &str) {
+    if let Some(mut key) = table.key_mut(key) {
+        key.leaf_decor_mut().set_prefix(prefix);
+    }
+}
+
+fn comment_table(item: &mut Item, prefix: &str) {
+    if let Some(table) = item.as_table_mut() {
+        table.decor_mut().set_prefix(prefix);
+    }
+}
+
+fn comment_table_value(table: &mut Table, key: &str, prefix: &str) {
+    comment_key(table, key, prefix);
+}
+
+fn comment_nested_value(doc: &mut DocumentMut, table: &str, key: &str, prefix: &str) {
+    if let Some(table) = doc[table].as_table_mut() {
+        comment_key(table, key, prefix);
+    }
+}
+
+fn comment_nested_table(doc: &mut DocumentMut, table: &str, nested: &str, prefix: &str) {
+    if let Some(table) = doc[table].get_mut(nested).and_then(Item::as_table_mut) {
+        table.decor_mut().set_prefix(prefix);
+    }
+}
+
+fn comment_nested_table_value(
+    doc: &mut DocumentMut,
+    table: &str,
+    nested: &str,
+    key: &str,
+    prefix: &str,
+) {
+    if let Some(table) = doc[table].get_mut(nested).and_then(Item::as_table_mut) {
+        comment_key(table, key, prefix);
+    }
+}
+
 fn default_schema() -> u32 {
     1
 }
@@ -282,12 +341,13 @@ impl Default for Config {
             tags_enabled: true,
             search: SearchConfig::default(),
             ui: UiConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 }
 
 impl Config {
-    /// Ignore the retired sync section only at the file boundary. It is not
+    /// Ignore the retired deploy section only at the file boundary. It is not
     /// represented in runtime configuration, and all other fields stay strict.
     fn parse(text: &str) -> Result<Self> {
         let mut doc: DocumentMut = text.parse()?;
@@ -364,12 +424,170 @@ impl Config {
         Self::path(root).is_file()
     }
 
-    /// Write the config. Used by `init`; everyday edits are expected to be made by hand.
+    /// Write the config without presentation comments. Tests and internal fixtures
+    /// use this; `init` writes the self-documenting form below.
     pub fn save(&self, root: &Path) -> Result<()> {
         let path = Self::path(root);
         std::fs::create_dir_all(path.parent().unwrap())?;
         let text = toml::to_string_pretty(self)?;
         crate::util::write_atomic(&path, text.as_bytes())
+    }
+
+    /// Write a complete, editable default configuration with the schema's
+    /// current values and explanations. Values still come from `Self`, so the
+    /// generated guide cannot silently choose different defaults.
+    pub fn save_commented(&self, root: &Path) -> Result<()> {
+        let path = Self::path(root);
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let mut doc = toml::to_string_pretty(self)?.parse::<DocumentMut>()?;
+        doc.as_table_mut().decor_mut().set_prefix(
+            "# Skills Manager configuration\n\
+             #\n\
+             # Edit this file directly. The TUI reloads valid changes automatically.\n\
+             # Unknown fields are rejected so misspelled settings do not fail silently.\n\
+             # Remove a setting to use its built-in default. TOML comments start with #.\n\n",
+        );
+        doc.remove("tags");
+
+        comment_key(
+            doc.as_table_mut(),
+            "schema",
+            "# Configuration schema version. Keep this at 1.\n",
+        );
+        comment_key(
+            doc.as_table_mut(),
+            "tags_enabled",
+            "# Show the Tags page and tag controls in the TUI.\n",
+        );
+
+        if let Some(agents) = doc["agents"].as_array_of_tables_mut() {
+            for (index, table) in agents.iter_mut().enumerate() {
+                table.decor_mut().set_prefix(if index == 0 {
+                    "\n# Agent deployment targets. Repeat [[agents]] for each target.\n\
+                     # key: stable CLI identifier; name: display label; skills_dir: target directory (~ allowed).\n"
+                } else {
+                    "\n# Another Agent deployment target.\n"
+                });
+                comment_table_value(table, "key", "# Short identifier used by CLI commands.\n");
+                comment_table_value(table, "name", "# Human-readable label shown in the TUI.\n");
+                comment_table_value(
+                    table,
+                    "skills_dir",
+                    "# Directory where this Agent reads deployed skills; ~ is expanded.\n",
+                );
+            }
+        }
+
+        comment_table(
+            &mut doc["search"],
+            "\n# Search behavior. Boolean switches can be true or false.\n",
+        );
+        for (key, text) in [
+            (
+                "prefix",
+                "# Match word prefixes, e.g. msgp finds msgpack.\n",
+            ),
+            (
+                "fuzzy",
+                "# Allow small spelling errors in longer query words.\n",
+            ),
+            (
+                "dictionary",
+                "# Expand queries through the built-in and user dictionaries.\n",
+            ),
+        ] {
+            comment_nested_value(&mut doc, "search", key, text);
+        }
+        comment_nested_table(
+            &mut doc,
+            "search",
+            "weights",
+            "\n# Relative relevance of each searchable field. Larger values rank higher.\n",
+        );
+        for (key, label) in [
+            ("name", "skill name"),
+            ("tag", "tag"),
+            ("description", "frontmatter description"),
+            ("note", "local note"),
+            ("heading", "document heading"),
+            ("body", "document body"),
+        ] {
+            comment_nested_table_value(
+                &mut doc,
+                "search",
+                "weights",
+                key,
+                &format!("# Weight for {label} matches.\n"),
+            );
+        }
+        comment_nested_table(
+            &mut doc,
+            "search",
+            "dictionaries",
+            "\n# Relative score of dictionary-expanded matches. Set one to 0 to disable that source.\n",
+        );
+        for (key, label) in [
+            ("tech", "built-in technical terms"),
+            ("common", "built-in general vocabulary"),
+            ("user", "the user dictionary"),
+        ] {
+            comment_nested_table_value(
+                &mut doc,
+                "search",
+                "dictionaries",
+                key,
+                &format!("# Weight for {label}.\n"),
+            );
+        }
+
+        comment_table(
+            &mut doc["ui"],
+            "\n# TUI presentation defaults. Layout changes made with v last for the session only.\n",
+        );
+        comment_nested_value(
+            &mut doc,
+            "ui",
+            "layout",
+            "# Initial layout: \"grid\", \"list\", or \"compact\".\n",
+        );
+        comment_nested_value(
+            &mut doc,
+            "ui",
+            "pill_caps",
+            "# Tag pill ends: \"round\" (Nerd Font), \"block\", or \"none\".\n",
+        );
+        comment_nested_value(
+            &mut doc,
+            "ui",
+            "icons",
+            "# Icon set: \"nerd\" (Nerd Font) or \"text\".\n",
+        );
+
+        comment_table(
+            &mut doc["sync"],
+            "\n# Automatic root-backup waits used by the TUI; values are whole seconds.\n\
+             # Manual sync is immediate. Setting either value to 0 disables only that wait, not safety checks.\n",
+        );
+        comment_nested_value(
+            &mut doc,
+            "sync",
+            "quiet_seconds",
+            &format!(
+                "# Require the Library diff to remain unchanged this long (default: {}).\n",
+                self.sync.quiet_seconds
+            ),
+        );
+        comment_nested_value(
+            &mut doc,
+            "sync",
+            "tui_idle_seconds",
+            &format!(
+                "# Wait this long after keyboard, paste, mouse, or resize input (default: {}).\n",
+                self.sync.tui_idle_seconds
+            ),
+        );
+
+        crate::util::write_atomic(&path, doc.to_string().as_bytes())
     }
 
     /// Change `config.toml` on disk without disturbing the rest of it. The
@@ -490,7 +708,16 @@ impl Config {
                 tag.skills.dedup();
             }
             let updated = toml::to_string(&config)?.parse::<DocumentMut>()?;
+            let decor = doc.get("tags").and_then(|item| match item {
+                Item::Value(value) => Some(value.decor().clone()),
+                _ => None,
+            });
             doc["tags"] = updated["tags"].clone();
+            if let Some(decor) = decor
+                && let Some(value) = doc["tags"].as_value_mut()
+            {
+                *value.decor_mut() = decor;
+            }
             Ok(true)
         })
     }
@@ -521,5 +748,144 @@ impl Config {
 
     pub fn agent_keys(&self) -> Vec<String> {
         self.agents.iter().map(|a| a.key.clone()).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commented_defaults_are_complete_parseable_and_preserved_by_edits() {
+        for (label, expected) in [
+            ("global", Config::default()),
+            ("local", Config::local_default()),
+        ] {
+            let tmp = crate::ops::DownloadDir::new(&format!("commented-{label}")).unwrap();
+            expected.save_commented(tmp.path()).unwrap();
+            let path = Config::path(tmp.path());
+            let text = std::fs::read_to_string(&path).unwrap();
+            let loaded = Config::load(tmp.path()).unwrap();
+
+            assert_eq!(loaded.schema, expected.schema);
+            assert_eq!(loaded.agent_keys(), expected.agent_keys());
+            assert_eq!(loaded.tags, expected.tags);
+            assert_eq!(loaded.tags_enabled, expected.tags_enabled);
+            assert_eq!(loaded.search, expected.search);
+            assert_eq!(loaded.ui, expected.ui);
+            assert_eq!(loaded.sync, expected.sync);
+            for required in [
+                "# Skills Manager configuration",
+                "[search]",
+                "[search.weights]",
+                "[search.dictionaries]",
+                "[ui]",
+                "[sync]",
+                "default: 120",
+                "default: 10",
+                "value to 0",
+                "Manual sync is immediate",
+                "\"grid\", \"list\", or \"compact\"",
+                "\"nerd\" (Nerd Font) or \"text\"",
+            ] {
+                assert!(text.contains(required), "missing {required:?} in {label}");
+            }
+            assert!(loaded.tags.is_empty(), "init must not create Tag data");
+            assert!(!text.lines().any(|line| line.starts_with("tags =")));
+            assert!(!text.contains("[[tags]]"));
+
+            Config::set_tags_enabled(tmp.path(), false).unwrap();
+            Config::add_agent(
+                tmp.path(),
+                &AgentConfig {
+                    key: format!("extra-{label}"),
+                    name: "Extra".into(),
+                    skills_dir: format!("~/.extra-{label}/skills"),
+                },
+                label == "local",
+            )
+            .unwrap();
+            let edited = std::fs::read_to_string(path).unwrap();
+            assert!(edited.starts_with("# Skills Manager configuration"));
+            assert!(edited.contains("# Automatic root-backup waits"));
+            assert!(edited.contains("# Relative relevance of each searchable field"));
+            assert!(edited.contains("# Initial layout:"));
+        }
+    }
+
+    #[test]
+    fn sync_waits_default_and_accept_nonnegative_seconds() {
+        assert_eq!(Config::parse("").unwrap().sync, SyncConfig::default());
+        assert_eq!(
+            Config::parse("[sync]\nquiet_seconds = 45").unwrap().sync,
+            SyncConfig {
+                quiet_seconds: 45,
+                tui_idle_seconds: 10,
+            }
+        );
+        let configured = Config::parse("[sync]\nquiet_seconds = 0\ntui_idle_seconds = 30").unwrap();
+        assert_eq!(configured.sync.quiet_seconds, 0);
+        assert_eq!(configured.sync.tui_idle_seconds, 30);
+        assert_eq!(
+            Config::parse("[sync]\ntui_idle_seconds = 0")
+                .unwrap()
+                .sync
+                .tui_idle_seconds,
+            0
+        );
+        for invalid in [
+            "quiet_seconds = -1",
+            "tui_idle_seconds = -1",
+            "quiet_seconds = 1.5",
+            "tui_idle_seconds = 'ten'",
+            "unknown_wait = 5",
+        ] {
+            assert!(Config::parse(&format!("[sync]\n{invalid}")).is_err());
+        }
+        let tmp = crate::ops::DownloadDir::new("sync-config-roundtrip").unwrap();
+        configured.save(tmp.path()).unwrap();
+        assert_eq!(Config::load(tmp.path()).unwrap().sync, configured.sync);
+    }
+
+    #[test]
+    fn local_config_edits_preserve_sync_values_comments_and_order() {
+        let tmp = crate::ops::DownloadDir::new("sync-config-preserve").unwrap();
+        let path = Config::path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let sync_section = "[sync] # automatic backup waits\nquiet_seconds = 42 # content\ntui_idle_seconds = 7 # activity\n\n";
+        std::fs::write(
+            &path,
+            format!("[[agents]]\nkey = 'existing'\nskills_dir = '~/.existing/skills'\n\n{sync_section}[ui]\nlayout = 'list'\n"),
+        )
+        .unwrap();
+        Config::edit_tags(tmp.path(), |tags| {
+            tags.push(TagConfig {
+                name: "example".into(),
+                skills: vec![],
+                color: None,
+                description: None,
+            });
+        })
+        .unwrap();
+        Config::add_agent(
+            tmp.path(),
+            &AgentConfig {
+                key: "example".into(),
+                name: "Example".into(),
+                skills_dir: "~/.example/skills".into(),
+            },
+            false,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains(sync_section));
+        assert!(text.find("[sync]").unwrap() < text.find("[ui]").unwrap());
+        assert_eq!(
+            Config::load(tmp.path()).unwrap().sync,
+            SyncConfig {
+                quiet_seconds: 42,
+                tui_idle_seconds: 7,
+            }
+        );
     }
 }

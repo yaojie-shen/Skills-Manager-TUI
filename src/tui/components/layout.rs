@@ -4,7 +4,8 @@ use ratatui::{
     Frame,
     layout::{Margin, Rect},
     style::{Modifier, Style},
-    widgets::{Block, BorderType, Borders},
+    text::Span,
+    widgets::{Block, BorderType, Borders, Paragraph},
 };
 
 /// Columns that fit in `width`, always at least one.
@@ -32,6 +33,22 @@ pub fn skill_frame(f: &mut Frame, cell: Rect, on: bool, focused: bool, ctx: &Ctx
         borders,
         frame_style(on, focused, &ctx.settings.theme),
     )
+}
+
+/// Draw a subdued divider inside a list item's reserved spacer row.
+/// The inset keeps the rule clear of the item marker and the scrollbar.
+pub fn skill_list_separator(f: &mut Frame, cell: Rect, th: &Theme) {
+    if cell.height < 5 || cell.width <= 4 {
+        return;
+    }
+    let separator = Rect::new(cell.x + 2, cell.y + 4, cell.width - 4, 1);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(separator.width as usize),
+            th.dim().add_modifier(Modifier::DIM),
+        )),
+        separator,
+    );
 }
 
 fn frame_style(on: bool, focused: bool, th: &Theme) -> Style {

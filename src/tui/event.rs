@@ -34,7 +34,7 @@ pub enum Task {
     SyncEnable,
     SyncDisable,
     Sync(super::sync_picker::Request),
-    AutoSync(Vec<String>),
+    AutoSync(skills::ops::sync::AutomaticSyncInput),
     DiscoverRepository {
         label: String,
         reference: skills::ops::install::InstallRef,
@@ -280,11 +280,11 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                         skills::ops::sync::run(&ws, request.mode, request.dry_run, &mut progress);
                     TaskOutput::Sync(request, result)
                 }
-                Task::AutoSync(expected_changes) => {
+                Task::AutoSync(expected) => {
                     let publishing_tx = tx.clone();
                     TaskOutput::AutoSync(skills::ops::sync::run_automatic(
                         &ws,
-                        &expected_changes,
+                        &expected,
                         &mut || {
                             let _ = publishing_tx.send(Msg::SyncPublishing);
                         },

@@ -28,7 +28,7 @@ skills sync configure git@github.com:YOUR-ACCOUNT/YOUR-BACKUP.git --branch main
 
 已有 `origin` 指向其他 URL 时，程序不会静默替换。分支默认为 `main`；root 当前检出的分支必须通过验证。
 
-设置保存在 root 的 `.git/config` 中：`remote.origin.url`、`skills.sync-branch`、`skills.autosync`。每份克隆都需要单独配置。旧的单技能备份仓库不会自动转换。
+设置保存在 root 的 `.git/config` 中：`remote.origin.url`、`skills.sync-branch`、`skills.autosync`。每份克隆都需要单独配置。这些设置放在 `.git/config` 而不是 `config.toml`，是因为 `.skills-meta/config.toml` 本身也会被同步：写在里面的远程或开关会随拉取传到每台机器，在一台机器上关闭自动同步，其他机器也会跟着关闭。旧的单技能备份仓库不会自动转换。
 
 ## 手动命令
 
@@ -54,7 +54,7 @@ skills sync configure git@github.com:YOUR-ACCOUNT/YOUR-BACKUP.git --branch main
 
 无论自动同步是否启用，TUI 都会在启动时及后续定期探测状态。探测只更新缓存中的 dirty、ahead、behind 状态；比较远程时可能使用 `.git` 下的独立缓存。
 
-自动同步依据命令声明的 mutation scope，而不是最终 diff。Library 作用域命令成功后，即使文件没有变化，也可能触发同步。同步会暂存 root 中全部未忽略改动，包括此前由外部产生的文件。启动、读取、预览和仅修改 Agent 部署的操作不会触发自动同步。
+自动同步依据命令声明的 mutation scope，而不是最终 diff。Library 作用域命令成功后，即使文件没有变化，也可能触发同步。同步会暂存 root 中全部未忽略改动，包括此前由外部产生的文件。启动、读取、预览和仅修改 Agent 部署的操作不会触发自动同步。在 TUI 中，自动同步还会等 root 改动不再变化、输入暂停之后才执行；两项等待时间由[配置](../configuration/)中的 `[sync]` 表设置。
 
 ## 失败行为
 

@@ -5,6 +5,10 @@ use serde::Serialize;
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static SNAPSHOT_INDEX_ID: AtomicU64 = AtomicU64::new(0);
 
 const EXCLUDES: &[&str] = &[
     ".skills-meta/.sync",
@@ -35,6 +39,18 @@ pub struct Report {
     pub preview: bool,
     pub status: String,
 }
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorktreeSnapshot {
+    pub head: Option<String>,
+    pub tree: String,
+    pub has_local_changes: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutomaticSyncInput {
+    pub snapshot: WorktreeSnapshot,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Status {
     pub settings: Settings,
@@ -46,6 +62,8 @@ pub struct Status {
     pub local_revision: Option<String>,
     #[serde(skip)]
     pub remote_revision: Option<String>,
+    #[serde(skip)]
+    pub worktree: Option<WorktreeSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +196,86 @@ fn config(root: &Path, key: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_owned())
 }
+struct SnapshotStorage(PathBuf);
+
+impl SnapshotStorage {
+    fn create(root: &Path) -> Result<Self> {
+        for _ in 0..10 {
+            let id = SNAPSHOT_INDEX_ID.fetch_add(1, Ordering::Relaxed);
+            let path = root
+                .join(".git")
+                .join(format!("skills-sync-snapshot-{}-{id}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(anyhow!("could not allocate root sync snapshot storage"))
+    }
+}
+
+impl Drop for SnapshotStorage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn git_with_snapshot(root: &Path, index: &Path, objects: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_INDEX_FILE", index)
+        .env("GIT_OBJECT_DIRECTORY", objects)
+        .env(
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            root.join(".git/objects"),
+        )
+        .output()
+        .map_err(|error| anyhow!("running git: {error}"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Compute the exact tree that `git add --all -- .` would stage without
+/// touching the repository's real index, object database, worktree, or refs.
+pub fn worktree_snapshot(ws: &Workspace) -> Result<WorktreeSnapshot> {
+    repository(&ws.root)?;
+    let storage = SnapshotStorage::create(&ws.root)?;
+    let objects = storage.0.join("objects");
+    std::fs::create_dir(&objects)?;
+    let index = storage.0.join("index");
+    let head = git(&["rev-parse", "--verify", "HEAD"], Some(&ws.root))
+        .ok()
+        .map(|revision| revision.trim().to_owned());
+    if head.is_some() {
+        git_with_snapshot(&ws.root, &index, &objects, &["read-tree", "HEAD"])?;
+    }
+    let baseline = git_with_snapshot(&ws.root, &index, &objects, &["write-tree"])?
+        .trim()
+        .to_owned();
+    git_with_snapshot(&ws.root, &index, &objects, &["add", "--all", "--", "."])?;
+    let tree = git_with_snapshot(&ws.root, &index, &objects, &["write-tree"])?
+        .trim()
+        .to_owned();
+    Ok(WorktreeSnapshot {
+        head,
+        has_local_changes: tree != baseline,
+        tree,
+    })
+}
+
+fn staged_tree(root: &Path) -> Result<String> {
+    Ok(git(&["write-tree"], Some(root))?.trim().to_owned())
+}
+
 impl Settings {
     pub fn load(ws: &Workspace) -> Result<Self> {
         if !ws.root.join(".git").exists() {
@@ -206,6 +304,7 @@ pub fn status(ws: &Workspace, check_remote: bool) -> Result<Status> {
         .lines()
         .map(str::to_owned)
         .collect();
+    let worktree = Some(worktree_snapshot(ws)?);
     let (ahead, behind) = if check_remote {
         compare_remote(ws, &settings)?
     } else {
@@ -248,6 +347,7 @@ pub fn status(ws: &Workspace, check_remote: bool) -> Result<Status> {
         remote_checked: check_remote,
         local_revision,
         remote_revision,
+        worktree,
     })
 }
 
@@ -645,7 +745,7 @@ pub fn run(
 /// lock, closing the gap between an asynchronous probe and Git staging.
 pub fn run_automatic(
     ws: &Workspace,
-    expected_changes: &[String],
+    expected: &AutomaticSyncInput,
     publishing: &mut dyn FnMut(),
     progress: &mut dyn FnMut(&str),
 ) -> std::result::Result<Report, AutoSyncFailure> {
@@ -654,16 +754,8 @@ pub fn run_automatic(
         "consume root sync status",
     )
     .map_err(classify_auto_failure)?;
-    let mut report = run_checked(
-        ws,
-        Mode::Sync,
-        false,
-        Some(expected_changes),
-        false,
-        true,
-        progress,
-    )
-    .map_err(classify_auto_failure)?;
+    let mut report = run_checked(ws, Mode::Sync, false, Some(expected), false, true, progress)
+        .map_err(classify_auto_failure)?;
     drop(cache_lock);
     publishing();
     if git(&["rev-parse", "--verify", "HEAD"], Some(&ws.root)).is_ok() {
@@ -695,7 +787,7 @@ fn run_checked(
     ws: &Workspace,
     mode: Mode,
     preview: bool,
-    expected_changes: Option<&[String]>,
+    expected: Option<&AutomaticSyncInput>,
     push: bool,
     cached_remote: bool,
     progress: &mut dyn FnMut(&str),
@@ -707,14 +799,10 @@ fn run_checked(
     repository(&ws.root)?;
     let _lock = MutationGuard::acquire(ws, "root sync")?;
     ensure_ready(ws, &branch)?;
-    if let Some(expected) = expected_changes {
-        let current: Vec<String> = git(&["status", "--short"], Some(&ws.root))?
-            .lines()
-            .map(str::to_owned)
-            .collect();
-        if current != expected {
-            return Err(WorkingTreeChanged.into());
-        }
+    if let Some(expected) = expected
+        && worktree_snapshot(ws)? != expected.snapshot
+    {
+        return Err(WorkingTreeChanged.into());
     }
     validate_tree(ws, None)?;
     let mut report = Report {
@@ -777,6 +865,21 @@ fn run_checked(
     }
     progress("Saving root changes …");
     git(&["add", "--all", "--", "."], Some(&ws.root))?;
+    if let Some(expected) = expected {
+        let expected_tree = if expected.snapshot.head.is_none()
+            && !expected.snapshot.has_local_changes
+            && git(&["rev-parse", "--verify", "HEAD"], Some(&ws.root)).is_ok()
+        {
+            git(&["rev-parse", "HEAD^{tree}"], Some(&ws.root))?
+                .trim()
+                .to_owned()
+        } else {
+            expected.snapshot.tree.clone()
+        };
+        if staged_tree(&ws.root)? != expected_tree {
+            return Err(WorkingTreeChanged.into());
+        }
+    }
     validate_tree(ws, None)?;
     if !git(&["diff", "--cached", "--name-only"], Some(&ws.root))?
         .trim()

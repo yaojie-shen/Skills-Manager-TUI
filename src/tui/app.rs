@@ -32,7 +32,7 @@ use skills::config::Config;
 use skills::history::{self, History, Plan};
 use skills::ops::{MutationScope, deploy};
 use skills::reconcile::Snapshot;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 
@@ -251,12 +251,14 @@ pub struct App {
     pub toasts: Toasts,
     pub history: History,
     tasks_running: usize,
+    root_tasks_running: BTreeSet<u64>,
     sync: SyncCoordinator,
     next_task_id: u64,
     latest_scan_task: Option<u64>,
     repository_refresh_tasks: BTreeMap<String, u64>,
     spinner: usize,
     last_root_poll: std::time::Instant,
+    last_user_activity: Instant,
     root_stamp: Option<skills::reconcile::watch::Stamp>,
     tx: Sender<Msg>,
     external: Option<External>,
@@ -428,12 +430,14 @@ impl App {
             batch_modal_owned: false,
             history: History::default(),
             tasks_running: 0,
+            root_tasks_running: BTreeSet::new(),
             sync: SyncCoordinator::default(),
             next_task_id: 0,
             latest_scan_task: None,
             repository_refresh_tasks: BTreeMap::new(),
             spinner: 0,
             last_root_poll: std::time::Instant::now(),
+            last_user_activity: Instant::now(),
             root_stamp,
             tx,
             external: None,
@@ -477,6 +481,7 @@ impl App {
         self.command_palette = None;
         self.settings
             .reload(&self.ws.config, &self.session_settings);
+        self.sync.set_quiet_window(self.settings.sync.quiet_window);
         if !self.settings.tags_enabled && self.tab == Tab::Tags {
             self.tab = Tab::Search;
         }
@@ -547,12 +552,25 @@ impl App {
     // ---- messages ---------------------------------------------------------
 
     pub fn handle(&mut self, msg: Msg) {
+        if matches!(
+            &msg,
+            Msg::Key(_) | Msg::Paste(_) | Msg::Mouse(_) | Msg::Resize
+        ) {
+            self.last_user_activity = Instant::now();
+        }
         let background = matches!(&msg, Msg::Task(..));
         let actions = match msg {
             Msg::Tick => {
                 self.spinner = (self.spinner + 1) % SPINNER.len();
                 self.toasts.expire();
-                if self.sync.probe_due(Instant::now()) {
+                let now = Instant::now();
+                if self
+                    .sync
+                    .stability_probe_due(now, self.settings.interaction.root_poll_interval)
+                {
+                    self.refresh_sync_status(false, ProbeReason::Stability);
+                }
+                if self.sync.probe_due(now) {
                     self.refresh_sync_status(true, ProbeReason::Periodic);
                 }
                 if self.tasks_running == 0
@@ -601,6 +619,7 @@ impl App {
             Msg::Task(id, out) => {
                 self.toasts.finish(id);
                 self.tasks_running = self.tasks_running.saturating_sub(1);
+                self.root_tasks_running.remove(&id);
                 self.on_task(id, *out)
             }
             Msg::Paste(text) => self.on_paste(&text),
@@ -636,12 +655,15 @@ impl App {
     }
 
     pub fn sync_if_ready(&mut self) {
-        let safe = self.tasks_running == 0
+        self.sync.set_quiet_window(self.settings.sync.quiet_window);
+        let safe = self.last_user_activity.elapsed() >= self.settings.sync.tui_idle_window
+            && self.tasks_running == 0
             && !self.batch_running
             && !self.library_edit_active()
+            && !self.manual_sync_review_active()
             && self.external.is_none();
         if let Some(request) = self.sync.take_auto_sync(safe) {
-            self.spawn(Task::AutoSync(request.expected_changes));
+            self.spawn(Task::AutoSync(request.expected));
         }
     }
 
@@ -656,6 +678,11 @@ impl App {
     }
 
     fn open_sync(&mut self, check_remote: bool) -> Vec<Action> {
+        if self.sync.syncing() || !self.root_tasks_running.is_empty() {
+            return vec![Action::Toast(
+                "Root backup is busy; open backup settings again when it finishes.".into(),
+            )];
+        }
         let ctx = Ctx {
             ws: &self.ws,
             snap: &self.snap,
@@ -665,7 +692,7 @@ impl App {
             &ctx,
             self.sync.status.clone(),
             self.sync.presentation(),
-            self.sync.probing() || check_remote,
+            self.sync.probing(),
             self.sync.error.clone(),
         ) {
             Ok(picker) => vec![
@@ -690,6 +717,14 @@ impl App {
     fn library_edit_active(&self) -> bool {
         self.modal.as_ref().is_some_and(Modal::library_edit_active)
             || (self.tab == Tab::Tags && self.tags.input_focused())
+    }
+
+    fn manual_sync_review_active(&self) -> bool {
+        matches!(self.modal, Some(Modal::Sync(_)))
+            || self
+                .pending_task_ui
+                .iter()
+                .any(|action| matches!(action, Action::OpenModal(modal) if matches!(modal.as_ref(), Modal::Sync(_))))
     }
 
     fn on_task(&mut self, id: u64, out: TaskOutput) -> Vec<Action> {
@@ -2048,9 +2083,15 @@ impl App {
         if matches!(task, Task::RepairApply(_)) {
             self.batch_running = true;
         }
+        if task.is_root_operation() && matches!(self.modal, Some(Modal::Sync(_))) {
+            self.modal = None;
+        }
         self.tasks_running += 1;
         self.next_task_id += 1;
         let id = self.next_task_id;
+        if task.is_root_operation() {
+            self.root_tasks_running.insert(id);
+        }
         match &task {
             Task::Scan => self.latest_scan_task = Some(id),
             Task::RefreshRepository(alias) => {
@@ -5405,7 +5446,261 @@ mod root_sync_tests {
             remote_checked,
             local_revision: Some("local".into()),
             remote_revision: Some("remote".into()),
+            worktree: Some(skills::ops::sync::WorktreeSnapshot {
+                head: Some("local".into()),
+                tree: format!("tree-{changes}"),
+                has_local_changes: changes > 0,
+            }),
         }
+    }
+
+    fn ready_app() -> App {
+        let mut app = app();
+        app.sync.set_probing(false);
+        let probe = app.sync.request_probe(false, ProbeReason::Startup).unwrap();
+        app.sync.finish_probe(probe.id, Ok(status(0, 1, 0, false)));
+        assert!(app.sync.pending());
+        app
+    }
+
+    fn render_app(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn successful_dry_run(app: &mut App) {
+        app.tasks_running = 1;
+        app.handle(Msg::Task(
+            1,
+            Box::new(TaskOutput::Sync(
+                super::super::sync_picker::Request {
+                    mode: skills::ops::sync::Mode::Sync,
+                    dry_run: true,
+                },
+                Ok(skills::ops::sync::Report::default()),
+            )),
+        ));
+    }
+
+    #[test]
+    fn manual_sync_preview_blocks_ready_automatic_sync() {
+        let mut app = ready_app();
+        app.settings.sync.tui_idle_window = std::time::Duration::ZERO;
+
+        successful_dry_run(&mut app);
+
+        assert!(matches!(app.modal, Some(Modal::Sync(_))));
+        assert!(!app.sync.syncing());
+        assert_eq!(app.tasks_running, 0);
+
+        app.apply(Action::CloseModal);
+        app.sync_if_ready();
+        assert!(app.sync.syncing());
+        assert_eq!(app.tasks_running, 1);
+    }
+
+    #[test]
+    fn queued_manual_sync_preview_blocks_ready_automatic_sync() {
+        let mut app = ready_app();
+        app.settings.sync.tui_idle_window = std::time::Duration::ZERO;
+        app.modal = Some(Modal::Help { scroll: 0 });
+
+        successful_dry_run(&mut app);
+
+        assert!(matches!(app.modal, Some(Modal::Help { .. })));
+        assert!(matches!(
+            app.pending_task_ui.front(),
+            Some(Action::OpenModal(modal)) if matches!(modal.as_ref(), Modal::Sync(_))
+        ));
+        assert!(!app.sync.syncing());
+
+        app.handle(Msg::Key(KeyEvent::from(KeyCode::Esc)));
+        assert!(matches!(app.modal, Some(Modal::Sync(_))));
+        assert!(app.pending_task_ui.is_empty());
+        assert!(!app.sync.syncing());
+    }
+
+    #[test]
+    fn manual_sync_picker_is_not_opened_during_automatic_run() {
+        let mut app = ready_app();
+        app.settings.sync.tui_idle_window = std::time::Duration::ZERO;
+        app.sync_if_ready();
+        assert!(app.sync.syncing());
+
+        let actions = app.open_sync(true);
+
+        assert!(
+            matches!(actions.as_slice(), [Action::Toast(message)] if message.contains("Root backup is busy"))
+        );
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn dry_run_blocks_second_picker_but_scan_does_not() {
+        let mut app = app();
+        let request = super::super::sync_picker::Request {
+            mode: skills::ops::sync::Mode::Sync,
+            dry_run: true,
+        };
+        app.spawn(Task::Sync(request.clone()));
+        let task_id = app.next_task_id;
+
+        let actions = app.open_sync(true);
+        assert!(
+            matches!(actions.as_slice(), [Action::Toast(message)] if message.contains("Root backup is busy"))
+        );
+        assert!(app.modal.is_none());
+
+        app.handle(Msg::Task(
+            task_id,
+            Box::new(TaskOutput::Sync(
+                request,
+                Ok(skills::ops::sync::Report::default()),
+            )),
+        ));
+        assert!(matches!(app.modal, Some(Modal::Sync(_))));
+
+        app.modal = None;
+        app.spawn(Task::Scan);
+        assert!(matches!(
+            app.open_sync(true).as_slice(),
+            [Action::OpenModal(_), Action::RefreshSyncStatus { .. }]
+        ));
+    }
+
+    #[test]
+    fn rejected_sync_spawn_keeps_review_open() {
+        let mut app = app();
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        let picker = super::super::sync_picker::SyncPicker::preview(
+            &ctx,
+            super::super::sync_picker::Request {
+                mode: skills::ops::sync::Mode::Sync,
+                dry_run: true,
+            },
+            skills::ops::sync::Report::default(),
+        )
+        .unwrap();
+        app.modal = Some(Modal::Sync(Box::new(picker)));
+        app.tasks_running = 1;
+
+        app.apply(Action::Spawn(Task::Sync(
+            super::super::sync_picker::Request {
+                mode: skills::ops::sync::Mode::Sync,
+                dry_run: false,
+            },
+        )));
+
+        assert!(matches!(app.modal, Some(Modal::Sync(_))));
+        assert!(render_app(&mut app, 100, 30).contains("Wait for the current operation"));
+    }
+
+    #[test]
+    fn rejected_sync_enable_spawn_keeps_picker_open() {
+        let mut app = app();
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        let picker = super::super::sync_picker::SyncPicker::new(&ctx).unwrap();
+        app.modal = Some(Modal::Sync(Box::new(picker)));
+        app.batch_running = true;
+
+        app.apply(Action::Spawn(Task::SyncEnable));
+
+        assert!(matches!(app.modal, Some(Modal::Sync(_))));
+        assert!(render_app(&mut app, 100, 30).contains("operation is still running"));
+    }
+
+    #[test]
+    fn readonly_inputs_defer_ready_sync_until_user_idle() {
+        for msg in [
+            Msg::Key(KeyEvent::from(KeyCode::Down)),
+            Msg::Key(KeyEvent::from(KeyCode::Tab)),
+            Msg::Paste(String::new()),
+            Msg::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Msg::Resize,
+        ] {
+            let mut app = ready_app();
+            let before = Instant::now() - std::time::Duration::from_secs(20);
+            app.last_user_activity = before;
+            app.handle(msg);
+            assert!(app.last_user_activity > before);
+            assert!(!app.sync.syncing());
+            assert_eq!(app.tasks_running, 0);
+
+            app.last_user_activity = Instant::now() - app.settings.sync.tui_idle_window;
+            app.sync_if_ready();
+            assert!(app.sync.syncing());
+            assert_eq!(app.tasks_running, 1);
+        }
+    }
+
+    #[test]
+    fn background_messages_do_not_reset_user_idle_clock() {
+        let mut app = ready_app();
+        let before = app.last_user_activity;
+        app.handle(Msg::Progress(0, "background".into()));
+        app.handle(Msg::SyncStatus(u64::MAX, Ok(status(0, 1, 0, false))));
+        app.handle(Msg::Task(
+            0,
+            Box::new(TaskOutput::RootStamp(Err(anyhow::anyhow!("busy")))),
+        ));
+        app.handle(Msg::Tick);
+        assert_eq!(app.last_user_activity, before);
+        assert!(!app.sync.syncing());
+    }
+
+    #[test]
+    fn user_idle_does_not_bypass_diff_stability_and_manual_sync_bypasses_idle() {
+        let mut app = app();
+        app.sync.set_probing(false);
+        let probe = app
+            .sync
+            .request_probe(false, ProbeReason::Mutation)
+            .unwrap();
+        app.sync.finish_probe(probe.id, Ok(status(1, 0, 0, false)));
+        app.last_user_activity = Instant::now() - app.settings.sync.tui_idle_window;
+        app.sync_if_ready();
+        assert!(!app.sync.syncing());
+
+        app.handle(Msg::Key(KeyEvent::from(KeyCode::Down)));
+        app.spawn(Task::Sync(super::super::sync_picker::Request {
+            mode: skills::ops::sync::Mode::Sync,
+            dry_run: false,
+        }));
+        assert!(app.sync.syncing());
+        assert_eq!(app.tasks_running, 1);
+    }
+
+    #[test]
+    fn zero_user_idle_disables_only_the_input_wait() {
+        let mut app = ready_app();
+        app.settings.sync.tui_idle_window = std::time::Duration::ZERO;
+        app.tasks_running = 1;
+        app.sync_if_ready();
+        assert!(!app.sync.syncing());
+        app.tasks_running = 0;
+        app.sync_if_ready();
+        assert!(app.sync.syncing());
     }
 
     #[test]
@@ -5582,6 +5877,9 @@ mod root_sync_tests {
                 std::time::Instant::now() < deadline,
                 "auto-sync did not settle"
             );
+            app.sync.mature_stability();
+            app.last_user_activity = Instant::now() - app.settings.sync.tui_idle_window;
+            app.handle(Msg::Tick);
             app.sync_if_ready();
             // Status probes are deliberately not counted as blocking tasks.
             // The production event loop still receives them while idle.

@@ -237,7 +237,7 @@ impl SyncPicker {
     }
 
     fn run(request: Request) -> Vec<Action> {
-        vec![Action::CloseModal, Action::Spawn(Task::Sync(request))]
+        vec![Action::Spawn(Task::Sync(request))]
     }
 
     fn activate_overview(&mut self) -> Vec<Action> {
@@ -264,7 +264,7 @@ impl SyncPicker {
                 vec![]
             }
             OverviewAction::Enable => {
-                vec![Action::CloseModal, Action::Spawn(Task::SyncEnable)]
+                vec![Action::Spawn(Task::SyncEnable)]
             }
             OverviewAction::Disable => {
                 self.step = Step::Disable;
@@ -287,7 +287,7 @@ impl SyncPicker {
                 ..request.clone()
             }),
             Step::Changes => self.back(),
-            Step::Disable => vec![Action::CloseModal, Action::Spawn(Task::SyncDisable)],
+            Step::Disable => vec![Action::Spawn(Task::SyncDisable)],
             Step::Configure { fields, .. } => {
                 let url = fields[0].value().trim().to_string();
                 let branch = fields[1].value().trim().to_string();
@@ -297,10 +297,7 @@ impl SyncPicker {
                 if branch.is_empty() {
                     return vec![Action::Error("Branch is required".into())];
                 }
-                vec![
-                    Action::CloseModal,
-                    Action::Spawn(Task::SyncConfigure { url, branch }),
-                ]
+                vec![Action::Spawn(Task::SyncConfigure { url, branch })]
             }
         }
     }
@@ -980,13 +977,10 @@ mod tests {
         picker.key(key(KeyCode::Down), &ctx);
         assert!(matches!(
             picker.key(key(KeyCode::Enter), &ctx).as_slice(),
-            [
-                Action::CloseModal,
-                Action::Spawn(Task::Sync(Request {
-                    mode: Mode::Push,
-                    dry_run: true
-                }))
-            ]
+            [Action::Spawn(Task::Sync(Request {
+                mode: Mode::Push,
+                dry_run: true
+            }))]
         ));
 
         for (shortcut, mode) in [('s', Mode::Sync), ('p', Mode::Push), ('P', Mode::Pull)] {
@@ -995,13 +989,10 @@ mod tests {
             picker.settings.branch = Some("main".into());
             assert!(matches!(
                 picker.key(key(KeyCode::Char(shortcut)), &ctx).as_slice(),
-                [
-                    Action::CloseModal,
-                    Action::Spawn(Task::Sync(Request {
+                [Action::Spawn(Task::Sync(Request {
                         mode: actual,
                         dry_run: true
-                    }))
-                ] if std::mem::discriminant(actual) == std::mem::discriminant(&mode)
+                    }))] if std::mem::discriminant(actual) == std::mem::discriminant(&mode)
             ));
         }
     }
@@ -1025,7 +1016,7 @@ mod tests {
         assert!(!screen.contains("Turn off auto sync"), "{screen}");
         assert!(matches!(
             picker.key(key(KeyCode::Enter), &ctx).as_slice(),
-            [Action::CloseModal, Action::Spawn(Task::SyncEnable)]
+            [Action::Spawn(Task::SyncEnable)]
         ));
     }
 
@@ -1049,10 +1040,7 @@ mod tests {
         assert_eq!(picker.focus, ChoiceFocus::Apply);
         assert!(matches!(
             picker.key(key(KeyCode::Enter), &ctx).as_slice(),
-            [
-                Action::CloseModal,
-                Action::Spawn(Task::Sync(Request { dry_run: false, .. }))
-            ]
+            [Action::Spawn(Task::Sync(Request { dry_run: false, .. }))]
         ));
         let mut picker = SyncPicker::preview(
             &ctx,
@@ -1065,10 +1053,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             picker.key(key(KeyCode::Char('y')), &ctx).as_slice(),
-            [
-                Action::CloseModal,
-                Action::Spawn(Task::Sync(Request { dry_run: false, .. }))
-            ]
+            [Action::Spawn(Task::Sync(Request { dry_run: false, .. }))]
         ));
         for (width, height) in [(80, 24), (48, 12)] {
             assert!(render(&mut picker, &ctx, width, height).contains("Root backup"));
@@ -1093,10 +1078,7 @@ mod tests {
         picker.focus = ChoiceFocus::Apply;
         assert!(matches!(
             picker.key(key(KeyCode::Enter), &ctx).as_slice(),
-            [
-                Action::CloseModal,
-                Action::Spawn(Task::SyncConfigure { url, branch })
-            ] if url == "/tmp/remote.git" && branch == "main"
+            [Action::Spawn(Task::SyncConfigure { url, branch })] if url == "/tmp/remote.git" && branch == "main"
         ));
         assert!(!ws.root.join(".git").exists());
 
@@ -1107,7 +1089,7 @@ mod tests {
         picker.focus = ChoiceFocus::Apply;
         assert!(matches!(
             picker.key(key(KeyCode::Enter), &ctx).as_slice(),
-            [Action::CloseModal, Action::Spawn(Task::SyncDisable)]
+            [Action::Spawn(Task::SyncDisable)]
         ));
         assert!(!ws.root.join(".git").exists());
     }
@@ -1135,13 +1117,10 @@ mod tests {
         assert_eq!(picker.list.selected(), Some(3));
         assert!(matches!(
             picker.mouse(click(), &ctx).as_slice(),
-            [
-                Action::CloseModal,
-                Action::Spawn(Task::Sync(Request {
-                    mode: Mode::Pull,
-                    dry_run: true
-                }))
-            ]
+            [Action::Spawn(Task::Sync(Request {
+                mode: Mode::Pull,
+                dry_run: true
+            }))]
         ));
     }
 }

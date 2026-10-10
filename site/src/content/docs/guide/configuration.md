@@ -19,7 +19,7 @@ printf '%s\n' "$HOME/skills-library" > "$HOME/.config/skills-tui/root"
 skills init
 ```
 
-When neither `--root` nor `SKILLS_HOME` is set, the program reads the pointer file. `init` creates `.skills-meta/config.toml` and refuses to overwrite it. Environment variables and the pointer file may contain paths that start with `~`. For a shell `--root` argument, use `"$HOME/path"` rather than a quoted tilde.
+When neither `--root` nor `SKILLS_HOME` is set, the program reads the pointer file. `init` creates `.skills-meta/config.toml` with commented defaults and refuses to overwrite it. Environment variables and the pointer file may contain paths that start with `~`. For a shell `--root` argument, use `"$HOME/path"` rather than a quoted tilde.
 
 In the CLI, `--local` and `--project DIR` use `<project>/.agents/skills` as a separate project store. Init, install, and Agent registration may create this directory. Read commands require it to exist. In the TUI, the same flags select the deployment context while the central Library remains in use. See [Agent deployment](../deployment/) for the scope rules.
 
@@ -90,4 +90,19 @@ Prefix, fuzzy, and dictionary search are enabled by default.
 | heading | 1.5 |
 | body | 1 |
 
-The dictionary weights are tech 0.7, common 0.4, and user 1. Unknown fields in supported tables cause validation to fail. Root sync does not use a `[sync]` table. Configure it with `skills sync configure` as described in [root backup](../sync/).
+The dictionary weights are tech 0.7, common 0.4, and user 1. Unknown fields in supported tables cause validation to fail.
+
+## Automatic sync waits
+
+```toml
+[sync]
+quiet_seconds = 120
+tui_idle_seconds = 10
+```
+
+| Setting | Behavior |
+| --- | --- |
+| `quiet_seconds` | Waits until the root's uncommitted changes have stayed the same for this many seconds. Default 120. |
+| `tui_idle_seconds` | Waits this many seconds after the last keyboard, paste, mouse, or resize input. Default 10. |
+
+Values are whole seconds. `0` disables only that wait; safety checks still apply. The waits apply only to automatic sync in the TUI, and manual sync runs immediately. The remote, branch, and enablement are not set here; configure them with `skills sync configure` as described in [root backup](../sync/).

@@ -8,6 +8,7 @@
 //! All writes go through `skills::ops`, like the CLI, with fresh validation there.
 
 mod app;
+mod backend;
 mod batch;
 mod components;
 mod deploy_picker;
@@ -39,7 +40,7 @@ use crossterm::terminal::{
 };
 use std::sync::mpsc;
 
-type Term = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
+type Term = ratatui::Terminal<backend::WideCellBackend<std::io::Stdout>>;
 
 pub fn run(ws: skills::Workspace, launch_dir: Option<&std::path::Path>) -> Result<()> {
     let (tx, rx) = mpsc::channel();
@@ -92,7 +93,7 @@ fn enter() -> Result<Term> {
             EnableMouseCapture,
             EnableBracketedPaste
         )?;
-        let backend = ratatui::backend::CrosstermBackend::new(stdout);
+        let backend = backend::WideCellBackend::new(stdout);
         let mut terminal = ratatui::Terminal::new(backend)?;
         terminal.clear()?;
         Ok(terminal)

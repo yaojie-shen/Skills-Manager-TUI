@@ -35,6 +35,7 @@ impl Fixture {
             }],
             search: Default::default(),
             ui: Default::default(),
+            sync: Default::default(),
         }
         .save(&root)
         .unwrap();

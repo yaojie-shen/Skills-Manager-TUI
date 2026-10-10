@@ -7,13 +7,13 @@ use crate::tui::app::Ctx;
 use crate::tui::components::skill::{status_glyph, status_text};
 use crate::tui::text::{highlight_line, highlight_spans};
 use crate::tui::theme::Theme;
-use crate::tui::widgets::OverlayClear as Clear;
+use crate::tui::widgets::{OverlayClear as Clear, render_vertical_scrollbar, scrollbar_gutter};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Margin, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use skills::reconcile::{DeployState, SkillRecord};
 
 /// A preview floating over a page. Lives in the view that opened it, so the
@@ -165,8 +165,9 @@ impl Overlay {
         ]);
         let block = th.block(title, true);
         let inner = block.inner(rect);
+        let (content, track) = scrollbar_gutter(inner);
         f.render_widget(block, rect);
-        self.height = inner.height;
+        self.height = content.height;
         let lines = if let Some(preview) = &self.agent_preview {
             let mut lines = vec![
                 kv("agent", &preview.agent, th),
@@ -184,7 +185,7 @@ impl Overlay {
             if !self.expanded_fields {
                 lines = lines
                     .into_iter()
-                    .map(|line| single_line(line, inner.width as usize))
+                    .map(|line| single_line(line, content.width as usize))
                     .collect();
             }
             match &preview.doc {
@@ -192,14 +193,14 @@ impl Overlay {
                     lines.extend(markdown_section(
                         "Description",
                         &doc.description,
-                        inner.width as usize,
+                        content.width as usize,
                         &[],
                         th,
                     ));
                     lines.extend(markdown_section(
                         "SKILL.md",
                         &doc.body,
-                        inner.width as usize,
+                        content.width as usize,
                         &[],
                         th,
                     ));
@@ -208,32 +209,26 @@ impl Overlay {
             }
             lines
         } else if let Some(r) = ctx.snap.get(key) {
-            record_lines(r, ctx, &[], inner.width as usize, self.expanded_fields)
+            record_lines(r, ctx, &[], content.width as usize, self.expanded_fields)
         } else {
             vec![Line::from(Span::styled("not in the skills root", th.err()))]
         };
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        self.lines = paragraph.line_count(inner.width);
+        self.lines = paragraph.line_count(content.width);
         let max = self
             .lines
-            .saturating_sub(inner.height as usize)
+            .saturating_sub(content.height as usize)
             .min(u16::MAX as usize) as u16;
         self.scroll = self.scroll.min(max);
-        f.render_widget(paragraph.scroll((self.scroll, 0)), inner);
-        if self.lines > inner.height as usize {
-            let mut sb = ScrollbarState::new(self.lines.saturating_sub(inner.height as usize))
-                .position(self.scroll as usize);
-            f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(None)
-                    .end_symbol(None),
-                rect.inner(Margin {
-                    vertical: 1,
-                    horizontal: 0,
-                }),
-                &mut sb,
-            );
-        }
+        f.render_widget(paragraph.scroll((self.scroll, 0)), content);
+        render_vertical_scrollbar(
+            f,
+            track,
+            self.lines,
+            content.height as usize,
+            self.scroll as usize,
+            th.dim(),
+        );
     }
 }
 
@@ -434,6 +429,49 @@ fn markdown_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scrolling_cjk_overlay_keeps_borders_and_internal_track_separate() {
+        let root = skills::ops::DownloadDir::new("cjk-overlay-boundaries").unwrap();
+        let skill = root.path().join("cjk");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: cjk\ndescription: {}\n---\n{}",
+                "中文❤️".repeat(40),
+                "中文中文❤️中文中文\n".repeat(80)
+            ),
+        )
+        .unwrap();
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut overlay = Overlay::default();
+        overlay.open("cjk".into());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        for scroll in [0, u16::MAX] {
+            overlay.scroll = scroll;
+            terminal
+                .draw(|frame| overlay.draw(frame, frame.area(), &ctx))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rect = overlay.rect;
+            let track_x = rect.right() - 2;
+            for y in rect.y + 1..rect.bottom() - 1 {
+                assert_eq!(buffer[(rect.x, y)].symbol(), "│");
+                assert_eq!(buffer[(rect.right() - 1, y)].symbol(), "│");
+                assert!(matches!(buffer[(track_x, y)].symbol(), "║" | "█" | " "));
+            }
+            assert!(overlay.scroll <= (overlay.lines - overlay.height as usize) as u16);
+        }
+    }
+
     #[test]
     fn metadata_stays_on_one_row_with_wide_text_and_control_characters() {
         for columns in 0..80 {

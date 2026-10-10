@@ -18,6 +18,36 @@ fn write(ws: &Workspace, name: &str, text: &str) {
 fn run(ws: &Workspace) -> anyhow::Result<sync::Report> {
     sync::run(ws, Mode::Sync, false, &mut |_| {})
 }
+
+fn automatic_input(status: sync::Status) -> sync::AutomaticSyncInput {
+    sync::AutomaticSyncInput {
+        snapshot: status.worktree.expect("configured status has a snapshot"),
+    }
+}
+fn directory_entries(root: &Path) -> Vec<String> {
+    fn visit(root: &Path, path: &Path, entries: &mut Vec<String>) {
+        let mut children: Vec<_> = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        children.sort();
+        for child in children {
+            entries.push(
+                child
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            if child.is_dir() {
+                visit(root, &child, entries);
+            }
+        }
+    }
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
+    entries
+}
 fn remote(path: &Path) {
     git(
         &[
@@ -109,6 +139,51 @@ fn status_reports_local_and_remote_work_without_mutating_repository_refs() {
 }
 
 #[test]
+fn semantic_snapshot_tracks_content_without_mutating_the_real_index() {
+    let tmp = DownloadDir::new("root-semantic-snapshot").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+    let root = ws(&tmp.path().join("root"));
+    configure(&root, &repo);
+    write(&root, "skill/SKILL.md", "first");
+    run(&root).unwrap();
+
+    write(&root, "skill/SKILL.md", "second");
+    git(&["add", "skill/SKILL.md"], Some(&root.root)).unwrap();
+    write(&root, "skill/SKILL.md", "third");
+    write(&root, "new-skill/SKILL.md", "draft one");
+    let index_before = fs::read(root.root.join(".git/index")).unwrap();
+    let status_before = git(&["status", "--short"], Some(&root.root)).unwrap();
+    let objects_before = directory_entries(&root.root.join(".git/objects"));
+
+    let first = sync::status(&root, false).unwrap();
+    write(&root, "new-skill/SKILL.md", "draft two");
+    let second = sync::status(&root, false).unwrap();
+
+    assert_eq!(first.changes, second.changes);
+    assert_ne!(first.worktree, second.worktree);
+    assert_eq!(
+        fs::read(root.root.join(".git/index")).unwrap(),
+        index_before
+    );
+    assert_eq!(
+        git(&["status", "--short"], Some(&root.root)).unwrap(),
+        status_before
+    );
+    assert_eq!(
+        directory_entries(&root.root.join(".git/objects")),
+        objects_before
+    );
+    assert!(!root.root.join(".git").read_dir().unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("skills-sync-snapshot-")
+    }));
+}
+
+#[test]
 fn automatic_sync_uses_the_probed_cache_and_rejects_later_tree_changes() {
     let tmp = DownloadDir::new("root-auto-cache").unwrap();
     let repo = tmp.path().join("remote.git");
@@ -124,7 +199,7 @@ fn automatic_sync_uses_the_probed_cache_and_rejects_later_tree_changes() {
     write(&one, "remote-change", "downloaded by probe");
     run(&one).unwrap();
 
-    let expected = sync::status(&two, true).unwrap().changes;
+    let expected = automatic_input(sync::status(&two, true).unwrap());
     let offline = tmp.path().join("offline.git");
     fs::rename(&repo, &offline).unwrap();
     let report = sync::run_automatic(&two, &expected, &mut || {}, &mut |_| {}).unwrap_err();
@@ -139,7 +214,7 @@ fn automatic_sync_uses_the_probed_cache_and_rejects_later_tree_changes() {
     );
 
     fs::rename(&offline, &repo).unwrap();
-    let expected = sync::status(&two, true).unwrap().changes;
+    let expected = automatic_input(sync::status(&two, true).unwrap());
     fs::remove_dir_all(two.root.join(".git/skills-sync-cache")).unwrap();
     let cache_error = sync::run_automatic(&two, &expected, &mut || {}, &mut |_| {}).unwrap_err();
     assert_eq!(
@@ -148,7 +223,7 @@ fn automatic_sync_uses_the_probed_cache_and_rejects_later_tree_changes() {
     );
 
     sync::status(&two, true).unwrap();
-    let expected = sync::status(&two, false).unwrap().changes;
+    let expected = automatic_input(sync::status(&two, false).unwrap());
     write(&two, "unexpected", "external");
     let before = head(&two);
     let error = sync::run_automatic(&two, &expected, &mut || {}, &mut |_| {}).unwrap_err();
@@ -240,7 +315,7 @@ fn conflicts_abort_merge_and_retain_local_backup_then_allow_retry() {
     run(&one).unwrap();
     sync::status(&two, true).unwrap();
     write(&two, "shared", "local\n");
-    let expected = sync::status(&two, false).unwrap().changes;
+    let expected = automatic_input(sync::status(&two, false).unwrap());
     let conflict = sync::run_automatic(&two, &expected, &mut || {}, &mut |_| {}).unwrap_err();
     assert_eq!(conflict.disposition, sync::AutoSyncDisposition::Fatal);
     assert!(conflict.to_string().contains("local backup retained"));
