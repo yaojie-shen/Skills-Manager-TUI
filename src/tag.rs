@@ -100,11 +100,31 @@ impl TagStore {
         self.parse_entries(files)
     }
 
+    /// Validate Tag documents produced by a migration, which must also use
+    /// the canonical filenames for the whole set.
+    pub(crate) fn validate_documents(&self, files: Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
+        let entries = self.parse_entries(files)?;
+        let allocated =
+            group_filename::allocate(entries.iter().map(|entry| entry.tag.name.as_str()))?;
+        for entry in &entries {
+            let expected = self.path_for_stem(&allocated[&entry.tag.name]);
+            ensure!(
+                entry.path == expected,
+                "noncanonical Tag filename {} (expected {})",
+                entry.path.display(),
+                expected.display()
+            );
+        }
+        Ok(())
+    }
+
     /// Parse and validate Tag documents already read from this store's
-    /// directory, including the canonical filename check.
+    /// directory. Filenames need not be canonical: root sync can merge
+    /// definitions created on different machines, and the next write to the
+    /// store renames them.
     pub(crate) fn parse_entries(&self, files: Vec<(PathBuf, Vec<u8>)>) -> Result<Vec<Entry>> {
         let mut out = Vec::new();
-        let mut names = BTreeSet::new();
+        let mut names: BTreeMap<String, PathBuf> = BTreeMap::new();
         for (path, bytes) in files {
             let text = std::str::from_utf8(&bytes)
                 .with_context(|| format!("invalid UTF-8 in {}", path.display()))?;
@@ -124,23 +144,15 @@ impl TagStore {
             let mut tag: Tag = toml::from_str(&doc.to_string())
                 .with_context(|| format!("invalid Tag: {}", path.display()))?;
             tag.normalize()?;
-            ensure!(
-                names.insert(tag.name.clone()),
-                "duplicate Tag name: {}",
-                tag.name
-            );
+            if let Some(first) = names.insert(tag.name.clone(), path.clone()) {
+                bail!(
+                    "duplicate Tag name {} in {} and {}; merge or rename one of them",
+                    tag.name,
+                    first.display(),
+                    path.display()
+                );
+            }
             out.push(Entry { path, tag, bytes });
-        }
-        let allocated = group_filename::allocate(out.iter().map(|entry| entry.tag.name.as_str()))?;
-        for entry in &out {
-            let expected = self.path_for_stem(&allocated[&entry.tag.name]);
-            ensure!(
-                entry.path == expected,
-                "noncanonical Tag filename {} for layout {} (expected {}); copy the originals you need back from .skills-meta/backups, including format.toml if that backup has one, otherwise delete .skills-meta/format.toml; then reopen to re-run migration",
-                entry.path.display(),
-                crate::migration::CURRENT_LAYOUT,
-                expected.display()
-            );
         }
         Ok(out)
     }
@@ -209,6 +221,7 @@ impl TagStore {
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<std::io::Result<_>>()?;
         for entry in desired {
+            crate::util::reject_ignored_occupant(&physical, &sources, &entry.path, "Tag")?;
             let destination_key = entry
                 .path
                 .file_name()
@@ -433,6 +446,40 @@ mod tests {
     }
 
     #[test]
+    fn an_ignored_file_holding_the_destination_name_is_named() {
+        let temp = DownloadDir::new("tag-ignored-occupant").unwrap();
+        let store = TagStore::new(temp.path());
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let occupant = store.dir.join("Zzz.TOML");
+        std::fs::write(&occupant, b"foreign").unwrap();
+        assert!(store.list().unwrap().is_empty());
+        let error = format!(
+            "{:#}",
+            store
+                .save(&Tag {
+                    name: "zzz".into(),
+                    skills: vec![],
+                    color: None,
+                    description: None,
+                })
+                .unwrap_err()
+        );
+        assert!(
+            error.contains(&format!("{} already uses that name", occupant.display())),
+            "{error}"
+        );
+        assert!(error.contains("rename or remove"), "{error}");
+        assert_eq!(std::fs::read(&occupant).unwrap(), b"foreign");
+        // Compare exact names: on a case-insensitive filesystem `zzz.toml`
+        // resolves to `Zzz.TOML`, so an existence check cannot tell them apart.
+        let names: Vec<_> = std::fs::read_dir(&store.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["Zzz.TOML"]);
+    }
+
+    #[test]
     fn toml_symlink_and_directory_entries_are_still_rejected() {
         let temp = DownloadDir::new("tag-invalid-entries").unwrap();
         let store = TagStore::new(temp.path());
@@ -446,6 +493,68 @@ mod tests {
         std::fs::create_dir(store.dir.join("folder.toml")).unwrap();
         let error = store.list().unwrap_err();
         assert!(format!("{error:#}").contains("invalid Tag store entry"));
+    }
+
+    fn file_names(dir: &Path) -> BTreeSet<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn merged_noncanonical_filenames_open_and_the_next_write_canonicalizes() {
+        // Two machines each created one of these; root sync merged both files.
+        for (first, second) in [("Work", "work"), ("A/B", "A-B")] {
+            let temp = DownloadDir::new("tag-merged-noncanonical").unwrap();
+            let store = TagStore::new(temp.path());
+            std::fs::create_dir_all(&store.dir).unwrap();
+            for (file, name) in [("one.toml", first), ("two.toml", second)] {
+                std::fs::write(
+                    store.dir.join(file),
+                    format!("schema = 1\nname = '{name}'\nskills = ['{file}']\n"),
+                )
+                .unwrap();
+            }
+            let names: Vec<_> = store.list().unwrap().into_iter().map(|t| t.name).collect();
+            assert_eq!(names.len(), 2);
+            store
+                .save(&Tag {
+                    name: "extra".into(),
+                    skills: vec![],
+                    color: None,
+                    description: None,
+                })
+                .unwrap();
+            let entries = store.entries().unwrap();
+            let allocation =
+                group_filename::allocate(entries.iter().map(|e| e.tag.name.as_str())).unwrap();
+            for entry in &entries {
+                assert_eq!(
+                    entry.path,
+                    store.path_for_stem(&allocation[&entry.tag.name])
+                );
+            }
+            assert_eq!(file_names(&store.dir).len(), 3);
+            assert_eq!(store.load(first).unwrap().unwrap().skills, ["one.toml"]);
+            assert_eq!(store.load(second).unwrap().unwrap().skills, ["two.toml"]);
+        }
+    }
+
+    #[test]
+    fn duplicate_names_name_both_files() {
+        let temp = DownloadDir::new("tag-duplicate-files").unwrap();
+        let store = TagStore::new(temp.path());
+        std::fs::create_dir_all(&store.dir).unwrap();
+        for file in ["one.toml", "two.toml"] {
+            std::fs::write(store.dir.join(file), "schema = 1\nname = 'same'\n").unwrap();
+        }
+        let error = format!("{:#}", store.list().unwrap_err());
+        assert!(error.contains("duplicate Tag name same"), "{error}");
+        assert!(
+            error.contains("one.toml") && error.contains("two.toml"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -195,7 +195,7 @@ fn validate_current(root: &Path, view: &snapshot::HomeView) -> anyhow::Result<()
             ),
         }
     }
-    crate::tag::TagStore::new(root).parse_entries(tags)?;
+    crate::tag::TagStore::new(root).validate_documents(tags)?;
     crate::preset::PresetStore::new(root).validate_documents(presets)?;
     Ok(())
 }
@@ -531,6 +531,24 @@ mod tests {
             assert_eq!(business_tree(temp.path()), before);
             assert!(!meta.join(".metadata.lock").exists());
             assert!(!version::path(temp.path()).exists());
+        }
+    }
+
+    #[test]
+    fn final_validation_still_requires_canonical_filenames() {
+        let temp = DownloadDir::new("migration-canonical-validation").unwrap();
+        for (dir, kind) in [("tags", "Tag"), ("presets", "preset")] {
+            let mut view = snapshot::HomeView::default();
+            view.insert(
+                format!("{dir}/odd.toml"),
+                b"schema = 1\nname = 'work'\n".to_vec(),
+            )
+            .unwrap();
+            let error = format!("{:#}", validate_current(temp.path(), &view).unwrap_err());
+            assert!(
+                error.contains(&format!("noncanonical {kind} filename")),
+                "{error}"
+            );
         }
     }
 

@@ -190,15 +190,31 @@ impl PresetStore {
         self.parse_entries(files)
     }
 
-    /// Validate preset documents already read from this store's directory,
-    /// including the canonical filename check.
+    /// Validate preset documents produced by a migration, which must also use
+    /// the canonical filenames for the whole set.
     pub(crate) fn validate_documents(&self, files: Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
-        self.parse_entries(files).map(drop)
+        let entries = self.parse_entries(files)?;
+        let allocation = crate::group_filename::allocate(
+            entries.iter().map(|entry| entry.preset.name.as_str()),
+        )?;
+        for entry in &entries {
+            let expected = self.path_for_stem(&allocation[&entry.preset.name]);
+            anyhow::ensure!(
+                entry.path == expected,
+                "noncanonical preset filename {} (expected {})",
+                entry.path.display(),
+                expected.display()
+            );
+        }
+        Ok(())
     }
 
+    /// Parse preset documents already read from this store's directory.
+    /// Filenames need not be canonical: root sync can merge presets created on
+    /// different machines, and the next write to the store renames them.
     fn parse_entries(&self, files: Vec<(PathBuf, Vec<u8>)>) -> Result<Vec<StoredPreset>> {
         let mut out = Vec::new();
-        let mut names = BTreeSet::new();
+        let mut names: BTreeMap<String, PathBuf> = BTreeMap::new();
         for (path, bytes) in files {
             let text = std::str::from_utf8(&bytes)?;
             let mut doc: DocumentMut = text
@@ -215,28 +231,19 @@ impl PresetStore {
             let mut preset: Preset = toml::from_str(&doc.to_string())
                 .with_context(|| format!("invalid preset: {}", path.display()))?;
             preset.name = crate::group_filename::normalize_name(&preset.name)?;
-            anyhow::ensure!(
-                names.insert(preset.name.clone()),
-                "duplicate preset name: {}",
-                preset.name
-            );
+            if let Some(first) = names.insert(preset.name.clone(), path.clone()) {
+                bail!(
+                    "duplicate preset name {} in {} and {}; merge or rename one of them",
+                    preset.name,
+                    first.display(),
+                    path.display()
+                );
+            }
             out.push(StoredPreset {
                 path,
                 preset,
                 bytes,
             });
-        }
-        let allocation =
-            crate::group_filename::allocate(out.iter().map(|entry| entry.preset.name.as_str()))?;
-        for entry in &out {
-            let expected = self.path_for_stem(&allocation[&entry.preset.name]);
-            anyhow::ensure!(
-                entry.path == expected,
-                "noncanonical preset filename {} for layout {} (expected {}); copy the originals you need back from .skills-meta/backups, including format.toml if that backup has one, otherwise delete .skills-meta/format.toml; then reopen to re-run migration",
-                entry.path.display(),
-                crate::migration::CURRENT_LAYOUT,
-                expected.display()
-            );
         }
         Ok(out)
     }
@@ -298,7 +305,11 @@ impl PresetStore {
         }
         std::fs::create_dir_all(&self.dir)?;
         let sources: BTreeSet<_> = before.iter().map(|e| e.path.clone()).collect();
+        let physical: Vec<_> = std::fs::read_dir(&self.dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<_>>()?;
         for entry in desired {
+            crate::util::reject_ignored_occupant(&physical, &sources, &entry.path, "preset")?;
             // A case-only rename may resolve to an existing source on macOS.
             let source_collision = before.iter().any(|source| {
                 source
@@ -491,6 +502,90 @@ mod tests {
             assert_eq!(std::fs::read(store.dir.join(name)).unwrap(), b"stray");
         }
         assert!(store.dir.join("notes").is_dir());
+    }
+
+    #[test]
+    fn merged_noncanonical_filenames_open_and_the_next_write_canonicalizes() {
+        for (first, second) in [("Work", "work"), ("A/B", "A-B")] {
+            let temp = DownloadDir::new("preset-merged-noncanonical").unwrap();
+            let store = PresetStore::new(temp.path());
+            std::fs::create_dir_all(&store.dir).unwrap();
+            for (file, name) in [("one.toml", first), ("two.toml", second)] {
+                std::fs::write(
+                    store.dir.join(file),
+                    format!("# {file}\nschema = 1\nname = '{name}'\nskills = ['{file}']\n"),
+                )
+                .unwrap();
+            }
+            assert_eq!(store.list().unwrap().len(), 2);
+            store
+                .save(&Preset {
+                    name: "extra".into(),
+                    ..Preset::default()
+                })
+                .unwrap();
+            let entries = store.entries().unwrap();
+            let allocation = crate::group_filename::allocate(
+                entries.iter().map(|entry| entry.preset.name.as_str()),
+            )
+            .unwrap();
+            for entry in &entries {
+                assert_eq!(
+                    entry.path,
+                    store.path_for_stem(&allocation[&entry.preset.name])
+                );
+            }
+            assert_eq!(std::fs::read_dir(&store.dir).unwrap().count(), 3);
+            let kept = std::fs::read_to_string(store.path(first)).unwrap();
+            assert!(kept.starts_with("# one.toml"), "{kept}");
+            assert_eq!(store.load(second).unwrap().unwrap().skills, ["two.toml"]);
+        }
+    }
+
+    #[test]
+    fn duplicate_names_name_both_files() {
+        let temp = DownloadDir::new("preset-duplicate-files").unwrap();
+        let store = PresetStore::new(temp.path());
+        std::fs::create_dir_all(&store.dir).unwrap();
+        for file in ["one.toml", "two.toml"] {
+            std::fs::write(store.dir.join(file), "schema = 1\nname = 'same'\n").unwrap();
+        }
+        let error = format!("{:#}", store.list().unwrap_err());
+        assert!(error.contains("duplicate preset name same"), "{error}");
+        assert!(
+            error.contains("one.toml") && error.contains("two.toml"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_ignored_file_holding_the_destination_name_is_named() {
+        let temp = DownloadDir::new("preset-ignored-occupant").unwrap();
+        let store = PresetStore::new(temp.path());
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let occupant = store.dir.join("Daily.TOML");
+        std::fs::write(&occupant, b"foreign").unwrap();
+        let error = format!(
+            "{:#}",
+            store
+                .save(&Preset {
+                    name: "daily".into(),
+                    ..Preset::default()
+                })
+                .unwrap_err()
+        );
+        assert!(
+            error.contains(&format!("{} already uses that name", occupant.display())),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&occupant).unwrap(), b"foreign");
+        // Compare exact names: on a case-insensitive filesystem `daily.toml`
+        // resolves to `Daily.TOML`, so an existence check cannot tell them apart.
+        let names: Vec<_> = std::fs::read_dir(&store.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["Daily.TOML"]);
     }
 
     #[test]

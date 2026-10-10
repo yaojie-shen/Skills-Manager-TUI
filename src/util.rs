@@ -95,6 +95,37 @@ pub(crate) fn is_store_document_name(name: &std::ffi::OsStr) -> bool {
     !name.starts_with(b".") && name.ends_with(b".toml")
 }
 
+/// Refuse to publish `destination` when a file that store readers ignore (for
+/// example `Work.TOML` or `.work.toml`) in `physical`, the store's current
+/// entries, already holds the same name once case and Unicode normalization
+/// are disregarded: case-insensitive filesystems resolve one to the other.
+pub(crate) fn reject_ignored_occupant(
+    physical: &[std::path::PathBuf],
+    sources: &std::collections::BTreeSet<std::path::PathBuf>,
+    destination: &Path,
+    kind: &str,
+) -> Result<()> {
+    let key = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(crate::group_filename::collision_key)
+    };
+    let wanted = key(destination);
+    if let Some(occupant) = physical.iter().find(|path| {
+        !sources.contains(*path)
+            && !path.file_name().is_some_and(is_store_document_name)
+            && key(path) == wanted
+    }) {
+        anyhow::bail!(
+            "cannot write {kind} file {}: {} already uses that name (ignoring case), and Skills Manager does not read it as a {kind}; rename or remove {}, then retry",
+            destination.display(),
+            occupant.display(),
+            occupant.display()
+        );
+    }
+    Ok(())
+}
+
 /// Whether a `repos/` entry name is a repository metadata document: a store
 /// document name, or the hidden `.root.toml` for standalone remote skills.
 /// Every reader of `repos/` uses this, so they agree on what they ignore.
