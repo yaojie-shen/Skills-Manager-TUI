@@ -165,6 +165,99 @@ pub struct Baseline {
     pub hash_algo: u32,
 }
 
+/// Validate one repository metadata document using the current repository codec.
+pub(crate) fn validate_repository_document(path: &Path, doc: &DocumentMut) -> Result<()> {
+    use anyhow::ensure;
+    let filename_alias = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .context("repository metadata filename is not valid UTF-8")?;
+    let mut value: toml::Value = toml::from_str(&doc.to_string())?;
+    let table = value
+        .as_table_mut()
+        .context("repository metadata must be a TOML table")?;
+    table.remove("schema");
+    let is_root = filename_alias == ".root";
+    if is_root {
+        ensure!(
+            table.get("alias").is_none() && table.get("url").is_none(),
+            ".root.toml must not define repository identity"
+        );
+    } else {
+        let repository: crate::repository::Repository = toml::Value::Table(table.clone())
+            .try_into()
+            .with_context(|| format!("invalid repository identity in {}", path.display()))?;
+        ensure!(
+            crate::util::valid_skill_key(&repository.alias),
+            "invalid repository alias: {:?}",
+            repository.alias
+        );
+        ensure!(
+            repository.alias == filename_alias,
+            "repository metadata filename {filename_alias:?} does not match alias {:?}",
+            repository.alias
+        );
+        if let Some(name) = &repository.name {
+            crate::repository::validate_name(name)?;
+        }
+    }
+    let top_kind = table
+        .get("kind")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("git")
+        .to_owned();
+    let top_url = table
+        .get("url")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
+    let top_branch = table
+        .get("branch")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned);
+    if let Some(skills) = table.get_mut("skills") {
+        let skills = skills.as_table_mut().context("skills must be a table")?;
+        for (name, metadata) in skills.iter_mut() {
+            let key = if is_root {
+                name.to_owned()
+            } else {
+                format!("repos/{filename_alias}/{name}")
+            };
+            ensure!(
+                crate::repository::valid_id(&key),
+                "invalid skill identity: {key}"
+            );
+            if let Some(source) = metadata
+                .get_mut("source")
+                .and_then(toml::Value::as_table_mut)
+                && matches!(
+                    source.get("type").and_then(toml::Value::as_str),
+                    Some("git" | "archive")
+                )
+                && !is_root
+            {
+                ensure!(
+                    source.get("type").and_then(toml::Value::as_str) == Some(top_kind.as_str()),
+                    "repository kind differs from skill source"
+                );
+                source.insert(
+                    "url".into(),
+                    top_url.as_deref().context("repository URL missing")?.into(),
+                );
+                if top_kind == "git"
+                    && let Some(branch) = &top_branch
+                {
+                    source.insert("branch".into(), branch.as_str().into());
+                }
+            }
+            let _: SkillMeta = metadata
+                .clone()
+                .try_into()
+                .with_context(|| format!("invalid metadata for skill {key}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Access to the metadata directory.
 #[derive(Debug, Clone)]
 pub struct MetaStore {
@@ -218,12 +311,24 @@ impl MetaStore {
     }
     pub(crate) fn read(path: &Path) -> Result<DocumentMut> {
         match std::fs::read_to_string(path) {
-            Ok(text) => text
-                .parse()
-                .with_context(|| format!("invalid metadata: {}", path.display())),
+            Ok(text) => Self::parse_document(path, &text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(DocumentMut::new()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
+    }
+    /// Parse one current repository metadata document.
+    pub(crate) fn parse_document(path: &Path, text: &str) -> Result<DocumentMut> {
+        let doc = text
+            .parse()
+            .with_context(|| format!("invalid metadata: {}", path.display()))?;
+        crate::schema::require_current(
+            &doc,
+            path,
+            "repository metadata",
+            crate::schema::REPOSITORY,
+            0,
+        )?;
+        Ok(doc)
     }
     pub fn exists(&self, key: &str) -> bool {
         self.load(key).map(|m| m.is_some()).unwrap_or(true)
@@ -279,8 +384,9 @@ impl MetaStore {
         let repos = self.dir.join("repos");
         if repos.is_dir() {
             for entry in std::fs::read_dir(repos)? {
-                let path = entry?.path();
-                if path.is_file() && path.extension().is_some_and(|e| e == "toml") {
+                let entry = entry?;
+                let path = entry.path();
+                if crate::util::is_repository_document_name(&entry.file_name()) && path.is_file() {
                     let alias = path.file_stem().unwrap().to_string_lossy();
                     if alias == ".root" {
                         files.push((path.clone(), String::new()));
@@ -313,6 +419,7 @@ impl MetaStore {
         Ok(keys)
     }
     fn put(doc: &mut DocumentMut, key: &str, meta: &SkillMeta) -> Result<()> {
+        crate::schema::set(doc, crate::schema::REPOSITORY);
         let mut item = toml::to_string(meta)?
             .parse::<DocumentMut>()?
             .as_table()
@@ -605,7 +712,7 @@ mod tests {
         let store = MetaStore::new(temp.path());
         let file = store.path("repos/demo/one");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, "alias = 'demo'\nurl = 'https://example.com/repo'\nbranch = 'main'\n[skills.one.source]\ntype = 'git'\nsubpath = 'one'\nrevision = 'abcdef'\n").unwrap();
+        std::fs::write(&file, "schema = 1\nalias = 'demo'\nurl = 'https://example.com/repo'\nbranch = 'main'\n[skills.one.source]\ntype = 'git'\nsubpath = 'one'\nrevision = 'abcdef'\n").unwrap();
         let source = store
             .load("repos/demo/one")
             .unwrap()
@@ -691,7 +798,7 @@ mod tests {
         let store = MetaStore::new(&tmp);
         std::fs::write(
             store.path("foo"),
-            "# hand written comment\n[skills.foo]\nnote = \"hi\"\n",
+            "# hand written comment\nschema = 1\n[skills.foo]\nnote = \"hi\"\n",
         )
         .unwrap();
         let mut doc = MetaStore::read(&store.path("foo")).unwrap();

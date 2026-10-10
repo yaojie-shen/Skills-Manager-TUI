@@ -3,7 +3,7 @@
 
 use super::event::{Msg, Task, TaskOutput, spawn_sync_status, spawn_task};
 use super::keymap;
-use super::modal::Modal;
+use super::modal::{MessageKind, Modal};
 use super::settings::{LayoutScope, RuntimeSettings, SessionSettings};
 use super::sync_coordinator::{ProbeReason, SyncCoordinator};
 use super::theme::Theme;
@@ -450,15 +450,8 @@ impl App {
         };
         app.on_snapshot();
         app.refresh_sync_status(true, ProbeReason::Startup);
-        if let Some(report) = &app.ws.preset_migration {
-            app.toast(
-                format!(
-                    "Converted {} presets to fixed members · backup: {}",
-                    report.migrated_names.len(),
-                    report.backup_dir.display()
-                ),
-                Level::Info,
-            );
+        if let Some(report) = &app.ws.migration {
+            app.modal = Some(Modal::migration_recovery(report));
         }
         Ok(app)
     }
@@ -740,10 +733,7 @@ impl App {
                 match result {
                     Ok(report) => vec![
                         Action::Rescan,
-                        Action::OpenModal(Box::new(Modal::message(
-                            "Repair results",
-                            report.lines(),
-                        ))),
+                        Action::OpenModal(Box::new(Modal::repair_results(report.lines()))),
                     ],
                     Err(e) => vec![
                         Action::Rescan,
@@ -949,6 +939,7 @@ impl App {
                     vec![]
                 } else {
                     vec![Action::OpenModal(Box::new(Modal::Message {
+                        kind: MessageKind::Normal,
                         title: "Operation needs attention".into(),
                         lines: outcome.errors,
                         scroll: 0,
@@ -1448,6 +1439,19 @@ impl App {
                     AppCommand::Repair => vec![Action::OpenModal(Box::new(Modal::HealthRepair(
                         Box::default(),
                     )))],
+                    AppCommand::MigrationReport => {
+                        if let Some(report) = &self.ws.migration {
+                            vec![Action::OpenModal(Box::new(Modal::migration_recovery(
+                                report,
+                            )))]
+                        } else {
+                            self.toast(
+                                "No metadata migration ran when this library was opened.",
+                                Level::Info,
+                            );
+                            vec![]
+                        }
+                    }
                     AppCommand::RootSync => self.open_sync(true),
                     AppCommand::ToggleTags => {
                         let enabled = !self.settings.tags_enabled;
@@ -3247,17 +3251,14 @@ mod matrix_key_tests {
             ));
         }
         assert_eq!(app.pending_task_ui.len(), 2);
-        app.handle(key(KeyCode::Enter)); // Invalid preset name: keep editing.
-        assert!(matches!(&app.modal, Some(Modal::Input { .. })));
-        assert_eq!(app.pending_task_ui.len(), 2);
         app.handle(key(KeyCode::Char('b')));
         let Some(Modal::Input { input, .. }) = &app.modal else {
             panic!("lost input")
         };
         assert_eq!(input.value(), "ab/");
-        app.handle(key(KeyCode::Delete));
-        app.handle(key(KeyCode::Enter)); // Save; only the first task may appear.
-        assert!(app.ws.presets.load("ab").unwrap().is_some());
+        app.handle(key(KeyCode::Enter)); // Save with a normalized safe filename.
+        assert!(app.ws.presets.load("ab/").unwrap().is_some());
+        assert!(app.ws.presets.dir.join("ab.toml").exists());
         let Some(Modal::Repository(picker)) = &app.modal else {
             panic!("expected first result")
         };
@@ -3831,6 +3832,64 @@ mod escape_hierarchy_tests {
     }
     fn key(app: &mut App, code: KeyCode) {
         app.handle(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn migration_startup_modal_dismisses_and_palette_reopens_or_explains_absence() {
+        let root = skills::ops::DownloadDir::new("app-migration-recovery").unwrap();
+        let meta = skills::paths::meta_dir(root.path());
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::write(
+            meta.join("config.toml"),
+            "schema = 1\ntags = [{ name = 'work', skills = ['one'] }]\n",
+        )
+        .unwrap();
+        let ws = Workspace::open(root.path()).unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut migrated_app = App::new(ws, tx).unwrap();
+        assert!(matches!(
+            migrated_app.modal,
+            Some(Modal::Message {
+                kind: MessageKind::MigrationRecovery,
+                ..
+            })
+        ));
+        key(&mut migrated_app, KeyCode::Enter);
+        assert!(migrated_app.modal.is_none());
+        let actions =
+            migrated_app.palette_event(PaletteEvent::Execute(AppCommand::MigrationReport));
+        assert!(
+            matches!(actions.as_slice(), [Action::OpenModal(modal)] if matches!(modal.as_ref(), Modal::Message { kind: MessageKind::MigrationRecovery, .. }))
+        );
+        for action in actions {
+            migrated_app.apply(action);
+        }
+        assert!(matches!(
+            migrated_app.modal,
+            Some(Modal::Message {
+                kind: MessageKind::MigrationRecovery,
+                ..
+            })
+        ));
+
+        let (_clean_root, mut clean) = app();
+        assert!(clean.ws.migration.is_none());
+        assert!(
+            clean
+                .palette_event(PaletteEvent::Execute(AppCommand::MigrationReport))
+                .is_empty()
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| clean.draw(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("No metadata migration ran when this library was opened."));
     }
 
     #[test]
@@ -4751,6 +4810,7 @@ mod context_menu_tests {
         );
 
         app.modal = Some(Modal::Message {
+            kind: MessageKind::Normal,
             title: "status".into(),
             lines: vec!["line".into()],
             scroll: 0,

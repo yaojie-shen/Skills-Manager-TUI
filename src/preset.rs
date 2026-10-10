@@ -3,7 +3,6 @@
 
 use crate::config::Config;
 use crate::paths::meta_dir;
-use crate::util::write_atomic;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,8 +11,7 @@ use toml_edit::DocumentMut;
 
 pub const PRESET_DIR: &str = "presets";
 
-mod migration;
-pub use migration::MigrationReport;
+pub use crate::migration::MigrationReport;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Preset {
@@ -123,144 +121,457 @@ pub fn tag_coverages(config: &Config, skills: &BTreeSet<String>) -> Vec<TagCover
 #[derive(Debug, Clone)]
 pub struct PresetStore {
     pub dir: PathBuf,
+    root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct StoredPreset {
+    path: PathBuf,
+    preset: Preset,
+    bytes: Vec<u8>,
 }
 
 impl PresetStore {
     pub fn new(root: &Path) -> Self {
         Self {
             dir: meta_dir(root).join(PRESET_DIR),
+            root: root.to_path_buf(),
         }
+    }
+
+    fn path_for_stem(&self, stem: &str) -> PathBuf {
+        self.dir.join(format!("{stem}.toml"))
     }
 
     pub fn path(&self, name: &str) -> PathBuf {
-        self.dir.join(format!("{name}.toml"))
-    }
-
-    /// Check the stored spelling, even on a case-insensitive filesystem.
-    pub fn contains_name(&self, name: &str) -> Result<bool> {
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e.into()),
-        };
-        let filename = format!("{name}.toml");
-        for entry in entries {
-            if entry?.file_name() == filename.as_str() {
-                return Ok(true);
-            }
+        let normalized = crate::group_filename::normalize_name(name).ok();
+        if let (Some(name), Ok(entries)) = (normalized.as_ref(), self.entries())
+            && let Some(entry) = entries.iter().find(|entry| &entry.preset.name == name)
+        {
+            return entry.path.clone();
         }
-        Ok(false)
+        let stem = crate::group_filename::safe_stem(name).unwrap_or_else(|_| "invalid".into());
+        self.path_for_stem(&stem)
     }
 
-    pub fn load(&self, name: &str) -> Result<Option<Preset>> {
-        let path = self.path(name);
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                let value: toml::Value = toml::from_str(&text)?;
-                anyhow::ensure!(
-                    value.get("tags").is_none(),
-                    "legacy Tag references in {}; reopen the workspace to migrate this preset",
+    fn entries(&self) -> Result<Vec<StoredPreset>> {
+        let files = crate::file_set::read_store(
+            &meta_dir(&self.root),
+            PRESET_DIR,
+            "preset",
+            &crate::util::is_store_document_name,
+            &mut |_, _, _| Ok(()),
+        )?;
+        self.parse_entries(files)
+    }
+
+    /// Validate preset documents produced by a migration, which must also use
+    /// the canonical filenames for the whole set.
+    pub(crate) fn validate_documents(&self, files: Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
+        let entries = self.parse_entries(files)?;
+        let allocation = crate::group_filename::allocate(
+            entries.iter().map(|entry| entry.preset.name.as_str()),
+        )?;
+        for entry in &entries {
+            let expected = self.path_for_stem(&allocation[&entry.preset.name]);
+            anyhow::ensure!(
+                entry.path == expected,
+                "noncanonical preset filename {} (expected {})",
+                entry.path.display(),
+                expected.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Parse preset documents already read from this store's directory.
+    /// Filenames need not be canonical: root sync can merge presets created on
+    /// different machines, and the next write to the store renames them.
+    fn parse_entries(&self, files: Vec<(PathBuf, Vec<u8>)>) -> Result<Vec<StoredPreset>> {
+        let mut out = Vec::new();
+        let mut names: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for (path, bytes) in files {
+            let text = std::str::from_utf8(&bytes)?;
+            let mut doc: DocumentMut = text
+                .parse()
+                .with_context(|| format!("invalid preset: {}", path.display()))?;
+            crate::schema::require_current(&doc, &path, "preset", crate::schema::PRESET, 0)?;
+            anyhow::ensure!(
+                doc.get("tags").is_none(),
+                "{} uses legacy preset Tag references, but this Skills Manager expects fixed skill members; {}",
+                path.display(),
+                crate::schema::legacy_advice()
+            );
+            doc.remove("schema");
+            let mut preset: Preset = toml::from_str(&doc.to_string())
+                .with_context(|| format!("invalid preset: {}", path.display()))?;
+            preset.name = crate::group_filename::normalize_name(&preset.name)?;
+            if let Some(first) = names.insert(preset.name.clone(), path.clone()) {
+                bail!(
+                    "duplicate preset name {} in {} and {}; merge or rename one of them",
+                    preset.name,
+                    first.display(),
                     path.display()
                 );
-                let p: Preset = toml::from_str(&text)
-                    .with_context(|| format!("invalid preset: {}", path.display()))?;
-                Ok(Some(p))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-        }
-    }
-
-    pub fn list(&self) -> Result<Vec<Preset>> {
-        let mut out = Vec::new();
-        let rd = match std::fs::read_dir(&self.dir) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e.into()),
-        };
-        let mut names: Vec<String> = rd
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let n = e.file_name().to_string_lossy().into_owned();
-                n.strip_suffix(".toml").map(|s| s.to_string())
-            })
-            .collect();
-        names.sort();
-        for n in names {
-            if let Some(p) = self.load(&n)? {
-                out.push(p);
-            }
+            out.push(StoredPreset {
+                path,
+                preset,
+                bytes,
+            });
         }
         Ok(out)
     }
 
-    pub fn save(&self, preset: &Preset) -> Result<()> {
-        if !crate::util::valid_skill_key(&preset.name) {
-            bail!("invalid preset name: {}", preset.name);
-        }
-        let mut preset = preset.clone();
-        preset.skills = preset.members();
-        let text = toml::to_string_pretty(&preset)?;
-        write_atomic(&self.path(&preset.name), text.as_bytes())
+    fn serialize(preset: &Preset) -> Result<Vec<u8>> {
+        let mut doc = toml::to_string_pretty(preset)?.parse::<DocumentMut>()?;
+        crate::schema::set(&mut doc, crate::schema::PRESET);
+        Ok(doc.to_string().into_bytes())
     }
 
-    /// Remove a fixed skill key without rewriting unrelated fields or comments.
+    fn apply(&self, before: &[StoredPreset], presets: Vec<Preset>) -> Result<()> {
+        let allocation = crate::group_filename::allocate(presets.iter().map(|p| p.name.as_str()))?;
+        let previous: BTreeMap<_, _> = before
+            .iter()
+            .map(|entry| (entry.preset.name.clone(), entry))
+            .collect();
+        let desired: Vec<_> = presets
+            .into_iter()
+            .map(|mut preset| {
+                preset.name = crate::group_filename::normalize_name(&preset.name)?;
+                preset.skills = preset.members();
+                let path = self.path_for_stem(&allocation[&preset.name]);
+                let bytes = if let Some(old) = previous.get(&preset.name) {
+                    if old.preset == preset {
+                        old.bytes.clone()
+                    } else {
+                        let mut doc = std::str::from_utf8(&old.bytes)?.parse::<DocumentMut>()?;
+                        let fresh = toml::to_string(&preset)?.parse::<DocumentMut>()?;
+                        for field in ["name", "description", "color", "skills", "agents"] {
+                            if let Some(value) = fresh.get(field) {
+                                doc[field] = value.clone();
+                            } else {
+                                doc.remove(field);
+                            }
+                        }
+                        crate::schema::set(&mut doc, crate::schema::PRESET);
+                        doc.to_string().into_bytes()
+                    }
+                } else {
+                    Self::serialize(&preset)?
+                };
+                Ok(StoredPreset {
+                    path,
+                    preset,
+                    bytes,
+                })
+            })
+            .collect::<Result<_>>()?;
+        self.apply_entries(before, &desired)
+    }
+
+    fn apply_entries(&self, before: &[StoredPreset], desired: &[StoredPreset]) -> Result<()> {
+        for entry in before {
+            anyhow::ensure!(
+                std::fs::read(&entry.path)? == entry.bytes,
+                "preset {} changed during this operation",
+                entry.preset.name
+            );
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        let sources: BTreeSet<_> = before.iter().map(|e| e.path.clone()).collect();
+        let physical: Vec<_> = std::fs::read_dir(&self.dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<_>>()?;
+        for entry in desired {
+            crate::util::reject_ignored_occupant(&physical, &sources, &entry.path, "preset")?;
+            // A case-only rename may resolve to an existing source on macOS.
+            let source_collision = before.iter().any(|source| {
+                source
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(crate::group_filename::collision_key)
+                    == entry
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(crate::group_filename::collision_key)
+            });
+            anyhow::ensure!(
+                sources.contains(&entry.path) || source_collision || !entry.path.exists(),
+                "preset destination {} appeared during this operation",
+                entry.path.display()
+            );
+        }
+        crate::file_set::publish_changes(
+            &crate::file_set::Target::store(&meta_dir(&self.root), PRESET_DIR),
+            &before
+                .iter()
+                .map(|entry| crate::file_set::File {
+                    path: &entry.path,
+                    bytes: &entry.bytes,
+                })
+                .collect::<Vec<_>>(),
+            &desired
+                .iter()
+                .map(|entry| crate::file_set::File {
+                    path: &entry.path,
+                    bytes: &entry.bytes,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .context("publishing preset files")
+    }
+
+    pub fn contains_name(&self, name: &str) -> Result<bool> {
+        let name = crate::group_filename::normalize_name(name)?;
+        Ok(self
+            .entries()?
+            .iter()
+            .any(|entry| entry.preset.name == name))
+    }
+
+    pub fn load(&self, name: &str) -> Result<Option<Preset>> {
+        let name = crate::group_filename::normalize_name(name)?;
+        Ok(self
+            .entries()?
+            .into_iter()
+            .find(|entry| entry.preset.name == name)
+            .map(|entry| entry.preset))
+    }
+
+    pub fn list(&self) -> Result<Vec<Preset>> {
+        Ok(self
+            .entries()?
+            .into_iter()
+            .map(|entry| entry.preset)
+            .collect())
+    }
+
+    pub fn save(&self, preset: &Preset) -> Result<()> {
+        let _lock = crate::meta::MetaStore::new(&self.root).lock()?;
+        let mut preset = preset.clone();
+        preset.name = crate::group_filename::normalize_name(&preset.name)?;
+        let before = self.entries()?;
+        let mut values: Vec<_> = before.iter().map(|e| e.preset.clone()).collect();
+        match values.iter_mut().find(|p| p.name == preset.name) {
+            Some(current) => *current = preset,
+            None => values.push(preset),
+        }
+        self.apply(&before, values)
+    }
+
     pub fn remove_skill(&self, name: &str, key: &str) -> Result<bool> {
-        let path = self.path(name);
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let mut doc = text
-            .parse::<DocumentMut>()
-            .with_context(|| format!("invalid preset: {}", path.display()))?;
-        let Some(skills) = doc.get_mut("skills").and_then(|item| item.as_array_mut()) else {
+        let _lock = crate::meta::MetaStore::new(&self.root).lock()?;
+        let before = self.entries()?;
+        let mut values: Vec<_> = before.iter().map(|e| e.preset.clone()).collect();
+        let Some(preset) = values.iter_mut().find(|p| p.name == name) else {
             return Ok(false);
         };
-        let old_len = skills.len();
-        skills.retain(|value| value.as_str() != Some(key));
-        if skills.len() == old_len {
+        let old = preset.skills.len();
+        preset.skills.retain(|skill| skill != key);
+        if old == preset.skills.len() {
             return Ok(false);
         }
-        write_atomic(&path, doc.to_string().as_bytes())?;
+        self.apply(&before, values)?;
         Ok(true)
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {
-        let path = self.path(name);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("no such preset: {name}"),
-            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        let _lock = crate::meta::MetaStore::new(&self.root).lock()?;
+        let name = crate::group_filename::normalize_name(name)?;
+        let before = self.entries()?;
+        let mut found = false;
+        let values = before
+            .iter()
+            .filter_map(|e| {
+                found |= e.preset.name == name;
+                (e.preset.name != name).then(|| e.preset.clone())
+            })
+            .collect();
+        if !found {
+            bail!("no such preset: {name}");
+        }
+        self.apply(&before, values)
+    }
+
+    pub fn rename(&self, old: &str, new: &str) -> Result<Preset> {
+        let _lock = crate::meta::MetaStore::new(&self.root).lock()?;
+        let old = crate::group_filename::normalize_name(old)?;
+        let new = crate::group_filename::normalize_name(new)?;
+        let before = self.entries()?;
+        if old == new {
+            return before
+                .into_iter()
+                .find(|e| e.preset.name == old)
+                .map(|e| e.preset)
+                .with_context(|| format!("no such preset: {old}"));
+        }
+        anyhow::ensure!(
+            !before.iter().any(|e| e.preset.name == new),
+            "preset {new} already exists"
+        );
+        let source = before
+            .iter()
+            .find(|e| e.preset.name == old)
+            .with_context(|| format!("no such preset: {old}"))?;
+        let mut doc = std::str::from_utf8(&source.bytes)?.parse::<DocumentMut>()?;
+        doc["name"] = toml_edit::value(&new);
+        let mut values: Vec<_> = before.iter().map(|e| e.preset.clone()).collect();
+        let renamed = values.iter_mut().find(|p| p.name == old).unwrap();
+        renamed.name = new.clone();
+        let result = renamed.clone();
+        let allocation = crate::group_filename::allocate(values.iter().map(|p| p.name.as_str()))?;
+        let previous: BTreeMap<_, _> = before.iter().map(|e| (e.preset.name.clone(), e)).collect();
+        let desired: Vec<_> = values
+            .into_iter()
+            .map(|p| {
+                let path = self.path_for_stem(&allocation[&p.name]);
+                let bytes = if p.name == new {
+                    doc.to_string().into_bytes()
+                } else {
+                    previous[&p.name].bytes.clone()
+                };
+                StoredPreset {
+                    path,
+                    preset: p,
+                    bytes,
+                }
+            })
+            .collect();
+        // Keep the prepared document (including hand-edited comments).
+        self.apply_entries(&before, &desired)?;
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::DownloadDir;
+
+    #[test]
+    fn stray_store_files_are_ignored_and_left_alone() {
+        let temp = DownloadDir::new("preset-strays").unwrap();
+        let store = PresetStore::new(temp.path());
+        std::fs::create_dir_all(store.dir.join("notes")).unwrap();
+        let strays = [".DS_Store", "daily.toml~", "README", ".daily.toml.tmp-1"];
+        for name in strays {
+            std::fs::write(store.dir.join(name), b"stray").unwrap();
+        }
+        store
+            .save(&Preset {
+                name: "daily".into(),
+                skills: vec!["one".into()],
+                ..Preset::default()
+            })
+            .unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert!(store.load("daily").unwrap().is_some());
+        assert!(store.remove_skill("daily", "one").unwrap());
+        store.rename("daily", "weekly").unwrap();
+        store.remove("weekly").unwrap();
+        assert!(store.list().unwrap().is_empty());
+        for name in strays {
+            assert_eq!(std::fs::read(store.dir.join(name)).unwrap(), b"stray");
+        }
+        assert!(store.dir.join("notes").is_dir());
+    }
+
+    #[test]
+    fn merged_noncanonical_filenames_open_and_the_next_write_canonicalizes() {
+        for (first, second) in [("Work", "work"), ("A/B", "A-B")] {
+            let temp = DownloadDir::new("preset-merged-noncanonical").unwrap();
+            let store = PresetStore::new(temp.path());
+            std::fs::create_dir_all(&store.dir).unwrap();
+            for (file, name) in [("one.toml", first), ("two.toml", second)] {
+                std::fs::write(
+                    store.dir.join(file),
+                    format!("# {file}\nschema = 1\nname = '{name}'\nskills = ['{file}']\n"),
+                )
+                .unwrap();
+            }
+            assert_eq!(store.list().unwrap().len(), 2);
+            store
+                .save(&Preset {
+                    name: "extra".into(),
+                    ..Preset::default()
+                })
+                .unwrap();
+            let entries = store.entries().unwrap();
+            let allocation = crate::group_filename::allocate(
+                entries.iter().map(|entry| entry.preset.name.as_str()),
+            )
+            .unwrap();
+            for entry in &entries {
+                assert_eq!(
+                    entry.path,
+                    store.path_for_stem(&allocation[&entry.preset.name])
+                );
+            }
+            assert_eq!(std::fs::read_dir(&store.dir).unwrap().count(), 3);
+            let kept = std::fs::read_to_string(store.path(first)).unwrap();
+            assert!(kept.starts_with("# one.toml"), "{kept}");
+            assert_eq!(store.load(second).unwrap().unwrap().skills, ["two.toml"]);
         }
     }
 
-    /// Move a preset to a new name. The name is inside the file as well as on
-    /// it, so this is a save under the new name followed by removing the old
-    /// file rather than a rename of the file itself. That order also means a
-    /// crash between the two leaves both copies, which is easy to see and fix,
-    /// where the other order could leave none. Only the preset file moves;
-    /// deployment state is not stored in the preset.
-    pub fn rename(&self, old: &str, new: &str) -> Result<Preset> {
-        let mut p = self
-            .load(old)?
-            .with_context(|| format!("no such preset: {old}"))?;
-        let aliases_old = old != new
-            && old.eq_ignore_ascii_case(new)
-            && self.path(new).exists()
-            && !self.contains_name(new)?;
-        if self.path(new).exists() && !aliases_old {
-            bail!("preset {new} already exists");
+    #[test]
+    fn duplicate_names_name_both_files() {
+        let temp = DownloadDir::new("preset-duplicate-files").unwrap();
+        let store = PresetStore::new(temp.path());
+        std::fs::create_dir_all(&store.dir).unwrap();
+        for file in ["one.toml", "two.toml"] {
+            std::fs::write(store.dir.join(file), "schema = 1\nname = 'same'\n").unwrap();
         }
-        p.name = new.to_string();
-        // `save` refuses an invalid name, and does so before the old file
-        // goes, so a bad name loses nothing.
-        self.save(&p)?;
-        // Atomic replacement can retain the existing filename's spelling.
-        // Rename that entry explicitly; removing `old` would delete the result.
-        if aliases_old {
-            std::fs::rename(self.path(old), self.path(new))?;
-        } else {
-            self.remove(old)?;
-        }
-        Ok(p)
+        let error = format!("{:#}", store.list().unwrap_err());
+        assert!(error.contains("duplicate preset name same"), "{error}");
+        assert!(
+            error.contains("one.toml") && error.contains("two.toml"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_ignored_file_holding_the_destination_name_is_named() {
+        let temp = DownloadDir::new("preset-ignored-occupant").unwrap();
+        let store = PresetStore::new(temp.path());
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let occupant = store.dir.join("Daily.TOML");
+        std::fs::write(&occupant, b"foreign").unwrap();
+        let error = format!(
+            "{:#}",
+            store
+                .save(&Preset {
+                    name: "daily".into(),
+                    ..Preset::default()
+                })
+                .unwrap_err()
+        );
+        assert!(
+            error.contains(&format!("{} already uses that name", occupant.display())),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&occupant).unwrap(), b"foreign");
+        // Compare exact names: on a case-insensitive filesystem `daily.toml`
+        // resolves to `Daily.TOML`, so an existence check cannot tell them apart.
+        let names: Vec<_> = std::fs::read_dir(&store.dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["Daily.TOML"]);
+    }
+
+    #[test]
+    fn toml_symlink_entries_are_still_rejected() {
+        let temp = DownloadDir::new("preset-symlink").unwrap();
+        let store = PresetStore::new(temp.path());
+        std::fs::create_dir_all(&store.dir).unwrap();
+        let target = temp.path().join("elsewhere.toml");
+        std::fs::write(&target, "schema = 1\nname = 'linked'\n").unwrap();
+        std::os::unix::fs::symlink(&target, store.dir.join("linked.toml")).unwrap();
+        let error = store.list().unwrap_err();
+        assert!(format!("{error:#}").contains("invalid preset store entry"));
     }
 }

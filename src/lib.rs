@@ -5,17 +5,23 @@
 pub mod agents;
 pub mod config;
 pub mod dict;
+mod file_set;
+pub(crate) mod group_filename;
 pub mod hash;
 pub mod history;
 pub mod meta;
+pub mod migration;
 pub mod ops;
 pub mod paths;
 pub mod preset;
 pub mod reconcile;
 pub mod repository;
+pub(crate) mod schema;
 pub mod search;
 pub mod skill;
+pub mod tag;
 pub mod util;
+pub mod warnings;
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -30,28 +36,16 @@ pub struct Workspace {
     pub inventory_products: Option<std::collections::BTreeSet<String>>,
     pub config: config::Config,
     pub meta: meta::MetaStore,
+    pub tags: tag::TagStore,
     pub presets: preset::PresetStore,
-    pub preset_migration: Option<preset::MigrationReport>,
+    pub migration: Option<migration::MigrationReport>,
 }
 
 impl Workspace {
     pub fn open(root: &Path) -> Result<Self> {
-        // Library callers need the same canonical root as the CLI. In
-        // particular, macOS /var and /private/var can name the same directory.
         let root = paths::resolve_root(Some(root))?;
-        let config = config::Config::load(&root)?;
-        let presets = preset::PresetStore::new(&root);
-        let preset_migration = presets.migrate_legacy_tags(&config)?;
-        Ok(Self {
-            meta: meta::MetaStore::new(&root),
-            presets,
-            preset_migration,
-            root,
-            project: None,
-            inventory_project: None,
-            inventory_products: None,
-            config,
-        })
+        let migration = migration::ensure_current(&root)?;
+        Self::load_current(root, None, migration)
     }
 
     /// Open an isolated project store; never consult the global root pointer.
@@ -64,35 +58,47 @@ impl Workspace {
         if create {
             std::fs::create_dir_all(&root)?;
         }
-        // Do not load global defaults even when no local config exists yet.
         let root = paths::resolve_root(Some(&root))?;
+        let migration = migration::ensure_current(&root)?;
+        Self::load_current(root, Some(project), migration)
+    }
+
+    fn load_current(
+        root: PathBuf,
+        project: Option<PathBuf>,
+        migration: Option<migration::MigrationReport>,
+    ) -> Result<Self> {
         let mut ws = Self {
             meta: meta::MetaStore::new(&root),
+            tags: tag::TagStore::new(&root),
             presets: preset::PresetStore::new(&root),
-            preset_migration: None,
+            migration,
             root,
-            project: Some(project),
+            project,
             inventory_project: None,
             inventory_products: None,
-            config: config::Config::local_default(),
+            config: config::Config::default(),
         };
         ws.config = ws.load_config()?;
-        ws.preset_migration = ws.presets.migrate_legacy_tags(&ws.config)?;
         Ok(ws)
     }
 
     pub fn load_config(&self) -> Result<config::Config> {
+        // Rejects a layout newer than this build, e.g. after a root-sync pull.
+        migration::version::read(&self.root)?;
         let Some(project) = &self.project else {
-            let config = config::Config::load(&self.root)?;
-            return Ok(config);
+            return config::Config::load(&self.root);
         };
-        let mut config = if config::Config::exists(&self.root) {
+        let exists = config::Config::exists(&self.root);
+        let mut config = if exists {
             config::Config::load(&self.root)?
         } else {
-            config::Config::local_default()
+            let mut config = config::Config::local_default();
+            config.tags = self.tags.list()?;
+            config
         };
         // An omitted agents table also means local defaults.
-        if config::Config::exists(&self.root) {
+        if exists {
             let text = std::fs::read_to_string(config::Config::path(&self.root))?;
             let doc: toml::Value = toml::from_str(&text)?;
             if doc.get("agents").is_none() {

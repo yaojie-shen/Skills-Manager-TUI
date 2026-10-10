@@ -1,0 +1,12 @@
+# preserved config comment
+schema = 1
+tags_enabled = true
+
+[[tags]]
+name = "work"
+skills = ["two", "one"]
+color = "blue"
+description = "Work tools"
+
+[deploy]
+legacy = true

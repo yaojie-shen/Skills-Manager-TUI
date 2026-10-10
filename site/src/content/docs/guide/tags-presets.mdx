@@ -60,6 +60,6 @@ Tag-picker changes apply immediately, so `Esc` closes the picker without reverti
 
 Set `tags_enabled = false` to hide tag classification and disable tag commands without deleting tag or preset data. The TUI command palette and `Ctrl+O` expose the same confirmed toggle.
 
-Tags live in `.skills-meta/config.toml`. Presets live in `.skills-meta/presets/<name>.toml` and store their skills and Agents explicitly. Duplicate skill keys are deduplicated.
+Each tag lives in its own `.skills-meta/tags/<tag>.toml` file. Presets live in `.skills-meta/presets/<name>.toml` and store their skills and Agents explicitly. Duplicate skill keys are deduplicated.
 
-Opening older tag-based preset data may migrate it to fixed members. Skills Manager reports the backup directory; keep that backup until the resulting membership is confirmed.
+Opening tags or presets written by an older version upgrades them first: tags move out of `config.toml` into their own files, and presets that list tags get those tags' skills as fixed members. Skills Manager reports the backup directory; keep that backup until the resulting membership is confirmed. See [metadata format upgrades](../configuration/#metadata-format-upgrades).

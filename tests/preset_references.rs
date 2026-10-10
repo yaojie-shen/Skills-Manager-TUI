@@ -226,13 +226,14 @@ fn legacy_migration_snapshots_members_once_and_keeps_exact_backups() {
     std::fs::create_dir_all(&f.ws.presets.dir).unwrap();
     let original = "# keep the original format for recovery\nname = 'daily'\ndescription = 'Daily tools'\ncolor = '#b87e54'\nskills = ['extra', 'one', 'extra', 'missing']\ntags = ['work', 'study', 'work']\nagents = ['a']\n";
     let empty = "name = 'empty'\ntags = []\nskills = ['two', 'two']\n";
-    let modern = "# A fixed preset must not be inferred or rewritten\nname = 'modern'\nskills = ['two', 'one', 'one']\n";
+    let modern = "# A fixed preset must not be inferred or rewritten\nschema = 1\nname = 'modern'\nskills = ['two', 'one', 'one']\n";
     std::fs::write(f.ws.presets.path("daily"), original).unwrap();
     std::fs::write(f.ws.presets.path("empty"), empty).unwrap();
     std::fs::write(f.ws.presets.path("modern"), modern).unwrap();
+    std::fs::remove_file(skills::migration::version::path(&f.ws.root)).unwrap();
     assert!(f.ws.presets.load("daily").is_err());
     let mut ws = Workspace::open(&f.ws.root).unwrap();
-    let report = ws.preset_migration.as_ref().unwrap();
+    let report = ws.migration.as_ref().unwrap();
     assert_eq!(report.migrated_names, ["daily", "empty"]);
     assert!(
         report
@@ -240,11 +241,11 @@ fn legacy_migration_snapshots_members_once_and_keeps_exact_backups() {
             .starts_with(f.ws.root.join(".skills-meta/backups"))
     );
     assert_eq!(
-        std::fs::read(report.backup_dir.join("daily.toml")).unwrap(),
+        std::fs::read(report.backup_dir.join("presets/daily.toml")).unwrap(),
         original.as_bytes()
     );
     assert_eq!(
-        std::fs::read(report.backup_dir.join("empty.toml")).unwrap(),
+        std::fs::read(report.backup_dir.join("presets/empty.toml")).unwrap(),
         empty.as_bytes()
     );
     assert_eq!(
@@ -267,13 +268,11 @@ fn legacy_migration_snapshots_members_once_and_keeps_exact_backups() {
         "migration must not deploy any members"
     );
     let backup_parent = report.backup_dir.parent().unwrap().to_path_buf();
+    assert!(Workspace::open(&ws.root).unwrap().migration.is_none());
     assert!(
-        Workspace::open(&ws.root)
-            .unwrap()
-            .preset_migration
-            .is_none()
+        std::fs::read_dir(backup_parent).unwrap().count() >= 1,
+        "Tag and Preset upgrades may have separate one-time backups"
     );
-    assert_eq!(std::fs::read_dir(backup_parent).unwrap().count(), 1);
     Config::edit_tags(&ws.root, |tags| tags.clear()).unwrap();
     ws.config = ws.load_config().unwrap();
     assert_eq!(ws.presets.load("daily").unwrap().unwrap(), fixed);
@@ -295,8 +294,9 @@ fn migration_preflights_every_file_before_changing_any_definition() {
         let original = "name = 'daily'\ntags = ['work']\n";
         std::fs::write(f.ws.presets.path("daily"), original).unwrap();
         std::fs::write(f.ws.presets.path("z-bad"), invalid).unwrap();
+        std::fs::remove_file(skills::migration::version::path(&f.ws.root)).unwrap();
         let error = Workspace::open(&f.ws.root).unwrap_err();
-        assert!(format!("{error:#}").contains("z-bad.toml"));
+        assert!(format!("{error:#}").contains("z-bad.toml"), "{error:#}");
         assert_eq!(
             std::fs::read(f.ws.presets.path("daily")).unwrap(),
             original.as_bytes()
@@ -305,7 +305,13 @@ fn migration_preflights_every_file_before_changing_any_definition() {
             std::fs::read(f.ws.presets.path("z-bad")).unwrap(),
             invalid.as_bytes()
         );
-        assert!(!f.ws.root.join(".skills-meta/backups").exists());
+        // The fixture's old config Tags may already have been migrated and
+        // backed up; this failed Preset preflight must not add another backup.
+        let backups = f.ws.root.join(".skills-meta/backups");
+        let before = std::fs::read_dir(&backups)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert!(before <= 1);
     }
 }
 
@@ -326,6 +332,7 @@ fn local_migration_uses_only_the_project_tag_members() {
     std::fs::create_dir_all(&store.dir).unwrap();
     let original = "name = 'daily'\ntags = ['work']\n";
     std::fs::write(store.path("daily"), original).unwrap();
+    let _ = std::fs::remove_file(skills::migration::version::path(&root));
     let local = Workspace::open_local(&project, false).unwrap();
     assert_eq!(
         local.presets.load("daily").unwrap().unwrap().skills,
@@ -333,7 +340,7 @@ fn local_migration_uses_only_the_project_tag_members() {
     );
     assert!(
         local
-            .preset_migration
+            .migration
             .unwrap()
             .backup_dir
             .starts_with(std::fs::canonicalize(root).unwrap())
@@ -350,6 +357,7 @@ fn cli_migration_reports_backups_on_stderr_without_polluting_json() {
         "name = 'daily'\ntags = ['work']\n",
     )
     .unwrap();
+    std::fs::remove_file(skills::migration::version::path(&f.ws.root)).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_skills"))
         .args([
             "--root",
@@ -369,7 +377,64 @@ fn cli_migration_reports_backups_on_stderr_without_polluting_json() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["skills"], serde_json::json!(["one", "two"]));
     assert!(value.get("tags").is_none());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("presets-before-fixed-members-"));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let backup = std::fs::read_dir(skills::paths::meta_dir(&f.ws.root).join("backups"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(stderr.contains(&backup.display().to_string()), "{stderr}");
+}
+
+#[test]
+fn cli_mutation_reports_migration_once_with_complete_backup_path() {
+    let f = Fixture::new("migration-cli-mutation");
+    std::fs::remove_file(skills::migration::version::path(&f.ws.root)).unwrap();
+    std::fs::write(
+        skills::paths::meta_dir(&f.ws.root).join("config.toml"),
+        "schema = 1\ntags_enabled = true\ntags = [{ name = 'legacy', skills = ['one'] }]\n",
+    )
+    .unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_skills"))
+            .args([
+                "--root",
+                f.ws.root.to_str().unwrap(),
+                "--json",
+                "tag",
+                "add",
+                "three",
+                "work",
+            ])
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.matches("Metadata migration recovery:").count(), 1);
+    let backup = std::fs::read_dir(skills::paths::meta_dir(&f.ws.root).join("backups"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(stderr.contains(&backup.display().to_string()), "{stderr}");
+
+    let output = run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Metadata migration recovery:"));
 }
 
 #[test]

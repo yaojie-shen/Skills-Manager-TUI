@@ -23,6 +23,6 @@ Skills Manager stores Agent Skills in a **Library** that you choose, then deploy
 
 ## Safety boundaries
 
-- Scans and previews do not apply repairs or deployments. Loading legacy preset data during a scan may still create a backup and migrate its format.
+- Scans and previews do not apply repairs or deployments. Opening metadata written by an older version may still upgrade it, with a backup.
 - Git status probes may contact the remote, but never commit, merge, or push.
 - Automatic root sync is separate and runs only after configured Library mutations.

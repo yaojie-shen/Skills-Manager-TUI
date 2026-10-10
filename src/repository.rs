@@ -207,12 +207,17 @@ impl Repository {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "toml") {
-                let text = std::fs::read_to_string(&path)?;
-                let doc: toml::Value = toml::from_str(&text)?;
-                if doc.get("url").is_none() {
+            if crate::util::is_repository_document_name(&entry.file_name()) {
+                let document = crate::meta::MetaStore::read(&path)?;
+                let doc: toml::Value = toml::from_str(&document.to_string())?;
+                if path.file_name().is_some_and(|name| name == ".root.toml") {
                     continue;
                 }
+                anyhow::ensure!(
+                    doc.get("url").is_some(),
+                    "repository URL missing in {}",
+                    path.display()
+                );
                 let repo: Self = doc.try_into()?;
                 if !valid_skill_key(&repo.alias) {
                     bail!("invalid repository alias")
@@ -273,6 +278,7 @@ impl Repository {
         self.validate(ws)?;
         let path = Self::path(&ws.root, &self.alias);
         let mut doc = crate::meta::MetaStore::read(&path)?;
+        crate::schema::set(&mut doc, crate::schema::REPOSITORY);
         doc["alias"] = toml_edit::value(self.alias.as_str());
         doc["url"] = toml_edit::value(self.url.as_str());
         doc["kind"] = toml_edit::value(self.kind.as_str());
@@ -1152,8 +1158,7 @@ mod tests {
         let temp = DownloadDir::new("repository-filename-alias").unwrap();
         let path = Repository::path(temp.path(), "renamed");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let metadata =
-            "# hand-edited\nalias = 'original'\nurl = 'https://example.com/repo'\ncustom = true\n";
+        let metadata = "# hand-edited\nschema = 1\nalias = 'original'\nurl = 'https://example.com/repo'\ncustom = true\n";
         std::fs::write(&path, metadata).unwrap();
 
         let error = Repository::list(temp.path()).unwrap_err();

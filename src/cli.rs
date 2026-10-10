@@ -530,6 +530,9 @@ pub fn run(cli: Cli) -> Result<()> {
     } else {
         None
     };
+    if let Some(ws) = &ws {
+        print_migration_notice(ws.migration.as_ref());
+    }
     let guard = scope
         .zip(ws.as_ref())
         .map(|(scope, ws)| scope.guard(ws, "CLI Library mutation"))
@@ -545,6 +548,14 @@ pub fn run(cli: Cli) -> Result<()> {
         eprintln!("Root backup pending: {e:#}; local changes retained");
     }
     result
+}
+
+fn print_migration_notice(report: Option<&skills::migration::MigrationReport>) {
+    let Some(report) = report else { return };
+    eprintln!("Metadata migration recovery:");
+    for line in report.recovery_lines() {
+        eprintln!("{line}");
+    }
 }
 
 fn run_command(cli: Cli) -> Result<()> {
@@ -577,13 +588,7 @@ fn run_command(cli: Cli) -> Result<()> {
         )
     );
     let ws = cli.workspace(create)?;
-    if let Some(report) = &ws.preset_migration {
-        eprintln!(
-            "Migrated {} presets to fixed members; original files: {}",
-            report.migrated_names.len(),
-            report.backup_dir.display()
-        );
-    }
+    print_migration_notice(ws.migration.as_ref());
     let command = cli
         .command
         .expect("dispatcher only calls run with a subcommand");

@@ -1,0 +1,4 @@
+# preserved preset comment
+name = "daily"
+skills = ["one", "two"]
+schema = 1

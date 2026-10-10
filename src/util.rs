@@ -85,3 +85,69 @@ pub fn valid_skill_key(name: &str) -> bool {
         && !name.contains('\\')
         && name != ".."
 }
+
+/// Whether a Tag or preset store entry name is a document. Hidden names
+/// (editor swap files, `.DS_Store`, atomic-write temporaries) and names without
+/// a `.toml` extension (`work.toml~`, `README`) are not, and are left alone.
+pub(crate) fn is_store_document_name(name: &std::ffi::OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let name = name.as_bytes();
+    !name.starts_with(b".") && name.ends_with(b".toml")
+}
+
+/// Refuse to publish `destination` when a file that store readers ignore (for
+/// example `Work.TOML` or `.work.toml`) in `physical`, the store's current
+/// entries, already holds the same name once case and Unicode normalization
+/// are disregarded: case-insensitive filesystems resolve one to the other.
+pub(crate) fn reject_ignored_occupant(
+    physical: &[std::path::PathBuf],
+    sources: &std::collections::BTreeSet<std::path::PathBuf>,
+    destination: &Path,
+    kind: &str,
+) -> Result<()> {
+    let key = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(crate::group_filename::collision_key)
+    };
+    let wanted = key(destination);
+    if let Some(occupant) = physical.iter().find(|path| {
+        !sources.contains(*path)
+            && !path.file_name().is_some_and(is_store_document_name)
+            && key(path) == wanted
+    }) {
+        anyhow::bail!(
+            "cannot write {kind} file {}: {} already uses that name (ignoring case), and Skills Manager does not read it as a {kind}; rename or remove {}, then retry",
+            destination.display(),
+            occupant.display(),
+            occupant.display()
+        );
+    }
+    Ok(())
+}
+
+/// Whether a `repos/` entry name is a repository metadata document: a store
+/// document name, or the hidden `.root.toml` for standalone remote skills.
+/// Every reader of `repos/` uses this, so they agree on what they ignore.
+pub(crate) fn is_repository_document_name(name: &std::ffi::OsStr) -> bool {
+    is_store_document_name(name) || name == ".root.toml"
+}
+
+/// Reject debris left by an interrupted metadata file-set transaction.
+pub(crate) fn reject_interrupted_transaction(
+    path: &Path,
+    file_type: &std::fs::FileType,
+) -> Result<()> {
+    if file_type.is_dir()
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".file-set-"))
+    {
+        anyhow::bail!(
+            "an interrupted metadata transaction left {}; it holds original-N (pre-change files) and stage-N/claimed-N entries; restore what you need (originals are also in .skills-meta/backups when a migration was running), then remove the directory",
+            path.display()
+        );
+    }
+    Ok(())
+}

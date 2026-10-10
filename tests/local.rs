@@ -46,6 +46,19 @@ fn success(output: std::process::Output) -> String {
 }
 
 #[test]
+fn configless_local_tags_survive_reopening() {
+    let f = Fixture::new("configless-tags");
+    let root = f.0.join(".agents/skills");
+    skill(&root.join("sample"));
+    success(f.cli(&["--local", "tag", "add", "sample", "work"]));
+    let local = success(f.cli(&["--local", "--json", "tag", "list"]));
+    let global = success(f.cli(&["--root", root.to_str().unwrap(), "--json", "tag", "list"]));
+    assert_eq!(local, global);
+    assert!(local.contains("work"));
+    assert!(!Config::path(&root).exists());
+}
+
+#[test]
 fn local_cli_installs_into_standard_directory_and_deploys_to_project_agents() {
     let f = Fixture::new("cli");
     skill(&f.0.join("source"));
@@ -272,11 +285,7 @@ fn catalog_needs_no_root_and_agent_registration_preserves_global_config() {
     );
     let root = f.0.join("global");
     std::fs::create_dir_all(root.join(".skills-meta")).unwrap();
-    std::fs::write(
-        Config::path(&root),
-        "# keep my comment\n[deploy]\nall_to_all = false\n",
-    )
-    .unwrap();
+    std::fs::write(Config::path(&root), "# keep my comment\nschema = 2\n").unwrap();
     Config::add_agent(&root, &skills::agents::BUILTINS[2].config(false), false).unwrap();
     let text = std::fs::read_to_string(Config::path(&root)).unwrap();
     assert!(text.starts_with("# keep my comment\n"));

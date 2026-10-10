@@ -1,0 +1,4 @@
+schema = 1
+# preserved root comment
+[skills.local]
+note = "root"

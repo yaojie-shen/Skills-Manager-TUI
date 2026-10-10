@@ -29,20 +29,37 @@ In the CLI, `--local` and `--project DIR` use `<project>/.agents/skills` as a se
 | --- | --- |
 | `hello-skill/SKILL.md` | Local skill; valid content is recognized without a metadata record. |
 | `repos/<alias>/<local-name>/` | Remote skill content. |
-| `.skills-meta/config.toml` | Agent, tag, search, and UI settings. |
+| `.skills-meta/config.toml` | Agent, search, UI, and sync-wait settings, plus the tag toggle. |
+| `.skills-meta/tags/<tag>.toml` | One tag: its name, skills, color, and description. |
 | `.skills-meta/repos/<alias>.toml` | Source identity and remote-skill metadata. |
 | `.skills-meta/repos/.root.toml` | Standalone remote-skill metadata. |
 | `.skills-meta/presets/<name>.toml` | Fixed preset members and target Agents. |
+| `.skills-meta/format.toml` | Metadata format version, written by Skills Manager. Do not edit it. |
 | `.git/config` | Root backup remote, branch, and enablement. |
 
-The Library stores its data in files. Local skills do not have per-skill notes or baselines. Reconciliation does not change skill content. If it opens legacy preset data, however, it may create a backup and migrate the file format.
+The Library stores its data in files. Local skills do not have per-skill notes or baselines. Reconciliation does not change skill content. Opening metadata written by an older version upgrades it first, as described in [metadata format upgrades](#metadata-format-upgrades).
+
+## Metadata format upgrades
+
+`.skills-meta/format.toml` records the format version of the Library's metadata. It is synced with the rest of the root, so keep every machine that syncs the Library on an up-to-date Skills Manager.
+
+When Skills Manager opens metadata written by an older version, it upgrades the files before anything else runs. Older metadata includes tags inside `config.toml`, presets that list tags instead of skills, and files without a `schema` field.
+
+- Every file is checked first. If any file cannot be upgraded, nothing is written and the error names the file.
+- Tags with the same name in an old `config.toml` are merged and their skills combined. If their colors or descriptions differ, the upgrade stops so you can choose one.
+- If a tag in `config.toml` is defined differently from its file in `.skills-meta/tags/`, for example after a machine with an older Skills Manager synced tags back into `config.toml`, the upgrade stops and names both. Make the two definitions match, or remove the `config.toml` entry you do not want, then open the Library again.
+- Before writing, the original files are copied to `.skills-meta/backups/metadata-before-layout-v<from>-to-v<to>-<timestamp>/` under their original paths. The backup holds only the files the upgrade changed or removed.
+- The CLI prints the backup path on stderr. The TUI shows a report at startup; until you quit, reopen it with **Show metadata migration report** in the command palette.
+- If root sync is running at that moment, the upgrade stops without writing. Open the Library again once the sync finishes.
+
+If an upgrade is interrupted, open the Library again: it continues and reaches the same result, unless the error asks for manual recovery. To run the upgrade again from the original files, copy the originals you need from the backup back into `.skills-meta`. Copy `format.toml` too if the backup has one; otherwise delete `.skills-meta/format.toml`. Then open the Library again, and Skills Manager upgrades those files again. The backup does not contain files the upgrade created, such as `tags/*.toml`; they stay in `.skills-meta`, so delete them first if the upgrade should start from the originals alone.
 
 ## UI settings
 
 Add keys to existing TOML tables; TOML does not allow the same table twice.
 
 ```toml
-schema = 1
+schema = 2
 tags_enabled = true
 
 [ui]

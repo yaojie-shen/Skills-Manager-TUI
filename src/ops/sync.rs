@@ -783,6 +783,62 @@ fn classify_auto_failure(error: anyhow::Error) -> AutoSyncFailure {
     }
 }
 
+fn remove_matching_generated_declaration(
+    ws: &Workspace,
+    remote_ref: &str,
+) -> Result<Option<Vec<u8>>> {
+    const DECLARATION: &str = ".skills-meta/format.toml";
+    let path = crate::migration::version::path(&ws.root);
+    let generated = crate::migration::version::content();
+    let local = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if local != generated {
+        return Ok(None);
+    }
+    let untracked = git(
+        &[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+            DECLARATION,
+        ],
+        Some(&ws.root),
+    )?;
+    if untracked.trim() != DECLARATION {
+        return Ok(None);
+    }
+    let metadata = git(
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            remote_ref,
+            "--",
+            ".skills-meta",
+        ],
+        Some(&ws.root),
+    )?;
+    if metadata.lines().any(|path| path == DECLARATION) {
+        let remote = git(
+            &["show", &format!("{remote_ref}:{DECLARATION}")],
+            Some(&ws.root),
+        )?;
+        if remote.as_bytes() != generated {
+            return Ok(None);
+        }
+    } else if metadata.trim().is_empty() {
+        return Ok(None);
+    }
+    // Otherwise the remote holds metadata written before declarations
+    // existed: drop ours so the next open detects that metadata and upgrades it.
+    std::fs::remove_file(path)?;
+    Ok(Some(local))
+}
+
 fn run_checked(
     ws: &Workspace,
     mode: Mode,
@@ -849,17 +905,25 @@ fn run_checked(
         )
         .is_ok()
         {
-            validate_tree(ws, Some("refs/remotes/origin/skills-root-sync"))?;
-            git(
+            let remote_ref = "refs/remotes/origin/skills-root-sync";
+            validate_tree(ws, Some(remote_ref))?;
+            let removed_declaration = remove_matching_generated_declaration(ws, remote_ref)?;
+            if let Err(error) = git(
                 &[
                     "checkout",
                     "--no-overwrite-ignore",
                     "-B",
                     &branch,
-                    "refs/remotes/origin/skills-root-sync",
+                    remote_ref,
                 ],
                 Some(&ws.root),
-            )?;
+            ) {
+                if let Some(contents) = removed_declaration {
+                    std::fs::write(crate::migration::version::path(&ws.root), contents)
+                        .context("restore local Skill Home declaration after failed checkout")?;
+                }
+                return Err(error);
+            }
             report.pulled = true;
         }
     }
@@ -1041,7 +1105,11 @@ pub struct MutationGuard {
 
 impl MutationGuard {
     pub fn acquire(ws: &Workspace, operation: &str) -> Result<Self> {
-        let git_dir = ws.root.join(".git");
+        Self::acquire_root(&ws.root, operation)
+    }
+
+    pub(crate) fn acquire_root(root: &Path, operation: &str) -> Result<Self> {
+        let git_dir = root.join(".git");
         if !git_dir.is_dir() {
             return Ok(Self {
                 _guard: FileGuard(None),
@@ -1049,6 +1117,20 @@ impl MutationGuard {
         }
         FileGuard::acquire(git_dir.join("skills-sync.lock"), operation)
             .map(|guard| Self { _guard: guard })
+    }
+
+    pub(crate) fn try_acquire_root(root: &Path, operation: &str) -> Result<Option<Self>> {
+        let git_dir = root.join(".git");
+        if !git_dir.is_dir() {
+            return Ok(Some(Self {
+                _guard: FileGuard(None),
+            }));
+        }
+        match FileGuard::acquire(git_dir.join("skills-sync.lock"), operation) {
+            Ok(guard) => Ok(Some(Self { _guard: guard })),
+            Err(error) if error.downcast_ref::<CoordinationBusy>().is_some() => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 }
 

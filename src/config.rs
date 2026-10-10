@@ -6,6 +6,7 @@
 //! at load time.
 
 use crate::paths::{expand_tilde, meta_dir};
+pub use crate::tag::Tag as TagConfig;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -20,7 +21,9 @@ pub struct Config {
     pub schema: u32,
     #[serde(default = "default_agents")]
     pub agents: Vec<AgentConfig>,
-    #[serde(default)]
+    /// Runtime aggregate. Current init omits this field; legacy files and
+    /// internal fixtures may still serialize it for one-time migration.
+    #[serde(default, skip_serializing)]
     pub tags: Vec<TagConfig>,
     #[serde(default = "default_true")]
     pub tags_enabled: bool,
@@ -269,18 +272,6 @@ impl AgentConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TagConfig {
-    #[serde(default)]
-    pub skills: Vec<String>,
-    pub name: String,
-    #[serde(default)]
-    pub color: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
 fn comment_key(table: &mut Table, key: &str, prefix: &str) {
     if let Some(mut key) = table.key_mut(key) {
         key.leaf_decor_mut().set_prefix(prefix);
@@ -322,7 +313,7 @@ fn comment_nested_table_value(
 }
 
 fn default_schema() -> u32 {
-    1
+    crate::schema::CONFIG
 }
 fn default_true() -> bool {
     true
@@ -335,7 +326,7 @@ pub fn default_agents() -> Vec<AgentConfig> {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            schema: 1,
+            schema: crate::schema::CONFIG,
             agents: default_agents(),
             tags: Vec::new(),
             tags_enabled: true,
@@ -347,12 +338,26 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Ignore the retired deploy section only at the file boundary. It is not
-    /// represented in runtime configuration, and all other fields stay strict.
+    /// Parse the current configuration format.
+    fn parse_at(path: &Path, text: &str) -> Result<Self> {
+        let invalid = || format!("invalid config: {}", path.display());
+        let doc: DocumentMut = text.parse().with_context(invalid)?;
+        crate::schema::require_current(&doc, path, "config", crate::schema::CONFIG, 1)?;
+        anyhow::ensure!(
+            doc.get("tags").is_none() && doc.get("deploy").is_none(),
+            "config schema 2 no longer supports top-level tags or deploy in {}",
+            path.display()
+        );
+        toml::from_str(&doc.to_string()).with_context(invalid)
+    }
+
+    /// Validate config text with the current codec, as [`Config::load`] would.
+    pub(crate) fn validate_text(path: &Path, text: &str) -> Result<()> {
+        Self::parse_at(path, text).map(drop)
+    }
+
     fn parse(text: &str) -> Result<Self> {
-        let mut doc: DocumentMut = text.parse()?;
-        doc.remove("deploy");
-        Ok(toml::from_str(&doc.to_string())?)
+        Self::parse_at(Path::new("config.toml"), text)
     }
     pub fn local_default() -> Self {
         Self {
@@ -408,16 +413,34 @@ impl Config {
         meta_dir(root).join(CONFIG_FILE)
     }
 
-    /// Load the config, falling back to defaults when the file does not exist.
+    fn validate_existing_write_target(path: &Path) -> Result<()> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match text.parse::<DocumentMut>() {
+                Ok(doc) => {
+                    crate::schema::require_current(&doc, path, "config", crate::schema::CONFIG, 1)
+                }
+                // A complete save is also the recovery path for an interrupted
+                // hand edit. Future schemas are protected whenever the TOML
+                // document is readable; malformed contents have no usable
+                // schema and may be replaced explicitly by the caller.
+                Err(_) => Ok(()),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    /// Load current settings and the unified in-memory Tag view.
     pub fn load(root: &Path) -> Result<Self> {
         let path = Self::path(root);
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                Self::parse(&text).with_context(|| format!("invalid config: {}", path.display()))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-        }
+        let mut config = match std::fs::read_to_string(&path) {
+            // Every parse error already names the file.
+            Ok(text) => Self::parse_at(&path, &text)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        config.tags = crate::tag::TagStore::new(root).list()?;
+        Ok(config)
     }
 
     pub fn exists(root: &Path) -> bool {
@@ -428,9 +451,17 @@ impl Config {
     /// use this; `init` writes the self-documenting form below.
     pub fn save(&self, root: &Path) -> Result<()> {
         let path = Self::path(root);
+        Self::validate_existing_write_target(&path)?;
         std::fs::create_dir_all(path.parent().unwrap())?;
-        let text = toml::to_string_pretty(self)?;
-        crate::util::write_atomic(&path, text.as_bytes())
+        let mut current = self.clone();
+        current.schema = crate::schema::CONFIG;
+        let text = toml::to_string_pretty(&current)?;
+        crate::util::write_atomic(&path, text.as_bytes())?;
+        if !self.tags.is_empty() {
+            let store = crate::tag::TagStore::new(root);
+            store.edit(|tags| *tags = self.tags.clone())?;
+        }
+        Ok(())
     }
 
     /// Write a complete, editable default configuration with the schema's
@@ -438,8 +469,11 @@ impl Config {
     /// generated guide cannot silently choose different defaults.
     pub fn save_commented(&self, root: &Path) -> Result<()> {
         let path = Self::path(root);
+        Self::validate_existing_write_target(&path)?;
         std::fs::create_dir_all(path.parent().unwrap())?;
-        let mut doc = toml::to_string_pretty(self)?.parse::<DocumentMut>()?;
+        let mut current = self.clone();
+        current.schema = crate::schema::CONFIG;
+        let mut doc = toml::to_string_pretty(&current)?.parse::<DocumentMut>()?;
         doc.as_table_mut().decor_mut().set_prefix(
             "# Skills Manager configuration\n\
              #\n\
@@ -452,7 +486,7 @@ impl Config {
         comment_key(
             doc.as_table_mut(),
             "schema",
-            "# Configuration schema version. Keep this at 1.\n",
+            "# Configuration schema version. Keep this at 2.\n",
         );
         comment_key(
             doc.as_table_mut(),
@@ -601,10 +635,18 @@ impl Config {
     ) -> Result<()> {
         let path = Self::path(root);
         let mut doc = match std::fs::read_to_string(&path) {
-            Ok(text) => text
-                .parse::<DocumentMut>()
-                .with_context(|| format!("invalid config: {}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => DocumentMut::new(),
+            Ok(text) => {
+                let doc = text
+                    .parse::<DocumentMut>()
+                    .with_context(|| format!("invalid config: {}", path.display()))?;
+                crate::schema::require_current(&doc, &path, "config", crate::schema::CONFIG, 1)?;
+                doc
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut doc = DocumentMut::new();
+                crate::schema::set(&mut doc, crate::schema::CONFIG);
+                doc
+            }
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
         if edit(&mut doc)? {
@@ -613,113 +655,43 @@ impl Config {
         Ok(())
     }
 
-    /// The `[[tags]]` entries of a document, created when there are none yet.
-    /// `save` writes an empty list as `tags = []`, and a hand-written file may
-    /// use inline tables; either is turned into `[[tags]]` tables first.
-    fn tag_tables(doc: &mut DocumentMut) -> Result<&mut ArrayOfTables> {
-        if let Some(arr) = doc.get("tags").and_then(Item::as_array) {
-            let mut tables = ArrayOfTables::new();
-            for v in arr.iter() {
-                let t = v
-                    .as_inline_table()
-                    .context("an entry of `tags` in config.toml is not a table")?;
-                tables.push(t.clone().into_table());
-            }
-            doc["tags"] = Item::ArrayOfTables(tables);
-        }
-        doc.entry("tags")
-            .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
-            .as_array_of_tables_mut()
-            .context("`tags` in config.toml is not a list of [[tags]] tables")
-    }
-
-    fn tag_index(tables: &ArrayOfTables, name: &str) -> Option<usize> {
-        tables
-            .iter()
-            .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
-    }
-
-    /// Give a tag a colour, adding its `[[tags]]` entry when it has none, or
-    /// take the colour away again with `None`. The value is written as given;
-    /// what counts as a colour is the caller's business.
-    pub fn set_tag_color(root: &Path, name: &str, color: Option<&str>) -> Result<()> {
-        Self::edit_document(root, |doc| {
-            let tables = Self::tag_tables(doc)?;
-            match (Self::tag_index(tables, name), color) {
-                (Some(i), Some(c)) => {
-                    tables.get_mut(i).context("tag entry vanished")?["color"] = value(c);
-                }
-                (Some(i), None) => {
-                    let t = tables.get_mut(i).context("tag entry vanished")?;
-                    if t.remove("color").is_none() {
-                        return Ok(false);
-                    }
-                    // An entry with nothing left but its name says nothing, so
-                    // it goes rather than accumulate.
-                    if t.len() == 1 {
-                        tables.remove(i);
-                    }
-                }
-                (None, Some(c)) => {
-                    let mut t = Table::new();
-                    t["name"] = value(name);
-                    t["color"] = value(c);
-                    tables.push(t);
-                }
-                (None, None) => return Ok(false),
-            }
-            Ok(true)
-        })
-    }
-
-    /// Carry a tag's `[[tags]]` entry over to its new name. When the new name
-    /// already has an entry of its own, that one wins and the old is dropped:
-    /// the tag is being merged into it, not replacing it.
-    pub fn rename_tag_entry(root: &Path, old: &str, new: &str) -> Result<()> {
-        Self::edit_document(root, |doc| {
-            let tables = Self::tag_tables(doc)?;
-            let Some(i) = Self::tag_index(tables, old) else {
-                return Ok(false);
-            };
-            if Self::tag_index(tables, new).is_some() {
-                tables.remove(i);
-            } else {
-                tables.get_mut(i).context("tag entry vanished")?["name"] = value(new);
-            }
-            Ok(true)
-        })
-    }
-
     pub fn skill_tags(&self, key: &str) -> Vec<String> {
         self.tags
             .iter()
-            .filter(|t| t.skills.iter().any(|s| s == key))
-            .map(|t| t.name.clone())
+            .filter(|tag| tag.skills.iter().any(|skill| skill == key))
+            .map(|tag| tag.name.clone())
             .collect()
     }
 
+    /// Change Tag definitions through their owning store.
     pub fn edit_tags(root: &Path, edit: impl FnOnce(&mut Vec<TagConfig>)) -> Result<()> {
-        let _lock = crate::meta::MetaStore::new(root).lock()?;
-        Self::edit_document(root, |doc| {
-            let mut config = Self::parse(&doc.to_string())?;
-            edit(&mut config.tags);
-            for tag in &mut config.tags {
-                tag.skills.sort();
-                tag.skills.dedup();
+        crate::tag::TagStore::new(root).edit(edit)
+    }
+
+    pub fn set_tag_color(root: &Path, name: &str, color: Option<&str>) -> Result<()> {
+        let name = name.to_owned();
+        let color = color.map(str::to_owned);
+        Self::edit_tags(root, |tags| {
+            match tags.iter_mut().find(|tag| tag.name == name) {
+                Some(tag) => {
+                    tag.color = color;
+                    if tag.skills.is_empty() && tag.color.is_none() && tag.description.is_none() {
+                        tags.retain(|current| current.name != name);
+                    }
+                }
+                None if color.is_some() => tags.push(TagConfig {
+                    name,
+                    skills: Vec::new(),
+                    color,
+                    description: None,
+                }),
+                None => {}
             }
-            let updated = toml::to_string(&config)?.parse::<DocumentMut>()?;
-            let decor = doc.get("tags").and_then(|item| match item {
-                Item::Value(value) => Some(value.decor().clone()),
-                _ => None,
-            });
-            doc["tags"] = updated["tags"].clone();
-            if let Some(decor) = decor
-                && let Some(value) = doc["tags"].as_value_mut()
-            {
-                *value.decor_mut() = decor;
-            }
-            Ok(true)
         })
+    }
+
+    pub fn rename_tag_entry(root: &Path, old: &str, new: &str) -> Result<()> {
+        crate::tag::TagStore::new(root).rename(old, new)
     }
 
     pub fn set_tags_enabled(root: &Path, enabled: bool) -> Result<()> {
@@ -730,16 +702,7 @@ impl Config {
     }
 
     pub fn rename_tag_skill(root: &Path, old: &str, new: Option<&str>) -> Result<()> {
-        Self::edit_tags(root, |tags| {
-            for tag in tags {
-                if tag.skills.iter().any(|s| s == old) {
-                    tag.skills.retain(|s| s != old);
-                    if let Some(new) = new {
-                        tag.skills.push(new.to_string());
-                    }
-                }
-            }
-        })
+        crate::tag::TagStore::new(root).remove_skill(old, new)
     }
 
     pub fn agent(&self, key: &str) -> Option<&AgentConfig> {
@@ -815,19 +778,25 @@ mod tests {
 
     #[test]
     fn sync_waits_default_and_accept_nonnegative_seconds() {
-        assert_eq!(Config::parse("").unwrap().sync, SyncConfig::default());
         assert_eq!(
-            Config::parse("[sync]\nquiet_seconds = 45").unwrap().sync,
+            Config::parse("schema = 2").unwrap().sync,
+            SyncConfig::default()
+        );
+        assert_eq!(
+            Config::parse("schema = 2\n[sync]\nquiet_seconds = 45")
+                .unwrap()
+                .sync,
             SyncConfig {
                 quiet_seconds: 45,
                 tui_idle_seconds: 10,
             }
         );
-        let configured = Config::parse("[sync]\nquiet_seconds = 0\ntui_idle_seconds = 30").unwrap();
+        let configured =
+            Config::parse("schema = 2\n[sync]\nquiet_seconds = 0\ntui_idle_seconds = 30").unwrap();
         assert_eq!(configured.sync.quiet_seconds, 0);
         assert_eq!(configured.sync.tui_idle_seconds, 30);
         assert_eq!(
-            Config::parse("[sync]\ntui_idle_seconds = 0")
+            Config::parse("schema = 2\n[sync]\ntui_idle_seconds = 0")
                 .unwrap()
                 .sync
                 .tui_idle_seconds,
@@ -840,7 +809,7 @@ mod tests {
             "tui_idle_seconds = 'ten'",
             "unknown_wait = 5",
         ] {
-            assert!(Config::parse(&format!("[sync]\n{invalid}")).is_err());
+            assert!(Config::parse(&format!("schema = 2\n[sync]\n{invalid}")).is_err());
         }
         let tmp = crate::ops::DownloadDir::new("sync-config-roundtrip").unwrap();
         configured.save(tmp.path()).unwrap();
@@ -855,7 +824,7 @@ mod tests {
         let sync_section = "[sync] # automatic backup waits\nquiet_seconds = 42 # content\ntui_idle_seconds = 7 # activity\n\n";
         std::fs::write(
             &path,
-            format!("[[agents]]\nkey = 'existing'\nskills_dir = '~/.existing/skills'\n\n{sync_section}[ui]\nlayout = 'list'\n"),
+            format!("schema = 2\n\n[[agents]]\nkey = 'existing'\nskills_dir = '~/.existing/skills'\n\n{sync_section}[ui]\nlayout = 'list'\n"),
         )
         .unwrap();
         Config::edit_tags(tmp.path(), |tags| {

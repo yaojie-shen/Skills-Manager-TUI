@@ -71,25 +71,8 @@ pub fn tag_set(ws: &Workspace, key: &str, tags: &[String]) -> Result<Vec<String>
 pub fn tag_rename(ws: &Workspace, old: &str, new: &str) -> Result<usize> {
     let new = new.trim();
     anyhow::ensure!(!new.is_empty(), "new tag name is empty");
-    let mut count = 0;
-    Config::edit_tags(&ws.root, |tags| {
-        if let Some(i) = tags.iter().position(|t| t.name == old) {
-            let mut tag = tags.remove(i);
-            count = tag.skills.len();
-            if let Some(target) = tags.iter_mut().find(|t| t.name == new) {
-                target.skills.extend(tag.skills);
-                if target.color.is_none() {
-                    target.color = tag.color;
-                }
-                if target.description.is_none() {
-                    target.description = tag.description;
-                }
-            } else {
-                tag.name = new.into();
-                tags.push(tag);
-            }
-        }
-    })?;
+    let count = ws.tags.load(old)?.map_or(0, |tag| tag.skills.len());
+    ws.tags.rename(old, new)?;
     Ok(count)
 }
 

@@ -606,6 +606,225 @@ fn refuses_remote_runtime_files_and_metadata_symlinks_before_checkout() {
 }
 
 #[test]
+fn first_pull_accepts_generated_layout_declaration_tracked_by_remote() {
+    use skills::tag::Tag;
+
+    let tmp = DownloadDir::new("root-bootstrap-declaration").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+
+    let remote_home = ws(&tmp.path().join("remote"));
+    remote_home
+        .tags
+        .save(&Tag {
+            skills: Vec::new(),
+            name: "remote".into(),
+            color: None,
+            description: None,
+        })
+        .unwrap();
+    let remote_home = ws(&remote_home.root);
+    configure(&remote_home, &repo);
+    run(&remote_home).unwrap();
+
+    let local = ws(&tmp.path().join("local"));
+    local
+        .tags
+        .save(&Tag {
+            skills: Vec::new(),
+            name: "local".into(),
+            color: None,
+            description: None,
+        })
+        .unwrap();
+    let local = ws(&local.root);
+    let declaration = fs::read(local.root.join(".skills-meta/format.toml")).unwrap();
+    configure(&local, &repo);
+
+    run(&local).unwrap();
+
+    assert!(local.tags.load("local").unwrap().is_some());
+    assert!(local.tags.load("remote").unwrap().is_some());
+    assert_eq!(
+        fs::read(local.root.join(".skills-meta/format.toml")).unwrap(),
+        declaration
+    );
+    assert_eq!(
+        git(
+            &["ls-files", "--", ".skills-meta/format.toml"],
+            Some(&local.root)
+        )
+        .unwrap()
+        .trim(),
+        ".skills-meta/format.toml"
+    );
+    assert!(
+        git(&["status", "--short"], Some(&local.root))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn first_pull_drops_generated_declaration_for_a_pre_format_remote() {
+    use skills::tag::Tag;
+
+    let tmp = DownloadDir::new("root-bootstrap-pre-format").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+
+    // A remote last written by a build that predates format.toml.
+    let remote_home = ws(&tmp.path().join("remote"));
+    configure(&remote_home, &repo);
+    assert!(!remote_home.root.join(".skills-meta/format.toml").exists());
+    write(
+        &remote_home,
+        ".skills-meta/config.toml",
+        "schema = 1\ntags = [{ name = 'remote', skills = ['one'] }]\n",
+    );
+    commit(&remote_home, "pre-format metadata");
+    git(
+        &["push", "origin", "HEAD:refs/heads/main"],
+        Some(&remote_home.root),
+    )
+    .unwrap();
+
+    let local = ws(&tmp.path().join("local"));
+    local
+        .tags
+        .save(&Tag {
+            skills: Vec::new(),
+            name: "local".into(),
+            color: None,
+            description: None,
+        })
+        .unwrap();
+    let local = ws(&local.root);
+    assert!(local.root.join(".skills-meta/format.toml").exists());
+    configure(&local, &repo);
+
+    run(&local).unwrap();
+
+    assert!(!local.root.join(".skills-meta/format.toml").exists());
+    assert!(
+        git(
+            &["ls-files", "--", ".skills-meta/format.toml"],
+            Some(&local.root)
+        )
+        .unwrap()
+        .trim()
+        .is_empty()
+    );
+    let reopened = Workspace::open(&local.root).unwrap();
+    assert!(reopened.migration.is_some());
+    assert!(reopened.tags.load("remote").unwrap().is_some());
+    assert!(reopened.tags.load("local").unwrap().is_some());
+    assert!(local.root.join(".skills-meta/format.toml").exists());
+}
+
+#[test]
+fn failed_first_pull_restores_generated_declaration_and_preserves_different_config() {
+    use skills::tag::Tag;
+
+    let tmp = DownloadDir::new("root-bootstrap-restore-declaration").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+
+    let remote_home = ws(&tmp.path().join("remote"));
+    remote_home
+        .tags
+        .save(&Tag {
+            skills: Vec::new(),
+            name: "remote".into(),
+            color: None,
+            description: None,
+        })
+        .unwrap();
+    let remote_home = ws(&remote_home.root);
+    write(
+        &remote_home,
+        ".skills-meta/config.toml",
+        "# remote config\n",
+    );
+    configure(&remote_home, &repo);
+    run(&remote_home).unwrap();
+
+    let local = ws(&tmp.path().join("local"));
+    local
+        .tags
+        .save(&Tag {
+            skills: Vec::new(),
+            name: "local".into(),
+            color: None,
+            description: None,
+        })
+        .unwrap();
+    let local = ws(&local.root);
+    let declaration = fs::read(local.root.join(".skills-meta/format.toml")).unwrap();
+    let local_config = b"# local config\n";
+    fs::write(local.root.join(".skills-meta/config.toml"), local_config).unwrap();
+    configure(&local, &repo);
+
+    let error = run(&local).unwrap_err().to_string();
+
+    assert!(error.contains("untracked working tree files would be overwritten"));
+    assert_eq!(
+        fs::read(local.root.join(".skills-meta/format.toml")).unwrap(),
+        declaration
+    );
+    assert_eq!(
+        fs::read(local.root.join(".skills-meta/config.toml")).unwrap(),
+        local_config
+    );
+}
+
+#[test]
+fn first_pull_refuses_a_different_local_layout_declaration() {
+    use skills::tag::Tag;
+
+    let tmp = DownloadDir::new("root-bootstrap-different-declaration").unwrap();
+    let repo = tmp.path().join("remote.git");
+    remote(&repo);
+
+    let remote_home = ws(&tmp.path().join("remote"));
+    remote_home
+        .tags
+        .save(&Tag {
+            skills: Vec::new(),
+            name: "remote".into(),
+            color: None,
+            description: None,
+        })
+        .unwrap();
+    let remote_home = ws(&remote_home.root);
+    configure(&remote_home, &repo);
+    run(&remote_home).unwrap();
+
+    let local = ws(&tmp.path().join("local"));
+    local
+        .tags
+        .save(&Tag {
+            skills: Vec::new(),
+            name: "local".into(),
+            color: None,
+            description: None,
+        })
+        .unwrap();
+    let local = ws(&local.root);
+    let edited = b"# local edit\nlayout = 1\n";
+    fs::write(local.root.join(".skills-meta/format.toml"), edited).unwrap();
+    configure(&local, &repo);
+
+    let error = run(&local).unwrap_err().to_string();
+
+    assert!(error.contains("untracked working tree files would be overwritten"));
+    assert_eq!(
+        fs::read(local.root.join(".skills-meta/format.toml")).unwrap(),
+        edited
+    );
+}
+
+#[test]
 fn first_pull_preserves_ignored_local_files_and_legacy_backups_require_migration() {
     let tmp = DownloadDir::new("root-bootstrap").unwrap();
     let repo = tmp.path().join("remote.git");

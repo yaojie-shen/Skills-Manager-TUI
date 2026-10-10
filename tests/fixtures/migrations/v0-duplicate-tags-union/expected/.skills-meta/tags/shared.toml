@@ -1,0 +1,9 @@
+skills = [
+    "one",
+    "three",
+    "two",
+]
+name = "shared"
+color = "blue"
+description = "Merged definition"
+schema = 1

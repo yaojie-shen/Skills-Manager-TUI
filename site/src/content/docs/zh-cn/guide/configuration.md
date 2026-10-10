@@ -29,20 +29,37 @@ skills init
 | --- | --- |
 | `hello-skill/SKILL.md` | 本地技能；有效内容无需元数据记录即可识别。 |
 | `repos/<alias>/<local-name>/` | 远程技能内容。 |
-| `.skills-meta/config.toml` | Agent、标签、搜索和 UI 设置。 |
+| `.skills-meta/config.toml` | Agent、搜索、UI 和同步等待设置，以及标签开关。 |
+| `.skills-meta/tags/<tag>.toml` | 单个标签：名称、技能、颜色和描述。 |
 | `.skills-meta/repos/<alias>.toml` | 来源身份和远程技能元数据。 |
 | `.skills-meta/repos/.root.toml` | 独立远程技能元数据。 |
 | `.skills-meta/presets/<name>.toml` | 固定预设成员和目标 Agent。 |
+| `.skills-meta/format.toml` | 元数据格式版本，由 Skills Manager 写入，请勿手动修改。 |
 | `.git/config` | 根目录备份的远程、分支和启用状态。 |
 
-Library 使用文件存储。本地技能不保存单技能备注或基线。协调过程不会修改技能内容。不过，打开旧版预设数据时，程序可能先创建备份，再迁移文件格式。
+Library 使用文件存储。本地技能不保存单技能备注或基线。协调过程不会修改技能内容。打开旧版本写入的元数据时，程序会先升级格式，详见[元数据格式升级](#元数据格式升级)。
+
+## 元数据格式升级
+
+`.skills-meta/format.toml` 记录 Library 元数据的格式版本。它会随 root 一起同步，所以请让同步同一个 Library 的每台机器都使用最新版本的 Skills Manager。
+
+打开旧版本写入的元数据时，Skills Manager 会先升级文件，再执行其他操作。旧版元数据包括：写在 `config.toml` 中的标签、按标签而不是技能列出成员的预设，以及没有 `schema` 字段的文件。
+
+- 程序会先检查全部文件。只要有一个文件无法升级，就不写入任何内容，并在错误中指出该文件。
+- 旧 `config.toml` 中同名的标签会被合并，技能取并集；如果它们的颜色或描述不同，升级会停止，由你决定保留哪一个。
+- 如果 `config.toml` 中的某个标签与 `.skills-meta/tags/` 中对应文件的定义不同（例如使用旧版 Skills Manager 的机器把标签同步回了 `config.toml`），升级会停止并指出两处位置。请让两处定义一致，或删除 `config.toml` 中不需要的那一项，然后重新打开 Library。
+- 写入前，原文件会按原相对路径复制到 `.skills-meta/backups/metadata-before-layout-v<from>-to-v<to>-<timestamp>/`。备份只包含这次升级修改或删除的文件。
+- CLI 会在 stderr 输出备份路径。TUI 会在启动时显示升级报告；退出程序之前，可在命令面板中通过 **Show metadata migration report** 再次打开。
+- 如果此时 root 同步正在进行，升级会停止且不写入。等同步结束后重新打开 Library 即可。
+
+如果升级中途被打断，重新打开 Library 即可继续，并得到相同的结果；错误提示需要手动恢复时除外。要从原文件重新执行升级，把需要的原文件从备份复制回 `.skills-meta`。如果备份中有 `format.toml`，也一并复制回去；否则删除 `.skills-meta/format.toml`。然后重新打开 Library，Skills Manager 会再次升级这些文件。备份不包含升级新建的文件，例如 `tags/*.toml`；这些文件仍留在 `.skills-meta` 中，如果希望只从原文件开始升级，请先删除它们。
 
 ## UI 设置
 
 将键加入现有 TOML 表；同一个表不能重复声明。
 
 ```toml
-schema = 1
+schema = 2
 tags_enabled = true
 
 [ui]

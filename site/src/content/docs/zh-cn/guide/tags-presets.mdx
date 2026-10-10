@@ -60,6 +60,6 @@ skills preset undeploy writing-kit
 
 设置 `tags_enabled = false` 可隐藏标签分类并禁用标签命令，不会删除标签或预设数据。TUI 命令面板和 `Ctrl+O` 提供相同的确认开关。
 
-标签保存在 `.skills-meta/config.toml`。预设保存在 `.skills-meta/presets/<name>.toml`，其中明确记录技能和 Agent；重复的技能 key 会被去重。
+每个标签单独保存在 `.skills-meta/tags/<tag>.toml`。预设保存在 `.skills-meta/presets/<name>.toml`，其中明确记录技能和 Agent；重复的技能 key 会被去重。
 
-打开旧版按标签定义的预设时，Skills Manager 可能将其迁移为固定成员，并报告备份目录。确认迁移结果前请保留该备份。
+打开旧版本写入的标签或预设时，程序会先升级格式：标签从 `config.toml` 移到各自的文件中，按标签列出成员的预设会改为以这些标签的技能作为固定成员。Skills Manager 会报告备份目录，确认升级结果前请保留该备份。详见[元数据格式升级](../configuration/#元数据格式升级)。
