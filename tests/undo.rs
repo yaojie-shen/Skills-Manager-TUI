@@ -714,7 +714,6 @@ fn preset_case_only_rename_preserves_contents_references_and_history() {
         name: "commute".into(),
         description: Some("Daily tools".into()),
         skills: vec!["bicycle".into()],
-        agents: vec!["a".into()],
     };
     ws.presets.save(&original).unwrap();
     let (_, intent) = history::preset_rename(&ws, "commute", "Commute").unwrap();

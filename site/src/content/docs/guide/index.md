@@ -12,7 +12,7 @@ Skills Manager stores Agent Skills in a **Library** that you choose, then deploy
 | Library / root | The directory that contains skill files and `.skills-meta`. Each skill is a directory with a valid, readable `SKILL.md`. |
 | Source | A Git repository, archive URL, or local directory. Skills imported from a remote source retain its details and a content baseline. |
 | Deployment | A link in an Agent directory that points to a Library skill. Editing files through the link changes the Library copy. |
-| Tags / presets | Tags organize skills. Presets store a fixed set of skills and deployment targets; their membership does not change with a tag. |
+| Tags / presets | Tags organize skills. Presets store a fixed set of skills; their membership does not change with a tag. |
 
 ## Common tasks
 

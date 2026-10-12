@@ -33,7 +33,7 @@ skills init
 | `.skills-meta/tags/<tag>.toml` | 单个标签：名称、技能、颜色和描述。 |
 | `.skills-meta/repos/<alias>.toml` | 来源身份和远程技能元数据。 |
 | `.skills-meta/repos/.root.toml` | 独立远程技能元数据。 |
-| `.skills-meta/presets/<name>.toml` | 固定预设成员和目标 Agent。 |
+| `.skills-meta/presets/<name>.toml` | 固定预设成员。 |
 | `.skills-meta/format.toml` | 元数据格式版本，由 Skills Manager 写入，请勿手动修改。 |
 | `.git/config` | 根目录备份的远程、分支和启用状态。 |
 

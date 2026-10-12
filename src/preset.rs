@@ -22,9 +22,6 @@ pub struct Preset {
     pub color: Option<String>,
     #[serde(default)]
     pub skills: Vec<String>,
-    /// Agents this preset targets; empty means every configured agent.
-    #[serde(default)]
-    pub agents: Vec<String>,
 }
 
 impl Preset {
@@ -247,7 +244,7 @@ impl PresetStore {
                     } else {
                         let mut doc = std::str::from_utf8(&old.bytes)?.parse::<DocumentMut>()?;
                         let fresh = toml::to_string(&preset)?.parse::<DocumentMut>()?;
-                        for field in ["name", "description", "color", "skills", "agents"] {
+                        for field in ["name", "description", "color", "skills"] {
                             if let Some(value) = fresh.get(field) {
                                 doc[field] = value.clone();
                             } else {

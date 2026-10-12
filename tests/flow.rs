@@ -948,7 +948,6 @@ fn cli_repairs_and_preset_edits_round_trip_as_json() {
             description: None,
             color: Some("#b87e54".into()),
             skills: vec!["printer".into()],
-            agents: vec![],
         })
         .unwrap();
     let v = skills_json(

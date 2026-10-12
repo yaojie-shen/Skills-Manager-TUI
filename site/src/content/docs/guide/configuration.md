@@ -33,7 +33,7 @@ In the CLI, `--local` and `--project DIR` use `<project>/.agents/skills` as a se
 | `.skills-meta/tags/<tag>.toml` | One tag: its name, skills, color, and description. |
 | `.skills-meta/repos/<alias>.toml` | Source identity and remote-skill metadata. |
 | `.skills-meta/repos/.root.toml` | Standalone remote-skill metadata. |
-| `.skills-meta/presets/<name>.toml` | Fixed preset members and target Agents. |
+| `.skills-meta/presets/<name>.toml` | Fixed preset members. |
 | `.skills-meta/format.toml` | Metadata format version, written by Skills Manager. Do not edit it. |
 | `.git/config` | Root backup remote, branch, and enablement. |
 

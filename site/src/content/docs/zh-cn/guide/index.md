@@ -12,7 +12,7 @@ Skills Manager 将 Agent Skills 保存在你选择的 **Library** 中，再通�
 | Library / root | 保存技能文件和 `.skills-meta` 的目录。每个技能都是一个包含有效、可读 `SKILL.md` 的目录。 |
 | Source（来源） | Git 仓库、归档 URL 或本地目录。从远程来源导入的技能会记录来源信息和内容基线。 |
 | Deployment（部署） | Agent 目录中指向 Library 技能的链接。通过链接编辑文件时，修改的是 Library 副本。 |
-| Tags / presets | 标签用于整理技能。预设保存一组固定的技能和部署目标，其成员不会随标签变化。 |
+| Tags / presets | 标签用于整理技能。预设保存一组固定的技能，其成员不会随标签变化。 |
 
 ## 常见任务
 

@@ -5,7 +5,7 @@ description: "用标签分类技能，将固定的部署集合保存为预设。
 
 import DocsTuiCapture from '../../../../components/DocsTuiCapture.astro';
 
-标签用于分类技能；预设保存明确的技能集合和部署目标。
+标签用于分类技能；预设保存明确的技能集合。
 
 ## 用标签分类
 
@@ -24,28 +24,24 @@ skills tag set hello-skill writing
 ## 保存部署集合
 
 ```sh
-skills preset create writing-kit --description "Writing helpers" --tag writing --agent claude
+skills preset create writing-kit --description "Writing helpers" --tag writing
 skills preset show writing-kit
 skills preset add writing-kit hello-skill
-skills preset deploy writing-kit --dry-run
-skills preset deploy writing-kit
+skills preset deploy writing-kit --agent claude --dry-run
+skills preset deploy writing-kit --all-agents
 ```
 
 `--tag writing` 只复制该标签当时的成员。以后标签成员发生变化，预设不会随之更新。使用 `skills preset add` 或 `skills preset remove` 调整预设成员；两个命令都接受技能 key 或 `--tag`。`skills preset create` 还可以重复传入 `--skill KEY`。
 
-<DocsTuiCapture frame="presets" caption="Presets 页面显示每个预设保存的固定成员和部署目标。" />
+<DocsTuiCapture frame="presets" caption="Presets 页面显示每个预设保存的固定成员。" />
 
-部署目标按以下顺序选择：
-
-1. 命令中的 `--agent`。
-2. 预设保存的 Agent。
-3. 所有已配置的 Agent。
+部署和取消部署必须重复传入 `--agent AGENT`，或使用 `--all-agents`。
 
 取消部署前先预览：
 
 ```sh
-skills preset undeploy writing-kit --dry-run
-skills preset undeploy writing-kit
+skills preset undeploy writing-kit --agent claude --dry-run
+skills preset undeploy writing-kit --all-agents
 ```
 
 `preset delete NAME --yes` 只删除预设定义，不会删除已安装技能或已有部署链接。
@@ -60,6 +56,6 @@ skills preset undeploy writing-kit
 
 设置 `tags_enabled = false` 可隐藏标签分类并禁用标签命令，不会删除标签或预设数据。TUI 命令面板和 `Ctrl+O` 提供相同的确认开关。
 
-每个标签单独保存在 `.skills-meta/tags/<tag>.toml`。预设保存在 `.skills-meta/presets/<name>.toml`，其中明确记录技能和 Agent；重复的技能 key 会被去重。
+每个标签单独保存在 `.skills-meta/tags/<tag>.toml`。预设保存在 `.skills-meta/presets/<name>.toml`，其中明确记录技能；重复的技能 key 会被去重。
 
 打开旧版本写入的标签或预设时，程序会先升级格式：标签从 `config.toml` 移到各自的文件中，按标签列出成员的预设会改为以这些标签的技能作为固定成员。Skills Manager 会报告备份目录，确认升级结果前请保留该备份。详见[元数据格式升级](../configuration/#元数据格式升级)。

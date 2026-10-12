@@ -5,7 +5,7 @@ description: "Classify skills with tags and save fixed deployment sets as preset
 
 import DocsTuiCapture from '../../../components/DocsTuiCapture.astro';
 
-Tags classify skills. Presets save an explicit set of skills and deployment targets.
+Tags classify skills. Presets save an explicit set of skills.
 
 ## Classify skills with tags
 
@@ -24,28 +24,24 @@ skills tag set hello-skill writing
 ## Save a deployment set
 
 ```sh
-skills preset create writing-kit --description "Writing helpers" --tag writing --agent claude
+skills preset create writing-kit --description "Writing helpers" --tag writing
 skills preset show writing-kit
 skills preset add writing-kit hello-skill
-skills preset deploy writing-kit --dry-run
-skills preset deploy writing-kit
+skills preset deploy writing-kit --agent claude --dry-run
+skills preset deploy writing-kit --all-agents
 ```
 
 `--tag writing` copies the tag's current members once. Later changes to the tag do not update the preset. Use `skills preset add` or `skills preset remove` to change its members; both accept skill keys or `--tag`. `skills preset create` also accepts repeated `--skill KEY` options.
 
-<DocsTuiCapture frame="presets" caption="The Presets view shows each preset's fixed members and targets." />
+<DocsTuiCapture frame="presets" caption="The Presets view shows each preset's fixed members." />
 
-Target selection follows this order:
-
-1. `--agent` values on the command.
-2. Agents saved in the preset.
-3. Every configured Agent.
+Deploy and undeploy require repeatable `--agent AGENT` values or `--all-agents`.
 
 Preview removal before applying it:
 
 ```sh
-skills preset undeploy writing-kit --dry-run
-skills preset undeploy writing-kit
+skills preset undeploy writing-kit --agent claude --dry-run
+skills preset undeploy writing-kit --all-agents
 ```
 
 `preset delete NAME --yes` removes only the preset definition. It does not remove installed skills or existing deployment links.
@@ -60,6 +56,6 @@ Tag-picker changes apply immediately, so `Esc` closes the picker without reverti
 
 Set `tags_enabled = false` to hide tag classification and disable tag commands without deleting tag or preset data. The TUI command palette and `Ctrl+O` expose the same confirmed toggle.
 
-Each tag lives in its own `.skills-meta/tags/<tag>.toml` file. Presets live in `.skills-meta/presets/<name>.toml` and store their skills and Agents explicitly. Duplicate skill keys are deduplicated.
+Each tag lives in its own `.skills-meta/tags/<tag>.toml` file. Presets live in `.skills-meta/presets/<name>.toml` and store their skills explicitly. Duplicate skill keys are deduplicated.
 
 Opening tags or presets written by an older version upgrades them first: tags move out of `config.toml` into their own files, and presets that list tags get those tags' skills as fixed members. Skills Manager reports the backup directory; keep that backup until the resulting membership is confirmed. See [metadata format upgrades](../configuration/#metadata-format-upgrades).

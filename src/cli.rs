@@ -382,8 +382,6 @@ pub enum PresetCommand {
         name: String,
         #[arg(long)]
         description: Option<String>,
-        #[arg(long = "agent", value_name = "AGENT")]
-        agents: Vec<String>,
         #[arg(long = "skill", value_name = "SKILL")]
         skills: Vec<String>,
         /// Add a snapshot of each tag's current members
@@ -414,12 +412,16 @@ pub enum PresetCommand {
         #[arg(long = "agent", value_name = "AGENT")]
         agents: Vec<String>,
         #[arg(long)]
+        all_agents: bool,
+        #[arg(long)]
         dry_run: bool,
     },
     Undeploy {
         name: String,
         #[arg(long = "agent", value_name = "AGENT")]
         agents: Vec<String>,
+        #[arg(long)]
+        all_agents: bool,
         #[arg(long)]
         dry_run: bool,
     },
@@ -1728,16 +1730,7 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
             let list = store.list()?;
             ctx.out(&list, || {
                 for p in &list {
-                    println!(
-                        "{:<20} {:>3} skills  agents: {}",
-                        p.name,
-                        p.members().len(),
-                        if p.agents.is_empty() {
-                            "all".into()
-                        } else {
-                            p.agents.join(",")
-                        }
-                    );
+                    println!("{:<20} {:>3} skills", p.name, p.members().len());
                 }
             })
         }
@@ -1752,18 +1745,11 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
         PresetCommand::Create {
             name,
             description,
-            agents,
             skills,
             tags,
         } => {
             if store.load(&name)?.is_some() {
                 bail!("preset {name} already exists");
-            }
-            for a in &agents {
-                ctx.ws
-                    .config
-                    .agent(a)
-                    .with_context(|| format!("unknown agent: {a}"))?;
             }
             let mut skills = skills;
             skills.extend(skills::preset::tag_members(&ctx.ws.config, &tags)?);
@@ -1771,7 +1757,6 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
                 name: name.clone(),
                 description,
                 skills,
-                agents,
                 color: None,
             };
             p.skills = p.members();
@@ -1812,13 +1797,15 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
         PresetCommand::Deploy {
             name,
             agents,
+            all_agents,
             dry_run,
-        } => preset_links(ctx, &name, &agents, dry_run, true),
+        } => preset_links(ctx, &name, &agents, all_agents, dry_run, true),
         PresetCommand::Undeploy {
             name,
             agents,
+            all_agents,
             dry_run,
-        } => preset_links(ctx, &name, &agents, dry_run, false),
+        } => preset_links(ctx, &name, &agents, all_agents, dry_run, false),
         // Both go through the same functions the TUI uses, so the message and
         // the config follow-through are the same from either side.
         PresetCommand::Rename { old, new } => {
@@ -1841,19 +1828,20 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
     }
 }
 
-fn preset_links(ctx: &Ctx, name: &str, agents: &[String], dry_run: bool, on: bool) -> Result<()> {
+fn preset_links(
+    ctx: &Ctx,
+    name: &str,
+    agents: &[String],
+    all_agents: bool,
+    dry_run: bool,
+    on: bool,
+) -> Result<()> {
     let p = ctx
         .ws
         .presets
         .load(name)?
         .with_context(|| format!("no such preset: {name}"))?;
-    let targets: Vec<String> = if !agents.is_empty() {
-        agents.to_vec()
-    } else if !p.agents.is_empty() {
-        p.agents.clone()
-    } else {
-        ctx.ws.config.agent_keys()
-    };
+    let targets = resolve_agents(ctx, agents, all_agents)?;
     let snap = ctx.ws.scan()?;
     let actions = if on {
         deploy::plan_preset_activate(&ctx.ws, &snap, &p, &targets)?
