@@ -2546,7 +2546,8 @@ mod tests {
         with_hook(
             Box::new(|_, _, _| panic!("same-name rename must not publish")),
             || {
-                assert_eq!(store.rename(" work ", "work").unwrap().name, "work");
+                store.rename(" work ", "work").unwrap();
+                assert_eq!(store.load("work").unwrap().unwrap().name, "work");
             },
         );
         assert_eq!(fs::read(&source).unwrap(), bytes);

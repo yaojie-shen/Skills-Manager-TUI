@@ -7,6 +7,7 @@ pub mod config;
 pub mod dict;
 mod file_set;
 pub(crate) mod group_filename;
+mod group_store;
 pub mod hash;
 pub mod history;
 pub mod meta;
