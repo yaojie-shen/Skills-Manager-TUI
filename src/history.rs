@@ -1395,7 +1395,6 @@ mod tests {
             description: Some("Daily work".into()),
             color: Some("blue".into()),
             skills: vec!["alpha".into(), "beta".into()],
-            agents: vec!["claude".into()],
         };
         ws.presets.save(&preset).unwrap();
 

@@ -37,7 +37,7 @@ skills --json status
 | 上游 | `accept KEY`、`check KEY/--all/--repo ALIAS`、`update KEY/--all/--repo ALIAS` |
 | 部署 | `deploy/undeploy KEYS… --agent AGENT`（可重复），或 `--all-agents`；`--dry-run` 用于预览 |
 | Agent | `agents list/catalog/add/status/clean/remove-link/adopt-link/relink` |
-| 预设 | `preset list/show/create/delete/add/remove/deploy/undeploy/rename/describe` |
+| 预设 | `preset list/show/create/delete/add/remove/deploy/undeploy/rename/describe`；deploy/undeploy 使用 `--agent AGENT` 或 `--all-agents` |
 | 健康 | `repair [--deployment AGENT/LINK=KEY]`；`--apply` 执行计划 |
 | 根目录备份 | `sync configure/disable/status/push/pull/run`；单独使用 `sync` 执行完整同步 |
 

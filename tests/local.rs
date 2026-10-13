@@ -248,7 +248,6 @@ fn shared_readers_observe_deployment_and_undeploy_only_once() {
             name: "only-gemini-cli".into(),
             description: None,
             skills: vec![key.into()],
-            agents: vec!["gemini-cli".into()],
         })
         .unwrap();
     let plan = deploy::plan_deploy(

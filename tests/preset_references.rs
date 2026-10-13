@@ -226,15 +226,17 @@ fn legacy_migration_snapshots_members_once_and_keeps_exact_backups() {
     std::fs::create_dir_all(&f.ws.presets.dir).unwrap();
     let original = "# keep the original format for recovery\nname = 'daily'\ndescription = 'Daily tools'\ncolor = '#b87e54'\nskills = ['extra', 'one', 'extra', 'missing']\ntags = ['work', 'study', 'work']\nagents = ['a']\n";
     let empty = "name = 'empty'\ntags = []\nskills = ['two', 'two']\n";
+    let targets = "schema = 1\nname = 'targets'\nskills = ['two']\nagents = []\n";
     let modern = "# A fixed preset must not be inferred or rewritten\nschema = 1\nname = 'modern'\nskills = ['two', 'one', 'one']\n";
     std::fs::write(f.ws.presets.path("daily"), original).unwrap();
     std::fs::write(f.ws.presets.path("empty"), empty).unwrap();
+    std::fs::write(f.ws.presets.path("targets"), targets).unwrap();
     std::fs::write(f.ws.presets.path("modern"), modern).unwrap();
     std::fs::remove_file(skills::migration::version::path(&f.ws.root)).unwrap();
     assert!(f.ws.presets.load("daily").is_err());
     let mut ws = Workspace::open(&f.ws.root).unwrap();
     let report = ws.migration.as_ref().unwrap();
-    assert_eq!(report.migrated_names, ["daily", "empty"]);
+    assert_eq!(report.migrated_names, ["daily", "empty", "targets"]);
     assert!(
         report
             .backup_dir
@@ -249,6 +251,10 @@ fn legacy_migration_snapshots_members_once_and_keeps_exact_backups() {
         empty.as_bytes()
     );
     assert_eq!(
+        std::fs::read(report.backup_dir.join("presets/targets.toml")).unwrap(),
+        targets.as_bytes()
+    );
+    assert_eq!(
         std::fs::read(f.ws.presets.path("modern")).unwrap(),
         modern.as_bytes()
     );
@@ -256,11 +262,15 @@ fn legacy_migration_snapshots_members_once_and_keeps_exact_backups() {
     assert_eq!(fixed.members(), ["extra", "missing", "one", "three", "two"]);
     assert_eq!(fixed.description.as_deref(), Some("Daily tools"));
     assert_eq!(fixed.color.as_deref(), Some("#b87e54"));
-    assert_eq!(fixed.agents, ["a"]);
     assert!(
         !std::fs::read_to_string(ws.presets.path("daily"))
             .unwrap()
             .contains("tags =")
+    );
+    assert!(
+        !std::fs::read_to_string(ws.presets.path("targets"))
+            .unwrap()
+            .contains("agents =")
     );
     assert_eq!(ws.presets.load("empty").unwrap().unwrap().skills, ["two"]);
     assert!(
@@ -487,6 +497,45 @@ fn cli_tag_selection_materializes_current_members_for_create_add_and_remove() {
 }
 
 #[test]
+fn cli_preset_targets_require_explicit_agents_or_all_agents() {
+    let f = Fixture::new("cli-targets");
+    f.cli(&["preset", "create", "daily", "--skill", "one"]);
+    for operation in ["deploy", "undeploy"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_skills"))
+            .args([
+                "--root",
+                f.ws.root.to_str().unwrap(),
+                "preset",
+                operation,
+                "daily",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("pass --agent <key> or --all-agents")
+        );
+    }
+    f.cli(&["preset", "deploy", "daily", "--all-agents"]);
+    assert!(f.base.join("agent/one").is_dir());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_skills"))
+        .args([
+            "--root",
+            f.ws.root.to_str().unwrap(),
+            "preset",
+            "create",
+            "bad",
+            "--agent",
+            "a",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--agent'"));
+}
+
+#[test]
 fn snapshot_indexes_fixed_members_including_missing_sources_and_refreshes_query_filters() {
     use skills::search::{Query, Searcher};
     let f = Fixture::new("index-query");
@@ -568,7 +617,6 @@ fn removing_a_skill_removes_its_key_from_every_preset() {
                 name: name.into(),
                 description: Some(format!("{name} description")),
                 skills: members.into_iter().map(String::from).collect(),
-                agents: vec!["a".into()],
                 ..Default::default()
             })
             .unwrap();
@@ -588,7 +636,6 @@ fn removing_a_skill_removes_its_key_from_every_preset() {
         let preset = f.ws.presets.load(name).unwrap().unwrap();
         assert!(!preset.skills.iter().any(|skill| skill == "one"));
         assert_eq!(preset.description, Some(format!("{name} description")));
-        assert_eq!(preset.agents, ["a"]);
         assert!(log.contains(&format!("updated preset {name}")));
     }
     assert_eq!(f.ws.presets.load("daily").unwrap().unwrap().skills, ["two"]);

@@ -3036,8 +3036,6 @@ mod deployment_scope_tests {
                 .save(&Preset {
                     name: name.into(),
                     skills: vec!["one".into()],
-                    // An explicitly selected scope takes precedence over legacy defaults.
-                    agents: vec!["another-agent".into()],
                     ..Default::default()
                 })
                 .unwrap();

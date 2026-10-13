@@ -248,7 +248,7 @@ pub fn upgrade(view: &mut HomeView) -> Result<StepNotes> {
             .with_context(|| format!("invalid preset: {}", rel.as_path().display()))?;
         let schema = v1::schema(&doc, rel.as_path(), "preset", SCHEMAS.preset, 0)?;
         let legacy = doc.remove("tags");
-        let had = legacy.is_some();
+        let had = doc.remove("agents").is_some() || legacy.is_some();
         let mut domain = doc.clone();
         domain.remove("schema");
         let preset: PresetV1 = toml::from_str(&domain.to_string())?;

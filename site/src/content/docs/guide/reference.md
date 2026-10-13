@@ -37,7 +37,7 @@ Uppercase terms are placeholders. Prefix each command in the table with `skills`
 | Upstream | `accept KEY`, `check KEY/--all/--repo ALIAS`, `update KEY/--all/--repo ALIAS` |
 | Deployment | `deploy/undeploy KEYS… --agent AGENT` (repeatable), or `--all-agents`; `--dry-run` previews |
 | Agents | `agents list/catalog/add/status/clean/remove-link/adopt-link/relink` |
-| Presets | `preset list/show/create/delete/add/remove/deploy/undeploy/rename/describe` |
+| Presets | `preset list/show/create/delete/add/remove/deploy/undeploy/rename/describe`; deploy/undeploy take `--agent AGENT` or `--all-agents` |
 | Health | `repair [--deployment AGENT/LINK=KEY]`; `--apply` executes the plan |
 | Root backup | `sync configure/disable/status/push/pull/run`; bare `sync` runs a full sync |
 

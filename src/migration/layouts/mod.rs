@@ -220,10 +220,10 @@ mod tests {
     fn preset_documents_round_trip_like_live_presets() {
         for text in [
             "name = 'daily'\nskills = ['one', 'two']\n",
-            "name = 'full'\ndescription = 'd'\ncolor = 'blue'\nskills = ['a']\nagents = ['claude']\n",
+            "name = 'full'\ndescription = 'd'\ncolor = 'blue'\nskills = ['a']\n",
             "name = 'extra'\nunknown = 1\n",
             "skills = ['one']\n",
-            "name = 'typed'\nagents = 'claude'\n",
+            "name = 'typed'\nskills = 'one'\n",
         ] {
             let frozen = toml::from_str::<v1::PresetV1>(text);
             let live = toml::from_str::<Preset>(text);
@@ -235,15 +235,8 @@ mod tests {
                             &frozen.description,
                             &frozen.color,
                             &frozen.skills,
-                            &frozen.agents
                         ),
-                        (
-                            &live.name,
-                            &live.description,
-                            &live.color,
-                            &live.skills,
-                            &live.agents
-                        ),
+                        (&live.name, &live.description, &live.color, &live.skills),
                         "{DRIFT}: {text:?}"
                     );
                     assert_eq!(

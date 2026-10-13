@@ -942,7 +942,6 @@ mod tests {
             color: Some("#b87e54".into()),
             description: Some("**Document tools** with 中文说明".into()),
             skills: vec!["document".into(), "missing".into()],
-            agents: vec!["SampleAgent".into()],
         };
         let view = PresetsView::default();
         let lines = view.preset_card(&preset, &ctx, 65);

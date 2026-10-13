@@ -83,8 +83,6 @@ pub struct PresetV1 {
     pub color: Option<String>,
     #[serde(default)]
     pub skills: Vec<String>,
-    #[serde(default)]
-    pub agents: Vec<String>,
 }
 
 const MAX_STEM_BYTES: usize = 180;
