@@ -452,7 +452,9 @@ mod tests {
                 })
                 .unwrap_err()
         );
-        assert!(error.contains("appeared during this operation"), "{error}");
+        // Case-insensitive filesystems overwrite the source instead, which the
+        // before-bytes check reports; either way nothing is published.
+        assert!(error.contains("during this operation"), "{error}");
 
         for (first, second) in [("A/B", "A-B"), ("Work", "work")] {
             let temp = DownloadDir::new(&format!("group-{label}-merged")).unwrap();
