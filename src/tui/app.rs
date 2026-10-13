@@ -3279,6 +3279,83 @@ mod matrix_key_tests {
     }
 
     #[test]
+    fn rename_conflicts_confirm_merge_and_default_to_cancel() {
+        for preset in [false, true] {
+            let temp = skills::ops::DownloadDir::new("rename-merge-confirm").unwrap();
+            Config {
+                agents: vec![],
+                ..Default::default()
+            }
+            .save(temp.path())
+            .unwrap();
+            let ws = Workspace::open(temp.path()).unwrap();
+            if preset {
+                for (name, skill) in [("source", "one"), ("target", "two")] {
+                    ws.presets
+                        .save(&skills::preset::Preset {
+                            name: name.into(),
+                            skills: vec![skill.into()],
+                            ..Default::default()
+                        })
+                        .unwrap();
+                }
+            } else {
+                for (name, skill) in [("source", "one"), ("target", "two")] {
+                    ws.tags
+                        .save(&skills::tag::Tag {
+                            name: name.into(),
+                            skills: vec![skill.into()],
+                            color: None,
+                            description: None,
+                        })
+                        .unwrap();
+                }
+            }
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let mut app = App::new(ws, tx).unwrap();
+            let open = |app: &mut App| {
+                app.modal = Some(if preset {
+                    Modal::rename_preset("source")
+                } else {
+                    Modal::rename_tag("source")
+                });
+                for _ in 0.."source".len() {
+                    app.handle(Msg::Key(KeyEvent::new(
+                        KeyCode::Backspace,
+                        KeyModifiers::NONE,
+                    )));
+                }
+                for c in "target".chars() {
+                    app.handle(Msg::Key(KeyEvent::new(
+                        KeyCode::Char(c),
+                        KeyModifiers::NONE,
+                    )));
+                }
+                app.handle(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+            };
+            let source_exists = |app: &App| {
+                if preset {
+                    app.ws.presets.load("source").unwrap().is_some()
+                } else {
+                    app.ws.tags.load("source").unwrap().is_some()
+                }
+            };
+            open(&mut app);
+            assert!(
+                matches!(app.modal, Some(Modal::ConfirmWrite { btn: 1, ref apply_label, .. }) if apply_label == "Merge")
+            );
+            app.handle(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+            assert!(app.modal.is_none() && source_exists(&app));
+            open(&mut app);
+            app.handle(Msg::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )));
+            assert!(!source_exists(&app));
+        }
+    }
+
+    #[test]
     fn failed_inputs_keep_their_text_and_cursor_until_a_successful_retry() {
         let root = std::env::temp_dir().join(format!("skills-input-retry-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -3327,15 +3404,6 @@ mod matrix_key_tests {
         assert!(app.modal.is_none());
         assert!(app.ws.presets.load("readings2").unwrap().is_some());
 
-        // A metadata write can fail after validation, too.
-        app.modal = Some(Modal::rename_preset("readings2"));
-        press(&mut app, KeyCode::Backspace);
-        press(&mut app, KeyCode::Enter); // Existing destination.
-        assert_eq!(value(&app), "readings");
-        press(&mut app, KeyCode::Char('3'));
-        press(&mut app, KeyCode::Enter);
-        assert!(app.modal.is_none());
-        assert!(app.ws.presets.load("readings3").unwrap().is_some());
         app.modal = Some(Modal::new_preset());
         press(&mut app, KeyCode::Esc);
         assert!(app.modal.is_none());

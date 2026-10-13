@@ -916,6 +916,43 @@ pub fn preset_rename(ws: &Workspace, from: &str, to: &str) -> Result<(String, Op
     ))
 }
 
+/// Merge one preset into another as one undoable metadata change.
+pub fn preset_merge(
+    ws: &Workspace,
+    source: &str,
+    target: &str,
+) -> Result<(String, Option<Intent>)> {
+    let source_preset = ws
+        .presets
+        .load(source)?
+        .with_context(|| format!("no such preset: {source}"))?;
+    let target_before = ws
+        .presets
+        .load(target)?
+        .with_context(|| format!("no such preset: {target}"))?;
+    let added = source_preset
+        .skills
+        .iter()
+        .filter(|s| !target_before.skills.contains(s))
+        .cloned()
+        .collect();
+    ws.presets.merge(source, target)?;
+    Ok((
+        format!("merged preset {source} into {target}"),
+        Some(Intent::Meta(vec![
+            MetaChange::PresetExistence {
+                preset: source_preset,
+                present: false,
+            },
+            MetaChange::Preset {
+                name: target.to_string(),
+                added,
+                removed: vec![],
+            },
+        ])),
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub intent: Intent,
@@ -996,8 +1033,8 @@ impl WriteBack {
                 preset_rename(ws, from, to).map(|(message, _)| message)
             }
             WriteBack::Meta(changes) => {
-                if let Some(why) = tag_definition_conflict(ws, changes)? {
-                    return Ok(format!("{why}; related tag changes left as they are"));
+                if let Some((kind, why)) = definition_conflict(ws, changes)? {
+                    return Ok(format!("{why}; related {kind} changes left as they are"));
                 }
                 let mut done = Vec::new();
                 for c in changes {
@@ -1279,14 +1316,24 @@ fn links(actions: Vec<Action>, intent: &Intent) -> Result<Plan> {
     }
 }
 
-fn tag_definition_conflict(ws: &Workspace, changes: &[MetaChange]) -> Result<Option<String>> {
+fn definition_conflict(
+    ws: &Workspace,
+    changes: &[MetaChange],
+) -> Result<Option<(&'static str, String)>> {
     for change in changes {
-        if matches!(
-            change,
-            MetaChange::TagExistence { .. } | MetaChange::TagEntry { .. }
-        ) && let Fate::Blocked(why) = change.fate(ws)?
-        {
-            return Ok(Some(why));
+        let kind = match change {
+            MetaChange::TagExistence { .. } | MetaChange::TagEntry { .. } => "tag",
+            MetaChange::PresetExistence { .. }
+                if changes
+                    .iter()
+                    .any(|c| matches!(c, MetaChange::Preset { .. })) =>
+            {
+                "preset"
+            }
+            _ => continue,
+        };
+        if let Fate::Blocked(why) = change.fate(ws)? {
+            return Ok(Some((kind, why)));
         }
     }
     Ok(None)
@@ -1296,9 +1343,9 @@ fn tag_definition_conflict(ws: &Workspace, changes: &[MetaChange]) -> Result<Opt
 /// overtaken is dropped with its reason rather than written over. Tag definition
 /// changes are prerequisites: their membership changes move together.
 fn meta(ws: &Workspace, changes: &[MetaChange]) -> Result<Plan> {
-    if let Some(why) = tag_definition_conflict(ws, changes)? {
+    if let Some((kind, why)) = definition_conflict(ws, changes)? {
         return Ok(Plan::Nothing(format!(
-            "{why}; related tag changes left as they are"
+            "{why}; related {kind} changes left as they are"
         )));
     }
     let mut ready = Vec::new();
@@ -1324,7 +1371,9 @@ fn meta(ws: &Workspace, changes: &[MetaChange]) -> Result<Plan> {
             if changes.iter().any(|change| {
                 matches!(
                     change,
-                    MetaChange::TagExistence { .. } | MetaChange::TagEntry { .. }
+                    MetaChange::TagExistence { .. }
+                        | MetaChange::TagEntry { .. }
+                        | MetaChange::PresetExistence { .. }
                 )
             }) {
                 changes.to_vec()

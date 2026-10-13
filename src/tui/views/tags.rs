@@ -266,7 +266,7 @@ impl TagsView {
                 self.prompt = None;
                 vec![Action::WriteMeta(Box::new(move |ws| {
                     history::tag_edit(ws, |ws| {
-                        edit::tag_rename(ws, &tag, &into)
+                        edit::tag_merge(ws, &tag, &into)
                             .map(|n| format!("merged {tag} into {into} on {n} skill(s)"))
                     })
                 }))]

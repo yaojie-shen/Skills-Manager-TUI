@@ -766,7 +766,7 @@ fn ordinary_tag_edits_and_undo_never_change_fixed_preset_definitions() {
         let (_, intent) = history::tag_edit(&f.ws, |ws| {
             match operation {
                 "rename" => edit::tag_rename(ws, "work", "renamed"),
-                "merge" => edit::tag_rename(ws, "work", "study"),
+                "merge" => edit::tag_merge(ws, "work", "study"),
                 _ => edit::tag_delete(ws, "work"),
             }
             .map(|count| count.to_string())
@@ -776,4 +776,59 @@ fn ordinary_tag_edits_and_undo_never_change_fixed_preset_definitions() {
         history_step(&f.ws, &intent.unwrap(), true);
         assert_eq!(std::fs::read(f.ws.presets.path("daily")).unwrap(), original);
     }
+}
+
+#[test]
+fn cli_group_rename_requires_merge_flag_for_an_existing_target() {
+    let f = Fixture::new("cli-rename-merge");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_skills"))
+            .args(["--root", f.ws.root.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let error = run(&["tag", "rename", "work", "study"]);
+    assert!(!error.status.success());
+    assert!(
+        String::from_utf8_lossy(&error.stderr)
+            .contains("Tag study already exists; pass --merge to merge work into it")
+    );
+    assert!(
+        run(&["tag", "rename", "work", "study", "--merge"])
+            .status
+            .success()
+    );
+    assert!(f.ws.tags.load("work").unwrap().is_none());
+
+    f.ws.presets
+        .save(&Preset {
+            name: "source".into(),
+            skills: vec!["one".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    f.ws.presets
+        .save(&Preset {
+            name: "target".into(),
+            skills: vec!["two".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    let error = run(&["preset", "rename", "source", "target"]);
+    assert!(!error.status.success());
+    assert!(
+        String::from_utf8_lossy(&error.stderr)
+            .contains("preset target already exists; pass --merge to merge source into it")
+    );
+    assert!(
+        run(&["preset", "rename", "source", "target", "--merge"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        f.ws.presets.load("target").unwrap().unwrap().skills,
+        ["one", "two"]
+    );
 }

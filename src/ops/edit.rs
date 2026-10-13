@@ -76,6 +76,12 @@ pub fn tag_rename(ws: &Workspace, old: &str, new: &str) -> Result<usize> {
     Ok(count)
 }
 
+pub fn tag_merge(ws: &Workspace, source: &str, target: &str) -> Result<usize> {
+    let count = ws.tags.load(source)?.map_or(0, |tag| tag.skills.len());
+    ws.tags.merge(source, target)?;
+    Ok(count)
+}
+
 pub fn tag_delete(ws: &Workspace, tag: &str) -> Result<usize> {
     let mut count = 0;
     Config::edit_tags(&ws.root, |tags| {

@@ -93,6 +93,7 @@ pub enum Modal {
         scope: MutationScope,
         /// Set when this confirmation is a history step.
         then: Option<Step>,
+        after: Option<Box<Action>>,
         apply_label: String,
         btn: usize,
         btn_rects: Vec<Rect>,
@@ -247,6 +248,7 @@ impl Modal {
             background: None,
             scope: MutationScope::Library,
             then: None,
+            after: None,
             apply_label: "Yes".into(),
             btn: 1,
             btn_rects: Vec::new(),
@@ -264,6 +266,12 @@ impl Modal {
     fn apply_label(mut self, label: &str) -> Self {
         if let Self::ConfirmWrite { apply_label, .. } = &mut self {
             *apply_label = label.to_string();
+        }
+        self
+    }
+    fn after(mut self, action: Action) -> Self {
+        if let Self::ConfirmWrite { after, .. } = &mut self {
+            *after = Some(Box::new(action));
         }
         self
     }
@@ -879,6 +887,7 @@ impl Modal {
             Modal::ConfirmWrite {
                 write,
                 then,
+                after,
                 btn,
                 background,
                 scope,
@@ -888,7 +897,14 @@ impl Modal {
                 KeyCode::Char('y') => write
                     .take()
                     .map(|w| {
-                        write_actions(w, then.take(), background.take(), title.clone(), *scope)
+                        write_actions(
+                            w,
+                            then.take(),
+                            after.take(),
+                            background.take(),
+                            title.clone(),
+                            *scope,
+                        )
                     })
                     .unwrap_or_default(),
                 KeyCode::Enter => {
@@ -899,6 +915,7 @@ impl Modal {
                                 write_actions(
                                     w,
                                     then.take(),
+                                    after.take(),
                                     background.take(),
                                     title.clone(),
                                     *scope,
@@ -1138,6 +1155,7 @@ impl Modal {
             Modal::ConfirmWrite {
                 write,
                 then,
+                after,
                 background,
                 scope,
                 title,
@@ -1153,6 +1171,7 @@ impl Modal {
                                 write_actions(
                                     w,
                                     then.take(),
+                                    after.take(),
                                     background.take(),
                                     title.clone(),
                                     *scope,
@@ -1710,6 +1729,7 @@ fn refilter(query: &str, items: &[PickItem], shown: &mut Vec<usize>) {
 fn write_actions(
     w: MetaFn,
     then: Option<Step>,
+    after: Option<Box<Action>>,
     background: Option<Vec<String>>,
     title: String,
     scope: MutationScope,
@@ -1730,6 +1750,9 @@ fn write_actions(
     let mut out = vec![Action::CloseModal, action];
     if let Some(step) = then {
         out.push(Action::Step(step));
+    }
+    if let Some(action) = after {
+        out.push(*action);
     }
     out
 }
@@ -1774,6 +1797,20 @@ fn apply_links(actions: Vec<deploy::Action>, then: Option<Step>) -> Vec<Action> 
             Action::Rescan,
         ],
     }
+}
+
+fn merge_confirm(kind: &str, old: &str, new: &str, write: MetaFn) -> Modal {
+    Modal::confirm_meta(
+        format!(" merge {old} into {new} "),
+        vec![
+            format!("{kind} {new} already exists."),
+            format!(
+                "Merge combines skills, keeps {new}'s colour and description, and removes {old}."
+            ),
+        ],
+        write,
+    )
+    .apply_label("Merge")
 }
 
 fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
@@ -1857,10 +1894,24 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
             }
             let old = old.clone();
             let land_on = new.clone();
-            vec![
-                Action::WriteMeta(Box::new(move |ws| history::preset_rename(ws, &old, &new))),
-                Action::SelectPreset(land_on),
-            ]
+            if matches!(ctx.ws.presets.conflicts(&old, &new), Ok(true)) {
+                let merge_old = old.clone();
+                let merge_new = new.clone();
+                vec![Action::OpenModal(Box::new(
+                    merge_confirm(
+                        "preset",
+                        &old,
+                        &new,
+                        Box::new(move |ws| history::preset_merge(ws, &merge_old, &merge_new)),
+                    )
+                    .after(Action::SelectPreset(land_on)),
+                ))]
+            } else {
+                vec![
+                    Action::WriteMeta(Box::new(move |ws| history::preset_rename(ws, &old, &new))),
+                    Action::SelectPreset(land_on),
+                ]
+            }
         }
         InputKind::Install => {
             let reference = value.trim().to_string();
@@ -1933,11 +1984,29 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
             if new.is_empty() || new == old {
                 return vec![];
             }
-            vec![Action::WriteMeta(Box::new(move |ws| {
-                history::tag_edit(ws, |ws| {
-                    edit::tag_rename(ws, &old, &new).map(|n| format!("renamed tag on {n} skill(s)"))
-                })
-            }))]
+            if matches!(ctx.ws.tags.conflicts(&old, &new), Ok(true)) {
+                let merge_old = old.clone();
+                let merge_new = new.clone();
+                vec![Action::OpenModal(Box::new(merge_confirm(
+                    "Tag",
+                    &old,
+                    &new,
+                    Box::new(move |ws| {
+                        history::tag_edit(ws, |ws| {
+                            edit::tag_merge(ws, &merge_old, &merge_new).map(|n| {
+                                format!("merged {merge_old} into {merge_new} on {n} skill(s)")
+                            })
+                        })
+                    }),
+                )))]
+            } else {
+                vec![Action::WriteMeta(Box::new(move |ws| {
+                    history::tag_edit(ws, |ws| {
+                        edit::tag_rename(ws, &old, &new)
+                            .map(|n| format!("renamed tag on {n} skill(s)"))
+                    })
+                }))]
+            }
         }
     }
 }

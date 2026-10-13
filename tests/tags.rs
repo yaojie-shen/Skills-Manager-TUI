@@ -95,7 +95,7 @@ fn merging_onto_an_existing_tag_leaves_one_copy_and_comes_back_as_one_step() {
 
     let mut log = History::default();
     let (_, intent) = history::tag_edit(&ws, |ws| {
-        edit::tag_rename(ws, "paper", "office").map(|n| n.to_string())
+        edit::tag_merge(ws, "paper", "office").map(|n| n.to_string())
     })
     .unwrap();
     log.record(intent.expect("a merge changes something"));
@@ -138,12 +138,12 @@ fn renaming_a_tag_carries_its_colour_and_merging_keeps_the_targets() {
     assert_eq!(fx.color_of("storage"), None);
 
     // Merging a coloured tag into one without a colour brings the colour along.
-    assert_eq!(edit::tag_rename(&ws, "bytes", "disk").unwrap(), 1);
-    assert_eq!(fx.color_of("disk").as_deref(), Some("blue"));
+    assert_eq!(edit::tag_merge(&ws, "bytes", "disk").unwrap(), 1);
+    assert_eq!(fx.color_of("disk"), None);
 
     // Merging into a tag that has its own colour keeps the target's.
     Config::set_tag_color(&fx.root, "keep", Some("red")).unwrap();
-    assert_eq!(edit::tag_rename(&ws, "disk", "keep").unwrap(), 2);
+    assert_eq!(edit::tag_merge(&ws, "disk", "keep").unwrap(), 2);
     assert_eq!(fx.color_of("keep").as_deref(), Some("red"));
     assert_eq!(fx.color_of("disk"), None);
     let cfg = Config::load(&fx.root).unwrap();

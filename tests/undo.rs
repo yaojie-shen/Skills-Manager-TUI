@@ -372,7 +372,7 @@ fn undoing_a_tag_rename_carries_the_colour_entry_back() {
     // keeps its own, so undoing must not hand it to the old name.
     Config::set_tag_color(&ws.root, "office", Some("red")).unwrap();
     let (_, intent) = history::tag_edit(&ws, |ws| {
-        edit::tag_rename(ws, "stationery", "office").map(|n| n.to_string())
+        edit::tag_merge(ws, "stationery", "office").map(|n| n.to_string())
     })
     .unwrap();
     log.record(intent.expect("a merge"));
@@ -869,4 +869,104 @@ fn undoing_a_preset_rename_stops_when_the_old_name_is_taken() {
     let err = history::preset_rename(&ws, "errands", "commute").unwrap_err();
     assert!(err.to_string().contains("already exists"), "{err:#}");
     assert!(ws.presets.load("errands").unwrap().is_some());
+}
+
+#[test]
+fn preset_merge_round_trips_as_one_step() {
+    let fx = Fixture::new("preset-merge");
+    let ws = fx.ws();
+    let mut log = History::default();
+    ws.presets
+        .save(&Preset {
+            name: "source".into(),
+            description: Some("source description".into()),
+            color: Some("blue".into()),
+            skills: vec!["one".into(), "both".into()],
+        })
+        .unwrap();
+    ws.presets
+        .save(&Preset {
+            name: "target".into(),
+            description: Some("target description".into()),
+            color: Some("red".into()),
+            skills: vec!["two".into(), "both".into()],
+        })
+        .unwrap();
+    let (_, intent) = history::preset_merge(&ws, "source", "target").unwrap();
+    log.record(intent.unwrap());
+    assert!(ws.presets.load("source").unwrap().is_none());
+    let target = ws.presets.load("target").unwrap().unwrap();
+    assert_eq!(target.skills, ["both", "one", "two"]);
+    assert_eq!(target.color.as_deref(), Some("red"));
+    assert_eq!(target.description.as_deref(), Some("target description"));
+    step(&ws, &mut log, true);
+    let source = ws.presets.load("source").unwrap().unwrap();
+    assert_eq!(source.skills, ["both", "one"]);
+    assert_eq!(source.color.as_deref(), Some("blue"));
+    assert_eq!(
+        ws.presets.load("target").unwrap().unwrap().skills,
+        ["both", "two"]
+    );
+    step(&ws, &mut log, false);
+    assert!(ws.presets.load("source").unwrap().is_none());
+    assert_eq!(
+        ws.presets.load("target").unwrap().unwrap().skills,
+        ["both", "one", "two"]
+    );
+}
+
+#[test]
+fn preset_merge_definition_conflicts_block_membership_changes() {
+    for redo in [false, true] {
+        let fx = Fixture::new(if redo {
+            "preset-merge-redo-conflict"
+        } else {
+            "preset-merge-undo-conflict"
+        });
+        let ws = fx.ws();
+        let mut log = History::default();
+        ws.presets
+            .save(&Preset {
+                name: "source".into(),
+                skills: vec!["one".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        ws.presets
+            .save(&Preset {
+                name: "target".into(),
+                skills: vec!["two".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let (_, intent) = history::preset_merge(&ws, "source", "target").unwrap();
+        log.record(intent.unwrap());
+        if redo {
+            step(&ws, &mut log, true);
+            let mut source = ws.presets.load("source").unwrap().unwrap();
+            source.description = Some("changed".into());
+            ws.presets.save(&source).unwrap();
+        } else {
+            ws.presets
+                .save(&Preset {
+                    name: "source".into(),
+                    description: Some("replacement".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let message = step(&ws, &mut log, !redo);
+        assert!(
+            message.contains("related preset changes left as they are"),
+            "{message}"
+        );
+        assert_eq!(
+            ws.presets.load("target").unwrap().unwrap().skills,
+            if redo {
+                vec!["two"]
+            } else {
+                vec!["one", "two"]
+            }
+        );
+    }
 }

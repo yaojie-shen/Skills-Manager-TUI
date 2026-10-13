@@ -32,12 +32,12 @@ skills --json status
 | 检查 | `list [QUERY…]`、`show KEY`、`status`（别名 `rescan`） |
 | 导入与重命名 | `install REFERENCE`、`adopt PATH`、`repos`、`repos rename ALIAS NAME`、`rename OLD NEW`、`set-source KEY REFERENCE` |
 | 删除 | `remove KEY --yes`；`--keep-meta` 保留元数据，不保留文件 |
-| 标签 | `tag add/remove/set KEY [TAGS…]`、`tag list [KEY]`、`tag rename OLD NEW`、`tag delete TAG --yes` |
+| 标签 | `tag add/remove/set KEY [TAGS…]`、`tag list [KEY]`、`tag rename OLD NEW [--merge]`、`tag delete TAG --yes` |
 | 备注 | `note get/set/clear/edit`；set 接受 `KEY TEXT` 或 `KEY -`；edit 使用 `$EDITOR`；仅支持远程技能 |
 | 上游 | `accept KEY`、`check KEY/--all/--repo ALIAS`、`update KEY/--all/--repo ALIAS` |
 | 部署 | `deploy/undeploy KEYS… --agent AGENT`（可重复），或 `--all-agents`；`--dry-run` 用于预览 |
 | Agent | `agents list/catalog/add/status/clean/remove-link/adopt-link/relink` |
-| 预设 | `preset list/show/create/delete/add/remove/deploy/undeploy/rename/describe`；deploy/undeploy 使用 `--agent AGENT` 或 `--all-agents` |
+| 预设 | `preset list/show/create/delete/add/remove/deploy/undeploy/describe`、`preset rename OLD NEW [--merge]`；deploy/undeploy 使用 `--agent AGENT` 或 `--all-agents` |
 | 健康 | `repair [--deployment AGENT/LINK=KEY]`；`--apply` 执行计划 |
 | 根目录备份 | `sync configure/disable/status/push/pull/run`；单独使用 `sync` 执行完整同步 |
 

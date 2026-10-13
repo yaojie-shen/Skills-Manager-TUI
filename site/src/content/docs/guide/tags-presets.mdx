@@ -17,7 +17,7 @@ skills tag remove hello-skill example
 skills tag set hello-skill writing
 ```
 
-`skills tag set` replaces every tag on the skill. `skills tag rename OLD NEW` merges members if `NEW` already exists. `skills tag delete NAME --yes` removes the classification and all memberships, but not the skills.
+`skills tag set` replaces every tag on the skill. Renaming a tag or preset to an existing name reports a conflict; pass `--merge` to combine skills, remove the source, and keep the target's colour and description. In the TUI this opens a confirmation that defaults to Cancel. `skills tag delete NAME --yes` removes the classification and all memberships, but not the skills.
 
 <DocsTuiCapture frame="tags" caption="The Tags view groups Library skills by tag." />
 

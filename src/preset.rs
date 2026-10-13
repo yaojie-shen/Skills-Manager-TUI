@@ -124,6 +124,7 @@ impl crate::group_store::Group for Preset {
     fn name_mut(&mut self) -> &mut String {
         &mut self.name
     }
+
     fn skills_mut(&mut self) -> &mut Vec<String> {
         &mut self.skills
     }

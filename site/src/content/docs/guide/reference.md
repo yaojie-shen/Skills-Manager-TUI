@@ -32,12 +32,12 @@ Uppercase terms are placeholders. Prefix each command in the table with `skills`
 | Inspect | `list [QUERY…]`, `show KEY`, `status` (alias `rescan`) |
 | Import and rename | `install REFERENCE`, `adopt PATH`, `repos`, `repos rename ALIAS NAME`, `rename OLD NEW`, `set-source KEY REFERENCE` |
 | Remove | `remove KEY --yes`; `--keep-meta` retains metadata, not files |
-| Tags | `tag add/remove/set KEY [TAGS…]`, `tag list [KEY]`, `tag rename OLD NEW`, `tag delete TAG --yes` |
+| Tags | `tag add/remove/set KEY [TAGS…]`, `tag list [KEY]`, `tag rename OLD NEW [--merge]`, `tag delete TAG --yes` |
 | Notes | `note get/set/clear/edit`; set accepts `KEY TEXT` or `KEY -`; edit uses `$EDITOR`; remote skills only |
 | Upstream | `accept KEY`, `check KEY/--all/--repo ALIAS`, `update KEY/--all/--repo ALIAS` |
 | Deployment | `deploy/undeploy KEYS… --agent AGENT` (repeatable), or `--all-agents`; `--dry-run` previews |
 | Agents | `agents list/catalog/add/status/clean/remove-link/adopt-link/relink` |
-| Presets | `preset list/show/create/delete/add/remove/deploy/undeploy/rename/describe`; deploy/undeploy take `--agent AGENT` or `--all-agents` |
+| Presets | `preset list/show/create/delete/add/remove/deploy/undeploy/describe`, `preset rename OLD NEW [--merge]`; deploy/undeploy take `--agent AGENT` or `--all-agents` |
 | Health | `repair [--deployment AGENT/LINK=KEY]`; `--apply` executes the plan |
 | Root backup | `sync configure/disable/status/push/pull/run`; bare `sync` runs a full sync |
 

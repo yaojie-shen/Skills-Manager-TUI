@@ -191,6 +191,8 @@ pub enum TagCommand {
     Rename {
         old: String,
         new: String,
+        #[arg(long)]
+        merge: bool,
     },
     Delete {
         tag: String,
@@ -429,6 +431,8 @@ pub enum PresetCommand {
     Rename {
         old: String,
         new: String,
+        #[arg(long)]
+        merge: bool,
     },
     /// Set the one-line description; empty or omitted text clears it
     Describe {
@@ -1110,8 +1114,16 @@ fn cmd_tag(ctx: &Ctx, c: TagCommand) -> Result<()> {
                 }
             })
         }
-        TagCommand::Rename { old, new } => {
-            let n = edit::tag_rename(&ctx.ws, &old, &new)?;
+        TagCommand::Rename { old, new, merge } => {
+            let exists = ctx.ws.tags.conflicts(&old, &new)?;
+            if exists && !merge {
+                bail!("Tag {new} already exists; pass --merge to merge {old} into it");
+            }
+            let n = if exists {
+                edit::tag_merge(&ctx.ws, &old, &new)?
+            } else {
+                edit::tag_rename(&ctx.ws, &old, &new)?
+            };
             ctx.out(
                 &serde_json::json!({"renamed": {"from": old, "to": new}, "skills": n}),
                 || println!("renamed tag on {n} skill(s)"),
@@ -1808,8 +1820,16 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
         } => preset_links(ctx, &name, &agents, all_agents, dry_run, false),
         // Both go through the same functions the TUI uses, so the message and
         // the config follow-through are the same from either side.
-        PresetCommand::Rename { old, new } => {
-            let (message, _) = history::preset_rename(&ctx.ws, &old, &new)?;
+        PresetCommand::Rename { old, new, merge } => {
+            let exists = store.conflicts(&old, &new)?;
+            if exists && !merge {
+                bail!("preset {new} already exists; pass --merge to merge {old} into it");
+            }
+            let (message, _) = if exists {
+                history::preset_merge(&ctx.ws, &old, &new)?
+            } else {
+                history::preset_rename(&ctx.ws, &old, &new)?
+            };
             ctx.out(
                 &serde_json::json!({"renamed": {"from": old, "to": new}, "message": message}),
                 || println!("{message}"),

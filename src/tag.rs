@@ -26,20 +26,9 @@ impl Group for Tag {
     fn name_mut(&mut self) -> &mut String {
         &mut self.name
     }
+
     fn skills_mut(&mut self) -> &mut Vec<String> {
         &mut self.skills
-    }
-    fn rename_onto(target: &mut Self, source: &Self) -> Result<()> {
-        target.skills.extend(source.skills.clone());
-        target.skills.sort();
-        target.skills.dedup();
-        if target.color.is_none() {
-            target.color = source.color.clone();
-        }
-        if target.description.is_none() {
-            target.description = source.description.clone();
-        }
-        Ok(())
     }
 }
 pub type TagStore = GroupStore<Tag>;

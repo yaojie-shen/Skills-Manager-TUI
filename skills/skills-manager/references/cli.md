@@ -88,7 +88,7 @@ skills tag add KEY [TAG...]
 skills tag remove KEY [TAG...]
 skills tag set KEY [TAG...]      # no tags clears them
 skills tag list [KEY]            # all tags with counts, or one skill's tags
-skills tag rename OLD NEW
+skills tag rename OLD NEW [--merge]
 skills tag delete TAG --yes
 ```
 
@@ -124,7 +124,7 @@ skills preset show NAME
 skills preset create NAME [--description TEXT] [--skill KEY]... [--tag TAG]...
 skills preset add NAME [KEY...] [--tag TAG]...
 skills preset remove NAME [KEY...] [--tag TAG]...
-skills preset rename OLD NEW
+skills preset rename OLD NEW [--merge]
 skills preset describe NAME [TEXT]           # no TEXT clears it
 skills preset delete NAME --yes
 skills preset deploy NAME ([--agent AGENT]... | --all-agents) [--dry-run]
@@ -132,6 +132,8 @@ skills preset undeploy NAME ([--agent AGENT]... | --all-agents) [--dry-run]
 ```
 
 `--tag` copies the tag's current members into the preset once; later tag changes do not follow.
+
+Renaming a tag or preset to an existing name fails; `--merge` combines the skills into the existing one, keeps its colour and description, and removes the old one.
 
 ## Deploy
 

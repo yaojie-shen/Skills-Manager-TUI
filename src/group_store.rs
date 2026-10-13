@@ -28,9 +28,6 @@ pub(crate) trait Group: Clone + PartialEq + Serialize + DeserializeOwned {
     fn missing_rename(_name: &str) -> Result<()> {
         Ok(())
     }
-    fn rename_onto(target: &mut Self, _source: &Self) -> Result<()> {
-        bail!("{} {} already exists", Self::KIND, target.name())
-    }
     fn normalize(&mut self) -> Result<()> {
         *self.name_mut() = group_filename::normalize_name(self.name())?;
         self.skills_mut().sort();
@@ -150,6 +147,11 @@ impl<G: Group> GroupStore<G> {
     pub fn contains_name(&self, name: &str) -> Result<bool> {
         Ok(self.load(name)?.is_some())
     }
+    pub fn conflicts(&self, old: &str, new: &str) -> Result<bool> {
+        let old = group_filename::normalize_name(old)?;
+        let new = group_filename::normalize_name(new)?;
+        Ok(old != new && self.contains_name(&old)? && self.contains_name(&new)?)
+    }
     pub fn edit(&self, edit: impl FnOnce(&mut Vec<G>)) -> Result<()> {
         let _lock = MetaStore::new(&self.root).lock()?;
         let before = self.entries()?;
@@ -187,29 +189,49 @@ impl<G: Group> GroupStore<G> {
         let new = group_filename::normalize_name(new)?;
         let _lock = MetaStore::new(&self.root).lock()?;
         let before = self.entries()?;
-        let Some(source) = before
-            .iter()
-            .find(|e| e.group.name() == old)
-            .map(|e| e.group.clone())
-        else {
+        if !before.iter().any(|e| e.group.name() == old) {
             G::missing_rename(&old)?;
             return Ok(());
-        };
+        }
         if old == new {
             return Ok(());
         }
         let mut values = Self::values(&before);
-        if let Some(target) = values.iter_mut().find(|g| g.name() == new) {
-            G::rename_onto(target, &source)?;
-            values.retain(|g| g.name() != old);
-        } else {
-            *values
-                .iter_mut()
-                .find(|g| g.name() == old)
-                .unwrap()
-                .name_mut() = new.clone();
-        }
+        ensure!(
+            !values.iter().any(|g| g.name() == new),
+            "{} {new} already exists",
+            G::KIND
+        );
+        *values
+            .iter_mut()
+            .find(|g| g.name() == old)
+            .unwrap()
+            .name_mut() = new.clone();
         self.write(&before, values, Some((&old, &new)))
+    }
+    pub fn merge(&self, source: &str, target: &str) -> Result<()> {
+        let source = group_filename::normalize_name(source)?;
+        let target = group_filename::normalize_name(target)?;
+        let _lock = MetaStore::new(&self.root).lock()?;
+        let before = self.entries()?;
+        ensure!(
+            source != target,
+            "cannot merge {} {source} into itself",
+            G::KIND
+        );
+        let mut values = Self::values(&before);
+        let mut source_group = values
+            .iter()
+            .find(|g| g.name() == source)
+            .cloned()
+            .with_context(|| format!("no such {}: {source}", G::KIND))?;
+        let target_group = values
+            .iter_mut()
+            .find(|g| g.name() == target)
+            .with_context(|| format!("no such {}: {target}", G::KIND))?;
+        target_group.skills_mut().append(source_group.skills_mut());
+        values.retain(|g| g.name() != source);
+        self.write(&before, values, None)
     }
     fn write(
         &self,
@@ -342,6 +364,40 @@ mod tests {
         for name in strays {
             assert_eq!(std::fs::read(store.dir.join(name)).unwrap(), b"stray");
         }
+
+        let temp = DownloadDir::new(&format!("group-{label}-merge")).unwrap();
+        let store = GroupStore::<G>::new(temp.path());
+        store
+            .save(&make("source", vec!["one".into(), "both".into()]))
+            .unwrap();
+        store
+            .save(&make("target", vec!["two".into(), "both".into()]))
+            .unwrap();
+        let conflict = format!("{:#}", store.rename("source", "target").unwrap_err());
+        assert_eq!(conflict, format!("{} target already exists", G::KIND));
+        assert!(!store.conflicts("source", "source").unwrap());
+        assert!(!store.conflicts("missing", "target").unwrap());
+        store.rename("source", "source").unwrap();
+        assert!(!store.conflicts("source", "  source  ").unwrap());
+        store.rename("source", "  source  ").unwrap();
+        store.save(&make("Café", vec![])).unwrap();
+        assert!(!store.conflicts("Café", "Cafe\u{301}").unwrap());
+        store.rename("Café", "Cafe\u{301}").unwrap();
+        let target_path = store.path("target");
+        let text = format!(
+            "# target comment\n{}",
+            std::fs::read_to_string(&target_path).unwrap()
+        );
+        std::fs::write(&target_path, text).unwrap();
+        store.merge("source", "target").unwrap();
+        assert!(store.load("source").unwrap().is_none());
+        let mut target = store.load("target").unwrap().unwrap();
+        assert_eq!(target.skills_mut(), &["both", "one", "two"]);
+        assert!(
+            std::fs::read_to_string(target_path)
+                .unwrap()
+                .starts_with("# target comment")
+        );
 
         let temp = DownloadDir::new(&format!("group-{label}-patch")).unwrap();
         let store = GroupStore::<G>::new(temp.path());
