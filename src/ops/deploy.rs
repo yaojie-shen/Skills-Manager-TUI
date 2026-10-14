@@ -29,6 +29,12 @@ pub enum Action {
         agent: String,
         skill: String,
         path: PathBuf,
+        #[serde(skip)]
+        target: PathBuf,
+        #[serde(skip)]
+        parent_identity: (u64, u64),
+        #[serde(skip)]
+        link_identity: (u64, u64, i64, i64),
     },
     /// Remove only the exact broken link that was previewed.
     #[serde(rename = "unlink")]
@@ -73,7 +79,9 @@ impl Action {
                     crate::paths::contract_tilde(target)
                 )
             }
-            Action::Unlink { agent, skill, path } => {
+            Action::Unlink {
+                agent, skill, path, ..
+            } => {
                 format!("unlink {agent}/{skill} ({})", path.display())
             }
             Action::Clean {
@@ -99,6 +107,19 @@ impl Action {
     }
     pub fn is_change(&self) -> bool {
         !matches!(self, Action::Skip { .. })
+    }
+
+    pub fn unlink(agent: String, skill: String, path: PathBuf) -> Result<Self> {
+        let parent = path.parent().context("invalid unlink path")?;
+        Ok(Self::Unlink {
+            agent,
+            skill,
+            target: fs::read_link(&path)
+                .with_context(|| format!("reading link {}", path.display()))?,
+            parent_identity: identity(&fs::symlink_metadata(parent)?),
+            link_identity: symlink_identity(&fs::symlink_metadata(&path)?),
+            path,
+        })
     }
 }
 
@@ -245,13 +266,9 @@ pub fn plan_undeploy(
                             reason: "not deployed".into(),
                         });
                     }
-                    Some(EntryState::Deployed) | Some(EntryState::Broken { .. }) => {
-                        actions.push(Action::Unlink {
-                            agent: agent.clone(),
-                            skill: skill.clone(),
-                            path: dir.join(name),
-                        })
-                    }
+                    Some(EntryState::Deployed) | Some(EntryState::Broken { .. }) => actions.push(
+                        Action::unlink(agent.clone(), skill.clone(), dir.join(name))?,
+                    ),
                     None => actions.push(Action::Skip {
                         agent: agent.clone(),
                         skill: skill.clone(),
@@ -428,17 +445,44 @@ pub fn plan_relink(
     Ok(actions)
 }
 
-/// Execute planned actions in order. Stops at the first failure.
-pub fn apply(actions: &[Action]) -> Result<usize> {
-    // A clean preview is permission to remove only the exact broken links it
-    // observed. Preflight the whole batch before any mutations, and validate
-    // again at the individual removal to narrow the race window.
+/// Validate a planned batch against the current filesystem without mutating it.
+/// Same-name conflicts within the batch are left to the caller's conflict
+/// resolution; this checks only state that can make an otherwise resolved plan
+/// unsafe to apply.
+pub fn preflight(actions: &[Action]) -> Result<()> {
+    // A configured agent directory can be replaced after planning. Reject the
+    // whole batch before any action can write through that new symlink.
     for action in actions {
-        if matches!(action, Action::Clean { .. }) {
-            validate_clean(action)?;
+        match action {
+            Action::Link { path, .. } | Action::Relink { path, .. }
+                if path.parent().is_some_and(|p| p.is_symlink()) =>
+            {
+                bail!("Agent directory became a symlink; refresh before deploying")
+            }
+            Action::Mkdir { path, .. } if path.is_symlink() => {
+                bail!("Agent directory became a symlink; refresh before deploying")
+            }
+            Action::Unlink { path, .. } if path.parent().is_some_and(|p| p.is_symlink()) => {
+                bail!("Agent directory became a symlink; refresh before undeploying")
+            }
+            _ => {}
         }
     }
-    // Validate the entire batch before changing even the first directory.
+    // An unlink or clean preview is permission to remove only the exact link it
+    // observed. Apply validates again at the individual removal to narrow the
+    // race window.
+    for action in actions {
+        match action {
+            Action::Unlink { .. } => {
+                validate_unlink(action)?;
+            }
+            Action::Clean { .. } => {
+                validate_clean(action)?;
+            }
+            _ => {}
+        }
+    }
+
     let removed: BTreeSet<_> = actions
         .iter()
         .filter_map(|a| match a {
@@ -446,20 +490,10 @@ pub fn apply(actions: &[Action]) -> Result<usize> {
             _ => None,
         })
         .collect();
-    let mut planned = Vec::new();
     for action in actions {
         if let Action::Link { path, target, .. } = action {
             let name = crate::skill::SkillDoc::load(target)?.name;
             let parent = path.parent().context("invalid deployment path")?;
-            let directory = std::fs::canonicalize(parent).unwrap_or(parent.to_path_buf());
-            for (other_dir, other_path, other_name, other_target) in &planned {
-                anyhow::ensure!(
-                    other_dir != &directory
-                        || other_target == target
-                        || (other_path != path && other_name != &name),
-                    "deployment conflict: choose only one skill per folder/name"
-                );
-            }
             if parent.is_dir() {
                 for entry in std::fs::read_dir(parent)? {
                     let other = entry?.path();
@@ -481,6 +515,30 @@ pub fn apply(actions: &[Action]) -> Result<usize> {
                         other.display()
                     );
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Execute planned actions in order. Stops at the first failure.
+pub fn apply(actions: &[Action]) -> Result<usize> {
+    preflight(actions)?;
+
+    // Applying cannot leave an unresolved duplicate-name choice to the caller.
+    let mut planned = Vec::new();
+    for action in actions {
+        if let Action::Link { path, target, .. } = action {
+            let name = crate::skill::SkillDoc::load(target)?.name;
+            let parent = path.parent().context("invalid deployment path")?;
+            let directory = std::fs::canonicalize(parent).unwrap_or(parent.to_path_buf());
+            for (other_dir, other_path, other_name, other_target) in &planned {
+                anyhow::ensure!(
+                    other_dir != &directory
+                        || other_target == target
+                        || (other_path != path && other_name != &name),
+                    "deployment conflict: choose only one skill per folder/name"
+                );
             }
             planned.push((directory, path.clone(), name, target.clone()));
         }
@@ -547,20 +605,10 @@ pub fn apply(actions: &[Action]) -> Result<usize> {
                 done += 1;
             }
             Action::Unlink { path, .. } => {
-                match std::fs::symlink_metadata(path) {
-                    // Already gone, by another session or by hand. The state
-                    // asked for is the state there is, so carry on rather than
-                    // abandoning the rest of the batch.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    // Something is there that we did not put there.
-                    Ok(m) if !m.file_type().is_symlink() => {
-                        bail!("refusing to remove non-symlink {}", path.display())
-                    }
-                    _ => {
-                        std::fs::remove_file(path)
-                            .with_context(|| format!("removing {}", path.display()))?;
-                        done += 1;
-                    }
+                if validate_unlink(a)? == LinkState::Remove {
+                    fs::remove_file(path)
+                        .with_context(|| format!("removing {}", path.display()))?;
+                    done += 1;
                 }
             }
             Action::Clean { path, .. } => {
@@ -573,6 +621,50 @@ pub fn apply(actions: &[Action]) -> Result<usize> {
         }
     }
     Ok(done)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkState {
+    Gone,
+    Remove,
+}
+
+fn validate_unlink(action: &Action) -> Result<LinkState> {
+    let Action::Unlink {
+        path,
+        target,
+        parent_identity,
+        link_identity,
+        ..
+    } = action
+    else {
+        unreachable!("unlink validation called for another action")
+    };
+
+    let parent = path.parent().context("invalid unlink path")?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .with_context(|| format!("checking agent directory {}", parent.display()))?;
+    if !parent_metadata.is_dir() || identity(&parent_metadata) != *parent_identity {
+        bail!(
+            "{} changed since it was planned; refresh and retry",
+            path.display()
+        );
+    }
+    let link_metadata = match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(LinkState::Gone),
+        Err(error) => return Err(error).with_context(|| format!("checking {}", path.display())),
+        Ok(metadata) => metadata,
+    };
+    if !link_metadata.file_type().is_symlink()
+        || symlink_identity(&link_metadata) != *link_identity
+        || fs::read_link(path).map_or(true, |current| current != *target)
+    {
+        bail!(
+            "{} changed since it was planned; refresh and retry",
+            path.display()
+        );
+    }
+    Ok(LinkState::Remove)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -873,6 +965,9 @@ mod tests {
             agent: agent.into(),
             skill: skill.into(),
             path: PathBuf::new(),
+            target: PathBuf::new(),
+            parent_identity: (0, 0),
+            link_identity: (0, 0, 0, 0),
         }
     }
     fn skip() -> Action {
@@ -1032,11 +1127,7 @@ pub fn resolve_names(
                 )?;
                 if actions.iter().any(|a| matches!(a,Action::Link {skill:s,agent,..} if *s == skill && *agent == conflict.agent)) { bail!("cannot replace when the batch selects multiple skills with the same name; choose one") }
                 if seen.insert(conflict.other_path.clone()) {
-                    resolved.push(Action::Unlink {
-                        agent: conflict.agent,
-                        skill,
-                        path: conflict.other_path,
-                    });
+                    resolved.push(Action::unlink(conflict.agent, skill, conflict.other_path)?);
                 }
             }
             resolved.extend_from_slice(actions);

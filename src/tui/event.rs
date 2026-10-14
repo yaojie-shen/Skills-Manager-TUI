@@ -477,6 +477,26 @@ impl BatchWork {
                         };
                     }
                 }
+                let removals: Vec<_> = actions
+                    .iter()
+                    .filter(|action| {
+                        matches!(
+                            action,
+                            deploy::Action::Unlink { .. } | deploy::Action::Clean { .. }
+                        )
+                    })
+                    .cloned()
+                    .collect();
+                if let Err(error) = deploy::preflight(&removals) {
+                    return BatchOutcome {
+                        conflict: None,
+                        message: "Batch deployment failed".into(),
+                        intent: None,
+                        failed: keys,
+                        errors: vec![format!("{error:#}")],
+                        changed_scope: None,
+                    };
+                }
                 let mut completed = Vec::new();
                 let mut failed = std::collections::BTreeSet::new();
                 let mut errors = Vec::new();
@@ -497,7 +517,7 @@ impl BatchWork {
                     let result = if let deploy::Action::Skip { reason, .. } = action {
                         Err(anyhow::anyhow!(reason.clone()))
                     } else {
-                        apply_batch_link(ws, action)
+                        apply_batch_link(action)
                     };
                     match result {
                         Ok(changes) if changes > 0 => completed.push(action.clone()),
@@ -539,7 +559,7 @@ pub fn spawn_batch(
     }).map(|_| ())
 }
 
-fn apply_batch_link(ws: &Workspace, action: &skills::ops::deploy::Action) -> Result<usize> {
+fn apply_batch_link(action: &skills::ops::deploy::Action) -> Result<usize> {
     use skills::ops::deploy;
     match action {
         deploy::Action::Link { path, target, .. } => {
@@ -561,18 +581,6 @@ fn apply_batch_link(ws: &Workspace, action: &skills::ops::deploy::Action) -> Res
             // that appeared after the plan was made, even if it is a symlink.
             std::os::unix::fs::symlink(target, path)?;
             Ok(1)
-        }
-        deploy::Action::Unlink { path, skill, .. } => {
-            if path.parent().is_some_and(|p| p.is_symlink()) {
-                anyhow::bail!("Agent directory became a symlink; refresh before undeploying");
-            }
-            if path.is_symlink() {
-                let expected = ws.skill_path(skill);
-                if skills::util::link_target_abs(path).as_deref() != Some(expected.as_path()) {
-                    anyhow::bail!("Link target changed; refusing to remove {}", path.display());
-                }
-            }
-            deploy::apply(std::slice::from_ref(action))
         }
         deploy::Action::Mkdir { path, .. } if path.is_symlink() => {
             anyhow::bail!("Agent directory became a symlink; refresh before deploying")
@@ -630,12 +638,14 @@ mod batch_tests {
         assert_eq!(added, vec![("alpha".into(), "test".into())]);
         assert!(removed.is_empty());
         assert_eq!(outcome.errors.len(), 1);
-        let unlink = skills::ops::deploy::Action::Unlink {
-            agent: "test".into(),
-            skill: "beta".into(),
-            path: agent.join("beta"),
-        };
-        assert!(apply_batch_link(&ws, &unlink).is_err());
+        std::fs::remove_file(agent.join("beta")).unwrap();
+        std::os::unix::fs::symlink(ws.skill_path("beta"), agent.join("beta")).unwrap();
+        let unlink =
+            skills::ops::deploy::Action::unlink("test".into(), "beta".into(), agent.join("beta"))
+                .unwrap();
+        std::fs::remove_file(agent.join("beta")).unwrap();
+        std::os::unix::fs::symlink(&foreign, agent.join("beta")).unwrap();
+        assert!(apply_batch_link(&unlink).is_err());
         assert_eq!(std::fs::read_link(agent.join("beta")).unwrap(), foreign);
         std::fs::remove_dir_all(root).unwrap();
     }

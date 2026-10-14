@@ -1402,6 +1402,9 @@ mod tests {
             agent: agent.into(),
             skill: skill.into(),
             path: PathBuf::new(),
+            target: PathBuf::new(),
+            parent_identity: (0, 0),
+            link_identity: (0, 0, 0, 0),
         }
     }
     fn install(name: &str) -> Intent {

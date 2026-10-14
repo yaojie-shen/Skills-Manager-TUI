@@ -807,7 +807,7 @@ fn clean_batch_validates_every_link_before_removing_any() {
 }
 
 #[test]
-fn ordinary_undeploy_keeps_its_existing_unlink_semantics() {
+fn undeploy_refuses_a_link_replaced_since_planning() {
     let f = Fixture::new("undeploy-retargeted");
     f.add_skill("printer", "prints");
     let ws = f.ws();
@@ -819,11 +819,17 @@ fn ordinary_undeploy_keeps_its_existing_unlink_semantics() {
             .unwrap();
 
     let path = f.agent_a.join("printer");
+    let foreign = f.base.join("other");
     std::fs::remove_file(&path).unwrap();
-    std::os::unix::fs::symlink(f.base.join("other"), &path).unwrap();
+    std::os::unix::fs::symlink(&foreign, &path).unwrap();
 
-    assert_eq!(deploy::apply(&undeploy_plan).unwrap(), 1);
-    assert!(!entry_exists(&path));
+    let error = deploy::apply(&undeploy_plan).unwrap_err().to_string();
+    assert!(error.contains("changed since it was planned; refresh and retry"));
+    assert!(
+        deploy::preflight(&undeploy_plan).is_err(),
+        "dry-run validation"
+    );
+    assert_eq!(std::fs::read_link(&path).unwrap(), foreign);
 }
 
 #[test]
@@ -896,6 +902,61 @@ fn skills_json(root: &Path, args: &[&str]) -> Result<serde_json::Value, String> 
     } else {
         Err(String::from_utf8_lossy(&out.stderr).into_owned())
     }
+}
+
+#[test]
+fn deploy_dry_run_preflights_destinations_without_resolving_batch_name_choices() {
+    let f = Fixture::new("cli-deploy-preview");
+    f.add_skill("ordinary", "ordinary preview");
+    f.add_skill("occupied", "foreign destination");
+    f.add_skill("first", "first duplicate");
+    f.add_skill("second", "second duplicate");
+    for key in ["first", "second"] {
+        std::fs::write(
+            f.root.join(key).join("SKILL.md"),
+            format!("---\nname: shared\ndescription: {key}\n---\n# {key}\n"),
+        )
+        .unwrap();
+    }
+    std::fs::create_dir_all(&f.agent_a).unwrap();
+    std::fs::write(f.agent_a.join("occupied"), "foreign").unwrap();
+
+    let ordinary = skills_json(
+        &f.root,
+        &["deploy", "ordinary", "--agent", "a", "--dry-run"],
+    )
+    .unwrap();
+    assert_eq!(ordinary["dry_run"], true);
+    assert_eq!(ordinary["applied"], 0);
+    assert_eq!(ordinary["actions"][0]["op"], "link");
+    assert!(!f.agent_a.join("ordinary").exists());
+
+    let error = skills_json(
+        &f.root,
+        &["deploy", "occupied", "--agent", "a", "--dry-run"],
+    )
+    .unwrap_err();
+    assert!(
+        error.contains(&format!(
+            "deployment conflict at {}; choose one skill before applying",
+            f.agent_a.join("occupied").display()
+        )),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.agent_a.join("occupied")).unwrap(),
+        "foreign"
+    );
+
+    let duplicate = skills_json(
+        &f.root,
+        &["deploy", "first", "second", "--agent", "a", "--dry-run"],
+    )
+    .unwrap();
+    assert_eq!(duplicate["dry_run"], true);
+    assert_eq!(duplicate["actions"].as_array().unwrap().len(), 2);
+    assert!(!duplicate["name_conflicts"].as_array().unwrap().is_empty());
+    assert!(!f.agent_a.join("shared").exists());
 }
 
 #[test]
@@ -1013,6 +1074,36 @@ fn aliased_roots_use_the_same_identity_for_adopt_and_deployment() {
     assert!(matches!(entries["other-name"], EntryState::Foreign { .. }));
     assert!(matches!(entries["foreign"], EntryState::Foreign { .. }));
     assert!(matches!(entries["missing"], EntryState::Broken { .. }));
+}
+
+#[test]
+fn cli_note_get_rejects_missing_skills_but_accepts_existing_local_skills() {
+    let f = Fixture::new("note-get");
+    f.add_skill("local", "local skill");
+    let run = |key: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_skills"))
+            .args([
+                "--root",
+                f.root.to_str().unwrap(),
+                "--json",
+                "note",
+                "get",
+                key,
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let output = run("missing");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no such skill: missing"));
+
+    let output = run("local");
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::Value::Null
+    );
 }
 
 #[test]

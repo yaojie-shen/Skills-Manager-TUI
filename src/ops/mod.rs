@@ -140,6 +140,22 @@ pub fn require_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn require_existing_keys(ws: &crate::Workspace, keys: &[String]) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let snap = ws.scan()?;
+    let missing: std::collections::BTreeSet<_> =
+        keys.iter().filter(|key| snap.get(key).is_none()).collect();
+    if !missing.is_empty() {
+        bail!(
+            "no such skill: {}",
+            missing.into_iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Run `git` with arguments, returning stdout. Fails with stderr on non-zero exit.
 pub fn git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     let mut cmd = std::process::Command::new("git");

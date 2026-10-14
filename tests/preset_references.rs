@@ -497,6 +497,66 @@ fn cli_tag_selection_materializes_current_members_for_create_add_and_remove() {
 }
 
 #[test]
+fn cli_preset_members_reject_unknown_explicit_skills_without_writing() {
+    let f = Fixture::new("cli-unknown-members");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_skills"))
+            .args(["--root", f.ws.root.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let output = run(&[
+        "preset",
+        "create",
+        "daily",
+        "--skill",
+        "missing-b",
+        "--skill",
+        "one",
+        "--skill",
+        "missing-a",
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no such skill: missing-a, missing-b"),
+        "{stderr}"
+    );
+    assert!(!f.ws.presets.path("daily").exists());
+
+    f.cli(&["preset", "create", "daily", "--skill", "one"]);
+    let before = std::fs::read(f.ws.presets.path("daily")).unwrap();
+    let output = run(&["preset", "add", "daily", "two", "missing"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no such skill: missing"));
+    assert_eq!(std::fs::read(f.ws.presets.path("daily")).unwrap(), before);
+
+    f.ws.presets
+        .save(&Preset {
+            name: "stale".into(),
+            skills: vec!["missing".into()],
+            ..Default::default()
+        })
+        .unwrap();
+    let output = run(&["preset", "remove", "stale", "missing"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        f.ws.presets
+            .load("stale")
+            .unwrap()
+            .unwrap()
+            .skills
+            .is_empty()
+    );
+}
+
+#[test]
 fn cli_preset_targets_require_explicit_agents_or_all_agents() {
     let f = Fixture::new("cli-targets");
     f.cli(&["preset", "create", "daily", "--skill", "one"]);

@@ -1144,6 +1144,10 @@ fn cmd_tag(ctx: &Ctx, c: TagCommand) -> Result<()> {
 fn cmd_note(ctx: &Ctx, c: NoteCommand) -> Result<()> {
     match c {
         NoteCommand::Get { skill } => {
+            ctx.ws
+                .scan()?
+                .get(&skill)
+                .with_context(|| format!("no such skill: {skill}"))?;
             let m = ctx.ws.meta.load(&skill)?.unwrap_or_default();
             ctx.out(&m.note, || {
                 if let Some(n) = &m.note {
@@ -1550,19 +1554,35 @@ fn cmd_deploy(ctx: &Ctx, a: DeployArgs, on: bool) -> Result<()> {
     } else {
         deploy::plan_undeploy(&ctx.ws, &snap, &a.skills, &agents)?
     };
-    run_actions(ctx, &actions, a.dry_run)
+    run_actions(ctx, &snap, &actions, a.dry_run)
 }
 
-fn run_actions(ctx: &Ctx, actions: &[Action], dry_run: bool) -> Result<()> {
-    let snap = ctx.ws.scan()?;
-    let conflicts = deploy::name_conflicts(&snap, actions);
+fn run_actions(
+    ctx: &Ctx,
+    planning_snap: &Snapshot,
+    actions: &[Action],
+    dry_run: bool,
+) -> Result<()> {
+    let fresh_snap;
+    let snap = if dry_run {
+        planning_snap
+    } else {
+        fresh_snap = ctx.ws.scan_for_links()?;
+        &fresh_snap
+    };
+    let conflicts = deploy::name_conflicts(snap, actions);
     let resolved = if dry_run && ctx.same_name.is_none() {
         actions.to_vec()
     } else {
-        deploy::resolve_names(&snap, actions, ctx.same_name.as_deref())?
+        deploy::resolve_names(snap, actions, ctx.same_name.as_deref())?
     };
     let actions = resolved.as_slice();
-    let applied = if dry_run { 0 } else { deploy::apply(actions)? };
+    let applied = if dry_run {
+        deploy::preflight(actions)?;
+        0
+    } else {
+        deploy::apply(actions)?
+    };
     let changes = actions.iter().filter(|a| a.is_change()).count();
     ctx.out(
         &serde_json::json!({"dry_run": dry_run, "applied": applied, "actions": actions, "name_conflicts": conflicts}),
@@ -1649,7 +1669,7 @@ fn cmd_agents(ctx: &Ctx, c: Option<AgentsCommand>) -> Result<()> {
             let snap = ctx.ws.scan()?;
             let actions = deploy::plan_clean(&ctx.ws, &snap, &agent, &skills)?;
             gate(&actions, dry_run, yes, "cleaning removes links")?;
-            run_actions(ctx, &actions, dry_run)
+            run_actions(ctx, &snap, &actions, dry_run)
         }
         AgentsCommand::RemoveLink {
             agent,
@@ -1691,7 +1711,7 @@ fn cmd_agents(ctx: &Ctx, c: Option<AgentsCommand>) -> Result<()> {
                 yes,
                 "relinking deletes the agent's own copies",
             )?;
-            run_actions(ctx, &actions, dry_run)
+            run_actions(ctx, &snap, &actions, dry_run)
         }
     }
 }
@@ -1763,6 +1783,7 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
             if store.load(&name)?.is_some() {
                 bail!("preset {name} already exists");
             }
+            skills::ops::require_existing_keys(&ctx.ws, &skills)?;
             let mut skills = skills;
             skills.extend(skills::preset::tag_members(&ctx.ws.config, &tags)?);
             let mut p = Preset {
@@ -1788,6 +1809,7 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
             let mut p = store
                 .load(&name)?
                 .with_context(|| format!("no such preset: {name}"))?;
+            skills::ops::require_existing_keys(&ctx.ws, &skills)?;
             p.skills
                 .extend(skills::preset::tag_members(&ctx.ws.config, &tags)?);
             p.skills.extend(skills);
@@ -1868,7 +1890,7 @@ fn preset_links(
     } else {
         deploy::plan_preset_deactivate(&ctx.ws, &snap, &p, &targets)?
     };
-    run_actions(ctx, &actions, dry_run)
+    run_actions(ctx, &snap, &actions, dry_run)
 }
 
 #[cfg(test)]
@@ -1891,6 +1913,120 @@ mod tui_library_tests {
                 .contains("config already exists")
         );
         assert_eq!(std::fs::read_to_string(path).unwrap(), text);
+    }
+
+    fn deploy_fixture(name: &str) -> (skills::ops::DownloadDir, Ctx, PathBuf) {
+        let temp = skills::ops::DownloadDir::new(name).unwrap();
+        let root = temp.path().join("library");
+        let agent = temp.path().join("agent");
+        std::fs::create_dir(&root).unwrap();
+        skills::config::Config {
+            agents: vec![skills::config::AgentConfig {
+                key: "agent".into(),
+                name: "Agent".into(),
+                skills_dir: agent.display().to_string(),
+            }],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let skill = root.join("one");
+        std::fs::create_dir(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: shared\n---\n").unwrap();
+        let ctx = Ctx {
+            ws: Workspace::open(&root).unwrap(),
+            same_name: None,
+            json: false,
+        };
+        (temp, ctx, agent)
+    }
+
+    #[test]
+    fn apply_revalidation_catches_a_name_conflict_introduced_after_planning() {
+        let (_temp, ctx, agent) = deploy_fixture("cli-fresh-conflict");
+        let snap = ctx.ws.scan().unwrap();
+        let actions =
+            deploy::plan_deploy(&ctx.ws, &snap, &["one".into()], &["agent".into()]).unwrap();
+        std::fs::create_dir_all(agent.join("other")).unwrap();
+        std::fs::write(agent.join("other/SKILL.md"), "---\nname: shared\n---\n").unwrap();
+
+        let error = run_actions(&ctx, &snap, &actions, false).unwrap_err();
+        assert!(error.to_string().contains("skill name conflict"));
+        assert!(!agent.join("shared").exists());
+    }
+
+    #[test]
+    fn apply_revalidation_catches_a_skill_removed_after_planning() {
+        let (_temp, ctx, agent) = deploy_fixture("cli-fresh-removed");
+        let snap = ctx.ws.scan().unwrap();
+        let actions =
+            deploy::plan_deploy(&ctx.ws, &snap, &["one".into()], &["agent".into()]).unwrap();
+        std::fs::remove_dir_all(ctx.ws.root.join("one")).unwrap();
+
+        assert!(run_actions(&ctx, &snap, &actions, false).is_err());
+        assert!(!agent.join("shared").exists());
+    }
+
+    #[test]
+    fn apply_revalidation_refuses_agent_directory_symlink_before_deploying() {
+        let (temp, ctx, agent) = deploy_fixture("cli-fresh-agent-deploy");
+        let snap = ctx.ws.scan().unwrap();
+        let actions =
+            deploy::plan_deploy(&ctx.ws, &snap, &["one".into()], &["agent".into()]).unwrap();
+        let redirected = temp.path().join("redirected");
+        std::fs::create_dir(&redirected).unwrap();
+        std::os::unix::fs::symlink(&redirected, &agent).unwrap();
+
+        let error = run_actions(&ctx, &snap, &actions, false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Agent directory became a symlink; refresh before deploying"
+        );
+        assert!(!redirected.join("shared").exists());
+    }
+
+    #[test]
+    fn apply_revalidation_refuses_agent_directory_symlink_before_relinking() {
+        let (temp, ctx, agent) = deploy_fixture("cli-fresh-agent-relink");
+        std::fs::create_dir_all(agent.join("shared")).unwrap();
+        std::fs::copy(
+            ctx.ws.root.join("one/SKILL.md"),
+            agent.join("shared/SKILL.md"),
+        )
+        .unwrap();
+        let snap = ctx.ws.scan().unwrap();
+        let actions = deploy::plan_relink(&ctx.ws, &snap, "agent", &["shared".into()]).unwrap();
+        let redirected = temp.path().join("redirected");
+        std::fs::rename(&agent, &redirected).unwrap();
+        std::os::unix::fs::symlink(&redirected, &agent).unwrap();
+
+        let error = run_actions(&ctx, &snap, &actions, false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Agent directory became a symlink; refresh before deploying"
+        );
+        assert!(redirected.join("shared").is_dir());
+        assert!(!redirected.join("shared").is_symlink());
+    }
+
+    #[test]
+    fn apply_revalidation_refuses_agent_directory_symlink_before_undeploying() {
+        let (temp, ctx, agent) = deploy_fixture("cli-fresh-agent-undeploy");
+        std::fs::create_dir(&agent).unwrap();
+        std::os::unix::fs::symlink(ctx.ws.root.join("one"), agent.join("shared")).unwrap();
+        let snap = ctx.ws.scan().unwrap();
+        let actions =
+            deploy::plan_undeploy(&ctx.ws, &snap, &["one".into()], &["agent".into()]).unwrap();
+        let redirected = temp.path().join("redirected");
+        std::fs::rename(&agent, &redirected).unwrap();
+        std::os::unix::fs::symlink(&redirected, &agent).unwrap();
+
+        let error = run_actions(&ctx, &snap, &actions, false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Agent directory became a symlink; refresh before undeploying"
+        );
+        assert!(redirected.join("shared").is_symlink());
     }
 
     #[test]
