@@ -428,10 +428,8 @@ impl Batch {
             let config = skills::config::Config::load(&ws.root)?;
             anyhow::ensure!(config.tags_enabled, "Tags are disabled");
             anyhow::ensure!(!keys.is_empty(), "No skills selected");
-            anyhow::ensure!(
-                !name.is_empty() && name != "(untagged)" && !name.contains(','),
-                "Invalid tag name"
-            );
+            anyhow::ensure!(!name.is_empty(), "Invalid tag name");
+            skills::tag::validate_name(&name)?;
             for key in &keys {
                 anyhow::ensure!(ws.skill_path(key).is_dir(), "no such skill: {key}");
             }

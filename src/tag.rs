@@ -1,6 +1,6 @@
 //! Named skill groups stored independently under `<root>/.skills-meta/tags`.
 use crate::group_store::{Group, GroupStore};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub const TAG_DIR: &str = "tags";
@@ -26,11 +26,24 @@ impl Group for Tag {
     fn name_mut(&mut self) -> &mut String {
         &mut self.name
     }
+    fn validate_new_name(name: &str) -> Result<()> {
+        validate_name(name)
+    }
 
     fn skills_mut(&mut self) -> &mut Vec<String> {
         &mut self.skills
     }
 }
+pub fn validate_name(name: &str) -> Result<()> {
+    if name == "(untagged)" {
+        bail!("invalid tag name {name:?}: reserved for untagged skills");
+    }
+    if name.contains(',') {
+        bail!("invalid tag name {name:?}: tag names cannot contain commas");
+    }
+    Ok(())
+}
+
 pub type TagStore = GroupStore<Tag>;
 impl GroupStore<Tag> {
     pub fn remove_skill(&self, old: &str, new: Option<&str>) -> Result<()> {

@@ -9,7 +9,7 @@ use super::{SplitFocus, View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::components::context_menu::{Command, Item, Request, Target};
 use crate::tui::components::group;
-use crate::tui::components::group_prompt::Prompt;
+use crate::tui::components::group_prompt::{Ask, Prompt};
 use crate::tui::components::layout::{frame, split_panes};
 use crate::tui::modal::Modal;
 use crate::tui::settings::LayoutScope;
@@ -45,34 +45,65 @@ pub struct PresetsView {
     /// list is sorted and a preset just created or renamed can appear
     /// anywhere in it.
     pending: Option<String>,
-    color_prompt: Option<Prompt>,
+    group_prompt: Option<Prompt>,
 }
 
 impl PresetsView {
-    fn finish_color(&mut self, result: Option<bool>) -> Vec<Action> {
+    fn finish_prompt(&mut self, result: Option<bool>) -> Vec<Action> {
         match result {
-            Some(false) => self.color_prompt = None,
+            Some(false) => self.group_prompt = None,
             Some(true) => {
-                let Some(prompt) = self.color_prompt.as_ref() else {
+                let Some(prompt) = self.group_prompt.as_ref() else {
                     return vec![];
                 };
-                let Some(color) = prompt.color_text() else {
-                    return vec![Action::Error("Use a colour name or #rrggbb".into())];
-                };
                 let name = prompt.name().to_string();
-                self.color_prompt = None;
-                return vec![Action::Write(Box::new(move |ws| {
-                    let mut preset = ws
-                        .presets
-                        .load(&name)?
-                        .ok_or_else(|| anyhow::anyhow!("no such preset: {name}"))?;
-                    preset.color = color;
-                    ws.presets.save(&preset)?;
-                    Ok(format!("Updated colour of {name}"))
-                }))];
+                let actions = match prompt.kind() {
+                    Ask::Merge => {
+                        let Some(target) = prompt.chosen().map(str::to_string) else {
+                            return vec![Action::Error("Pick a preset to merge into".into())];
+                        };
+                        let selected = target.clone();
+                        vec![
+                            Action::WriteMeta(Box::new(move |ws| {
+                                history::preset_merge(ws, &name, &target)
+                            })),
+                            Action::SelectPreset(selected),
+                        ]
+                    }
+                    Ask::Color => {
+                        let Some(color) = prompt.color_text() else {
+                            return vec![Action::Error("Use a colour name or #rrggbb".into())];
+                        };
+                        vec![Action::Write(Box::new(move |ws| {
+                            let mut preset = ws
+                                .presets
+                                .load(&name)?
+                                .ok_or_else(|| anyhow::anyhow!("no such preset: {name}"))?;
+                            preset.color = color;
+                            ws.presets.save(&preset)?;
+                            Ok(format!("Updated colour of {name}"))
+                        }))]
+                    }
+                };
+                self.group_prompt = None;
+                return actions;
             }
             None => {}
         }
+        vec![]
+    }
+
+    fn ask_merge(&mut self) -> Vec<Action> {
+        let Some(source) = self.selected().map(|preset| preset.name.clone()) else {
+            return vec![];
+        };
+        let choices = self
+            .all_presets
+            .iter()
+            .map(|preset| preset.name.clone())
+            .filter(|name| name != &source)
+            .collect();
+        self.group_prompt = Some(Prompt::for_merge(group::Kind::Preset, &source, choices));
         vec![]
     }
 
@@ -83,7 +114,7 @@ impl PresetsView {
     }
 
     pub fn input_focused(&self) -> bool {
-        self.color_prompt.is_some()
+        self.group_prompt.is_some()
             || self.filter.editing
             || (self.focus == SplitFocus::Members
                 && self
@@ -92,7 +123,7 @@ impl PresetsView {
                     .is_some_and(|(_, v)| v.input_focused()))
     }
     pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
-        if let Some(prompt) = self.color_prompt.as_mut() {
+        if let Some(prompt) = self.group_prompt.as_mut() {
             return prompt.paste(text);
         }
         if self.filter.editing {
@@ -289,7 +320,7 @@ impl PresetsView {
 
 impl View for PresetsView {
     fn overlay_open(&self) -> bool {
-        self.color_prompt.is_some()
+        self.group_prompt.is_some()
             || self.matrix.hints().is_some()
             || (self.focus == SplitFocus::Members
                 && self
@@ -306,7 +337,7 @@ impl View for PresetsView {
         vec![]
     }
     fn actions_menu(&self, ctx: &Ctx) -> Option<Request> {
-        if self.color_prompt.is_some() || self.matrix.hints().is_some() || self.filter.editing {
+        if self.group_prompt.is_some() || self.matrix.hints().is_some() || self.filter.editing {
             return None;
         }
         if self.focus == SplitFocus::Members {
@@ -368,6 +399,14 @@ impl View for PresetsView {
                     1,
                 ),
                 Item::new(
+                    Command::Merge,
+                    "Merge into another preset",
+                    KeyCode::Null,
+                    self.all_presets.len() > 1,
+                    "No other preset to merge into",
+                    1,
+                ),
+                Item::new(
                     Command::Color,
                     "Change colour",
                     KeyCode::Char('c'),
@@ -387,7 +426,7 @@ impl View for PresetsView {
         })
     }
     fn context_menu(&mut self, x: u16, y: u16, ctx: &Ctx) -> Option<Request> {
-        if self.color_prompt.is_some() || self.matrix.hints().is_some() {
+        if self.group_prompt.is_some() || self.matrix.hints().is_some() {
             return None;
         }
         let view = &mut self.skill_search.as_mut()?.1;
@@ -419,9 +458,10 @@ impl View for PresetsView {
                     Modal::preset_description(&preset.name, preset.description.as_deref())
                 }),
                 Command::Rename => self.with_selected(|preset| Modal::rename_preset(&preset.name)),
+                Command::Merge => self.ask_merge(),
                 Command::Color => {
                     if let Some(preset) = self.selected() {
-                        self.color_prompt =
+                        self.group_prompt =
                             Some(Prompt::for_preset_color(preset, &ctx.settings.theme));
                     }
                     vec![]
@@ -493,9 +533,9 @@ impl View for PresetsView {
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
-        if let Some(prompt) = self.color_prompt.as_mut() {
+        if let Some(prompt) = self.group_prompt.as_mut() {
             let result = prompt.key(k);
-            return self.finish_color(result);
+            return self.finish_prompt(result);
         }
         if let Some(actions) = self.matrix.handle_key(k, ctx) {
             return actions;
@@ -607,7 +647,7 @@ impl View for PresetsView {
             KeyCode::Char('c') => vec![Action::OpenModal(Box::new(Modal::new_preset()))],
             KeyCode::Char('C') => {
                 if let Some(p) = self.selected() {
-                    self.color_prompt = Some(Prompt::for_preset_color(p, &ctx.settings.theme));
+                    self.group_prompt = Some(Prompt::for_preset_color(p, &ctx.settings.theme));
                 }
                 vec![]
             }
@@ -627,9 +667,9 @@ impl View for PresetsView {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
-        if let Some(prompt) = self.color_prompt.as_mut() {
+        if let Some(prompt) = self.group_prompt.as_mut() {
             let result = prompt.mouse(m);
-            return self.finish_color(result);
+            return self.finish_prompt(result);
         }
         if let Some(actions) = self.matrix.handle_mouse(m, ctx) {
             return actions;
@@ -711,14 +751,17 @@ impl View for PresetsView {
             self.skill_search = Some((name, view));
         }
         self.matrix.draw(f, area, ctx);
-        if let Some(prompt) = self.color_prompt.as_mut() {
+        if let Some(prompt) = self.group_prompt.as_mut() {
             prompt.draw(f, area, ctx);
         }
     }
 
     fn hints(&self) -> Hints {
-        if self.color_prompt.is_some() {
-            return &[("↑↓", "colour"), ("Enter", "apply"), ("Esc", "cancel")];
+        if let Some(prompt) = self.group_prompt.as_ref() {
+            return match prompt.kind() {
+                Ask::Merge => &[("↑↓", "target"), ("Enter", "merge"), ("Esc", "cancel")],
+                Ask::Color => &[("↑↓", "colour"), ("Enter", "apply"), ("Esc", "cancel")],
+            };
         }
         if self.filter.editing {
             return &[("Enter/↓", "presets"), ("Esc", "clear filter")];
@@ -834,9 +877,9 @@ mod tests {
                 .as_slice(),
             [Action::Error(_)]
         ));
-        assert!(view.color_prompt.is_some());
+        assert!(view.group_prompt.is_some());
         view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctx);
-        assert!(view.color_prompt.is_none());
+        assert!(view.group_prompt.is_none());
         assert_eq!(ws.presets.load("Office").unwrap().unwrap(), preset);
     }
 
@@ -907,6 +950,98 @@ mod tests {
                 .as_slice(),
             [Action::WriteMeta(_)]
         ));
+    }
+
+    #[test]
+    fn actions_menu_merges_into_a_picked_preset_and_undo_restores_source() {
+        let tmp = skills::ops::DownloadDir::new("preset-actions-merge").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        ws.presets
+            .save(&Preset {
+                name: "source".into(),
+                skills: vec!["shared".into(), "source-only".into()],
+                color: Some("red".into()),
+                description: Some("source metadata".into()),
+            })
+            .unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut view = PresetsView::default();
+        view.refresh(&ctx);
+        let merge = view
+            .actions_menu(&ctx)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.command == Command::Merge)
+            .unwrap();
+        assert_eq!(merge.label, "Merge into another preset");
+        assert_eq!(
+            merge.disabled.as_deref(),
+            Some("No other preset to merge into")
+        );
+
+        ws.presets
+            .save(&Preset {
+                name: "target".into(),
+                skills: vec!["shared".into(), "target-only".into()],
+                color: Some("blue".into()),
+                description: Some("target metadata".into()),
+            })
+            .unwrap();
+        let snap = ws.scan().unwrap();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        view.refresh(&ctx);
+        view.select("source");
+        view.refresh(&ctx);
+        assert!(view.actions_menu(&ctx).unwrap().allows(Command::Merge));
+        assert!(
+            view.context_execute(&Target::Preset("source".into()), Command::Merge, &ctx)
+                .is_empty()
+        );
+        assert!(view.group_prompt.is_some());
+        let mut actions = view.finish_prompt(Some(true));
+        assert!(matches!(actions.get(1), Some(Action::SelectPreset(name)) if name == "target"));
+        let Action::WriteMeta(write) = actions.remove(0) else {
+            panic!("expected preset merge write")
+        };
+        let (_, intent) = write(&ws).unwrap();
+        let target = ws.presets.load("target").unwrap().unwrap();
+        assert_eq!(target.members(), ["shared", "source-only", "target-only"]);
+        assert_eq!(target.color.as_deref(), Some("blue"));
+        assert_eq!(target.description.as_deref(), Some("target metadata"));
+        assert!(ws.presets.load("source").unwrap().is_none());
+
+        let undo_snap = ws.scan().unwrap();
+        let skills::history::Plan::Write { apply, .. } =
+            skills::history::undo_plan(&ws, &undo_snap, &intent.unwrap()).unwrap()
+        else {
+            panic!("expected merge undo write")
+        };
+        apply.apply(&ws).unwrap();
+        assert_eq!(
+            ws.presets.load("source").unwrap().unwrap().members(),
+            ["shared", "source-only"]
+        );
+        assert_eq!(
+            ws.presets.load("target").unwrap().unwrap().members(),
+            ["shared", "target-only"]
+        );
     }
 
     #[test]

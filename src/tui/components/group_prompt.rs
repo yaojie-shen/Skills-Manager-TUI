@@ -18,13 +18,13 @@ const NO_COLOR: &str = "none";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ask {
-    /// Which tag the selected one is merged into.
+    /// Which group the selected one is merged into.
     Merge,
     /// What colour identifies the selected tag or preset.
     Color,
 }
 
-/// Shared chooser for group colours and tag merge targets.
+/// Shared chooser for group colours and merge targets.
 /// Pages own the write action; the chooser owns filtering, selection and preview.
 pub struct Prompt {
     ask: Ask,
@@ -40,8 +40,8 @@ pub struct Prompt {
 }
 
 impl Prompt {
-    pub fn for_merge(name: &str, choices: Vec<String>) -> Self {
-        Self::new(Ask::Merge, Kind::Tag, name, choices)
+    pub fn for_merge(identity: Kind, name: &str, choices: Vec<String>) -> Self {
+        Self::new(Ask::Merge, identity, name, choices)
     }
 
     pub fn kind(&self) -> Ask {
@@ -177,17 +177,17 @@ impl Prompt {
         match p.ask {
             Ask::Merge => {
                 let label_width = preview_width.saturating_sub(3) / 2;
-                preview.extend(
-                    group::TagLabel::new(&p.name, tag_fill(&p.name, ctx)).render(ctx, label_width),
-                );
+                let badge = |name: &str, width| {
+                    group::Badge::for_kind(p.identity, name, p.group_fill(name, ctx))
+                        .render(ctx, width)
+                };
+                preview.extend(badge(&p.name, label_width));
                 let used = preview.iter().map(Span::width).sum::<usize>();
                 let arrow = fit(" → ", (swatch.width as usize).saturating_sub(used));
                 let remaining = (swatch.width as usize).saturating_sub(used + width(&arrow));
                 preview.push(Span::styled(arrow, th.dim()));
                 match p.chosen() {
-                    Some(into) => preview.extend(
-                        group::TagLabel::new(into, tag_fill(into, ctx)).render(ctx, remaining),
-                    ),
+                    Some(into) => preview.extend(badge(into, remaining)),
                     None => preview.push(Span::styled(fit("nothing matches", remaining), th.dim())),
                 }
             }
@@ -217,7 +217,7 @@ impl Prompt {
                 None => preview.push(Span::styled(fit("not a colour", preview_width), th.warn())),
             },
         }
-        if p.identity == Kind::Tag || p.color_text().is_none() {
+        if p.ask == Ask::Merge || p.identity == Kind::Tag || p.color_text().is_none() {
             f.render_widget(Paragraph::new(Line::from(preview)), swatch);
         }
         let list_area = Rect {
@@ -233,9 +233,8 @@ impl Prompt {
             .map(|&i| {
                 let name = &p.choices[i];
                 let spans = match p.ask {
-                    Ask::Merge => {
-                        group::TagLabel::new(name, tag_fill(name, ctx)).render(ctx, row_width)
-                    }
+                    Ask::Merge => group::Badge::for_kind(p.identity, name, p.group_fill(name, ctx))
+                        .render(ctx, row_width),
                     Ask::Color if name == NO_COLOR => {
                         vec![Span::styled(fit("none — the default", row_width), th.dim())]
                     }
@@ -291,6 +290,20 @@ impl Prompt {
         });
         preset.color = color;
         preset
+    }
+
+    fn group_fill(&self, name: &str, ctx: &Ctx) -> Color {
+        if self.identity == Kind::Tag {
+            tag_fill(name, ctx)
+        } else {
+            ctx.snap
+                .presets
+                .by_name
+                .get(name)
+                .map_or(ctx.settings.theme.tag, |preset| {
+                    group::preset_fill(preset, ctx)
+                })
+        }
     }
 
     fn refilter(&mut self) {

@@ -229,7 +229,7 @@ impl TagsView {
         if others.is_empty() {
             return vec![Action::Error("no other tag to merge into".into())];
         }
-        self.prompt = Some(Prompt::for_merge(&tag, others));
+        self.prompt = Some(Prompt::for_merge(group::Kind::Tag, &tag, others));
         vec![]
     }
 

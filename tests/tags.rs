@@ -6,7 +6,9 @@ use skills::Workspace;
 use skills::config::{AgentConfig, Config, TagConfig};
 use skills::history::{self, History};
 use skills::ops::edit;
+use skills::tag::Tag;
 use std::path::PathBuf;
+use std::process::Command;
 
 struct Fixture {
     base: PathBuf,
@@ -83,6 +85,86 @@ impl Drop for Fixture {
 fn set_tags(ws: &Workspace, key: &str, tags: &[&str]) {
     let tags: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
     edit::tag_set(ws, key, &tags).unwrap();
+}
+
+fn tag_files(fx: &Fixture) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut files: Vec<_> = std::fs::read_dir(fx.root.join(".skills-meta/tags"))
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (
+                path.file_name().unwrap().into(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn invalid_tag_names_are_rejected_without_writes() {
+    for (i, (name, reason)) in [
+        ("(untagged)", "reserved for untagged skills"),
+        (" (untagged) ", "reserved for untagged skills"),
+        ("a,b", "tag names cannot contain commas"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (op, run) in [("save", 0), ("rename", 1), ("add", 2)] {
+            let fx = Fixture::new(&format!("invalid-{i}-{op}"));
+            let ws = fx.ws();
+            let before = tag_files(&fx);
+            let error = match run {
+                0 => ws.tags.save(&Tag {
+                    name: name.into(),
+                    skills: vec![],
+                    color: None,
+                    description: None,
+                }),
+                1 => edit::tag_rename(&ws, "storage", name).map(|_| ()),
+                _ => edit::tag_add(&ws, "printer", &[name.into()]).map(|_| ()),
+            }
+            .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(
+                error.contains("invalid tag name") && error.contains(reason),
+                "{error}"
+            );
+            assert_eq!(tag_files(&fx), before);
+        }
+    }
+
+    let fx = Fixture::new("invalid-cli");
+    let out = Command::new(env!("CARGO_BIN_EXE_skills"))
+        .args([
+            "--root",
+            fx.root.to_str().unwrap(),
+            "tag",
+            "rename",
+            "storage",
+            "a,b",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid tag name"));
+}
+
+#[test]
+fn legacy_invalid_tag_names_remain_editable_and_renameable() {
+    for (i, name) in ["(untagged)", "a,b"].into_iter().enumerate() {
+        let fx = Fixture::new(&format!("legacy-{i}"));
+        let ws = fx.ws();
+        let path = ws.tags.dir.join(format!("legacy-{i}.toml"));
+        std::fs::write(&path, format!("schema = 1\nname = {name:?}\nskills = []\n")).unwrap();
+        assert!(ws.tags.load(name).unwrap().is_some());
+        edit::tag_add(&ws, "printer", &[name.into()]).unwrap();
+        assert_eq!(ws.tags.load(name).unwrap().unwrap().skills, ["printer"]);
+        edit::tag_rename(&ws, name, &format!("valid-{i}")).unwrap();
+        assert!(ws.tags.load(name).unwrap().is_none());
+    }
 }
 
 #[test]

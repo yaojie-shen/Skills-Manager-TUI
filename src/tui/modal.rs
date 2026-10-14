@@ -1887,11 +1887,6 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
             if new.is_empty() || new == *old {
                 return vec![];
             }
-            // Preset files share the naming rule of skill directories, since
-            // the name is the file name.
-            if !skills::util::valid_skill_key(&new) {
-                return vec![Action::Error(format!("invalid preset name: {new:?}"))];
-            }
             let old = old.clone();
             let land_on = new.clone();
             if matches!(ctx.ws.presets.conflicts(&old, &new), Ok(true)) {
@@ -1940,10 +1935,6 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
             let selected = name.clone();
             vec![
                 Action::WriteMeta(Box::new(move |ws| {
-                    anyhow::ensure!(
-                        name != "(untagged)" && !name.contains(','),
-                        "invalid tag name"
-                    );
                     history::tag_edit(ws, |ws| {
                         let mut exists = false;
                         skills::config::Config::edit_tags(&ws.root, |tags| {
@@ -2265,6 +2256,43 @@ mod picker_tests {
     use crate::tui::theme::Theme;
     use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::Config, preset::Preset};
+
+    #[test]
+    fn tag_rename_submit_reports_invalid_name() {
+        let temp = skills::ops::DownloadDir::new("tag-rename-modal").unwrap();
+        Config::default().save(temp.path()).unwrap();
+        let ws = Workspace::open(temp.path()).unwrap();
+        ws.tags
+            .save(&skills::tag::Tag {
+                name: "valid".into(),
+                skills: vec![],
+                color: None,
+                description: None,
+            })
+            .unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut actions = submit(
+            &InputKind::RenameTag {
+                old: "valid".into(),
+            },
+            " (untagged) ".into(),
+            &ctx,
+        );
+        let Action::WriteMeta(write) = actions.remove(0) else {
+            panic!("expected metadata write")
+        };
+        assert!(actions.is_empty());
+        assert_eq!(
+            format!("{:#}", write(&ws).unwrap_err()),
+            "invalid tag name \"(untagged)\": reserved for untagged skills"
+        );
+    }
 
     #[test]
     fn update_resolver_describes_only_whole_skill_choices() {
@@ -2802,6 +2830,48 @@ mod picker_tests {
             "editing filter selects its first result"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preset_rename_uses_store_name_rule() {
+        let tmp = skills::ops::DownloadDir::new("preset-rename-name-rule").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        ws.presets
+            .save(&Preset {
+                name: "daily".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+
+        for (old, new) in [("daily", "team/daily"), ("team/daily", "archive")] {
+            let mut actions = submit(
+                &InputKind::RenamePreset { old: old.into() },
+                new.into(),
+                &ctx,
+            );
+            assert!(
+                matches!(actions.as_slice(), [Action::WriteMeta(_), Action::SelectPreset(name)] if name == new)
+            );
+            let Action::WriteMeta(rename) = actions.remove(0) else {
+                unreachable!()
+            };
+            rename(&ws).unwrap();
+            assert!(ws.presets.load(old).unwrap().is_none());
+            assert_eq!(ws.presets.load(new).unwrap().unwrap().name, new);
+        }
     }
 
     #[test]

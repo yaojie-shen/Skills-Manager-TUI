@@ -3383,26 +3383,22 @@ mod matrix_key_tests {
         app.modal = Some(Modal::rename_preset("reading"));
         press(&mut app, KeyCode::End);
         press(&mut app, KeyCode::Char('/'));
-        press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+        assert!(app.ws.presets.load("reading/").unwrap().is_some());
+
+        app.modal = Some(Modal::new_preset());
+        for c in "reading/".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Enter); // Write closure rejects the duplicate.
         assert_eq!(value(&app), "reading/");
         press(&mut app, KeyCode::Char('s'));
         assert_eq!(value(&app), "readings/"); // Cursor stayed before the slash.
-        press(&mut app, KeyCode::Delete);
         press(&mut app, KeyCode::Enter);
         assert!(app.modal.is_none());
-        assert!(app.ws.presets.load("readings").unwrap().is_some());
-
-        app.modal = Some(Modal::new_preset());
-        for c in "readings".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
-        press(&mut app, KeyCode::Enter); // Write closure rejects the duplicate.
-        assert_eq!(value(&app), "readings");
-        press(&mut app, KeyCode::Char('2'));
-        press(&mut app, KeyCode::Enter);
-        assert!(app.modal.is_none());
-        assert!(app.ws.presets.load("readings2").unwrap().is_some());
+        assert!(app.ws.presets.load("readings/").unwrap().is_some());
 
         app.modal = Some(Modal::new_preset());
         press(&mut app, KeyCode::Esc);

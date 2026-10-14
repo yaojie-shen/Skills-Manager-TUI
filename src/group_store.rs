@@ -28,6 +28,9 @@ pub(crate) trait Group: Clone + PartialEq + Serialize + DeserializeOwned {
     fn missing_rename(_name: &str) -> Result<()> {
         Ok(())
     }
+    fn validate_new_name(_name: &str) -> Result<()> {
+        Ok(())
+    }
     fn normalize(&mut self) -> Result<()> {
         *self.name_mut() = group_filename::normalize_name(self.name())?;
         self.skills_mut().sort();
@@ -248,8 +251,13 @@ impl<G: Group> GroupStore<G> {
             "duplicate {} name",
             G::KIND
         );
-        let allocation = group_filename::allocate(desired.iter().map(|g| g.name()))?;
         let previous: BTreeMap<_, _> = before.iter().map(|e| (e.group.name(), e)).collect();
+        for group in &desired {
+            if !previous.contains_key(group.name()) {
+                G::validate_new_name(group.name())?;
+            }
+        }
+        let allocation = group_filename::allocate(desired.iter().map(|g| g.name()))?;
         let mut entries = Vec::new();
         for group in desired {
             let path = self.path_for_stem(&allocation[group.name()]);
