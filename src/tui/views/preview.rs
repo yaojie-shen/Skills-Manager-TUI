@@ -364,10 +364,10 @@ fn single_line(line: Line<'_>, columns: usize) -> Line<'static> {
         .into_iter()
         .map(|span| {
             Span::styled(
-                span.content
+                skills::util::display_safe(&span.content)
                     .chars()
                     .map(|c| {
-                        if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                        if matches!(c, '\n' | '\t' | '\u{2028}' | '\u{2029}') {
                             ' '
                         } else {
                             c

@@ -493,7 +493,8 @@ impl<'a> SkillPresentation<'a> {
 /// Render Markdown as readable text and wrap at words where possible. CJK and
 /// long unbroken tokens wrap at grapheme boundaries, never splitting an emoji.
 pub fn summary_lines(markdown: &str, columns: usize) -> [String; 2] {
-    let plain = tui_markdown::from_str(markdown)
+    let markdown = skills::util::display_safe(markdown);
+    let plain = tui_markdown::from_str(&markdown)
         .lines
         .iter()
         .map(ToString::to_string)
@@ -858,6 +859,14 @@ mod tests {
             healthy.card(&ctx, 60, &checked)[0]
                 .to_string()
                 .contains("[✓]")
+        );
+    }
+
+    #[test]
+    fn summary_neutralizes_terminal_controls() {
+        assert_eq!(
+            summary_lines("safe\u{1b}[2J\u{7}end", 80)[0],
+            "safe�[2J�end"
         );
     }
 

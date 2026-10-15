@@ -1,7 +1,31 @@
 //! Small filesystem helpers shared by the core.
 
 use anyhow::{Context, Result};
+use std::borrow::Cow;
 use std::path::Path;
+
+/// Neutralize terminal control characters while preserving multiline text.
+/// Clean input is returned without allocation.
+pub fn display_safe(text: &str) -> Cow<'_, str> {
+    if !text
+        .chars()
+        .any(|c| (c.is_control() && !matches!(c, '\n' | '\t')) || matches!(c, '\u{80}'..='\u{9f}'))
+    {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(
+        text.chars()
+            .map(|c| {
+                if (c.is_control() && !matches!(c, '\n' | '\t')) || matches!(c, '\u{80}'..='\u{9f}')
+                {
+                    '\u{fffd}'
+                } else {
+                    c
+                }
+            })
+            .collect(),
+    )
+}
 
 /// Write `data` to `path` via a temporary file in the same directory and an atomic rename.
 pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
@@ -150,4 +174,21 @@ pub(crate) fn reject_interrupted_transaction(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::display_safe;
+    use std::borrow::Cow;
+
+    #[test]
+    fn display_safe_borrows_clean_text() {
+        let text = "clean 文本\nwith\ttabs";
+        assert!(matches!(display_safe(text), Cow::Borrowed(value) if value == text));
+    }
+
+    #[test]
+    fn display_safe_replaces_terminal_controls() {
+        assert_eq!(display_safe("a\x1b\x07\u{7f}\u{80}\u{9f}z"), "a�����z");
+    }
 }

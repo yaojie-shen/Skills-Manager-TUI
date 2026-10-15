@@ -66,16 +66,20 @@ impl SkillDoc {
 /// with indented continuation lines. Anything more exotic is ignored.
 pub fn split_frontmatter(text: &str) -> Result<(std::collections::BTreeMap<String, String>, &str)> {
     let mut map = std::collections::BTreeMap::new();
-    let mut lines = text.lines();
-    let first = lines.next().unwrap_or("").trim_end();
+    // Offsets come from the raw lines so the body starts right after the
+    // closing delimiter whatever the line endings are.
+    let mut lines = text.split_inclusive('\n').map(|raw| {
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        (raw.len(), line.strip_suffix('\r').unwrap_or(line))
+    });
+    let (mut consumed, first) = lines.next().unwrap_or((0, ""));
     if first.trim() != "---" {
         bail!("no YAML frontmatter");
     }
-    let mut consumed = first.len() + 1;
     let mut current: Option<(String, String, bool)> = None; // key, value, block
     let mut closed = false;
-    for line in lines {
-        consumed += line.len() + 1;
+    for (len, line) in lines {
+        consumed += len;
         if line.trim() == "---" {
             closed = true;
             break;
@@ -117,7 +121,7 @@ pub fn split_frontmatter(text: &str) -> Result<(std::collections::BTreeMap<Strin
     if !closed {
         bail!("unterminated YAML frontmatter");
     }
-    let body = text.get(consumed.min(text.len())..).unwrap_or("");
+    let body = &text[consumed..];
     Ok((map, body))
 }
 
@@ -135,6 +139,19 @@ fn unquote(v: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_starts_after_the_closing_delimiter_for_any_line_ending() {
+        for (text, body) in [
+            ("---\nname: ok\n---\nbody", "body"),
+            ("---\r\nname: ok\r\n---\r\nbody\r\n", "body\r\n"),
+            ("---\nname: ok\n---", ""),
+            ("---\r\nname: ok\r\n---\r\n", ""),
+        ] {
+            let (m, rest) = split_frontmatter(text).unwrap();
+            assert_eq!((m["name"].as_str(), rest), ("ok", body), "{text:?}");
+        }
+    }
 
     #[test]
     fn parses_simple_frontmatter() {

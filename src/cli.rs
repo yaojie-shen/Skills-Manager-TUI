@@ -11,6 +11,7 @@ use skills::ops::{edit, install, update};
 use skills::reconcile::{AgentDirMode, DeployState, SkillStatus, Snapshot};
 use skills::search::{Query, Searcher};
 use skills::{Workspace, paths};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -705,7 +706,10 @@ fn run_command(cli: Cli) -> Result<()> {
                 println!(
                     "source of {} set to {}",
                     a.skill,
-                    m.source.as_ref().map(|s| s.summary()).unwrap_or_default()
+                    plain_text(
+                        &m.source.as_ref().map(|s| s.summary()).unwrap_or_default(),
+                        true,
+                    )
                 )
             })
         }
@@ -741,7 +745,11 @@ fn run_command(cli: Cli) -> Result<()> {
         } => {
             let repo = skills::repository::Repository::rename(&ctx.ws, &alias, &name)?;
             ctx.out(&repo, || {
-                println!("{}: {}", repo.alias, repo.display_name())
+                println!(
+                    "{}: {}",
+                    plain_text(&repo.alias, true),
+                    plain_text(&repo.display_name(), true)
+                )
             })
         }
         Command::Repos { command: None } => {
@@ -750,9 +758,9 @@ fn run_command(cli: Cli) -> Result<()> {
                 for repo in &repositories {
                     println!(
                         "{} [{}]  {}",
-                        repo.display_name(),
-                        repo.alias,
-                        repo.source("", None).summary()
+                        plain_text(&repo.display_name(), true),
+                        plain_text(&repo.alias, true),
+                        plain_text(&repo.source("", None).summary(), true)
                     );
                 }
             })
@@ -913,9 +921,24 @@ fn cmd_list(ctx: &Ctx, a: ListArgs) -> Result<()> {
     })
 }
 
+fn plain_text(s: &str, single_line: bool) -> Cow<'_, str> {
+    let safe = skills::util::display_safe(s);
+    if single_line && safe.contains(['\n', '\t']) {
+        Cow::Owned(
+            safe.chars()
+                .map(|c| if matches!(c, '\n' | '\t') { ' ' } else { c })
+                .collect(),
+        )
+    } else {
+        safe
+    }
+}
+
 fn truncate(s: &str, n: usize) -> String {
-    let mut out: String = s.chars().take(n).collect();
-    if s.chars().count() > n {
+    let safe = plain_text(s, true);
+    let mut chars = safe.chars();
+    let mut out: String = chars.by_ref().take(n).collect();
+    if chars.next().is_some() {
         out.push('…');
     }
     out
@@ -954,13 +977,16 @@ fn cmd_show(ctx: &Ctx, key: &str) -> Result<()> {
         );
         println!(
             "source:      {}",
-            r.source
-                .as_ref()
-                .map(|s| s.summary())
-                .unwrap_or_else(|| "-".into())
+            plain_text(
+                &r.source
+                    .as_ref()
+                    .map(|s| s.summary())
+                    .unwrap_or_else(|| "-".into()),
+                true,
+            )
         );
         if let Some(name) = r.source_display_name() {
-            println!("source name: {name}");
+            println!("source name: {}", plain_text(name, true));
         }
         let dep: Vec<String> = r
             .deploy
@@ -981,8 +1007,9 @@ fn cmd_show(ctx: &Ctx, key: &str) -> Result<()> {
 }
 
 fn indent(s: &str) -> String {
-    s.lines()
-        .map(|l| format!("  {l}"))
+    plain_text(s, false)
+        .lines()
+        .map(|line| format!("  {line}"))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1151,7 +1178,7 @@ fn cmd_note(ctx: &Ctx, c: NoteCommand) -> Result<()> {
             let m = ctx.ws.meta.load(&skill)?.unwrap_or_default();
             ctx.out(&m.note, || {
                 if let Some(n) = &m.note {
-                    println!("{n}");
+                    println!("{}", plain_text(n, false));
                 }
             })
         }

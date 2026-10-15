@@ -5,7 +5,8 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 pub fn render(body: &str, width: usize) -> Vec<Line<'static>> {
-    let lines: Vec<_> = tui_markdown::from_str(body)
+    let body = skills::util::display_safe(body);
+    let lines: Vec<_> = tui_markdown::from_str(&body)
         .lines
         .into_iter()
         .map(|line| Line {
@@ -266,5 +267,14 @@ mod tests {
         let md =
             "# Heading\n\n**bold** and `code`\n\n```\n┌────┐\n│ hi │\n├────┤\n│ xx │\n└────┘\n```";
         assert_eq!(render(md, 8), tui_markdown::from_str(md).lines);
+    }
+
+    #[test]
+    fn terminal_controls_are_neutralized() {
+        let text: String = render("safe\u{1b}[31m\u{7}text\u{85}end", 80)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(text, "safe�[31m�text�end");
     }
 }
