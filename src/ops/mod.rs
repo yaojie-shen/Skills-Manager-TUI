@@ -156,14 +156,33 @@ pub fn require_existing_keys(ws: &crate::Workspace, keys: &[String]) -> Result<(
     Ok(())
 }
 
+fn git_command() -> std::process::Command {
+    git_command_with(|key| std::env::var_os(key))
+}
+
+fn git_command_with(
+    mut environment: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    for (key, value) in [
+        ("GIT_HTTP_LOW_SPEED_LIMIT", "1000"),
+        ("GIT_HTTP_LOW_SPEED_TIME", "60"),
+    ] {
+        if environment(key).is_none() {
+            command.env(key, value);
+        }
+    }
+    command
+}
+
 /// Run `git` with arguments, returning stdout. Fails with stderr on non-zero exit.
 pub fn git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = git_command();
     cmd.args(args);
     if let Some(d) = cwd {
         cmd.current_dir(d);
     }
-    cmd.env("GIT_TERMINAL_PROMPT", "0");
     let out = cmd
         .output()
         .map_err(|e| anyhow::anyhow!("running git: {e}"))?;
@@ -181,11 +200,11 @@ pub fn git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
 /// characters. Clone stdout is unused; stderr is drained before waiting on Git.
 pub fn git_progress(args: &[&str], progress: &mut dyn FnMut(&str)) -> Result<()> {
     use std::io::{BufReader, Read};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
-    let mut child = Command::new("git")
+    let mut command = git_command();
+    let mut child = command
         .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -234,4 +253,34 @@ pub fn git_progress(args: &[&str], progress: &mut dyn FnMut(&str)) -> Result<()>
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::{OsStr, OsString};
+
+    fn command_env(command: &std::process::Command, key: &str) -> Option<Option<OsString>> {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == OsStr::new(key))
+            .map(|(_, value)| value.map(OsStr::to_os_string))
+    }
+
+    #[test]
+    fn git_stall_defaults_do_not_override_environment() {
+        let defaults = git_command_with(|_| None);
+        assert_eq!(
+            command_env(&defaults, "GIT_HTTP_LOW_SPEED_LIMIT"),
+            Some(Some("1000".into()))
+        );
+        assert_eq!(
+            command_env(&defaults, "GIT_HTTP_LOW_SPEED_TIME"),
+            Some(Some("60".into()))
+        );
+
+        let inherited = git_command_with(|key| Some(format!("custom-{key}").into()));
+        assert_eq!(command_env(&inherited, "GIT_HTTP_LOW_SPEED_LIMIT"), None);
+        assert_eq!(command_env(&inherited, "GIT_HTTP_LOW_SPEED_TIME"), None);
+    }
 }

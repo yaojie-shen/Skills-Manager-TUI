@@ -827,6 +827,8 @@ impl FetchedRepository {
             validate_subpath(path)?;
             crate::skill::SkillDoc::load(&self.workdir.join(path))
                 .with_context(|| format!("invalid skill at {path}/SKILL.md"))?;
+            crate::ops::source::validate_skill(&self.workdir.join(path))
+                .with_context(|| format!("refusing to install {path}"))?;
         }
         let new_paths: Vec<_> = paths
             .iter()

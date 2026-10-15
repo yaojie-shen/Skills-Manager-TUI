@@ -4,6 +4,7 @@
 mod archive;
 mod git;
 mod reference;
+mod validate;
 
 pub use reference::{InstallRef, parse_ref};
 
@@ -91,6 +92,12 @@ fn fetch_archive(
         branch: None,
         revision: crate::hash::hash_directory(destination)?,
     })
+}
+
+/// Check a selected remote skill before it is published, whatever transport
+/// fetched it.
+pub(crate) fn validate_skill(path: &Path) -> Result<()> {
+    validate::skill_tree(path)
 }
 
 pub fn latest_revision(source: &Source) -> Result<String> {

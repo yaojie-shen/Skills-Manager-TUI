@@ -254,6 +254,10 @@ impl UpdateSession {
         if !upstream_src.join(crate::skill::SKILL_FILE).is_file() {
             bail!("upstream no longer has a skill at {sub:?}; keeping local copy");
         }
+        if !matches!(source, Source::Local { .. }) {
+            crate::ops::source::validate_skill(&upstream_src)
+                .context("upstream skill is unsafe; keeping local copy and deployments")?;
+        }
         let upstream = crate::skill::SkillDoc::load(&upstream_src)
             .context("upstream skill is invalid; keeping local copy and deployments")?;
         anyhow::ensure!(

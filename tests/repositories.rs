@@ -124,6 +124,28 @@ fn repository_root_source_discovers_nested_skills_without_an_empty_path_filter()
 }
 
 #[test]
+fn repository_install_refuses_a_link_escaping_the_selected_skill() {
+    let f = Fixture::new();
+    f.put("safe", "safe", "safe");
+    f.put("unsafe", "unsafe", "unsafe");
+    std::os::unix::fs::symlink("/etc/passwd", f.repo.join("unsafe/resource")).unwrap();
+    f.commit();
+    let fetched = f.fetch("links");
+
+    let error = fetched
+        .install(&f.ws, &["unsafe".into()], &BTreeMap::new())
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("escapes the skill directory"));
+    assert!(!f.ws.skill_path("repos/links/unsafe").exists());
+    // Only the selected skill is checked, so an unsafe sibling does not block it.
+    let keys = fetched
+        .install(&f.ws, &["safe".into()], &BTreeMap::new())
+        .unwrap();
+    fetched.cleanup();
+    assert_eq!(keys, ["repos/links/safe"]);
+}
+
+#[test]
 fn repository_root_skill_uses_declared_name_instead_of_project_name() {
     let f = Fixture::new();
     f.put("", "review-article-architecture", "review");

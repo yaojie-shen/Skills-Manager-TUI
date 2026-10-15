@@ -31,6 +31,8 @@ skills list repo:toolbox
 
 Repeat `--select PATH` to choose specific paths. `--select .` chooses the source root. `--all` installs the valid outermost skills from separate branches of the directory tree; it does not install nested skills beneath them.
 
+Before a remote skill is copied into the Library, Skills Manager checks the selected skill directory. It refuses special files such as FIFOs or devices, symlinks that are absolute or lead outside the skill directory, and more than 20,000 entries or 512 MiB of file content. Symlinks that stay inside the skill are kept. For a Git source only the selected skills are checked, so an unsafe skill elsewhere in the repository does not block them. An archive is refused as a whole if it contains any symlink or special file. Local paths are copied as they are.
+
 <DocsTuiCapture frame="repos" caption="The Repos view shows each source and the skills installed from it." />
 
 ## How installed skills are named

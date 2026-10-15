@@ -39,7 +39,7 @@ skills update repos/toolbox/review --take upstream
 
 Without either choice, the result is `needs-resolution`. `--force` is an alias for `--take upstream`. Per-file merging with `--take-file` is not supported. Back up any local edits you need before taking the upstream copy.
 
-Invalid upstream content or an unexpected declared-name change stops replacement and preserves the installed copy and deployments.
+Invalid or unsafe upstream content, or an unexpected declared-name change, stops replacement and preserves the installed copy and deployments.
 
 ## 4. Apply
 

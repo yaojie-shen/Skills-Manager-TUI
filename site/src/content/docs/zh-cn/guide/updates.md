@@ -39,7 +39,7 @@ skills update repos/toolbox/review --take upstream
 
 未指定选择时，结果为 `needs-resolution`。`--force` 是 `--take upstream` 的别名。不支持使用 `--take-file` 逐文件合并。采用上游副本前，请先备份需要保留的本地修改。
 
-上游内容无效或声明名意外变化时，替换会停止，已安装内容和部署保持不变。
+上游内容无效或不安全，或声明名意外变化时，替换会停止，已安装内容和部署保持不变。
 
 ## 4. 应用
 

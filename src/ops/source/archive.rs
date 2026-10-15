@@ -9,8 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const MAX_DOWNLOAD: u64 = 128 * 1024 * 1024;
-const MAX_EXPANDED: u64 = 512 * 1024 * 1024;
-const MAX_ENTRIES: usize = 20_000;
+use super::validate::{MAX_ENTRIES, MAX_EXPANDED};
 const MAX_METADATA: u64 = 1024 * 1024;
 const XZ_MEMORY_LIMIT_KIB: u32 = 128 * 1024;
 

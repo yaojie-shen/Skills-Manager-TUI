@@ -3,7 +3,7 @@ use crate::{meta::SourceKind, ops::git};
 use anyhow::{Context, Result};
 use std::{
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     time::{Duration, Instant},
 };
 
@@ -84,10 +84,9 @@ pub(super) fn checkout_revision(tree: &Path, revision: &str) -> bool {
 /// Probe through Git so authentication, URL rewrites and supported HTTP protocols
 /// match cloning. Discard the advertisement rather than limiting its total size.
 pub(super) fn is_http_repository(url: &str) -> bool {
-    let mut command = Command::new("git");
+    let mut command = crate::ops::git_command();
     command
         .args(["ls-remote", "--quiet", "--", url, "HEAD"])
-        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -126,6 +125,7 @@ fn wait_for_probe(mut child: Child, timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn latest_revision_returns_checkout_commit_for_branches_and_tags() {

@@ -63,6 +63,7 @@ pub fn fetch(ws: &Workspace, r: &InstallRef) -> Result<Fetched> {
                 }
                 return Err(NotOneSkill { choices }.into());
             }
+            crate::ops::source::validate_skill(&skill_dir)?;
             Ok(Fetched {
                 skill_dir,
                 source: acquired.source(subpath),
