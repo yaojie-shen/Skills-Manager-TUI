@@ -685,55 +685,42 @@ fn foreign_broken_and_cyclic_directory_links_are_not_merged() {
 }
 
 #[test]
-fn inventory_hides_config_only_products_and_ignores_shared_directories() {
+fn inventory_shows_explicit_config_or_detected_products() {
     let f = Fixture::new("installed-only");
     let project = f.0.join("project");
     let home = f.0.join("fake-home");
-    std::fs::create_dir_all(home.join(".agents/skills")).unwrap();
-    std::fs::create_dir_all(project.join(".agents/skills")).unwrap();
     let mut ws = f.ws();
-    ws.config.agents = skills::agents::defaults(false);
-    for key in ["shared", "legacy-storage"] {
-        ws.config.agents.push(AgentConfig {
-            key: key.into(),
-            name: key.into(),
-            skills_dir: home.join(".agents/skills").display().to_string(),
-        });
-    }
-    targets::discover_in(&mut ws, &project, &home).unwrap();
-    assert_eq!(targets::visible_agents(&ws).count(), 0);
-    assert_eq!(ws.config.agents.len(), 4, "saved destinations are retained");
-    for dir in [
-        ".codex",
-        ".cursor",
-        ".claude",
-        ".gemini",
-        ".config/opencode",
-    ] {
-        std::fs::create_dir_all(home.join(dir).join("skills")).unwrap();
-        std::fs::create_dir_all(project.join(dir).join("skills")).unwrap();
-    }
+    ws.config.agents = vec![
+        AgentConfig {
+            key: "claude".into(),
+            name: "Configured Claude".into(),
+            skills_dir: home.join("configured-claude").display().to_string(),
+        },
+        AgentConfig {
+            key: "custom".into(),
+            name: "Configured Custom".into(),
+            skills_dir: home.join("custom").display().to_string(),
+        },
+    ];
     targets::discover_in(&mut ws, &project, &home).unwrap();
     assert_eq!(
-        targets::visible_agents(&ws).count(),
-        0,
-        "leftover product directories are not installs"
+        targets::visible_agents(&ws)
+            .map(|a| a.key.as_str())
+            .collect::<Vec<_>>(),
+        ["claude", "custom"]
     );
+    assert!(
+        targets::visible_agents(&ws).all(|a| a.key != "codex"),
+        "undetected, unconfigured built-ins stay hidden"
+    );
+
     use std::os::unix::fs::PermissionsExt;
     let binary = home.join(".local/bin/codex");
     std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
     std::fs::write(&binary, "not executed").unwrap();
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
     targets::discover_in(&mut ws, &project, &home).unwrap();
-    assert!(targets::visible_agents(&ws).count() > 0);
-    assert!(targets::visible_agents(&ws).all(|a| targets::product_key(a) == "codex"));
-    std::fs::remove_file(binary).unwrap();
-    targets::discover_in(&mut ws, &project, &home).unwrap();
-    assert_eq!(
-        targets::visible_agents(&ws).count(),
-        0,
-        "discovery refreshes evidence"
-    );
+    assert!(targets::visible_agents(&ws).any(|a| a.key == "codex"));
 }
 
 #[test]

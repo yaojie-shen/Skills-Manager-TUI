@@ -309,7 +309,7 @@ impl AgentsView {
         });
         self.filter_editing = false;
     }
-    pub(super) fn filter_key(&mut self, k: KeyEvent) -> Option<Vec<Action>> {
+    pub(super) fn filter_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Option<Vec<Action>> {
         if self.focus() != Focus::Filters {
             return None;
         }
@@ -330,7 +330,7 @@ impl AgentsView {
                         .input
                         .set(&toggle_filter(self.search_panel.input.value(), key));
                     self.search_panel.completion.close();
-                    self.entries.first(0);
+                    self.rebuild_current(ctx);
                 }
             }
             _ => {}
@@ -598,7 +598,7 @@ impl AgentsView {
                 .position(|k| *k == key)
                 .unwrap_or(0);
             self.set_focus(Focus::Filters);
-            self.entries.first(0);
+            self.rebuild_current(ctx);
             return Some(vec![]);
         }
         None

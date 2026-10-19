@@ -57,6 +57,12 @@ struct Row<'a> {
     record: Option<&'a skills::reconcile::SkillRecord>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum RowId {
+    Library(String),
+    AgentOwned { agent: String, name: String },
+}
+
 /// Actions available for an entry's observed filesystem state. Cached for the
 /// footer, which has no `Ctx`; each write must still validate its target again.
 #[derive(Debug, Clone, Copy, Default)]
@@ -90,6 +96,7 @@ pub struct AgentsView {
     destinations: Vec<skills::ops::targets::Scope>,
     launch_directory: Option<std::path::PathBuf>,
     destination: usize,
+    destination_initialized: bool,
     destination_offset: usize,
     agent_directories: std::collections::BTreeMap<String, Vec<std::path::PathBuf>>,
     scope_counts: std::collections::BTreeMap<std::path::PathBuf, ScopeInventory>,
@@ -109,6 +116,7 @@ pub struct AgentsView {
     entries: CardGrid,
     /// One per entry row, in the grid's order.
     caps: Vec<Caps>,
+    row_ids: Vec<RowId>,
     /// Actual density after adapting the shared preference to available height.
     entry_layout: UiLayout,
     scope_rects: Vec<(Rect, String)>,
@@ -312,7 +320,8 @@ impl AgentsView {
     pub fn discover(&mut self, start: &std::path::Path) -> anyhow::Result<()> {
         self.destinations = skills::ops::targets::discover_scopes(start)?;
         self.launch_directory = self.destinations.get(1).and_then(|s| s.project.clone());
-        self.destination = 1;
+        self.destination = 0;
+        self.destination_initialized = false;
         Ok(())
     }
 
@@ -331,7 +340,7 @@ impl AgentsView {
         match self.search_panel.paste(text) {
             Err(error) => return vec![Action::Error(error)],
             Ok(false) => return vec![],
-            Ok(true) => self.entries.first(0),
+            Ok(true) => {}
         }
         let data = self.scoped.clone();
         let scoped = data.as_ref().map(|d| Ctx {
@@ -339,7 +348,9 @@ impl AgentsView {
             snap: &d.1,
             settings: ctx.settings,
         });
-        self.update_search_completion(scoped.as_ref().unwrap_or(ctx));
+        let ctx = scoped.as_ref().unwrap_or(ctx);
+        self.rebuild_current(ctx);
+        self.update_search_completion(ctx);
         vec![]
     }
 
@@ -456,6 +467,38 @@ impl AgentsView {
     /// Ours first, then the agent's own; alphabetical inside each group.
     fn rows<'a>(&self, ctx: &'a Ctx) -> Vec<Row<'a>> {
         self.scope_rows(ctx, true)
+    }
+
+    fn row_id(&self, row: &Row<'_>) -> RowId {
+        if row.linked {
+            RowId::Library(row.key.clone())
+        } else {
+            RowId::AgentOwned {
+                agent: self.scope.clone(),
+                name: row.name.clone(),
+            }
+        }
+    }
+
+    fn rebuild_entries(&mut self, rows: &[Row<'_>]) {
+        let selected = self
+            .entries
+            .selected()
+            .and_then(|index| self.row_ids.get(index));
+        let ids: Vec<_> = rows.iter().map(|row| self.row_id(row)).collect();
+        let index = selected.and_then(|id| ids.iter().position(|candidate| candidate == id));
+        self.caps = rows.iter().map(|row| Caps::of(row.state)).collect();
+        if let Some(index) = index {
+            self.entries.select(Some(index));
+        } else {
+            self.entries.clamp(rows.len());
+        }
+        self.row_ids = ids;
+    }
+
+    fn rebuild_current(&mut self, ctx: &Ctx) {
+        let rows = self.rows(ctx);
+        self.rebuild_entries(&rows);
     }
 
     fn scope_rows<'a>(&self, ctx: &'a Ctx, filtered: bool) -> Vec<Row<'a>> {
@@ -674,9 +717,7 @@ impl AgentsView {
         } else {
             vec![]
         };
-        let rows = self.rows(ctx);
-        self.caps = rows.iter().map(|r| Caps::of(r.state)).collect();
-        self.entries.clamp(rows.len());
+        self.rebuild_current(ctx);
         self.search_panel.completion.close();
         if self.filter_editing {
             self.update_search_completion(ctx);
@@ -744,7 +785,7 @@ impl AgentsView {
         if let Some(acts) = self.matrix.handle_key(k, ctx) {
             return acts;
         }
-        if let Some(actions) = self.filter_key(k) {
+        if let Some(actions) = self.filter_key(k, ctx) {
             return actions;
         }
         if let Some(actions) = self.quick_key(k, ctx) {
@@ -770,7 +811,7 @@ impl AgentsView {
                     SearchEvent::Changed | SearchEvent::CursorMoved | SearchEvent::Accepted => {
                         self.update_search_completion(ctx);
                         if event != SearchEvent::CursorMoved {
-                            self.entries.first(0);
+                            self.rebuild_current(ctx);
                         }
                     }
                     _ => {}
@@ -818,7 +859,7 @@ impl AgentsView {
                 match self.focus() {
                     Focus::Entries if !self.search_panel.input.is_empty() => {
                         self.search_panel.input.clear();
-                        self.entries.clamp(self.rows(ctx).len());
+                        self.rebuild_current(ctx);
                     }
                     Focus::Entries => self.set_focus(if self.destinations.is_empty() {
                         Focus::Agents
@@ -939,7 +980,7 @@ impl AgentsView {
         if self.filter_editing {
             let (consumed, accepted) = self.search_panel.mouse_completion(m);
             if accepted {
-                self.entries.first(0);
+                self.rebuild_current(ctx);
                 self.update_search_completion(ctx);
             }
             if consumed {
@@ -1754,16 +1795,7 @@ impl AgentsView {
                 .launch_directory
                 .as_ref()
                 .context("missing launch directory")?;
-            let configured: Vec<_> = ctx
-                .ws
-                .config
-                .agents
-                .iter()
-                .filter(|a| {
-                    ctx.ws.inventory_products.as_ref().is_none_or(|products| {
-                        products.contains(skills::ops::targets::product_key(a))
-                    })
-                })
+            let configured: Vec<_> = skills::ops::targets::visible_agents(ctx.ws)
                 .cloned()
                 .collect();
             let selected = configured
@@ -1786,6 +1818,7 @@ impl AgentsView {
                     .is_some_and(|name| name == ".agents");
                 (scope.project.is_some(), shared)
             });
+            let previous = self.destination_initialized.then_some(previous).flatten();
             let index = previous
                 .as_ref()
                 .and_then(|old| {
@@ -1799,6 +1832,12 @@ impl AgentsView {
                             .iter()
                             .position(|s| s.project.is_some() == old.project.is_some())
                     })
+                })
+                .or_else(|| {
+                    let configured_path = selected.skills_path();
+                    locations
+                        .iter()
+                        .position(|scope| scope.directory.as_ref() == Some(&configured_path))
                 })
                 .unwrap_or(0);
             let location = locations
@@ -1837,6 +1876,7 @@ impl AgentsView {
             }
             self.destinations = locations;
             self.destination = index;
+            self.destination_initialized = true;
             let key: ScopeKey = ws
                 .config
                 .agents
@@ -1882,6 +1922,9 @@ impl AgentsView {
 impl View for AgentsView {
     fn overlay_open(&self) -> bool {
         self.preview.is_open() || self.matrix.hints().is_some() || self.quick.popup.is_some()
+    }
+    fn preview_overlay(&mut self) -> Option<&mut super::preview::Overlay> {
+        Some(&mut self.preview)
     }
     fn actions_menu(&self, ctx: &Ctx) -> Option<Request> {
         if self.preview.is_open()
@@ -2058,14 +2101,15 @@ impl View for AgentsView {
             let (consumed, accepted) = self.search_panel.mouse_completion(m);
             if consumed {
                 if accepted {
-                    self.entries.first(0);
                     let data = self.scoped.clone();
                     let scoped = data.as_ref().map(|d| Ctx {
                         ws: &d.0,
                         snap: &d.1,
                         settings: ctx.settings,
                     });
-                    self.update_search_completion(scoped.as_ref().unwrap_or(ctx));
+                    let ctx = scoped.as_ref().unwrap_or(ctx);
+                    self.rebuild_current(ctx);
+                    self.update_search_completion(ctx);
                 }
                 return vec![];
             }
@@ -2116,11 +2160,9 @@ impl View for AgentsView {
         self.scoped_actions(actions, scoped.as_ref().unwrap_or(ctx))
     }
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        if ctx
-            .ws
-            .inventory_products
-            .as_ref()
-            .is_some_and(|products| products.is_empty())
+        if skills::ops::targets::visible_agents(ctx.ws)
+            .next()
+            .is_none()
         {
             self.scope_rects.clear();
             self.destination_rects.clear();
@@ -2454,6 +2496,16 @@ mod overflow_tests {
             terminal
                 .draw(|f| view.preview.draw(f, f.area(), &ctx))
                 .unwrap();
+            let mut requests = view.preview.take_file_browser_requests();
+            while let Some(request) = requests.pop() {
+                requests.extend(
+                    view.preview
+                        .apply_file_browser(crate::tui::views::file_browser::load(&request)),
+                );
+            }
+            terminal
+                .draw(|f| view.preview.draw(f, f.area(), &ctx))
+                .unwrap();
             let buf = terminal.backend().buffer();
             let text = (0..40)
                 .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
@@ -2711,6 +2763,112 @@ mod deployment_scope_tests {
         config::{AgentConfig, Config},
     };
 
+    fn selection_fixture(
+        names: &[&str],
+        deployed: &[&str],
+    ) -> (skills::ops::DownloadDir, Workspace) {
+        let tmp = skills::ops::DownloadDir::new("agents-selection").unwrap();
+        let root = tmp.path().join("library");
+        let target = tmp.path().join("target");
+        for name in names {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(
+                root.join(name).join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: test\n---\nbody"),
+            )
+            .unwrap();
+        }
+        Config {
+            agents: vec![AgentConfig {
+                key: "sample".into(),
+                name: "Sample".into(),
+                skills_dir: target.display().to_string(),
+            }],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+        let ws = Workspace::open(&root).unwrap();
+        let snap = ws.scan().unwrap();
+        deploy::apply(
+            &deploy::plan_deploy(
+                &ws,
+                &snap,
+                &deployed
+                    .iter()
+                    .map(|name| (*name).into())
+                    .collect::<Vec<_>>(),
+                &["sample".into()],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        (tmp, ws)
+    }
+
+    #[test]
+    fn refresh_keeps_selected_entry_when_one_is_inserted_before_it() {
+        let (_tmp, ws) = selection_fixture(&["alpha", "beta"], &["beta"]);
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let mut view = AgentsView::default();
+        let snap = ws.scan().unwrap();
+        view.refresh_current(&Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        });
+        view.entries.select(Some(0));
+
+        deploy::apply(
+            &deploy::plan_deploy(&ws, &snap, &["alpha".into()], &["sample".into()]).unwrap(),
+        )
+        .unwrap();
+        let snap = ws.scan().unwrap();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        view.refresh_current(&ctx);
+
+        let selected = view.entries.selected().unwrap();
+        assert_eq!(view.rows(&ctx)[selected].name, "beta");
+    }
+
+    #[test]
+    fn refresh_clamps_old_index_when_selected_entry_disappears() {
+        let (_tmp, ws) =
+            selection_fixture(&["alpha", "beta", "gamma"], &["alpha", "beta", "gamma"]);
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let mut view = AgentsView::default();
+        let snap = ws.scan().unwrap();
+        view.refresh_current(&Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        });
+        view.entries.select(Some(1));
+
+        std::fs::remove_file(
+            ws.config
+                .agent("sample")
+                .unwrap()
+                .skills_path()
+                .join("beta"),
+        )
+        .unwrap();
+        let snap = ws.scan().unwrap();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        view.refresh_current(&ctx);
+
+        assert_eq!(view.entries.selected(), Some(1));
+        assert_eq!(view.rows(&ctx)[1].name, "gamma");
+    }
+
     #[test]
     fn same_named_repository_members_keep_identity_search_and_uninstall_targets() {
         let tmp = skills::ops::DownloadDir::new("agent-group-identity").unwrap();
@@ -2787,6 +2945,16 @@ mod deployment_scope_tests {
             .draw(|f| view.draw_current(f, f.area(), &ctx))
             .unwrap();
         view.preview_entry(&ctx);
+        terminal
+            .draw(|f| view.draw_current(f, f.area(), &ctx))
+            .unwrap();
+        let mut requests = view.preview.take_file_browser_requests();
+        while let Some(request) = requests.pop() {
+            requests.extend(
+                view.preview
+                    .apply_file_browser(crate::tui::views::file_browser::load(&request)),
+            );
+        }
         terminal
             .draw(|f| view.draw_current(f, f.area(), &ctx))
             .unwrap();
@@ -3174,13 +3342,17 @@ mod deployment_scope_tests {
             view.agent_skill_count(&view.scope).as_deref(),
             Some("1 skills total")
         );
-        view.move_destination(-1, &ctx);
+        assert_eq!(
+            view.destinations[view.destination].directory.as_ref(),
+            Some(&tmp.path().join("global-claude"))
+        );
+        view.move_destination(100, &ctx);
         assert_eq!(view.agent_directories[&view.scope], directories);
         assert_eq!(
             view.agent_skill_count(&view.scope).as_deref(),
             Some("1 skills total")
         );
-        view.move_destination(1, &ctx);
+        assert!(view.project().is_some());
         let first = view.scoped.clone().unwrap();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
@@ -3241,6 +3413,33 @@ mod deployment_scope_tests {
     }
 
     #[test]
+    fn project_library_defaults_to_its_configured_local_directory() {
+        let tmp = skills::ops::DownloadDir::new("configured-local-scope").unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let ws = Workspace::open_local(&project, true).unwrap();
+        let snap = ws.scan().unwrap();
+        let theme = crate::tui::theme::Theme::default();
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &{
+                let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+                settings.theme = theme;
+                settings
+            },
+        };
+        let mut view = AgentsView::default();
+        view.discover(&project).unwrap();
+        view.refresh(&ctx);
+        assert_eq!(
+            view.destinations[view.destination].directory.as_ref(),
+            Some(&ws.config.agents[0].skills_path())
+        );
+        assert!(view.project().is_some());
+    }
+
+    #[test]
     fn installed_product_filter_survives_scope_switches() {
         let tmp = skills::ops::DownloadDir::new("installed-scope-filter").unwrap();
         let root = tmp.path().join("root");
@@ -3265,6 +3464,7 @@ mod deployment_scope_tests {
         .save(&root)
         .unwrap();
         let mut ws = Workspace::open(&root).unwrap();
+        ws.inventory_configured_agents = Some(Default::default());
         ws.inventory_products = Some(std::collections::BTreeSet::from(["installed".into()]));
         let snap = ws.scan().unwrap();
         let theme = crate::tui::theme::Theme::default();
@@ -3365,6 +3565,8 @@ mod deployment_scope_tests {
         let mut view = AgentsView::default();
         view.discover(&project).unwrap();
         view.refresh(&ctx);
+        assert_eq!(view.project(), None);
+        view.move_destination(100, &ctx);
         assert_eq!(view.project(), Some(project.canonicalize().unwrap()));
         assert_eq!(view.scoped.as_ref().unwrap().0.root, ws.root);
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();

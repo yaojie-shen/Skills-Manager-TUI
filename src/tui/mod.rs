@@ -38,6 +38,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui::backend::Backend;
 use std::sync::mpsc;
 
 type Term = ratatui::Terminal<backend::WideCellBackend<std::io::Stdout>>;
@@ -99,7 +100,9 @@ fn enter() -> Result<Term> {
         )?;
         let backend = backend::WideCellBackend::new(stdout);
         let mut terminal = ratatui::Terminal::new(backend)?;
-        terminal.clear()?;
+        // Fullscreen startup has no cursor position to preserve. Terminal::clear()
+        // queries it, which fails on terminals that do not answer cursor reports.
+        terminal.backend_mut().clear()?;
         Ok(terminal)
     })();
     // An error after enabling a mode must not leave the shell in that mode.

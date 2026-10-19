@@ -35,6 +35,8 @@ pub struct Workspace {
     /// Project associated with the transient directory inventory.
     pub inventory_project: Option<PathBuf>,
     pub inventory_products: Option<std::collections::BTreeSet<String>>,
+    /// Agent keys loaded from config before discovery adds transient defaults.
+    pub inventory_configured_agents: Option<std::collections::BTreeSet<String>>,
     pub config: config::Config,
     pub meta: meta::MetaStore,
     pub tags: tag::TagStore,
@@ -78,6 +80,7 @@ impl Workspace {
             project,
             inventory_project: None,
             inventory_products: None,
+            inventory_configured_agents: None,
             config: config::Config::default(),
         };
         ws.config = ws.load_config()?;

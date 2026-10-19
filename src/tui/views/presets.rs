@@ -328,6 +328,11 @@ impl View for PresetsView {
                     .as_ref()
                     .is_some_and(|(_, view)| view.overlay_open()))
     }
+    fn preview_overlay(&mut self) -> Option<&mut super::preview::Overlay> {
+        self.skill_search
+            .as_mut()
+            .and_then(|(_, view)| view.preview_overlay())
+    }
     fn handle_control_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         if self.focus == SplitFocus::Members
             && let Some((_, view)) = self.skill_search.as_mut()

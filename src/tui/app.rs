@@ -589,6 +589,40 @@ impl App {
                 self.toasts.progress(id, detail);
                 Vec::new()
             }
+            Msg::FileBrowser(output) => {
+                let modal_accepts = self
+                    .modal
+                    .as_mut()
+                    .is_some_and(|modal| modal.accepts_file_browser(&output));
+                if modal_accepts {
+                    for request in self
+                        .modal
+                        .as_mut()
+                        .expect("accepting modal")
+                        .apply_file_browser(output)
+                    {
+                        super::event::spawn_file_browser(request, self.tx.clone());
+                    }
+                } else {
+                    let mut views: [&mut dyn View; 6] = [
+                        &mut self.search,
+                        &mut self.tags,
+                        &mut self.presets,
+                        &mut self.agents,
+                        &mut self.health,
+                        &mut self.repos,
+                    ];
+                    let index = views
+                        .iter_mut()
+                        .position(|view| view.accepts_file_browser(&output));
+                    if let Some(index) = index {
+                        for request in views[index].apply_file_browser(output) {
+                            super::event::spawn_file_browser(request, self.tx.clone());
+                        }
+                    }
+                }
+                Vec::new()
+            }
             Msg::SyncStatus(id, result) => {
                 let displayed = result.as_ref().ok().cloned();
                 let error = result.as_ref().err().map(|error| format!("{error:#}"));
@@ -620,6 +654,15 @@ impl App {
             Msg::Key(k) => self.on_key(k),
             Msg::Mouse(m) => self.on_mouse(m),
         };
+        let mut browser_requests = self
+            .modal
+            .as_mut()
+            .map(Modal::take_file_browser_requests)
+            .unwrap_or_default();
+        browser_requests.extend(self.active_view_mut().take_file_browser_requests());
+        for request in browser_requests {
+            super::event::spawn_file_browser(request, self.tx.clone());
+        }
         let mut queued = false;
         for action in actions {
             if background
@@ -1130,6 +1173,7 @@ impl App {
                         self.root_stamp = outcome.stamp;
                         self.snap = snapshot;
                         self.ws.inventory_products = outcome.inventory_products;
+                        self.ws.inventory_configured_agents = outcome.inventory_configured_agents;
                         if !self.single_write_running
                             && self.pending_writes.is_empty()
                             && let Some(Modal::Batch(batch)) = self.modal.as_mut()
@@ -1567,6 +1611,17 @@ impl App {
             Tab::Agents => &self.agents,
             Tab::Health => &self.health,
             Tab::Repos => &self.repos,
+        }
+    }
+
+    fn active_view_mut(&mut self) -> &mut dyn View {
+        match self.tab {
+            Tab::Search => &mut self.search,
+            Tab::Tags => &mut self.tags,
+            Tab::Presets => &mut self.presets,
+            Tab::Agents => &mut self.agents,
+            Tab::Health => &mut self.health,
+            Tab::Repos => &mut self.repos,
         }
     }
 
@@ -2612,6 +2667,40 @@ pub(crate) fn middle_ellipsis(text: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
+const BACKGROUND_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[cfg(test)]
+fn wait_for_msg_before(
+    rx: &std::sync::mpsc::Receiver<Msg>,
+    deadline: std::time::Instant,
+    waiting_for: &str,
+) -> Msg {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    rx.recv_timeout(remaining)
+        .unwrap_or_else(|error| panic!("timed out waiting for {waiting_for}: {error}"))
+}
+
+#[cfg(test)]
+fn wait_for_msg(rx: &std::sync::mpsc::Receiver<Msg>, waiting_for: &str) -> Msg {
+    wait_for_msg_before(rx, std::time::Instant::now() + BACKGROUND_WAIT, waiting_for)
+}
+
+#[cfg(test)]
+fn wait_for_msg_matching(
+    rx: &std::sync::mpsc::Receiver<Msg>,
+    waiting_for: &str,
+    matches: impl Fn(&Msg) -> bool,
+) -> Msg {
+    let deadline = std::time::Instant::now() + BACKGROUND_WAIT;
+    loop {
+        let message = wait_for_msg_before(rx, deadline, waiting_for);
+        if matches(&message) {
+            return message;
+        }
+    }
+}
+
+#[cfg(test)]
 mod matrix_key_tests {
     use super::*;
 
@@ -2674,6 +2763,8 @@ mod matrix_key_tests {
         );
 
         // Exercise the failed-scan path while retaining the known inventory.
+        app.ws.inventory_products = Some(BTreeSet::from(["known-product".into()]));
+        app.ws.inventory_configured_agents = Some(BTreeSet::from(["known-agent".into()]));
         app.latest_scan_task = Some(999);
         app.handle(Msg::Task(
             999,
@@ -2681,13 +2772,22 @@ mod matrix_key_tests {
                 snapshot: Err(anyhow::anyhow!("scan unavailable")),
                 stamp: None,
                 config: app.ws.config.clone(),
-                inventory_products: app.ws.inventory_products.clone(),
+                inventory_products: Some(BTreeSet::from(["failed-product".into()])),
+                inventory_configured_agents: Some(BTreeSet::from(["failed-agent".into()])),
                 warnings: vec![],
             })),
         ));
         assert!(app.snap.get("printer").is_some());
         assert!(selected(&app).is_empty());
         assert!(!app.settings.search.fuzzy);
+        assert_eq!(
+            app.ws.inventory_products,
+            Some(BTreeSet::from(["known-product".into()]))
+        );
+        assert_eq!(
+            app.ws.inventory_configured_agents,
+            Some(BTreeSet::from(["known-agent".into()]))
+        );
 
         std::fs::write(Config::path(tmp.path()), "[invalid").unwrap();
         app.rescan();
@@ -2724,6 +2824,7 @@ mod matrix_key_tests {
                 stamp: None,
                 config: app.ws.config.clone(),
                 inventory_products: Some(BTreeSet::from(["latest-product".into()])),
+                inventory_configured_agents: Some(BTreeSet::from(["latest-agent".into()])),
                 warnings: vec![],
             }),
         );
@@ -2731,6 +2832,10 @@ mod matrix_key_tests {
         assert_eq!(
             app.ws.inventory_products,
             Some(BTreeSet::from(["latest-product".into()]))
+        );
+        assert_eq!(
+            app.ws.inventory_configured_agents,
+            Some(BTreeSet::from(["latest-agent".into()]))
         );
         assert_eq!(
             app.ws.inventory_project.as_deref(),
@@ -2743,12 +2848,62 @@ mod matrix_key_tests {
                 stamp: None,
                 config: app.ws.config.clone(),
                 inventory_products: Some(BTreeSet::from(["stale-product".into()])),
+                inventory_configured_agents: Some(BTreeSet::from(["stale-agent".into()])),
                 warnings: vec![],
             }),
         );
         assert!(
             app.snap.get("latest").is_some(),
             "an older scan must not overwrite the accepted latest result"
+        );
+        assert_eq!(
+            app.ws.inventory_configured_agents,
+            Some(BTreeSet::from(["latest-agent".into()])),
+            "an older scan must not overwrite the accepted agent inventory"
+        );
+        assert_eq!(
+            app.ws.inventory_products,
+            Some(BTreeSet::from(["latest-product".into()])),
+            "an older scan must not overwrite the accepted product inventory"
+        );
+    }
+
+    #[test]
+    fn malformed_config_keeps_previous_explicit_agent_inventory() {
+        let tmp = skills::ops::DownloadDir::new("scan-invalid-agent-config").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(tmp.path()).unwrap(), tx).unwrap();
+        app.ws.config.agents = vec![
+            skills::config::AgentConfig {
+                key: "explicit".into(),
+                name: "Explicit".into(),
+                skills_dir: tmp.path().join("explicit").display().to_string(),
+            },
+            skills::config::AgentConfig {
+                key: "transient".into(),
+                name: "Transient".into(),
+                skills_dir: tmp.path().join("transient").display().to_string(),
+            },
+        ];
+        app.ws.inventory_configured_agents = Some(BTreeSet::from(["explicit".into()]));
+        std::fs::write(Config::path(tmp.path()), "[invalid").unwrap();
+
+        app.rescan();
+        app.benchmark_drain(&rx);
+
+        assert_eq!(
+            app.ws.inventory_configured_agents,
+            Some(BTreeSet::from(["explicit".into()]))
+        );
+        assert!(skills::ops::targets::visible_agents(&app.ws).any(|agent| agent.key == "explicit"));
+        assert!(
+            skills::ops::targets::visible_agents(&app.ws).all(|agent| agent.key != "transient")
         );
     }
 
@@ -2788,7 +2943,7 @@ mod matrix_key_tests {
         app.handle(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
         app.handle(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
         while app.batch_running || app.tasks_running > 0 {
-            app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+            app.handle(wait_for_msg(&rx, "preset member update"));
         }
         assert!(matches!(
             app.modal,
@@ -2811,7 +2966,7 @@ mod matrix_key_tests {
             "repeated apply must not submit twice"
         );
         while app.batch_running || app.tasks_running > 0 {
-            app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+            app.handle(wait_for_msg(&rx, "preset member update"));
         }
         assert!(app.modal.is_none(), "successful apply finishes editing");
         assert_eq!(
@@ -3053,7 +3208,7 @@ mod matrix_key_tests {
         app.handle(Msg::Tick);
         assert_eq!(app.tasks_running, 1);
         while app.tasks_running > 0 {
-            app.handle(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+            app.handle(wait_for_msg(&rx, "background scan"));
         }
         assert!(app.snap.get("new").is_some());
         assert!(matches!(
@@ -3064,7 +3219,7 @@ mod matrix_key_tests {
         app.last_root_poll = std::time::Instant::now() - std::time::Duration::from_secs(3);
         app.handle(Msg::Tick);
         while app.tasks_running > 0 {
-            app.handle(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+            app.handle(wait_for_msg(&rx, "background scan"));
         }
         assert!(app.snap.get("new").is_none());
         assert_eq!(
@@ -3080,7 +3235,7 @@ mod matrix_key_tests {
         app.last_root_poll = std::time::Instant::now() - std::time::Duration::from_secs(3);
         app.handle(Msg::Tick);
         let id = app.next_task_id;
-        app.handle(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+        app.handle(wait_for_msg(&rx, "background scan"));
         assert_eq!(
             app.next_task_id, id,
             "unchanged roots must not launch a scan"
@@ -3544,10 +3699,8 @@ mod matrix_key_tests {
         )));
         assert!(!app.quit);
         release.send(()).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while app.batch_running || app.tasks_running > 0 {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            app.handle(rx.recv_timeout(remaining).unwrap());
+            app.handle(wait_for_msg(&rx, "batch completion"));
         }
         assert!(app.modal.is_none());
         std::fs::remove_dir_all(root).unwrap();
@@ -4475,6 +4628,162 @@ mod escape_hierarchy_tests {
             assert_eq!(app.focus, AppFocus::Tabs, "{tab:?}");
             assert_eq!(app.tab, tab);
         }
+    }
+
+    #[test]
+    fn file_browser_result_returns_to_originating_tab() {
+        let root = skills::ops::DownloadDir::new("file-browser-routing").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("sample")).unwrap();
+        std::fs::write(
+            root.path().join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: sample\n---\nBody",
+        )
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(root.path()).unwrap(), tx).unwrap();
+        app.search.preview_overlay().unwrap().open("sample".into());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        app.search
+            .preview_overlay()
+            .unwrap()
+            .handle_key(KeyCode::Char('f').into());
+        let request = app
+            .search
+            .take_file_browser_requests()
+            .pop()
+            .expect("root directory request");
+
+        app.switch_tab(Tab::Tags);
+        app.handle(Msg::FileBrowser(super::super::views::file_browser::load(
+            &request,
+        )));
+
+        let Msg::FileBrowser(file_result) =
+            wait_for_msg_matching(&rx, "file browser preview", |message| {
+                matches!(message, Msg::FileBrowser(_))
+            })
+        else {
+            unreachable!()
+        };
+        assert_eq!(file_result.path, std::path::Path::new("SKILL.md"));
+        app.handle(Msg::FileBrowser(file_result));
+        app.switch_tab(Tab::Search);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("SKILL.md"));
+        assert!(!rendered.contains("loading…"));
+    }
+
+    fn settle_modal_browser(app: &mut App, rx: &std::sync::mpsc::Receiver<Msg>, label: &str) {
+        for expected in [std::path::Path::new(""), std::path::Path::new("SKILL.md")] {
+            let message =
+                wait_for_msg_matching(rx, label, |message| matches!(message, Msg::FileBrowser(_)));
+            let Msg::FileBrowser(output) = &message else {
+                unreachable!()
+            };
+            assert_eq!(output.path, expected);
+            app.handle(message);
+        }
+    }
+
+    #[test]
+    fn modal_previews_route_file_browser_results_to_default_skill_content() {
+        let (root, mut app) = app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.tx = tx;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        let mut preset = SearchView::preset_members("sample", &ctx);
+        preset.focus_list();
+        app.modal = Some(Modal::PresetSkills(Box::new(preset)));
+        app.handle(Msg::Key(KeyCode::Char('o').into()));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        app.modal = Some(Modal::Message {
+            kind: MessageKind::Normal,
+            title: "Operation needs attention".into(),
+            lines: vec!["retry the staged selection".into()],
+            scroll: 0,
+            return_to: app.modal.take().map(Box::new),
+        });
+        app.handle(Msg::Resize);
+        settle_modal_browser(&mut app, &rx, "preset preview files");
+        app.handle(Msg::Key(KeyCode::Esc.into()));
+        assert!(matches!(app.modal, Some(Modal::PresetSkills(_))));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("SKILL.md"));
+        assert!(rendered.contains("Body"));
+        assert!(!rendered.contains("loading…"));
+
+        let workdir = root.path().join("repository-download");
+        std::fs::create_dir_all(workdir.join("reader")).unwrap();
+        std::fs::write(
+            workdir.join("reader/SKILL.md"),
+            "---\nname: reader\ndescription: Reader\n---\nREPOSITORY PREVIEW BODY",
+        )
+        .unwrap();
+        let fetched = skills::repository::FetchedRepository {
+            repository: skills::repository::Repository {
+                name: Some("sample/repository".into()),
+                kind: Default::default(),
+                alias: "sample--repository".into(),
+                url: "https://example.com/sample/repository.git".into(),
+                branch: "main".into(),
+            },
+            revision: "0000000000000000000000000000000000000001".into(),
+            workdir,
+            choices: vec!["reader".into()],
+            invalid: Default::default(),
+        };
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        app.modal = Some(Modal::Repository(Box::new(
+            super::super::repository_picker::RepositoryPicker::new(fetched, &ctx),
+        )));
+        app.handle(Msg::Key(KeyCode::Char('v').into()));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        app.handle(Msg::Resize);
+        settle_modal_browser(&mut app, &rx, "repository preview files");
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("SKILL.md"));
+        assert!(rendered.contains("REPOSITORY PREVIEW BODY"));
+        assert!(!rendered.contains("loading…"));
     }
 
     #[test]
@@ -6358,19 +6667,29 @@ mod root_sync_tests {
             std::fs::write(ws.root.join("saved.txt"), "automatically backed up")?;
             Ok("saved".into())
         })));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let deadline = Instant::now() + BACKGROUND_WAIT;
         while app.tasks_running > 0 || app.sync.pending() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "auto-sync did not settle"
-            );
             app.sync.mature_stability();
             app.last_user_activity = Instant::now() - app.settings.sync.tui_idle_window;
             app.handle(Msg::Tick);
             app.sync_if_ready();
-            // Status probes are deliberately not counted as blocking tasks.
-            // The production event loop still receives them while idle.
-            app.handle(rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap());
+            // A pending sync may still be waiting for the tick above to launch
+            // a probe. Block only when a worker or probe is actually in flight.
+            if app.tasks_running > 0 || app.sync.probe_running() {
+                app.handle(wait_for_msg_before(
+                    &rx,
+                    deadline,
+                    "automatic root sync task or status probe",
+                ));
+            } else {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out driving automatic root sync: tasks_running={}, pending={}, probe_running={}",
+                    app.tasks_running,
+                    app.sync.pending(),
+                    app.sync.probe_running()
+                );
+            }
         }
         assert_eq!(
             skills::ops::git(&["show", "HEAD:saved.txt"], Some(&remote)).unwrap(),

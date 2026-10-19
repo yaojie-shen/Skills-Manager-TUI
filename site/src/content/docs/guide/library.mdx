@@ -35,6 +35,12 @@ Before a remote skill is copied into the Library, Skills Manager checks the sele
 
 <DocsTuiCapture frame="repos" caption="The Repos view shows each source and the skills installed from it." />
 
+## Browse a skill's files
+
+Open a skill preview from any TUI view to see compact metadata, the skill's file tree, and the selected file together on wider terminals. The preview starts on `SKILL.md` with the file content focused. Press `←` in the content to focus the tree, or `→` in the tree to focus the content; `Tab` also switches between them. `↑`/`↓` or `j`/`k` move through the tree or scroll the focused content. Use `Enter`/`l` to open a file or toggle a directory, `←`/`h` in the tree to collapse or move to its parent, `gg`/`G` to jump, and `Ctrl-d`/`Ctrl-u` to page. Directories load when first expanded; hidden entries are omitted until you press `.`. Press `e` to expand the metadata header; scroll it with `j`/`k`, arrows, `PgUp`/`PgDn`, `Home`, or `End`, then press `Tab` to return to the file content. The preview uses about 80% of the terminal width up to 160 columns. On terminals narrower than 64 columns, it starts with content only; press `←` or `Tab` to show the tree, and `→` or `Tab` to return to the content. `Esc` or `q` closes the preview without changing the page beneath it.
+
+Markdown files use the regular rendered preview. Other text has line numbers. Binary and unreadable files show an explanation; text previews are limited to 256 KiB and say when they are truncated. Symlinked directories never expand, and symlinked files are read only when their resolved target stays inside the skill directory. The browser is read-only and uses the existing `ui.icons` setting for Nerd Font icons or text markers.
+
 ## How installed skills are named
 
 The install command above uses `--repo-alias toolbox`, so Skills Manager stores the selected skill under `repos/toolbox/`. Installation prints the full Library key for use in later commands.

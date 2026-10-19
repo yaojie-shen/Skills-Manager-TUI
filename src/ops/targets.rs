@@ -740,6 +740,8 @@ fn discover_with_paths(
     applications: &[PathBuf],
 ) -> Result<()> {
     ws.inventory_project = Some(project.to_path_buf());
+    ws.inventory_configured_agents
+        .get_or_insert_with(|| ws.config.agents.iter().map(|a| a.key.clone()).collect());
     let products = crate::agents::detect_with_applications(home, project, dirs, applications);
     for definition in crate::agents::BUILTINS {
         if products.contains(definition.key) && ws.config.agent(definition.key).is_none() {
@@ -757,10 +759,15 @@ fn discover_with_paths(
     ws.inventory_products = Some(products);
     Ok(())
 }
-pub fn visible_agents(ws: &Workspace) -> impl Iterator<Item = &AgentConfig> {
-    ws.config.agents.iter().filter(|a| {
-        ws.inventory_products
+pub fn is_visible_agent(ws: &Workspace, agent: &AgentConfig) -> bool {
+    ws.inventory_configured_agents
+        .as_ref()
+        .is_none_or(|configured| configured.contains(&agent.key))
+        || ws
+            .inventory_products
             .as_ref()
-            .is_none_or(|products| products.contains(product_key(a)))
-    })
+            .is_none_or(|products| products.contains(product_key(agent)))
+}
+pub fn visible_agents(ws: &Workspace) -> impl Iterator<Item = &AgentConfig> {
+    ws.config.agents.iter().filter(|a| is_visible_agent(ws, a))
 }

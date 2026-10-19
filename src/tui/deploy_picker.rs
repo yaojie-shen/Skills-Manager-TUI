@@ -81,12 +81,7 @@ impl DeployPicker {
                     a.skills_path(),
                 )
             });
-            agents.retain(|agent| {
-                ctx.ws
-                    .inventory_products
-                    .as_ref()
-                    .is_none_or(|products| products.contains(targets::product_key(agent)))
-            });
+            agents.retain(|agent| targets::is_visible_agent(ctx.ws, agent));
             let snap = skills::reconcile::rescope(ctx.snap, &agents)?;
             agents.retain(|agent| {
                 !matches!(

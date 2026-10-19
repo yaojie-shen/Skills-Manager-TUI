@@ -687,6 +687,45 @@ impl Modal {
         }
     }
 
+    pub fn accepts_file_browser(&mut self, output: &super::views::file_browser::Output) -> bool {
+        match self {
+            Self::PresetSkills(view) => view.accepts_file_browser(output),
+            Self::Repository(picker) => picker.accepts_file_browser(output),
+            Self::Message {
+                return_to: Some(modal),
+                ..
+            } => modal.accepts_file_browser(output),
+            _ => false,
+        }
+    }
+
+    pub fn apply_file_browser(
+        &mut self,
+        output: super::views::file_browser::Output,
+    ) -> Vec<super::views::file_browser::Request> {
+        match self {
+            Self::PresetSkills(view) => view.apply_file_browser(output),
+            Self::Repository(picker) => picker.apply_file_browser(output),
+            Self::Message {
+                return_to: Some(modal),
+                ..
+            } => modal.apply_file_browser(output),
+            _ => vec![],
+        }
+    }
+
+    pub fn take_file_browser_requests(&mut self) -> Vec<super::views::file_browser::Request> {
+        match self {
+            Self::PresetSkills(view) => view.take_file_browser_requests(),
+            Self::Repository(picker) => picker.take_file_browser_requests(),
+            Self::Message {
+                return_to: Some(modal),
+                ..
+            } => modal.take_file_browser_requests(),
+            _ => vec![],
+        }
+    }
+
     pub fn hints(&self) -> Hints {
         match self {
             Modal::DeploymentChoices(picker) => picker.hints(),

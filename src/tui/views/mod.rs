@@ -2,6 +2,7 @@
 //! data always comes from `Ctx`.
 
 pub mod agents;
+pub mod file_browser;
 pub(crate) mod filter;
 pub mod health;
 pub mod matrix;
@@ -29,6 +30,23 @@ pub(super) enum SplitFocus {
 pub trait View {
     fn overlay_open(&self) -> bool {
         false
+    }
+    fn preview_overlay(&mut self) -> Option<&mut preview::Overlay> {
+        None
+    }
+    fn accepts_file_browser(&mut self, output: &file_browser::Output) -> bool {
+        self.preview_overlay()
+            .is_some_and(|overlay| overlay.accepts_file_browser(output))
+    }
+    fn apply_file_browser(&mut self, output: file_browser::Output) -> Vec<file_browser::Request> {
+        self.preview_overlay()
+            .map(|overlay| overlay.apply_file_browser(output))
+            .unwrap_or_default()
+    }
+    fn take_file_browser_requests(&mut self) -> Vec<file_browser::Request> {
+        self.preview_overlay()
+            .map(preview::Overlay::take_file_browser_requests)
+            .unwrap_or_default()
     }
     fn handle_control_key(&mut self, _key: KeyEvent, _ctx: &Ctx) -> Vec<Action> {
         vec![]

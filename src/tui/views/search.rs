@@ -249,6 +249,10 @@ impl SearchView {
         self.preset.is_some() || self.tag.is_some() || self.target.is_some()
     }
 
+    fn is_library(&self) -> bool {
+        !self.is_picker() && self.scope.is_none() && self.panel.is_none()
+    }
+
     fn includes_record(&self, record: &skills::reconcile::SkillRecord) -> bool {
         (!self.is_picker() || (record.status.is_present() && record.name.is_some()))
             && self
@@ -950,11 +954,23 @@ impl SearchView {
                         skills::repository::alias_of(&ctx.snap.skills[h.index].key).is_none()
                     })
                     .count();
-                format!(
+                let mut title = format!(
                     "{local_matches}/{local_total} local · {}/{} repository installs",
                     self.hits.len() - local_matches,
                     total - local_total
-                )
+                );
+                if self.is_library() {
+                    let hidden = ctx
+                        .snap
+                        .skills
+                        .iter()
+                        .filter(|record| !record.status.is_healthy())
+                        .count();
+                    if hidden > 0 {
+                        title.push_str(&format!(" · {hidden} in Health"));
+                    }
+                }
+                title
             }),
             Span::raw(" "),
         ])
@@ -1003,8 +1019,18 @@ impl SearchView {
             .layout(content, cols, cell_h, gap, self.hits.len());
 
         if self.hits.is_empty() {
+            let query = Query::parse(self.search_panel.input.value());
+            let hidden_status_match = self.is_library()
+                && !query.statuses.is_empty()
+                && self
+                    .searcher
+                    .search(&ctx.snap.skills, &query)
+                    .iter()
+                    .any(|hit| !ctx.snap.skills[hit.index].status.is_healthy());
             let msg = if ctx.snap.skills.is_empty() {
                 "no skills in this root"
+            } else if hidden_status_match {
+                "matching skills are in Health"
             } else {
                 "no match"
             };
@@ -1164,6 +1190,9 @@ impl SearchView {
 impl View for SearchView {
     fn overlay_open(&self) -> bool {
         self.overlay.is_open()
+    }
+    fn preview_overlay(&mut self) -> Option<&mut super::preview::Overlay> {
+        Some(&mut self.overlay)
     }
     fn handle_control_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         if self.multi && self.focus == Focus::List && super::super::keymap::control(key, 'a') {
@@ -1802,6 +1831,10 @@ mod tests {
         };
         let mut view = SearchView::default();
         view.refresh(&ctx);
+        assert_eq!(
+            view.input_title(&ctx).to_string(),
+            " 1/1 local · 0/0 repository installs "
+        );
         view.focus = Focus::Preview;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
@@ -2232,6 +2265,33 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(screen.contains("1/1 local"));
+        assert!(screen.contains("· 3 in Health"));
+        let mut narrow =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        narrow.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+
+        view.set_query("status:corrupt-meta", &ctx);
+        assert!(view.hits.is_empty());
+        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("matching skills are in Health"));
+        view.set_query("absent status:corrupt-meta", &ctx);
+        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("no match"));
+        assert!(!screen.contains("matching skills are in Health"));
         view.set_query("invalid", &ctx);
         assert!(view.hits.is_empty());
         view.set_query("", &ctx);
@@ -2481,6 +2541,14 @@ mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+        let mut requests = view.take_file_browser_requests();
+        while let Some(request) = requests.pop() {
+            requests
+                .extend(view.apply_file_browser(crate::tui::views::file_browser::load(&request)));
+        }
+        view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &ctx);
+        view.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE), &ctx);
+        terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
         let screen: String = terminal
             .backend()
             .buffer()
@@ -2489,9 +2557,11 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(
-            screen.contains("e fields · Esc closes"),
-            "expanded fields must render over split layouts"
+            screen.contains("details · e less"),
+            "expanded metadata must render over split layouts"
         );
+        assert!(screen.contains("SKILL.md"));
+        assert!(screen.contains("description: shared tools"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

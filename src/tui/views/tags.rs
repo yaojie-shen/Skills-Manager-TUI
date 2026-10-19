@@ -374,6 +374,9 @@ impl View for TagsView {
             || (self.focus == SplitFocus::Members
                 && self.skill_search.as_ref().is_some_and(View::overlay_open))
     }
+    fn preview_overlay(&mut self) -> Option<&mut super::preview::Overlay> {
+        self.skill_search.as_mut().and_then(View::preview_overlay)
+    }
     fn handle_control_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Vec<Action> {
         if self.focus == SplitFocus::Members
             && let Some(view) = self.skill_search.as_mut()

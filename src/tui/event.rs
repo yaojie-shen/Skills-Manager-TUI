@@ -18,6 +18,9 @@ pub enum Msg {
     Tick,
     SyncPublishing,
     SyncStatus(u64, Result<skills::ops::sync::Status>),
+    /// Read-only skill browser work. This deliberately bypasses `Task` so it
+    /// does not count as a mutation, delay polling/auto-sync, or block quit.
+    FileBrowser(super::views::file_browser::Output),
     Task(u64, Box<TaskOutput>),
     Progress(u64, String),
 }
@@ -256,6 +259,16 @@ pub fn spawn_sync_status(ws: Workspace, remote: bool, id: u64, tx: Sender<Msg>) 
         .expect("spawn sync status thread");
 }
 
+pub fn spawn_file_browser(request: super::views::file_browser::Request, tx: Sender<Msg>) {
+    std::thread::Builder::new()
+        .name("file-browser".into())
+        .spawn(move || {
+            let output = super::views::file_browser::load(&request);
+            let _ = tx.send(Msg::FileBrowser(output));
+        })
+        .expect("spawn file browser thread");
+}
+
 pub fn spawn_task(mut ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
     std::thread::Builder::new()
         .name("task".into())
@@ -338,7 +351,12 @@ pub fn spawn_task(mut ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                 Task::Scan => {
                     let mut warnings = Vec::new();
                     match ws.load_config() {
-                        Ok(config) => ws.config = config,
+                        Ok(config) => {
+                            ws.config = config;
+                            // The worker clone carries the previous successful
+                            // inventory. A fresh config needs a fresh explicit set.
+                            ws.inventory_configured_agents = None;
+                        }
                         Err(error) => warnings.push(format!("{error:#}")),
                     }
                     let project = ws
@@ -358,6 +376,7 @@ pub fn spawn_task(mut ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                         stamp,
                         config: ws.config,
                         inventory_products: ws.inventory_products,
+                        inventory_configured_agents: ws.inventory_configured_agents,
                         warnings,
                     })
                 }
@@ -417,6 +436,7 @@ pub struct ScanOutcome {
     pub stamp: Option<skills::reconcile::watch::Stamp>,
     pub config: skills::config::Config,
     pub inventory_products: Option<std::collections::BTreeSet<String>>,
+    pub inventory_configured_agents: Option<std::collections::BTreeSet<String>>,
     pub warnings: Vec<String>,
 }
 

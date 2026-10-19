@@ -796,6 +796,9 @@ impl View for HealthView {
     fn overlay_open(&self) -> bool {
         self.preview.is_open()
     }
+    fn preview_overlay(&mut self) -> Option<&mut super::preview::Overlay> {
+        Some(&mut self.preview)
+    }
     fn actions_menu(&self, ctx: &Ctx) -> Option<Request> {
         if self.preview.is_open() || self.filter.editing {
             return None;

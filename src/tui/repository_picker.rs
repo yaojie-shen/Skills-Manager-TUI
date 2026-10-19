@@ -128,6 +128,21 @@ impl RepositoryPicker {
         self.refilter();
         self.update_completion(ctx);
     }
+
+    pub fn accepts_file_browser(&self, output: &super::views::file_browser::Output) -> bool {
+        self.preview.accepts_file_browser(output)
+    }
+
+    pub fn apply_file_browser(
+        &mut self,
+        output: super::views::file_browser::Output,
+    ) -> Vec<super::views::file_browser::Request> {
+        self.preview.apply_file_browser(output)
+    }
+
+    pub fn take_file_browser_requests(&mut self) -> Vec<super::views::file_browser::Request> {
+        self.preview.take_file_browser_requests()
+    }
     fn update_completion(&mut self, ctx: &Ctx) {
         let candidate_ctx = Ctx {
             ws: ctx.ws,

@@ -215,6 +215,11 @@ impl SyncCoordinator {
         )
     }
 
+    #[cfg(test)]
+    pub fn probe_running(&self) -> bool {
+        self.probe.is_some()
+    }
+
     pub fn probe_due(&self, now: Instant) -> bool {
         self.probe.is_none() && now >= self.next_remote_probe
     }

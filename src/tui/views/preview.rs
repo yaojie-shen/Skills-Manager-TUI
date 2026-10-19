@@ -7,10 +7,10 @@ use crate::tui::app::Ctx;
 use crate::tui::components::skill::{status_glyph, status_text};
 use crate::tui::text::{highlight_line, highlight_spans};
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{OverlayClear as Clear, render_vertical_scrollbar, scrollbar_gutter};
+use crate::tui::widgets::{OverlayClear as Clear, fit};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
@@ -22,11 +22,15 @@ use skills::reconcile::{DeployState, SkillRecord};
 pub struct Overlay {
     key: Option<String>,
     agent_preview: Option<AgentPreview>,
-    scroll: u16,
     rect: Rect,
-    lines: usize,
-    height: u16,
     expanded_fields: bool,
+    browser: Option<super::file_browser::Browser>,
+    skill_root: Option<std::path::PathBuf>,
+    metadata_rect: Rect,
+    metadata_scroll: usize,
+    metadata_lines: usize,
+    metadata_height: usize,
+    metadata_focus: bool,
 }
 
 struct AgentPreview {
@@ -40,11 +44,17 @@ impl Overlay {
     pub fn open(&mut self, key: String) {
         self.agent_preview = None;
         self.key = Some(key);
-        self.scroll = 0;
         self.expanded_fields = false;
+        self.browser = None;
+        self.skill_root = None;
+        self.metadata_rect = Rect::default();
+        self.metadata_scroll = 0;
+        self.metadata_focus = false;
     }
     pub fn expand_fields(&mut self) {
         self.expanded_fields = true;
+        self.metadata_focus = true;
+        self.metadata_scroll = 0;
     }
     /// Read the selected agent entry once, never substitute a same-named root skill.
     pub fn open_agent(
@@ -56,6 +66,7 @@ impl Overlay {
     ) {
         self.open(key);
         let doc = skills::skill::SkillDoc::load(&path).map_err(|e| format!("{e:#}"));
+        self.skill_root = Some(path.clone());
         self.agent_preview = Some(AgentPreview {
             agent,
             path,
@@ -66,22 +77,67 @@ impl Overlay {
     pub fn close(&mut self) {
         self.agent_preview = None;
         self.key = None;
+        self.browser = None;
+        self.skill_root = None;
     }
     pub fn is_open(&self) -> bool {
         self.key.is_some()
     }
-    pub fn hints(&self) -> Option<crate::tui::app::Hints> {
-        self.is_open().then_some(&[
-            ("↑↓/j/k", "scroll"),
-            ("PgUp/PgDn", "page"),
-            ("Home/End", "top/bottom"),
-            ("e", "expand/collapse fields"),
-            ("Esc/Enter", "close"),
-        ])
+    pub fn accepts_file_browser(&self, output: &super::file_browser::Output) -> bool {
+        self.browser
+            .as_ref()
+            .is_some_and(|browser| browser.accepts(output))
     }
-    fn scroll_by(&mut self, delta: i32) {
-        let max = (self.lines as i32 - self.height as i32).max(0);
-        self.scroll = (self.scroll as i32 + delta).clamp(0, max) as u16;
+
+    pub fn apply_file_browser(
+        &mut self,
+        output: super::file_browser::Output,
+    ) -> Vec<super::file_browser::Request> {
+        if let Some(browser) = &mut self.browser {
+            browser.apply(output);
+            browser.take_requests()
+        } else {
+            vec![]
+        }
+    }
+
+    pub fn take_file_browser_requests(&mut self) -> Vec<super::file_browser::Request> {
+        self.browser
+            .as_mut()
+            .map(super::file_browser::Browser::take_requests)
+            .unwrap_or_default()
+    }
+
+    pub fn hints(&self) -> Option<crate::tui::app::Hints> {
+        if !self.is_open() {
+            None
+        } else if self.metadata_focus {
+            Some(&[
+                ("j/k ↑/↓", "scroll fields"),
+                ("PgUp/PgDn", "page"),
+                ("Home/End", "top/bottom"),
+                ("Tab", "content"),
+                ("e", "less"),
+                ("Esc/q", "close"),
+            ])
+        } else {
+            Some(&[
+                ("←/→", "files/content"),
+                ("j/k ↑/↓", "move/scroll"),
+                ("Enter/l", "open/expand"),
+                ("h/←", "collapse/parent"),
+                ("Tab", "files/content"),
+                ("e", "details"),
+                ("./gg/G", "hidden/top/bottom"),
+                ("Ctrl-d/u", "page"),
+                ("Esc/q", "close"),
+            ])
+        }
+    }
+
+    fn scroll_metadata_by(&mut self, delta: isize) {
+        let max = self.metadata_lines.saturating_sub(self.metadata_height);
+        self.metadata_scroll = self.metadata_scroll.saturating_add_signed(delta).min(max);
     }
 
     /// Consume every page key while the overlay is open, including unbound
@@ -90,19 +146,52 @@ impl Overlay {
         if !self.is_open() {
             return false;
         }
+        if self.metadata_focus {
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.close(),
+                KeyCode::Char('e') => {
+                    self.expanded_fields = false;
+                    self.metadata_focus = false;
+                    self.metadata_scroll = 0;
+                }
+                KeyCode::Tab => {
+                    self.metadata_focus = false;
+                    if let Some(browser) = &mut self.browser {
+                        browser.focus_preview();
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_metadata_by(1),
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_metadata_by(-1),
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    self.scroll_metadata_by(self.metadata_height.saturating_sub(1) as isize)
+                }
+                KeyCode::PageUp => {
+                    self.scroll_metadata_by(-(self.metadata_height.saturating_sub(1) as isize))
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.metadata_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => self.scroll_metadata_by(isize::MAX),
+                _ => {}
+            }
+            return true;
+        }
         match k.code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.close(),
+            KeyCode::Esc | KeyCode::Char('q') => self.close(),
             KeyCode::Char('e') => {
                 self.expanded_fields = !self.expanded_fields;
-                self.scroll = 0;
+                self.metadata_scroll = 0;
+                self.metadata_focus = self.expanded_fields;
             }
-            KeyCode::Down | KeyCode::Char('j') => self.scroll_by(1),
-            KeyCode::Up | KeyCode::Char('k') => self.scroll_by(-1),
-            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_by(self.height as i32 - 2),
-            KeyCode::PageUp => self.scroll_by(-(self.height as i32 - 2)),
-            KeyCode::Home | KeyCode::Char('g') => self.scroll = 0,
-            KeyCode::End | KeyCode::Char('G') => self.scroll_by(i32::MAX / 2),
-            _ => {}
+            KeyCode::Char('f') => {
+                self.metadata_focus = false;
+                if let Some(browser) = &mut self.browser {
+                    browser.focus_tree();
+                }
+            }
+            _ => {
+                if let Some(browser) = &mut self.browser {
+                    browser.handle_key(k);
+                }
+            }
         }
         true
     }
@@ -114,62 +203,121 @@ impl Overlay {
         if !self.is_open() {
             return false;
         }
-        match m.kind {
-            MouseEventKind::ScrollDown => self.scroll_by(ctx.settings.interaction.wheel_rows),
-            MouseEventKind::ScrollUp => self.scroll_by(-ctx.settings.interaction.wheel_rows),
-            MouseEventKind::Down(MouseButton::Left)
-                if !self.rect.contains((m.column, m.row).into()) =>
-            {
-                self.close()
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && !self.rect.contains((m.column, m.row).into())
+        {
+            self.close();
+        } else if self.metadata_rect.contains((m.column, m.row).into()) {
+            let amount = ctx.settings.interaction.wheel_rows.max(1) as usize;
+            match m.kind {
+                MouseEventKind::ScrollDown => {
+                    self.expanded_fields = true;
+                    self.metadata_focus = true;
+                    let max = self.metadata_lines.saturating_sub(self.metadata_height);
+                    self.metadata_scroll = self.metadata_scroll.saturating_add(amount).min(max);
+                }
+                MouseEventKind::ScrollUp => {
+                    self.expanded_fields = true;
+                    self.metadata_focus = true;
+                    self.metadata_scroll = self.metadata_scroll.saturating_sub(amount);
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.expanded_fields = true;
+                    self.metadata_focus = true;
+                }
+                _ => {}
             }
-            _ => {}
+        } else if let Some(browser) = &mut self.browser {
+            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.metadata_focus = false;
+            }
+            browser.handle_mouse(m, ctx.settings.interaction.wheel_rows);
         }
         true
     }
 
-    /// Draw over `area`. Sized to the page rather than to the text, so the
-    /// window stays put while the user scrolls through a long SKILL.md.
+    fn popup_rect(area: Rect) -> Rect {
+        let available = area.width.saturating_sub(4);
+        let responsive = ((area.width as u32 * 4 / 5) as u16).max(100);
+        let width = available.min(responsive.min(160)).max(1).min(area.width);
+        let height = area.height.saturating_sub(4).max(6).min(area.height);
+        Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        }
+    }
+
+    fn metadata_height(&self, available: u16, lines: usize) -> u16 {
+        if available < 8 {
+            return 0;
+        }
+        let cap = if self.expanded_fields {
+            available / 2
+        } else {
+            available / 3
+        }
+        .max(3);
+        u16::try_from(lines)
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(cap)
+            .min(available.saturating_sub(3))
+    }
+
+    /// Draw the unified metadata and file preview over `area`.
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let Some(key) = &self.key else {
+        let Some(key) = self.key.clone() else {
             self.rect = Rect::default();
             return;
         };
         let th = &ctx.settings.theme;
-        let w = area.width.saturating_sub(8).clamp(20, 100);
-        let h = area.height.saturating_sub(4).max(6);
-        let rect = Rect {
-            x: area.x + (area.width - w) / 2,
-            y: area.y + (area.height - h) / 2,
-            width: w,
-            height: h,
-        };
+        let rect = Self::popup_rect(area);
         self.rect = rect;
-        f.render_widget(Clear, rect);
-        let title = Line::from(vec![
-            Span::raw(" "),
-            Span::styled(
-                self.agent_preview
-                    .as_ref()
-                    .and_then(|p| p.doc.as_ref().ok())
-                    .map(|d| d.name.as_str())
-                    .or_else(|| {
-                        ctx.snap
-                            .get(key)
-                            .map(crate::tui::components::skill::display_name)
-                    })
-                    .unwrap_or(key)
-                    .to_string(),
-                th.bold(),
-            ),
-            Span::styled("  e fields · Esc closes ", th.dim()),
-        ]);
+        if self.skill_root.is_none() {
+            self.skill_root = self
+                .agent_preview
+                .as_ref()
+                .map(|preview| preview.path.clone())
+                .or_else(|| ctx.snap.get(&key).map(|record| record.path.clone()));
+        }
+        if self.browser.is_none()
+            && let Some(root) = self.skill_root.clone()
+        {
+            self.browser = Some(super::file_browser::Browser::open(key.clone(), root));
+        }
+
+        let display_name = self
+            .agent_preview
+            .as_ref()
+            .and_then(|preview| preview.doc.as_ref().ok())
+            .map(|doc| doc.name.as_str())
+            .or_else(|| {
+                ctx.snap
+                    .get(&key)
+                    .map(crate::tui::components::skill::display_name)
+            })
+            .unwrap_or(&key);
+        let title = format!(
+            " {} · e details · Esc closes ",
+            fit(
+                &skills::util::display_safe(display_name),
+                rect.width.saturating_sub(30) as usize
+            )
+        );
         let block = th.block(title, true);
         let inner = block.inner(rect);
-        let (content, track) = scrollbar_gutter(inner);
+        f.render_widget(Clear, rect);
         f.render_widget(block, rect);
-        self.height = content.height;
-        let lines = if let Some(preview) = &self.agent_preview {
-            let mut lines = vec![
+
+        let metadata_width = inner.width.saturating_sub(2) as usize;
+        let mut metadata = if let Some(preview) = &self.agent_preview {
+            let mut lines = Vec::new();
+            if let Ok(doc) = &preview.doc {
+                lines.push(kv("name", &doc.name, th));
+            }
+            lines.extend([
                 kv("agent", &preview.agent, th),
                 kv(
                     "path",
@@ -177,58 +325,83 @@ impl Overlay {
                     th,
                 ),
                 kv("entry", &preview.ownership, th),
-                Line::from(""),
-            ];
-            if let Ok(doc) = &preview.doc {
-                lines.push(kv("name", &doc.name, th));
-            }
-            if !self.expanded_fields {
-                lines = lines
-                    .into_iter()
-                    .map(|line| single_line(line, content.width as usize))
-                    .collect();
-            }
-            match &preview.doc {
-                Ok(doc) => {
-                    lines.extend(markdown_section(
-                        "Description",
-                        &doc.description,
-                        content.width as usize,
-                        &[],
-                        th,
-                    ));
-                    lines.extend(markdown_section(
-                        "SKILL.md",
-                        &doc.body,
-                        content.width as usize,
-                        &[],
-                        th,
-                    ));
-                }
-                Err(error) => lines.push(Line::from(Span::styled(error.clone(), th.err()))),
+            ]);
+            if let Err(error) = &preview.doc {
+                lines.push(Line::from(Span::styled(
+                    skills::util::display_safe(error).into_owned(),
+                    th.err(),
+                )));
             }
             lines
-        } else if let Some(r) = ctx.snap.get(key) {
-            record_lines(r, ctx, &[], content.width as usize, self.expanded_fields)
+        } else if let Some(record) = ctx.snap.get(&key) {
+            record_metadata_lines(
+                record,
+                ctx,
+                &[],
+                metadata_width,
+                self.expanded_fields,
+                MetadataMode::Overlay,
+            )
         } else {
             vec![Line::from(Span::styled("not in the skills root", th.err()))]
         };
-        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-        self.lines = paragraph.line_count(content.width);
-        let max = self
-            .lines
-            .saturating_sub(content.height as usize)
-            .min(u16::MAX as usize) as u16;
-        self.scroll = self.scroll.min(max);
-        f.render_widget(paragraph.scroll((self.scroll, 0)), content);
-        render_vertical_scrollbar(
-            f,
-            track,
-            self.lines,
-            content.height as usize,
-            self.scroll as usize,
-            th.dim(),
-        );
+        metadata = metadata
+            .into_iter()
+            .map(|line| {
+                single_line(
+                    line,
+                    if self.expanded_fields {
+                        usize::MAX
+                    } else {
+                        metadata_width
+                    },
+                )
+            })
+            .collect();
+        let metadata_paragraph = Paragraph::new(metadata).wrap(Wrap { trim: false });
+        self.metadata_lines = metadata_paragraph.line_count(metadata_width.max(1) as u16);
+        let metadata_height = self.metadata_height(inner.height, self.metadata_lines);
+        let (metadata_area, browser_area) = if metadata_height == 0 {
+            (Rect::default(), inner)
+        } else {
+            let areas = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(metadata_height), Constraint::Min(3)])
+                .split(inner);
+            (areas[0], areas[1])
+        };
+        if metadata_height > 0 {
+            let detail = if self.expanded_fields {
+                " details · e less "
+            } else {
+                " details · e more "
+            };
+            let metadata_block = th.block(detail, self.metadata_focus);
+            let content = metadata_block.inner(metadata_area);
+            self.metadata_rect = content;
+            self.metadata_height = content.height as usize;
+            let max = self.metadata_lines.saturating_sub(self.metadata_height);
+            self.metadata_scroll = self.metadata_scroll.min(max);
+            f.render_widget(metadata_block, metadata_area);
+            f.render_widget(
+                metadata_paragraph.scroll((self.metadata_scroll.min(u16::MAX as usize) as u16, 0)),
+                content,
+            );
+        } else {
+            self.metadata_rect = Rect::default();
+            self.metadata_height = 0;
+            self.metadata_scroll = 0;
+        }
+
+        if let Some(browser) = &mut self.browser {
+            browser.draw(f, browser_area, ctx);
+        } else {
+            f.render_widget(
+                Paragraph::new("Files are unavailable for this entry")
+                    .block(th.block(" Files ", false)),
+                browser_area,
+            );
+        }
     }
 }
 
@@ -254,6 +427,49 @@ fn record_lines<'a>(
     terms: &[String],
     available_width: usize,
     expanded: bool,
+) -> Vec<Line<'a>> {
+    let mut lines = record_metadata_lines(
+        r,
+        ctx,
+        terms,
+        available_width,
+        expanded,
+        MetadataMode::Inline,
+    );
+    if let Some(d) = &r.description {
+        lines.extend(markdown_section(
+            "Description",
+            d,
+            available_width,
+            terms,
+            &ctx.settings.theme,
+        ));
+    }
+    if let Some(b) = &r.body {
+        lines.extend(markdown_section(
+            "SKILL.md",
+            b,
+            available_width,
+            terms,
+            &ctx.settings.theme,
+        ));
+    }
+    lines
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetadataMode {
+    Inline,
+    Overlay,
+}
+
+fn record_metadata_lines<'a>(
+    r: &'a SkillRecord,
+    ctx: &'a Ctx,
+    terms: &[String],
+    available_width: usize,
+    expanded: bool,
+    mode: MetadataMode,
 ) -> Vec<Line<'a>> {
     let th = &ctx.settings.theme;
     let mut lines = vec![Line::from(vec![
@@ -289,17 +505,19 @@ fn record_lines<'a>(
             .unwrap_or_else(|| r.source_kind().into()),
         th,
     ));
-    if let Some(source) = r.source.as_ref().filter(|source| source.is_remote()) {
+    if (mode == MetadataMode::Inline || expanded)
+        && let Some(source) = r.source.as_ref().filter(|source| source.is_remote())
+    {
         lines.push(kv(
             "location",
             crate::tui::icons::source(ctx.settings.ui.icons, source),
             th,
         ));
     }
-    if r.external {
+    if (mode == MetadataMode::Inline || expanded) && r.external {
         lines.push(kv("path", format!("{} (symlink)", r.path.display()), th));
     }
-    if !expanded {
+    if mode == MetadataMode::Inline && !expanded {
         lines = lines
             .into_iter()
             .map(|line| single_line(line, available_width))
@@ -333,24 +551,14 @@ fn record_lines<'a>(
     }
     // Memberships wrap instead of truncating: details expose every association.
     lines.splice(1..1, memberships);
-    if let Some(n) = &r.note {
+    if (mode == MetadataMode::Inline || expanded)
+        && let Some(n) = &r.note
+    {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("note", th.bold().fg(th.tag))));
         for l in n.lines() {
             lines.push(Line::from(highlight_spans(l, terms, Style::default(), th)));
         }
-    }
-    if let Some(d) = &r.description {
-        lines.extend(markdown_section(
-            "Description",
-            d,
-            available_width,
-            terms,
-            th,
-        ));
-    }
-    if let Some(b) = &r.body {
-        lines.extend(markdown_section("SKILL.md", b, available_width, terms, th));
     }
     lines
 }
@@ -429,20 +637,17 @@ fn markdown_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn settle_browser(overlay: &mut Overlay) {
+        let mut requests = overlay.take_file_browser_requests();
+        while let Some(request) = requests.pop() {
+            requests.extend(overlay.apply_file_browser(super::super::file_browser::load(&request)));
+        }
+    }
+
     #[test]
-    fn scrolling_cjk_overlay_keeps_borders_and_internal_track_separate() {
-        let root = skills::ops::DownloadDir::new("cjk-overlay-boundaries").unwrap();
-        let skill = root.path().join("cjk");
-        std::fs::create_dir_all(&skill).unwrap();
-        std::fs::write(
-            skill.join("SKILL.md"),
-            format!(
-                "---\nname: cjk\ndescription: {}\n---\n{}",
-                "中文❤️".repeat(40),
-                "中文中文❤️中文中文\n".repeat(80)
-            ),
-        )
-        .unwrap();
+    fn file_browser_overlay_neutralizes_control_characters_in_skill_key() {
+        let root = skills::ops::DownloadDir::new("browser-overlay-key").unwrap();
         let ws = skills::Workspace::open(root.path()).unwrap();
         let snap = ws.scan().unwrap();
         let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
@@ -452,24 +657,141 @@ mod tests {
             settings: &settings,
         };
         let mut overlay = Overlay::default();
-        overlay.open("cjk".into());
+        overlay.open("unsafe\x1b[2J".into());
+        overlay.skill_root = Some(root.path().to_path_buf());
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-        for scroll in [0, u16::MAX] {
-            overlay.scroll = scroll;
+        terminal
+            .draw(|frame| overlay.draw(frame, frame.area(), &ctx))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains('\x1b'));
+        assert!(rendered.contains("unsafe\u{fffd}[2J"));
+    }
+
+    #[test]
+    fn unified_overlay_opens_files_directly_and_scales_responsively() {
+        let root = skills::ops::DownloadDir::new("unified-overlay").unwrap();
+        let skill = root.path().join("sample");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: sample\ndescription: compact metadata\n---\n# Direct body\nread me",
+        )
+        .unwrap();
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let mut snap = ws.scan().unwrap();
+        let record = snap
+            .skills
+            .iter_mut()
+            .find(|record| record.key == "sample")
+            .unwrap();
+        record.tags = (0..40).map(|index| format!("tag-{index:02}")).collect();
+        record.note = Some(
+            (0..30)
+                .map(|index| format!("note line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut overlay = Overlay::default();
+        overlay.open("sample".into());
+        overlay.metadata_scroll = 4;
+        overlay.expand_fields();
+        assert!(overlay.expanded_fields);
+        assert!(overlay.metadata_focus);
+        assert_eq!(overlay.metadata_scroll, 0);
+        overlay.handle_key(KeyCode::Char('e').into());
+        let mut widths = Vec::new();
+        for width in [60, 100, 200, 300] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
             terminal
                 .draw(|frame| overlay.draw(frame, frame.area(), &ctx))
                 .unwrap();
-            let buffer = terminal.backend().buffer();
-            let rect = overlay.rect;
-            let track_x = rect.right() - 2;
-            for y in rect.y + 1..rect.bottom() - 1 {
-                assert_eq!(buffer[(rect.x, y)].symbol(), "│");
-                assert_eq!(buffer[(rect.right() - 1, y)].symbol(), "│");
-                assert!(matches!(buffer[(track_x, y)].symbol(), "║" | "█" | " "));
+            settle_browser(&mut overlay);
+            terminal
+                .draw(|frame| overlay.draw(frame, frame.area(), &ctx))
+                .unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("sample"));
+            assert!(rendered.contains("Direct body"));
+            if width >= 100 {
+                assert!(rendered.contains("Files"));
+                assert!(rendered.contains("SKILL.md"));
             }
-            assert!(overlay.scroll <= (overlay.lines - overlay.height as usize) as u16);
+            widths.push(overlay.rect.width);
         }
+        assert_eq!(widths, [56, 96, 160, 160]);
+
+        overlay.handle_key(KeyCode::Char('f').into());
+        assert_eq!(
+            overlay.browser.as_ref().unwrap().focus,
+            super::super::file_browser::Focus::Tree
+        );
+        overlay.handle_key(KeyCode::Char('e').into());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| overlay.draw(frame, frame.area(), &ctx))
+            .unwrap();
+        assert!(overlay.metadata_lines > overlay.metadata_height);
+        overlay.handle_key(KeyCode::End.into());
+        assert!(overlay.metadata_scroll > 0);
+        overlay.handle_key(KeyCode::Tab.into());
+        assert!(!overlay.metadata_focus);
+        assert_eq!(
+            overlay.browser.as_ref().unwrap().focus,
+            super::super::file_browser::Focus::Preview,
+            "Tab from metadata always returns to content"
+        );
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Direct body"));
+
+        overlay.open("sample".into());
+        terminal
+            .draw(|frame| overlay.draw(frame, frame.area(), &ctx))
+            .unwrap();
+        overlay.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: overlay.metadata_rect.x,
+                row: overlay.metadata_rect.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &ctx,
+        );
+        assert!(overlay.expanded_fields);
+        assert!(overlay.metadata_focus);
+        overlay.handle_key(KeyCode::Char('e').into());
+        assert!(!overlay.expanded_fields);
+        assert!(!overlay.metadata_focus);
+
+        overlay.handle_key(KeyCode::Esc.into());
+        assert!(!overlay.is_open(), "Esc closes the unified overlay once");
     }
 
     #[test]
