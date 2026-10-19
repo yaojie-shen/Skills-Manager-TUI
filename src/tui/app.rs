@@ -1,7 +1,7 @@
 //! Application state: owns the snapshot, dispatches messages to the active
 //! view or modal, and applies the `Action`s they return.
 
-use super::event::{Msg, Task, TaskOutput, spawn_sync_status, spawn_task};
+use super::event::{Msg, Task, TaskOutput, WriteWork, spawn_sync_status, spawn_task, spawn_write};
 use super::keymap;
 use super::modal::{MessageKind, Modal};
 use super::settings::{LayoutScope, RuntimeSettings, SessionSettings};
@@ -246,6 +246,8 @@ pub struct App {
     context_menu: Option<ContextMenu>,
     command_palette: Option<CommandPalette>,
     pending_task_ui: VecDeque<Action>,
+    pending_writes: VecDeque<WriteWork>,
+    single_write_running: bool,
     batch_running: bool,
     batch_modal_owned: bool,
     pub toasts: Toasts,
@@ -426,6 +428,8 @@ impl App {
             context_menu: None,
             command_palette: None,
             pending_task_ui: VecDeque::new(),
+            pending_writes: VecDeque::new(),
+            single_write_running: false,
             batch_running: false,
             batch_modal_owned: false,
             history: History::default(),
@@ -521,25 +525,22 @@ impl App {
         match outcome {
             Ok((skill, None)) => {
                 self.toast(format!("note unchanged on {skill}"), Level::Info);
-                return;
             }
-            Ok((skill, Some(text))) => match self.run_meta(
-                MutationScope::Library,
-                Box::new(move |ws| history::note_edit(ws, &skill, Some(&text))),
-            ) {
-                Ok((msg, intent)) => {
-                    self.toast(msg, Level::Ok);
-                    if let Some(intent) = intent {
-                        self.history.record(intent);
-                    }
-                    self.library_changed();
-                    return;
-                }
-                Err(e) => self.toast(format!("note failed: {e:#}"), Level::Error),
-            },
-            Err(e) => self.toast(format!("editor: {e:#}"), Level::Error),
+            Ok((skill, Some(text))) => {
+                self.spawn_write(
+                    MutationScope::Library,
+                    Box::new(move |ws| history::note_edit(ws, &skill, Some(&text))),
+                    None,
+                    vec![],
+                    Some("note failed".into()),
+                    false,
+                );
+            }
+            Err(e) => {
+                self.toast(format!("editor: {e:#}"), Level::Error);
+                self.rescan();
+            }
         }
-        self.rescan();
     }
 
     // ---- messages ---------------------------------------------------------
@@ -891,6 +892,53 @@ impl App {
                     }
                 }
             }
+            TaskOutput::Write(outcome) => {
+                let actions = match outcome.result {
+                    Ok((message, intent)) => {
+                        let undo_hint = if outcome.undo_hint && intent.is_some() {
+                            " · Ctrl+Z undo"
+                        } else {
+                            ""
+                        };
+                        if let Some(intent) = intent {
+                            self.history.record(intent);
+                        }
+                        self.toast(format!("{message}{undo_hint}"), Level::Ok);
+                        self.mutation_finished(outcome.scope);
+                        for action in outcome.then {
+                            self.apply_scoped(action, outcome.scope);
+                        }
+                        Vec::new()
+                    }
+                    Err(error) => {
+                        let actions = if let Some(pending) =
+                            error.downcast_ref::<skills::ops::name_choices::Pending>()
+                        {
+                            vec![Action::OpenModal(Box::new(Modal::DeploymentChoices(
+                                Box::new(super::name_choices::NameChoices::new(pending.clone())),
+                            )))]
+                        } else {
+                            let detail = format!("{error:#}");
+                            let mut actions = vec![Action::Error(
+                                outcome
+                                    .error_prefix
+                                    .map(|prefix| format!("{prefix}: {detail}"))
+                                    .unwrap_or(detail),
+                            )];
+                            if let Some(prompt) = outcome.prompt {
+                                actions.push(Action::OpenModal(prompt));
+                            }
+                            actions
+                        };
+                        self.rescan();
+                        actions
+                    }
+                };
+                self.single_write_running = false;
+                self.batch_running = false;
+                self.start_next_write();
+                actions
+            }
             TaskOutput::Batch(outcome) => {
                 self.batch_running = false;
                 let changed_scope = outcome.changed_scope;
@@ -1073,17 +1121,29 @@ impl App {
             // A move can temporarily remove a directory while it is being polled.
             // Keep the last good snapshot and retry; explicit rescans report errors.
             TaskOutput::RootStamp(Err(_)) => Vec::new(),
-            TaskOutput::Scan(Ok(snap), stamp) if self.latest_scan_task == Some(id) => {
+            TaskOutput::Scan(outcome) if self.latest_scan_task == Some(id) => {
                 self.latest_scan_task = None;
-                self.root_stamp = stamp;
-                self.snap = snap;
+                let mut actions: Vec<_> = outcome.warnings.into_iter().map(Action::Error).collect();
+                self.ws.config = outcome.config;
+                match outcome.snapshot {
+                    Ok(snapshot) => {
+                        self.root_stamp = outcome.stamp;
+                        self.snap = snapshot;
+                        self.ws.inventory_products = outcome.inventory_products;
+                        if !self.single_write_running
+                            && self.pending_writes.is_empty()
+                            && let Some(Modal::Batch(batch)) = self.modal.as_mut()
+                        {
+                            batch.reconcile_tags();
+                        }
+                    }
+                    Err(error) => {
+                        self.root_stamp = None;
+                        actions.push(Action::Error(format!("scan failed: {error:#}")));
+                    }
+                }
                 self.on_snapshot();
-                Vec::new()
-            }
-            TaskOutput::Scan(Err(e), _) if self.latest_scan_task == Some(id) => {
-                self.latest_scan_task = None;
-                self.root_stamp = None;
-                vec![Action::Error(format!("scan failed: {e:#}"))]
+                actions
             }
             TaskOutput::Scan(..) => Vec::new(),
             TaskOutput::Check(results) => {
@@ -1658,8 +1718,16 @@ impl App {
                 | Action::BatchLinks { .. }
                 | Action::BackgroundWrite { .. }
         );
+        let single_write = matches!(
+            &action,
+            Action::Write(_)
+                | Action::WriteMeta(_)
+                | Action::SubmitInput(_)
+                | Action::ApplyLinks { .. }
+        );
         if writes
-            && (self.batch_running || (self.sync.switching() && scope == MutationScope::Library))
+            && ((self.batch_running && !(self.single_write_running && single_write))
+                || (self.sync.switching() && scope == MutationScope::Library))
         {
             self.toast(
                 "An operation is still running; retry when it finishes",
@@ -1730,47 +1798,37 @@ impl App {
                     _ => None,
                 };
             }
-            Action::SubmitInput(actions) => {
+            Action::SubmitInput(mut actions) => {
                 let prompt = self.modal.take();
-                for action in actions {
-                    let (scope, action) = match action {
-                        Action::Deployment(action) => (MutationScope::Deployment, *action),
-                        action => (scope, action),
-                    };
-                    let result = match action {
-                        Action::Error(error) => Err(anyhow::anyhow!(error)),
-                        Action::Write(write) => {
-                            let result = self.run_write(scope, write);
-                            if result.is_ok() {
-                                self.mutation_finished(scope);
-                            } else {
-                                self.rescan();
-                            }
-                            result.map(|message| self.toast(message, Level::Ok))
-                        }
-                        Action::WriteMeta(write) => {
-                            let result = self.run_meta(scope, write);
-                            if result.is_ok() {
-                                self.mutation_finished(scope);
-                            } else {
-                                self.rescan();
-                            }
-                            result.map(|(message, intent)| {
-                                self.toast(message, Level::Ok);
-                                if let Some(intent) = intent {
-                                    self.history.record(intent);
-                                }
-                            })
-                        }
-                        other => {
-                            self.apply_scoped(other, scope);
-                            Ok(())
-                        }
-                    };
-                    if let Err(error) = result {
+                if actions.is_empty() {
+                    return;
+                }
+                let first = actions.remove(0);
+                let (scope, first) = match first {
+                    Action::Deployment(action) => (MutationScope::Deployment, *action),
+                    action => (scope, action),
+                };
+                match first {
+                    Action::Error(error) => {
                         self.modal = prompt;
-                        self.toast(format!("{error:#}"), Level::Error);
-                        break;
+                        self.toast(error, Level::Error);
+                    }
+                    Action::Write(write) => self.spawn_write(
+                        scope,
+                        Box::new(move |ws| write(ws).map(|message| (message, None))),
+                        prompt,
+                        actions,
+                        None,
+                        true,
+                    ),
+                    Action::WriteMeta(write) => {
+                        self.spawn_write(scope, write, prompt, actions, None, true)
+                    }
+                    other => {
+                        self.apply_scoped(other, scope);
+                        for action in actions {
+                            self.apply_scoped(action, scope);
+                        }
                     }
                 }
             }
@@ -1830,16 +1888,31 @@ impl App {
                     );
                     return;
                 }
-                match deploy::apply(&actions) {
-                    Ok(_) => {
-                        self.toast(deploy::summarize(&actions), Level::Ok);
-                        if let Some(intent) = history::Intent::from_actions(&actions) {
-                            self.history.record(intent);
+                if self.single_write_running || !self.pending_writes.is_empty() {
+                    let message = deploy::summarize(&actions);
+                    self.spawn_write(
+                        MutationScope::Deployment,
+                        Box::new(move |_| {
+                            deploy::apply(&actions)?;
+                            Ok((message, history::Intent::from_actions(&actions)))
+                        }),
+                        None,
+                        vec![],
+                        Some(format!("{title} failed")),
+                        false,
+                    );
+                } else {
+                    match deploy::apply(&actions) {
+                        Ok(_) => {
+                            self.toast(deploy::summarize(&actions), Level::Ok);
+                            if let Some(intent) = history::Intent::from_actions(&actions) {
+                                self.history.record(intent);
+                            }
                         }
+                        Err(e) => self.toast(format!("{title} failed: {e:#}"), Level::Error),
                     }
-                    Err(e) => self.toast(format!("{title} failed: {e:#}"), Level::Error),
+                    self.rescan();
                 }
-                self.rescan();
             }
             Action::ConfirmLinks { title, actions } => {
                 match skills::ops::name_choices::Pending::for_actions(
@@ -1858,16 +1931,14 @@ impl App {
             Action::Record(intent) => self.history.record(intent),
             Action::Step(Step::Undo) => self.history.commit_undo(),
             Action::Step(Step::Redo) => self.history.commit_redo(),
-            Action::Write(write) => match self.run_write(scope, write) {
-                Ok(msg) => {
-                    self.toast(msg, Level::Ok);
-                    self.mutation_finished(scope);
-                }
-                Err(e) => {
-                    self.toast(format!("{e:#}"), Level::Error);
-                    self.rescan();
-                }
-            },
+            Action::Write(write) => self.spawn_write(
+                scope,
+                Box::new(move |ws| write(ws).map(|message| (message, None))),
+                None,
+                vec![],
+                None,
+                true,
+            ),
             Action::BackgroundWrite { title, write, keys } => {
                 self.spawn_batch(super::event::BatchWork::Metadata(scope, write, keys), title);
             }
@@ -1884,35 +1955,7 @@ impl App {
             } => {
                 self.spawn_batch(super::event::BatchWork::Links(actions, keys), title);
             }
-            Action::WriteMeta(write) => {
-                match self.run_meta(scope, write) {
-                    Ok((msg, intent)) => {
-                        let undo_hint = if intent.is_some() {
-                            " · Ctrl+Z undo"
-                        } else {
-                            ""
-                        };
-                        self.toast(format!("{msg}{undo_hint}"), Level::Ok);
-                        // A write that left the files as they were is not a step.
-                        if let Some(intent) = intent {
-                            self.history.record(intent);
-                        }
-                        self.mutation_finished(scope);
-                    }
-                    Err(e) => {
-                        if let Some(pending) =
-                            e.downcast_ref::<skills::ops::name_choices::Pending>()
-                        {
-                            self.modal = Some(Modal::DeploymentChoices(Box::new(
-                                super::name_choices::NameChoices::new(pending.clone()),
-                            )));
-                        } else {
-                            self.toast(format!("{e:#}"), Level::Error);
-                        }
-                        self.rescan();
-                    }
-                }
-            }
+            Action::WriteMeta(write) => self.spawn_write(scope, write, None, vec![], None, true),
         }
     }
 
@@ -2032,6 +2075,57 @@ impl App {
         }
     }
 
+    fn spawn_write(
+        &mut self,
+        scope: MutationScope,
+        write: MetaFn,
+        prompt: Option<Modal>,
+        then: Vec<Action>,
+        error_prefix: Option<String>,
+        undo_hint: bool,
+    ) {
+        let work = WriteWork {
+            scope,
+            write,
+            prompt: prompt.map(Box::new),
+            then,
+            error_prefix,
+            undo_hint,
+        };
+        if self.single_write_running {
+            self.pending_writes.push_back(work);
+        } else {
+            self.start_write(work);
+        }
+    }
+
+    fn start_next_write(&mut self) {
+        if let Some(work) = self.pending_writes.pop_front() {
+            self.start_write(work);
+        }
+    }
+
+    fn start_write(&mut self, work: WriteWork) {
+        self.single_write_running = true;
+        self.batch_running = true;
+        self.next_task_id += 1;
+        let id = self.next_task_id;
+        self.tasks_running += 1;
+        self.toasts.start(id, "Applying change…".into());
+        if let Err(failure) = spawn_write(self.ws.clone(), work, id, self.tx.clone()) {
+            self.single_write_running = false;
+            self.batch_running = false;
+            self.tasks_running = self.tasks_running.saturating_sub(1);
+            self.toasts.finish(id);
+            self.modal = failure.prompt.map(|prompt| *prompt);
+            self.toast(
+                format!("Cannot start write: {}", failure.error),
+                Level::Error,
+            );
+            self.start_next_write();
+        }
+    }
+
     fn spawn_batch(&mut self, work: super::event::BatchWork, title: String) {
         if self.batch_running {
             return;
@@ -2112,21 +2206,8 @@ impl App {
     }
 
     pub fn rescan(&mut self) {
-        // Refresh one configuration snapshot for every view. Invalid edits keep
-        // the last valid settings and report the error without disrupting input.
-        match self.ws.load_config() {
-            Ok(config) => {
-                self.ws.config = config;
-                if let Err(e) = Self::discover_local_agents(&mut self.ws) {
-                    self.toast(format!("{e:#}"), Level::Error);
-                }
-                // The last successful inventory stays visible while scanning.
-                // Publish valid settings together with their dependent caches
-                // now, so a slow or failed scan cannot leave old search rules.
-                self.on_snapshot();
-            }
-            Err(e) => self.toast(format!("{e:#}"), Level::Error),
-        }
+        // Configuration and discovered local agents belong to the same coherent
+        // inventory as the replacement snapshot, so load all three in the worker.
         self.spawn(Task::Scan);
     }
 
@@ -2143,20 +2224,6 @@ impl App {
             MutationScope::Library => self.library_changed(),
             MutationScope::Deployment => self.rescan(),
         }
-    }
-
-    fn run_write(&self, scope: MutationScope, write: WriteFn) -> Result<String> {
-        let _guard = scope.guard(&self.ws, "Library write")?;
-        write(&self.ws)
-    }
-
-    fn run_meta(
-        &self,
-        scope: MutationScope,
-        write: MetaFn,
-    ) -> Result<(String, Option<history::Intent>)> {
-        let _guard = scope.guard(&self.ws, "Library metadata write")?;
-        write(&self.ws)
     }
 
     // ---- drawing ----------------------------------------------------------
@@ -2226,6 +2293,9 @@ impl App {
             let scans = self.tasks_running.saturating_sub(tasks.len());
             if scans > 0 {
                 tasks.push(format!("Scan skills: {scans} running"));
+            }
+            if !self.pending_writes.is_empty() {
+                tasks.push(format!("Queued changes: {}", self.pending_writes.len()));
             }
             prompt.draw(f, area, &self.settings.theme, tasks);
         }
@@ -2545,6 +2615,19 @@ pub(crate) fn middle_ellipsis(text: &str, max: usize) -> String {
 mod matrix_key_tests {
     use super::*;
 
+    fn app() -> (skills::ops::DownloadDir, App) {
+        let temp = skills::ops::DownloadDir::new("write-modal-queue").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(temp.path())
+        .unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let app = App::new(Workspace::open(temp.path()).unwrap(), tx).unwrap();
+        (temp, app)
+    }
+
     #[test]
     fn config_reload_refreshes_search_before_scan_and_keeps_valid_rules_on_scan_failure() {
         let tmp = skills::ops::DownloadDir::new("settings-reload").unwrap();
@@ -2582,6 +2665,7 @@ mod matrix_key_tests {
         config.search.fuzzy = false;
         config.save(tmp.path()).unwrap();
         app.rescan();
+        app.benchmark_drain(&rx);
         assert!(!app.settings.search.fuzzy);
         assert_eq!(app.search.query(), "prnter");
         assert!(
@@ -2589,20 +2673,17 @@ mod matrix_key_tests {
             "cached search rules must refresh immediately"
         );
 
-        // Receive the worker result before dropping its temporary root, then
-        // exercise the failed-scan path while retaining the known inventory.
-        let id = loop {
-            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
-                Msg::Task(id, out) if matches!(*out, TaskOutput::Scan(..)) => break id,
-                _ => {}
-            }
-        };
+        // Exercise the failed-scan path while retaining the known inventory.
+        app.latest_scan_task = Some(999);
         app.handle(Msg::Task(
-            id,
-            Box::new(TaskOutput::Scan(
-                Err(anyhow::anyhow!("scan unavailable")),
-                None,
-            )),
+            999,
+            Box::new(TaskOutput::Scan(super::super::event::ScanOutcome {
+                snapshot: Err(anyhow::anyhow!("scan unavailable")),
+                stamp: None,
+                config: app.ws.config.clone(),
+                inventory_products: app.ws.inventory_products.clone(),
+                warnings: vec![],
+            })),
         ));
         assert!(app.snap.get("printer").is_some());
         assert!(selected(&app).is_empty());
@@ -2616,7 +2697,7 @@ mod matrix_key_tests {
         );
         assert_eq!(app.search.query(), "prnter");
         assert!(selected(&app).is_empty());
-        app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        app.benchmark_drain(&rx);
         assert!(selected(&app).is_empty());
     }
 
@@ -2633,11 +2714,38 @@ mod matrix_key_tests {
         )
         .unwrap();
         let latest = app.ws.scan().unwrap();
+        app.ws.inventory_project = Some(tmp.path().join("launch-project"));
         app.latest_scan_task = Some(2);
 
-        app.on_task(2, TaskOutput::Scan(Ok(latest), None));
+        app.on_task(
+            2,
+            TaskOutput::Scan(super::super::event::ScanOutcome {
+                snapshot: Ok(latest),
+                stamp: None,
+                config: app.ws.config.clone(),
+                inventory_products: Some(BTreeSet::from(["latest-product".into()])),
+                warnings: vec![],
+            }),
+        );
         assert!(app.snap.get("latest").is_some());
-        app.on_task(1, TaskOutput::Scan(Ok(old), None));
+        assert_eq!(
+            app.ws.inventory_products,
+            Some(BTreeSet::from(["latest-product".into()]))
+        );
+        assert_eq!(
+            app.ws.inventory_project.as_deref(),
+            Some(tmp.path().join("launch-project").as_path())
+        );
+        app.on_task(
+            1,
+            TaskOutput::Scan(super::super::event::ScanOutcome {
+                snapshot: Ok(old),
+                stamp: None,
+                config: app.ws.config.clone(),
+                inventory_products: Some(BTreeSet::from(["stale-product".into()])),
+                warnings: vec![],
+            }),
+        );
         assert!(
             app.snap.get("latest").is_some(),
             "an older scan must not overwrite the accepted latest result"
@@ -2830,6 +2938,59 @@ mod matrix_key_tests {
     }
 
     #[test]
+    fn external_note_success_keeps_its_original_toast() {
+        let tmp = skills::ops::DownloadDir::new("editor-note-toast").unwrap();
+        std::fs::create_dir(tmp.path().join("printer")).unwrap();
+        std::fs::write(
+            tmp.path().join("printer/SKILL.md"),
+            "---\nname: printer\n---\nBody",
+        )
+        .unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        ws.meta
+            .save(
+                "printer",
+                &skills::meta::SkillMeta {
+                    source: Some(skills::meta::Source::Git {
+                        url: "https://example.com/printer.git".into(),
+                        subpath: None,
+                        branch: None,
+                        revision: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(ws, tx).unwrap();
+        app.finish_external(Ok(("printer".into(), Some("saved note".into()))));
+        while app.batch_running {
+            app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains("note saved on printer"),
+            "rendered: {rendered}"
+        );
+        assert!(!rendered.contains("Ctrl+Z undo"));
+    }
+
+    #[test]
     fn unchanged_editor_buffer_does_not_create_metadata_or_start_a_scan() {
         let root =
             std::env::temp_dir().join(format!("skills-editor-unchanged-{}", std::process::id()));
@@ -2923,6 +3084,193 @@ mod matrix_key_tests {
         assert_eq!(
             app.next_task_id, id,
             "unchanged roots must not launch a scan"
+        );
+    }
+
+    #[test]
+    fn single_write_completion_preserves_scope_history_conflicts_and_errors() {
+        let tmp = skills::ops::DownloadDir::new("single-write-contract").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(tmp.path()).unwrap(), tx).unwrap();
+
+        app.apply(Action::deployment(Action::Write(Box::new(|_| {
+            Ok("deployed".into())
+        }))));
+        while app.batch_running {
+            app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        }
+        assert!(
+            !app.sync.pending(),
+            "Deployment writes must not schedule sync"
+        );
+
+        app.apply(Action::WriteMeta(Box::new(|_| {
+            Ok((
+                "saved".into(),
+                Some(history::Intent::OneWay {
+                    what: "first".into(),
+                }),
+            ))
+        })));
+        while app.batch_running {
+            app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        }
+        assert_eq!(app.history.last().unwrap().intent.describe(), "first");
+        assert!(app.sync.pending(), "Library writes must schedule sync");
+
+        let pending = skills::ops::name_choices::Pending::for_actions(
+            &app.ws,
+            &app.snap,
+            &[deploy::Action::Link {
+                skill: "missing".into(),
+                agent: "agent".into(),
+                path: tmp.path().join("agent/missing"),
+                target: tmp.path().join("missing"),
+            }],
+        );
+        if let Ok(Some(pending)) = pending {
+            app.apply(Action::WriteMeta(Box::new(move |_| {
+                Err(anyhow::Error::new(pending))
+            })));
+            while app.batch_running {
+                app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+            }
+            assert!(matches!(app.modal, Some(Modal::DeploymentChoices(_))));
+            app.modal = None;
+        }
+
+        app.apply(Action::SubmitInput(vec![Action::Write(Box::new(|_| {
+            anyhow::bail!("kept failure")
+        }))]));
+        while app.batch_running {
+            app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        }
+        assert!(app.modal.is_none());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("kept failure"));
+    }
+
+    #[test]
+    fn failed_single_write_queues_retry_prompt_behind_open_modal() {
+        let (_temp, mut app) = app();
+        app.modal = Some(Modal::help());
+
+        app.handle(Msg::Task(
+            0,
+            Box::new(TaskOutput::Write(super::super::event::WriteOutcome {
+                scope: MutationScope::Library,
+                result: Err(anyhow::anyhow!("write failed")),
+                prompt: Some(Box::new(Modal::new_preset())),
+                then: vec![],
+                error_prefix: None,
+                undo_hint: false,
+            })),
+        ));
+
+        assert!(matches!(app.modal, Some(Modal::Help { .. })));
+        assert!(matches!(
+            app.pending_task_ui.front(),
+            Some(Action::OpenModal(modal)) if matches!(modal.as_ref(), Modal::Input { .. })
+        ));
+        app.handle(Msg::Key(KeyEvent::from(KeyCode::Esc)));
+        assert!(matches!(app.modal, Some(Modal::Input { .. })));
+        assert!(app.pending_task_ui.is_empty());
+    }
+
+    #[test]
+    fn failed_single_write_queues_name_choices_behind_open_modal() {
+        let (_temp, mut app) = app();
+        app.modal = Some(Modal::help());
+        let pending = skills::ops::name_choices::Pending {
+            changes: vec![],
+            groups: vec![skills::ops::name_choices::Group {
+                name: "sample".into(),
+                directory: app.ws.root.join("agent"),
+                candidates: vec![skills::ops::name_choices::Candidate {
+                    key: Some("sample".into()),
+                    path: app.ws.root.join("agent/sample"),
+                    archive_hash: None,
+                }],
+            }],
+        };
+
+        app.handle(Msg::Task(
+            0,
+            Box::new(TaskOutput::Write(super::super::event::WriteOutcome {
+                scope: MutationScope::Deployment,
+                result: Err(anyhow::Error::new(pending)),
+                prompt: None,
+                then: vec![],
+                error_prefix: None,
+                undo_hint: false,
+            })),
+        ));
+
+        assert!(matches!(app.modal, Some(Modal::Help { .. })));
+        assert!(matches!(
+            app.pending_task_ui.front(),
+            Some(Action::OpenModal(modal)) if matches!(modal.as_ref(), Modal::DeploymentChoices(_))
+        ));
+        app.handle(Msg::Key(KeyEvent::from(KeyCode::Esc)));
+        assert!(matches!(app.modal, Some(Modal::DeploymentChoices(_))));
+        assert!(app.pending_task_ui.is_empty());
+    }
+
+    #[test]
+    fn single_writes_queue_in_order_and_continue_after_failure() {
+        let tmp = skills::ops::DownloadDir::new("queued-writes").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(tmp.path()).unwrap(), tx).unwrap();
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (release, wait) = std::sync::mpsc::channel();
+
+        let first_order = order.clone();
+        app.apply(Action::WriteMeta(Box::new(move |_| {
+            wait.recv().unwrap();
+            first_order.lock().unwrap().push("first");
+            anyhow::bail!("first failed")
+        })));
+        let second_order = order.clone();
+        app.apply(Action::deployment(Action::WriteMeta(Box::new(move |_| {
+            second_order.lock().unwrap().push("second");
+            Ok((
+                "second saved".into(),
+                Some(history::Intent::OneWay {
+                    what: "second".into(),
+                }),
+            ))
+        }))));
+
+        assert_eq!(app.pending_writes.len(), 1);
+        release.send(()).unwrap();
+        app.benchmark_drain(&rx);
+        assert_eq!(*order.lock().unwrap(), ["first", "second"]);
+        assert_eq!(app.history.last().unwrap().intent.describe(), "second");
+        assert!(app.pending_writes.is_empty());
+        assert!(
+            !app.sync.pending(),
+            "a failed Library write and successful Deployment write must not schedule sync"
         );
     }
 
@@ -3215,7 +3563,7 @@ mod matrix_key_tests {
         }
         .save(&root)
         .unwrap();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App::new(Workspace::open(&root).unwrap(), tx).unwrap();
         app.modal = Some(Modal::new_preset());
         let key = |code| Msg::Key(KeyEvent::new(code, KeyModifiers::NONE));
@@ -3257,6 +3605,7 @@ mod matrix_key_tests {
         };
         assert_eq!(input.value(), "ab/");
         app.handle(key(KeyCode::Enter)); // Save with a normalized safe filename.
+        app.benchmark_drain(&rx);
         assert!(app.ws.presets.load("ab/").unwrap().is_some());
         assert!(app.ws.presets.dir.join("ab.toml").exists());
         let Some(Modal::Repository(picker)) = &app.modal else {
@@ -3311,7 +3660,7 @@ mod matrix_key_tests {
                         .unwrap();
                 }
             }
-            let (tx, _rx) = std::sync::mpsc::channel();
+            let (tx, rx) = std::sync::mpsc::channel();
             let mut app = App::new(ws, tx).unwrap();
             let open = |app: &mut App| {
                 app.modal = Some(if preset {
@@ -3351,6 +3700,7 @@ mod matrix_key_tests {
                 KeyCode::Char('y'),
                 KeyModifiers::NONE,
             )));
+            app.benchmark_drain(&rx);
             assert!(!source_exists(&app));
         }
     }
@@ -3372,7 +3722,7 @@ mod matrix_key_tests {
                 ..Default::default()
             })
             .unwrap();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App::new(ws, tx).unwrap();
         let press =
             |app: &mut App, code| app.handle(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
@@ -3384,6 +3734,7 @@ mod matrix_key_tests {
         press(&mut app, KeyCode::End);
         press(&mut app, KeyCode::Char('/'));
         press(&mut app, KeyCode::Enter);
+        app.benchmark_drain(&rx);
         assert!(app.modal.is_none());
         assert!(app.ws.presets.load("reading/").unwrap().is_some());
 
@@ -3393,10 +3744,12 @@ mod matrix_key_tests {
         }
         press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Enter); // Write closure rejects the duplicate.
+        app.benchmark_drain(&rx);
         assert_eq!(value(&app), "reading/");
         press(&mut app, KeyCode::Char('s'));
         assert_eq!(value(&app), "readings/"); // Cursor stayed before the slash.
         press(&mut app, KeyCode::Enter);
+        app.benchmark_drain(&rx);
         assert!(app.modal.is_none());
         assert!(app.ws.presets.load("readings/").unwrap().is_some());
 
@@ -5527,7 +5880,7 @@ mod context_menu_tests {
 mod root_sync_tests {
     use super::*;
 
-    fn app() -> App {
+    fn app_with_rx() -> (App, std::sync::mpsc::Receiver<Msg>) {
         let temp = skills::ops::DownloadDir::new("tui-sync-scope").unwrap();
         Config {
             agents: vec![],
@@ -5535,8 +5888,15 @@ mod root_sync_tests {
         }
         .save(temp.path())
         .unwrap();
-        let (tx, _) = std::sync::mpsc::channel();
-        App::new(Workspace::open(temp.path()).unwrap(), tx).unwrap()
+        let (tx, rx) = std::sync::mpsc::channel();
+        (
+            App::new(Workspace::open(temp.path()).unwrap(), tx).unwrap(),
+            rx,
+        )
+    }
+
+    fn app() -> App {
+        app_with_rx().0
     }
 
     fn header(app: &mut App, width: u16) -> String {
@@ -5946,8 +6306,11 @@ mod root_sync_tests {
 
     #[test]
     fn successful_library_mutation_schedules_root_sync() {
-        let mut app = app();
+        let (mut app, rx) = app_with_rx();
         app.apply(Action::Write(Box::new(|_| Ok("saved".into()))));
+        while app.batch_running {
+            app.handle(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+        }
         assert!(app.sync.pending());
     }
 

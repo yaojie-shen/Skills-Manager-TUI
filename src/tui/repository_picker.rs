@@ -815,6 +815,7 @@ fn candidate_snapshot(fetched: &FetchedRepository) -> Snapshot {
                     .unwrap_or(SkillStatus::Repository),
                 name: doc.as_ref().map(|doc| doc.name.clone()),
                 description: doc.as_ref().map(|doc| doc.description.clone()),
+                document: None,
                 body: doc.map(|doc| doc.body),
                 external: false,
                 tags: vec![],

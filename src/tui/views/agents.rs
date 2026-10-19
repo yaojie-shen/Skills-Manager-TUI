@@ -699,6 +699,7 @@ impl AgentsView {
                     status: skills::reconcile::SkillStatus::Local,
                     name: Some(doc.name.clone()),
                     description: Some(doc.description.clone()),
+                    document: None,
                     body: Some(doc.body.clone()),
                     external: doc.external,
                     tags: vec![],

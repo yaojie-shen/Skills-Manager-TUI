@@ -1174,6 +1174,7 @@ mod tests {
             status: SkillStatus::MissingSource,
             name: Some(key.into()),
             description: Some(desc.into()),
+            document: None,
             body: Some(body.into()),
             external: false,
             tags: tags.iter().map(|t| t.to_string()).collect(),

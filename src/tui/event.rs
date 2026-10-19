@@ -137,6 +137,7 @@ pub enum TaskOutput {
         Result<skills::ops::sync::Report>,
     ),
     AutoSync(std::result::Result<skills::ops::sync::Report, skills::ops::sync::AutoSyncFailure>),
+    Write(WriteOutcome),
     Batch(BatchOutcome),
     RepositoryFetched(String, Result<skills::repository::FetchedRepository>),
     RepositoryRefreshed(String, Result<skills::repository::RepositoryInventory>),
@@ -144,7 +145,7 @@ pub enum TaskOutput {
         Box<super::repository_picker::InstallSelection>,
         Result<Vec<String>>,
     ),
-    Scan(Result<Snapshot>, Option<skills::reconcile::watch::Stamp>),
+    Scan(ScanOutcome),
     RootStamp(Result<skills::reconcile::watch::Stamp>),
     Check(Vec<CheckOutput>),
     Prepared(String, Result<Prepared>),
@@ -255,7 +256,7 @@ pub fn spawn_sync_status(ws: Workspace, remote: bool, id: u64, tx: Sender<Msg>) 
         .expect("spawn sync status thread");
 }
 
-pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
+pub fn spawn_task(mut ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
     std::thread::Builder::new()
         .name("task".into())
         .spawn(move || {
@@ -335,10 +336,30 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                     TaskOutput::RepositoryInstalled(selection, result)
                 }
                 Task::Scan => {
+                    let mut warnings = Vec::new();
+                    match ws.load_config() {
+                        Ok(config) => ws.config = config,
+                        Err(error) => warnings.push(format!("{error:#}")),
+                    }
+                    let project = ws
+                        .inventory_project
+                        .clone()
+                        .or_else(|| ws.project.clone())
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    if let Err(error) = skills::ops::targets::discover(&mut ws, &project) {
+                        warnings.push(format!("{error:#}"));
+                    }
                     // Capture before scanning: changes during the scan must still
                     // invalidate the next poll, while our own writes need no second scan.
                     let stamp = skills::reconcile::watch::stamp(&ws.root, &ws.config).ok();
-                    TaskOutput::Scan(ws.scan(), stamp)
+                    let snapshot = ws.scan();
+                    TaskOutput::Scan(ScanOutcome {
+                        snapshot,
+                        stamp,
+                        config: ws.config,
+                        inventory_products: ws.inventory_products,
+                        warnings,
+                    })
                 }
                 Task::PollRoot => {
                     TaskOutput::RootStamp(skills::reconcile::watch::stamp(&ws.root, &ws.config))
@@ -389,6 +410,80 @@ pub fn spawn_task(ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
             let _ = tx.send(Msg::Task(id, Box::new(out)));
         })
         .expect("spawn task thread");
+}
+
+pub struct ScanOutcome {
+    pub snapshot: Result<Snapshot>,
+    pub stamp: Option<skills::reconcile::watch::Stamp>,
+    pub config: skills::config::Config,
+    pub inventory_products: Option<std::collections::BTreeSet<String>>,
+    pub warnings: Vec<String>,
+}
+
+pub struct WriteOutcome {
+    pub scope: skills::ops::MutationScope,
+    pub result: Result<(String, Option<skills::history::Intent>)>,
+    pub prompt: Option<Box<super::modal::Modal>>,
+    pub then: Vec<super::app::Action>,
+    pub error_prefix: Option<String>,
+    pub undo_hint: bool,
+}
+
+pub struct SpawnWriteError {
+    pub error: std::io::Error,
+    pub prompt: Option<Box<super::modal::Modal>>,
+}
+
+pub struct WriteWork {
+    pub scope: skills::ops::MutationScope,
+    pub write: super::app::MetaFn,
+    pub prompt: Option<Box<super::modal::Modal>>,
+    pub then: Vec<super::app::Action>,
+    pub error_prefix: Option<String>,
+    pub undo_hint: bool,
+}
+
+pub fn spawn_write(
+    ws: Workspace,
+    work: WriteWork,
+    id: u64,
+    tx: Sender<Msg>,
+) -> std::result::Result<(), SpawnWriteError> {
+    let WriteWork {
+        scope,
+        write,
+        prompt,
+        then,
+        error_prefix,
+        undo_hint,
+    } = work;
+    let prompt = Arc::new(std::sync::Mutex::new(prompt));
+    let worker_prompt = Arc::clone(&prompt);
+    match std::thread::Builder::new()
+        .name("write".into())
+        .spawn(move || {
+            let result = scope
+                .guard(&ws, "Library write")
+                .and_then(|_guard| write(&ws));
+            let prompt = worker_prompt.lock().expect("write prompt lock").take();
+            let _ = tx.send(Msg::Task(
+                id,
+                Box::new(TaskOutput::Write(WriteOutcome {
+                    scope,
+                    result,
+                    prompt,
+                    then,
+                    error_prefix,
+                    undo_hint,
+                })),
+            ));
+        }) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(SpawnWriteError {
+            error,
+            prompt: prompt.lock().expect("write prompt lock").take(),
+        }),
+    }
 }
 
 /// Batch closures are not cloneable, so they use a dedicated worker rather than Task.

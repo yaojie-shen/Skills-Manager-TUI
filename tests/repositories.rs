@@ -1255,6 +1255,7 @@ fn inventory_does_not_treat_two_missing_hashes_as_a_clean_update() {
         name: Some("skill".into()),
         description: Some("Sample skill".into()),
         body: None,
+        document: None,
         external: false,
         tags: vec![],
         presets: vec![],

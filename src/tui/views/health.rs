@@ -75,6 +75,11 @@ pub struct HealthView {
     rows: Vec<Row>,
     filter: super::filter::Filter,
     total_issues: usize,
+    class_counts: [usize; 3],
+    formatted_width: u16,
+    formatted_rows: Vec<ListItem<'static>>,
+    #[cfg(test)]
+    draw_all_rows: bool,
     list: ListNav,
     left: Rect,
     right: Rect,
@@ -331,13 +336,89 @@ impl HealthView {
             .or_else(|| self.rows.iter().position(|r| r.heading.is_none()));
         self.list.select(selection);
         self.list.clamp(self.rows.len());
+        self.class_counts = [
+            self.rows
+                .iter()
+                .filter(|r| r.class == Some(HealthClass::Fault))
+                .count(),
+            self.rows
+                .iter()
+                .filter(|r| r.class == Some(HealthClass::Review))
+                .count(),
+            self.rows
+                .iter()
+                .filter(|r| r.class == Some(HealthClass::Independent))
+                .count(),
+        ];
+        if self.formatted_width > 0 {
+            self.format_rows(ctx, self.formatted_width);
+        }
     }
 
-    fn issue_count(&self) -> usize {
-        self.rows
+    fn format_rows(&mut self, ctx: &Ctx, width: u16) {
+        let th = &ctx.settings.theme;
+        self.formatted_width = width;
+        self.formatted_rows = self
+            .rows
             .iter()
-            .filter(|r| r.class == Some(HealthClass::Fault))
-            .count()
+            .map(|row| {
+                if let Some(heading) = &row.heading {
+                    return ListItem::new(Line::from(Span::styled(
+                        fit(heading, width.saturating_sub(4) as usize),
+                        th.bold().fg(th.accent),
+                    )));
+                }
+                if row.agent.is_some() {
+                    let (description, _) = agent_description(row);
+                    return ListItem::new(Line::from(Span::styled(
+                        fit(
+                            &format!(
+                                "[{}] {} {}  {description}",
+                                match row.class {
+                                    Some(HealthClass::Independent) => "independent",
+                                    Some(HealthClass::Review) => "review",
+                                    _ => "fault",
+                                },
+                                agent_marker(row),
+                                row.key
+                            ),
+                            width.saturating_sub(4) as usize,
+                        ),
+                        if row.class == Some(HealthClass::Independent) {
+                            th.dim()
+                        } else {
+                            th.warn()
+                        },
+                    )));
+                }
+                let r = ctx
+                    .snap
+                    .get(&row.key)
+                    .expect("skill row comes from snapshot");
+                let mut spans = vec![
+                    status_glyph(&r.status, th),
+                    Span::raw(format!(" {}", pad(&r.key, 26))),
+                ];
+                if !r.status.is_healthy() {
+                    spans.push(Span::styled(status_text(&r.status), th.warn()));
+                }
+                match self.checks.get(&r.key) {
+                    Some(Ok(c)) if c.update_available => spans.push(Span::styled(
+                        format!(
+                            "  update {} → {}",
+                            c.installed.as_deref().map(short_rev).unwrap_or("-"),
+                            short_rev(&c.remote)
+                        ),
+                        th.accent(),
+                    )),
+                    Some(Err(e)) => {
+                        spans.push(Span::styled(format!("  check failed: {e}"), th.err()))
+                    }
+                    _ => {}
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
     }
 
     fn agent_command(&self, code: Command, ctx: &Ctx) -> Option<Vec<Action>> {
@@ -885,15 +966,7 @@ impl View for HealthView {
             "Ctrl-R rescan · : commands · Filter health entries",
             &format!(
                 "health · {} faults · {} review · {} independent",
-                self.issue_count(),
-                self.rows
-                    .iter()
-                    .filter(|r| r.class == Some(HealthClass::Review))
-                    .count(),
-                self.rows
-                    .iter()
-                    .filter(|r| r.class == Some(HealthClass::Independent))
-                    .count()
+                self.class_counts[0], self.class_counts[1], self.class_counts[2]
             ),
             true,
             ctx,
@@ -936,73 +1009,46 @@ impl View for HealthView {
         let (left, right) = split_panes(area, 45, ctx);
         self.left = left;
         self.right = right;
-        let items: Vec<ListItem> = self
-            .rows
-            .iter()
-            .map(|row| {
-                if let Some(heading) = &row.heading {
-                    return ListItem::new(Line::from(Span::styled(
-                        fit(heading, left.width.saturating_sub(4) as usize),
-                        th.bold().fg(th.accent),
-                    )));
-                }
-                if row.agent.is_some() {
-                    let (description, _) = agent_description(row);
-                    return ListItem::new(Line::from(Span::styled(
-                        fit(
-                            &format!(
-                                "[{}] {} {}  {description}",
-                                match row.class {
-                                    Some(HealthClass::Independent) => "independent",
-                                    Some(HealthClass::Review) => "review",
-                                    _ => "fault",
-                                },
-                                agent_marker(row),
-                                row.key
-                            ),
-                            left.width.saturating_sub(4) as usize,
-                        ),
-                        if row.class == Some(HealthClass::Independent) {
-                            th.dim()
-                        } else {
-                            th.warn()
-                        },
-                    )));
-                }
-                let r = ctx
-                    .snap
-                    .get(&row.key)
-                    .expect("skill row comes from snapshot");
-                let mut spans = vec![
-                    status_glyph(&r.status, th),
-                    Span::raw(format!(" {}", pad(&r.key, 26))),
-                ];
-                if !r.status.is_healthy() {
-                    spans.push(Span::styled(status_text(&r.status), th.warn()));
-                }
-                match self.checks.get(&r.key) {
-                    Some(Ok(c)) if c.update_available => spans.push(Span::styled(
-                        format!(
-                            "  update {} → {}",
-                            c.installed.as_deref().map(short_rev).unwrap_or("-"),
-                            short_rev(&c.remote)
-                        ),
-                        th.accent(),
-                    )),
-                    Some(Err(e)) => {
-                        spans.push(Span::styled(format!("  check failed: {e}"), th.err()))
-                    }
-                    _ => {}
-                }
-                ListItem::new(Line::from(spans))
-            })
-            .collect();
-
+        if self.formatted_width != left.width {
+            self.format_rows(ctx, left.width);
+        }
         self.list.rows = left;
-        let list = List::new(items)
+        #[cfg(test)]
+        if self.draw_all_rows {
+            self.list.rows = left;
+            let list = List::new(self.formatted_rows.clone())
+                .highlight_style(th.selected())
+                .highlight_symbol("▸ ");
+            f.render_stateful_widget(list, left, &mut self.list.state);
+            self.draw_detail(f, right, ctx);
+            self.preview.draw(f, area, ctx);
+            return;
+        }
+        let height = left.height as usize;
+        let selected = self.list.selected();
+        let mut offset = self.list.state.offset();
+        if height == 0 {
+            return;
+        }
+        if let Some(selected) = selected {
+            if selected < offset {
+                offset = selected;
+            } else if selected >= offset + height {
+                offset = selected + 1 - height;
+            }
+        }
+        *self.list.state.offset_mut() = offset;
+        let end = (offset + height).min(self.formatted_rows.len());
+        let mut visible = self
+            .list
+            .state
+            .with_selected(selected.map(|selected| selected - offset));
+        *visible.offset_mut() = 0;
+        let list = List::new(self.formatted_rows[offset..end].to_vec())
             .highlight_style(th.selected())
             .highlight_symbol("▸ ");
-        f.render_stateful_widget(list, left, &mut self.list.state);
+        f.render_stateful_widget(list, left, &mut visible);
+        *self.list.state.offset_mut() = offset + visible.offset();
         self.draw_detail(f, right, ctx);
         self.preview.draw(f, area, ctx);
     }
@@ -1103,6 +1149,36 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::AgentConfig};
 
+    fn render(view: &mut HealthView, ctx: &Ctx, width: u16, height: u16) -> (String, usize, usize) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| view.draw(f, f.area(), ctx)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        (
+            text,
+            view.list.state.offset(),
+            view.list.selected().unwrap_or_default(),
+        )
+    }
+
+    fn assert_virtual_render_matches_full(
+        view: &mut HealthView,
+        ctx: &Ctx,
+        width: u16,
+        height: u16,
+    ) {
+        view.draw_all_rows = true;
+        let expected = render(view, ctx, width, height);
+        view.draw_all_rows = false;
+        let actual = render(view, ctx, width, height);
+        assert_eq!(actual, expected);
+    }
+
     fn context_request_for_row(view: &mut HealthView, index: usize, ctx: &Ctx) -> Request {
         let x = view.left.x.saturating_add(1);
         for y in view.list.rows.y..view.list.rows.bottom() {
@@ -1153,7 +1229,7 @@ mod tests {
             snap.get("repos").is_none(),
             "repos is a storage container, not an invalid skill"
         );
-        assert_eq!(view.issue_count(), 2);
+        assert_eq!(view.class_counts[0], 2);
         assert_eq!(view.rows.iter().filter(|r| r.heading.is_some()).count(), 2);
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
@@ -1169,6 +1245,14 @@ mod tests {
             assert!(text.contains(name), "missing {name}");
         }
         assert!(!text.contains("everything is healthy"));
+        for (width, height) in [(120, 30), (50, 12)] {
+            view.list.first(view.rows.len());
+            assert_virtual_render_matches_full(&mut view, &ctx, width, height);
+            view.list.last(view.rows.len());
+            assert_virtual_render_matches_full(&mut view, &ctx, width, height);
+        }
+        view.list.first(view.rows.len());
+        render(&mut view, &ctx, 120, 30);
 
         let broken_index = view
             .rows
@@ -1310,7 +1394,7 @@ mod tests {
         };
         let mut view = HealthView::default();
         view.refresh(&ctx);
-        assert_eq!(view.issue_count(), 0);
+        assert_eq!(view.class_counts[0], 0);
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
         terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
         let text: String = terminal
@@ -1330,7 +1414,7 @@ mod tests {
             settings: ctx.settings,
         };
         view.refresh(&independent_ctx);
-        assert_eq!(view.issue_count(), 0);
+        assert_eq!(view.class_counts[0], 0);
         terminal
             .draw(|f| view.draw(f, f.area(), &independent_ctx))
             .unwrap();

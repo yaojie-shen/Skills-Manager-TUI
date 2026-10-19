@@ -124,6 +124,8 @@ pub struct SkillRecord {
     pub description: Option<String>,
     #[serde(skip)]
     pub body: Option<String>,
+    #[serde(skip)]
+    pub document: Option<SkillDoc>,
     pub external: bool,
     pub tags: Vec<String>,
     /// Computed package membership from this snapshot's preset index.
@@ -220,6 +222,9 @@ pub struct AgentReport {
     /// Successfully parsed skills; invalid entries remain in `entries` for Health.
     #[serde(skip)]
     pub documents: BTreeMap<String, crate::skill::SkillDoc>,
+    /// Canonical target for entries classified as deployed, keyed by entry name.
+    #[serde(skip)]
+    deployed_targets: BTreeMap<String, PathBuf>,
 }
 
 impl AgentReport {
@@ -275,13 +280,14 @@ pub fn rescope(snapshot: &Snapshot, destinations: &[AgentConfig]) -> Result<Snap
         .iter()
         .map(|r| (r.key.clone(), r.clone()))
         .collect();
+    let index = ScanIndex::new(&records);
     let mut hashes = HashMap::new();
     let mut agents = Vec::with_capacity(destinations.len());
     for agent in destinations {
         agents.push(scan_agent(
             &snapshot.root,
             agent,
-            &records,
+            &index,
             &mut hashes,
             &mut hash_directory,
         )?);
@@ -291,7 +297,7 @@ pub fn rescope(snapshot: &Snapshot, destinations: &[AgentConfig]) -> Result<Snap
         for agent in &agents {
             record
                 .deploy
-                .insert(agent.key.clone(), deploy_state(agent, record));
+                .insert(agent.key.clone(), deploy_state(agent, record, &index));
         }
     }
     Ok(Snapshot {
@@ -446,14 +452,25 @@ fn scan_inventory(
             discovered.push((name, entry.path()));
         }
     }
-    // Per-skill aliases into repository storage are deployments, not second skills.
+    // Parse every discovered document once. Per-skill aliases into repository
+    // storage are deployments, not second skills.
+    let mut documents: HashMap<PathBuf, Result<SkillDoc, String>> = discovered
+        .iter()
+        .map(|(_, path)| {
+            (
+                path.clone(),
+                SkillDoc::load(path).map_err(|error| error.to_string()),
+            )
+        })
+        .collect();
     let aliases: std::collections::BTreeSet<PathBuf> = discovered
         .iter()
         .filter(|(key, _)| key.contains('/'))
         .filter_map(|(_, path)| {
-            let alias = crate::skill::SkillDoc::load(path)
-                .ok()
-                .map(|doc| root.join(doc.name))?;
+            let alias = documents
+                .get(path)
+                .and_then(|doc| doc.as_ref().ok())
+                .map(|doc| root.join(&doc.name))?;
             (is_symlink(&alias)
                 && std::fs::canonicalize(&alias).ok() == std::fs::canonicalize(path).ok())
             .then_some(alias)
@@ -464,14 +481,9 @@ fn scan_inventory(
             continue;
         }
         let external = is_symlink(&path);
-        let (status, doc) = match SkillDoc::load(&path) {
+        let (status, doc) = match documents.remove(&path).expect("discovered document parsed") {
             Ok(doc) => (SkillStatus::MissingSource, Some(doc)),
-            Err(e) => (
-                SkillStatus::Invalid {
-                    reason: e.to_string(),
-                },
-                None,
-            ),
+            Err(reason) => (SkillStatus::Invalid { reason }, None),
         };
         records.insert(
             name.clone(),
@@ -485,6 +497,7 @@ fn scan_inventory(
                     .map(|d| d.description.trim().to_string())
                     .filter(|d| !d.is_empty()),
                 body: doc.as_ref().map(|d| d.body.clone()),
+                document: doc,
                 external,
                 tags: Vec::new(),
                 presets: Vec::new(),
@@ -510,6 +523,7 @@ fn scan_inventory(
                     name: None,
                     description: None,
                     body: None,
+                    document: None,
                     external: false,
                     tags: Vec::new(),
                     presets: Vec::new(),
@@ -536,6 +550,7 @@ fn scan_inventory(
                     name: None,
                     description: None,
                     body: None,
+                    document: None,
                     external: false,
                     tags: Vec::new(),
                     presets: Vec::new(),
@@ -575,6 +590,7 @@ fn scan_inventory(
             name: None,
             description: None,
             body: None,
+            document: None,
             external: false,
             tags: Vec::new(),
             presets: Vec::new(),
@@ -705,17 +721,26 @@ fn scan_inventory(
         }
     }
 
-    // 4. Agents.
-    let mut agents = Vec::new();
-    for a in &config.agents {
-        agents.push(scan_agent(root, a, &records, &mut hashes, hash)?);
-    }
+    // 4. Agents. Build lookup tables once so each entry and record path is
+    // canonicalized at most once during reconciliation.
+    let index = ScanIndex::new(&records);
+    let agents = if parallel {
+        let (agents, agent_hashes) = scan_agents_parallel(root, &config.agents, &index)?;
+        hashes.extend(agent_hashes);
+        agents
+    } else {
+        let mut agents = Vec::new();
+        for agent in &config.agents {
+            agents.push(scan_agent(root, agent, &index, &mut hashes, hash)?);
+        }
+        agents
+    };
     for rec in records.values_mut() {
         if rec.current_hash.is_none() {
             rec.current_hash = hashes.get(&rec.path).cloned().flatten();
         }
         for a in &agents {
-            let state = deploy_state(a, rec);
+            let state = deploy_state(a, rec, &index);
             rec.deploy.insert(a.key.clone(), state);
         }
     }
@@ -729,10 +754,91 @@ fn scan_inventory(
     })
 }
 
+struct ScanIndex {
+    by_name: HashMap<String, Vec<(String, PathBuf)>>,
+    canonical_paths: HashMap<String, Option<PathBuf>>,
+    documents: HashMap<String, SkillDoc>,
+}
+
+impl ScanIndex {
+    fn new(records: &BTreeMap<String, SkillRecord>) -> Self {
+        let mut by_name: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
+        let mut canonical_paths = HashMap::new();
+        let mut documents = HashMap::new();
+        for (key, record) in records {
+            if let Some(name) = record.deployment_name() {
+                by_name
+                    .entry(name.to_string())
+                    .or_default()
+                    .push((key.clone(), record.path.clone()));
+            }
+            canonical_paths.insert(key.clone(), std::fs::canonicalize(&record.path).ok());
+            if let Some(document) = &record.document {
+                documents.insert(key.clone(), document.clone());
+            }
+        }
+        Self {
+            by_name,
+            canonical_paths,
+            documents,
+        }
+    }
+
+    fn canonical_path(&self, record: &SkillRecord) -> Option<&PathBuf> {
+        self.canonical_paths.get(&record.key)?.as_ref()
+    }
+}
+
+type AgentScan = (Vec<AgentReport>, HashMap<PathBuf, Option<String>>);
+
+fn scan_agents_parallel(
+    root: &Path,
+    agents: &[AgentConfig],
+    index: &ScanIndex,
+) -> Result<AgentScan> {
+    if agents.is_empty() {
+        return Ok((Vec::new(), HashMap::new()));
+    }
+    // Two workers gave the best network-storage median in the required 2/4/8
+    // benchmark while keeping directory streams and transient file handles bounded.
+    let workers = agents.len().min(2);
+    let batches = std::thread::scope(|scope| {
+        agents
+            .chunks(agents.len().div_ceil(workers))
+            .map(|chunk| {
+                scope.spawn(move || {
+                    let mut hashes = HashMap::new();
+                    let mut reports = Vec::with_capacity(chunk.len());
+                    for agent in chunk {
+                        reports.push(scan_agent(
+                            root,
+                            agent,
+                            index,
+                            &mut hashes,
+                            &mut hash_directory,
+                        )?);
+                    }
+                    Ok::<_, anyhow::Error>((reports, hashes))
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|job| job.join().expect("agent scan worker panicked"))
+            .collect::<Result<Vec<_>>>()
+    })?;
+    let mut reports = Vec::with_capacity(agents.len());
+    let mut hashes = HashMap::new();
+    for (batch_reports, batch_hashes) in batches {
+        reports.extend(batch_reports);
+        hashes.extend(batch_hashes);
+    }
+    Ok((reports, hashes))
+}
+
 fn scan_agent(
     root: &Path,
     a: &AgentConfig,
-    records: &BTreeMap<String, SkillRecord>,
+    index: &ScanIndex,
     hashes: &mut HashMap<PathBuf, Option<String>>,
     hash: &mut dyn FnMut(&Path) -> Result<String>,
 ) -> Result<AgentReport> {
@@ -745,6 +851,7 @@ fn scan_agent(
         mode: AgentDirMode::Missing,
         entries: BTreeMap::new(),
         documents: BTreeMap::new(),
+        deployed_targets: BTreeMap::new(),
     };
     if normalized_dir == root
         || normalized_dir.starts_with(root)
@@ -802,10 +909,20 @@ fn scan_agent(
             match resolved {
                 None => EntryState::Broken { target },
                 Some(res) => {
-                    if records.values().any(|r| {
-                        r.deployment_name() == Some(name.as_str())
-                            && std::fs::canonicalize(&r.path).ok().as_ref() == Some(&res)
+                    if let Some(key) = index.by_name.get(name.as_str()).and_then(|records| {
+                        records.iter().find_map(|(key, _)| {
+                            (index.canonical_paths.get(key).and_then(Option::as_ref) == Some(&res))
+                                .then_some(key)
+                        })
                     }) {
+                        report.deployed_targets.insert(name.clone(), res);
+                        if let Some(document) = index.documents.get(key) {
+                            let mut document = document.clone();
+                            document.key = name.clone();
+                            document.path = p.clone();
+                            document.external = true;
+                            report.documents.insert(name.clone(), document);
+                        }
                         EntryState::Deployed
                     } else if res.starts_with(root) {
                         // A managed target under a stale name is repaired explicitly.
@@ -816,10 +933,11 @@ fn scan_agent(
                 }
             }
         } else if ft.is_dir() {
-            let central = records
-                .values()
-                .find(|r| r.deployment_name() == Some(name.as_str()))
-                .map(|r| r.path.clone())
+            let central = index
+                .by_name
+                .get(name.as_str())
+                .and_then(|records| records.first())
+                .map(|(_, path)| path.clone())
                 .unwrap_or_else(|| root.join(&name));
             if central.is_dir() {
                 let same = match (
@@ -836,7 +954,9 @@ fn scan_agent(
         } else {
             continue;
         };
-        if let Ok(doc) = crate::skill::SkillDoc::load(&p) {
+        if !report.documents.contains_key(&name)
+            && let Ok(doc) = crate::skill::SkillDoc::load(&p)
+        {
             report.documents.insert(name.clone(), doc);
         }
         report.entries.insert(name, state);
@@ -862,7 +982,7 @@ fn prospective_path(path: &Path) -> PathBuf {
     crate::util::normalize(&resolved.join(suffix))
 }
 
-fn deploy_state(a: &AgentReport, record: &SkillRecord) -> DeployState {
+fn deploy_state(a: &AgentReport, record: &SkillRecord, index: &ScanIndex) -> DeployState {
     match &a.mode {
         AgentDirMode::Missing => DeployState::NoAgentDir,
         AgentDirMode::ReadOnly { .. } => DeployState::NotDeployed,
@@ -873,10 +993,7 @@ fn deploy_state(a: &AgentReport, record: &SkillRecord) -> DeployState {
             match a.entries.get(name) {
                 None => DeployState::NotDeployed,
                 Some(EntryState::Deployed) => {
-                    let destination = a.skills_dir.join(name);
-                    if std::fs::canonicalize(destination).ok()
-                        == std::fs::canonicalize(&record.path).ok()
-                    {
+                    if a.deployed_targets.get(name) == index.canonical_path(record) {
                         DeployState::Deployed
                     } else {
                         DeployState::NotDeployed

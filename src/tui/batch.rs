@@ -12,7 +12,7 @@ use ratatui::{
     widgets::{List, ListItem, Paragraph},
 };
 use skills::{history, ops::deploy};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -58,6 +58,7 @@ pub struct Batch {
     buttons: [Rect; 2],
     tag_chips: Vec<(Rect, String)>,
     selected_tags: Vec<String>,
+    tag_overrides: BTreeMap<String, usize>,
     remove_armed: bool,
     error: Option<String>,
 }
@@ -78,6 +79,7 @@ impl Batch {
             buttons: [Rect::default(); 2],
             tag_chips: vec![],
             selected_tags: vec![],
+            tag_overrides: BTreeMap::new(),
             remove_armed: false,
             error: None,
         }
@@ -152,6 +154,9 @@ impl Batch {
     pub fn set_busy(&mut self, busy: bool) {
         self.busy = busy;
     }
+    pub fn reconcile_tags(&mut self) {
+        self.tag_overrides.clear();
+    }
     pub fn deploy_agent(keys: Vec<String>, agent: &str, ctx: &Ctx) -> Self {
         let mut batch = Self::deploy(keys, ctx);
         batch.rows.retain(|r| r.id == agent);
@@ -207,13 +212,21 @@ impl Batch {
     }
     fn filter(&mut self) {
         let query = self.input.value().trim().to_lowercase();
+        let selected = self
+            .list
+            .selected()
+            .and_then(|i| self.shown.get(i))
+            .copied();
         self.shown = self
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| {
+            .filter(|(i, r)| {
                 r.label.to_lowercase().contains(&query)
-                    && (self.kind != Kind::Tags || r.count != self.keys.len() || !query.is_empty())
+                    && (self.kind != Kind::Tags
+                        || r.count != self.keys.len()
+                        || !query.is_empty()
+                        || selected == Some(*i))
             })
             .map(|(i, _)| i)
             .collect();
@@ -422,6 +435,18 @@ impl Batch {
     }
     fn edit_tag(&mut self, name: String, add: bool) -> Vec<Action> {
         let keys = self.keys.clone();
+        self.tag_overrides
+            .insert(name.clone(), if add { keys.len() } else { 0 });
+        if let Some(row) = self.rows.iter_mut().find(|row| row.id == name) {
+            row.count = if add { keys.len() } else { 0 };
+        }
+        if add {
+            if !self.selected_tags.contains(&name) {
+                self.selected_tags.push(name.clone());
+            }
+        } else {
+            self.selected_tags.retain(|selected| selected != &name);
+        }
         self.input = Input::default();
         self.filter();
         vec![Action::WriteMeta(Box::new(move |ws| {
@@ -626,7 +651,20 @@ impl Batch {
                         .map(|r| r.id.clone())
                         .unwrap_or_else(|| self.input.value().trim().to_string())
                 });
-            let fresh = Self::tags(self.keys.clone(), ctx);
+            let mut fresh = Self::tags(self.keys.clone(), ctx);
+            for (name, count) in &self.tag_overrides {
+                if let Some(row) = fresh.rows.iter_mut().find(|row| row.id == *name) {
+                    row.count = *count;
+                } else {
+                    fresh.rows.push(Row {
+                        id: name.clone(),
+                        label: name.clone(),
+                        count: *count,
+                        desired: None,
+                    });
+                    fresh.rows.sort_by(|left, right| left.id.cmp(&right.id));
+                }
+            }
             if self
                 .rows
                 .iter()
@@ -1024,6 +1062,106 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn rapid_tag_toggles_use_optimistic_picker_state() {
+        let fixture = Fixture::new();
+        let ws = Workspace::open(&fixture.0).unwrap();
+        edit::tag_add(&ws, "beta", &["new-tag".into()]).unwrap();
+        let ws = Workspace::open(&fixture.0).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut batch = Batch::tags(vec!["alpha".into()], &ctx);
+        let shown = batch
+            .shown
+            .iter()
+            .position(|i| batch.rows[*i].id == "new-tag")
+            .unwrap();
+        batch.list.select(Some(shown));
+
+        let first = batch.edit_selected_tag();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 25)).unwrap();
+        terminal
+            .draw(|frame| batch.draw(frame, frame.area(), &ctx))
+            .unwrap();
+        let second = batch.edit_selected_tag();
+        let writes = [first, second]
+            .into_iter()
+            .flatten()
+            .map(|action| match action {
+                Action::WriteMeta(write) => write,
+                _ => panic!("expected tag write"),
+            })
+            .collect::<Vec<_>>();
+        for write in writes {
+            write(&ws).unwrap();
+        }
+
+        assert!(
+            !skills::config::Config::load(&ws.root)
+                .unwrap()
+                .skill_tags("alpha")
+                .contains(&"new-tag".to_string())
+        );
+    }
+
+    #[test]
+    fn failed_queued_tag_edit_reconciles_to_the_fresh_snapshot() {
+        let fixture = Fixture::new();
+        let ws = Workspace::open(&fixture.0).unwrap();
+        edit::tag_add(&ws, "beta", &["new-tag".into()]).unwrap();
+        let ws = Workspace::open(&fixture.0).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut batch = Batch::tags(vec!["alpha".into()], &ctx);
+        let shown = batch
+            .shown
+            .iter()
+            .position(|i| batch.rows[*i].id == "new-tag")
+            .unwrap();
+        batch.list.select(Some(shown));
+
+        let mut first = batch.edit_selected_tag();
+        let Action::WriteMeta(write) = first.pop().unwrap() else {
+            panic!("expected tag write")
+        };
+        write(&ws).unwrap();
+        let _failed_remove = batch.edit_selected_tag();
+
+        let refreshed_ws = Workspace::open(&fixture.0).unwrap();
+        let refreshed_snap = refreshed_ws.scan().unwrap();
+        let refreshed_settings = crate::tui::settings::RuntimeSettings::new(&refreshed_ws.config);
+        let refreshed_ctx = Ctx {
+            ws: &refreshed_ws,
+            snap: &refreshed_snap,
+            settings: &refreshed_settings,
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 25)).unwrap();
+        terminal
+            .draw(|frame| batch.draw(frame, frame.area(), &refreshed_ctx))
+            .unwrap();
+        let row = batch.rows.iter().find(|row| row.id == "new-tag").unwrap();
+        assert_eq!(row.count, 0, "pending removal remains optimistic");
+
+        batch.reconcile_tags();
+        terminal
+            .draw(|frame| batch.draw(frame, frame.area(), &refreshed_ctx))
+            .unwrap();
+        let row = batch.rows.iter().find(|row| row.id == "new-tag").unwrap();
+        assert_eq!(row.count, 1, "failed removal returns to live membership");
+    }
+
     #[test]
     fn tag_picker_saves_each_choice_and_stays_open() {
         let fixture = Fixture::new();
