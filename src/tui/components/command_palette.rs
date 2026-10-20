@@ -11,6 +11,7 @@ use ratatui::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Rescan,
+    VerifyContent,
     Install,
     Repositories,
     Repair,
@@ -43,6 +44,12 @@ const ENTRIES: &[Entry] = &[
         label: "Rescan workspace",
         detail: "Refresh skills and deployment state",
         keywords: "refresh reload scan",
+    },
+    Entry {
+        command: Command::VerifyContent,
+        label: "Verify local content",
+        detail: "Compare repository skills with recorded baselines",
+        keywords: "health hash check modified local content",
     },
     Entry {
         command: Command::Install,

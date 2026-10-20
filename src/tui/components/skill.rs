@@ -62,6 +62,7 @@ impl Tone {
 fn status_marker(status: &SkillStatus) -> (&'static str, Tone) {
     match status {
         SkillStatus::Local | SkillStatus::Repository => ("●", Tone::Healthy),
+        SkillStatus::Unchecked => ("○", Tone::Normal),
         SkillStatus::MissingBaseline => ("●", Tone::Warning),
         SkillStatus::Modified => ("✎", Tone::Warning),
         SkillStatus::Missing => ("✗", Tone::Error),
@@ -158,7 +159,7 @@ impl<'a> SkillPresentation<'a> {
             presets: &r.presets,
             marker,
             tone,
-            warning: (!r.status.is_healthy()).then(|| r.status.label()),
+            warning: (!r.status.is_browsable()).then(|| r.status.label()),
         }
     }
 

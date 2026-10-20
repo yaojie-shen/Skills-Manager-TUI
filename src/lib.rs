@@ -124,6 +124,16 @@ impl Workspace {
         reconcile::scan(&self.root, &self.config)
     }
 
+    /// Read the current filesystem without verifying repository baselines.
+    pub fn inventory(&self) -> Result<reconcile::Snapshot> {
+        reconcile::inventory(&self.root, &self.config)
+    }
+
+    /// Verify selected repository skills while leaving all others unchecked.
+    pub fn scan_selected(&self, keys: &[String]) -> Result<reconcile::Snapshot> {
+        reconcile::scan_selected(&self.root, &self.config, keys)
+    }
+
     /// Fresh source/destination inventory for link planning, without unrelated
     /// baseline verification. Never use this snapshot to display content health.
     /// As with `scan`, configuration comes from `self.config`, not another file

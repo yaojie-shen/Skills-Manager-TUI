@@ -27,7 +27,7 @@ impl SkillStatus {
     pub fn health_class(&self) -> Option<HealthClass> {
         match self {
             Self::Repository | Self::Local => None,
-            Self::Modified | Self::Renamed { .. } => Some(HealthClass::Review),
+            Self::Unchecked | Self::Modified | Self::Renamed { .. } => Some(HealthClass::Review),
             _ => Some(HealthClass::Fault),
         }
     }
@@ -58,13 +58,22 @@ impl AgentDirMode {
 pub enum SkillStatus {
     Local,
     Repository,
+    /// Present remote skill whose local content has not been verified, or could
+    /// not be read during verification.
+    Unchecked,
     MissingBaseline,
     Modified,
     MissingSource,
     Missing,
-    Renamed { to: String },
-    Invalid { reason: String },
-    CorruptMeta { error: String },
+    Renamed {
+        to: String,
+    },
+    Invalid {
+        reason: String,
+    },
+    CorruptMeta {
+        error: String,
+    },
 }
 
 impl SkillStatus {
@@ -72,6 +81,7 @@ impl SkillStatus {
         match self {
             SkillStatus::Local => "local",
             SkillStatus::Repository => "repository",
+            SkillStatus::Unchecked => "unchecked",
             SkillStatus::MissingBaseline => "missing-baseline",
             SkillStatus::Modified => "modified",
             SkillStatus::MissingSource => "missing-source",
@@ -84,12 +94,18 @@ impl SkillStatus {
     pub fn is_healthy(&self) -> bool {
         matches!(self, SkillStatus::Local | SkillStatus::Repository)
     }
+    /// Safe to show in ordinary Library browsing even when content verification
+    /// has been deferred. Health still treats `Unchecked` as review work.
+    pub fn is_browsable(&self) -> bool {
+        self.is_healthy() || matches!(self, SkillStatus::Unchecked)
+    }
     /// Skill directory exists with a readable SKILL.md.
     pub fn is_present(&self) -> bool {
         matches!(
             self,
             SkillStatus::Local
                 | SkillStatus::Repository
+                | SkillStatus::Unchecked
                 | SkillStatus::MissingBaseline
                 | SkillStatus::Modified
                 | SkillStatus::MissingSource
@@ -270,7 +286,26 @@ impl Snapshot {
 
 /// Scan the root and every agent. Pure read.
 pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
-    scan_inventory(root, config, &mut hash_directory, true, true)
+    scan_inventory(root, config, &mut hash_directory, Verification::All, true)
+}
+
+/// Read Library and deployment inventory without verifying remote baselines or
+/// inferring content-based renames. Shadow copies are still compared freshly.
+pub fn inventory(root: &Path, config: &Config) -> Result<Snapshot> {
+    scan_inventory(root, config, &mut hash_directory, Verification::None, true)
+}
+
+/// Verify only the selected remote skills. Other present remote skills remain
+/// `Unchecked`; content-based rename inference is reserved for a full scan.
+pub fn scan_selected(root: &Path, config: &Config, keys: &[String]) -> Result<Snapshot> {
+    let keys: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+    scan_inventory(
+        root,
+        config,
+        &mut hash_directory,
+        Verification::Selected(&keys),
+        true,
+    )
 }
 
 /// Refresh deployment reports against an existing library snapshot. Scope browsing
@@ -335,7 +370,7 @@ fn cached_hash(
 /// use `scan` for display, health checks and content updates. Shadow comparisons
 /// and actual destination inspection remain fresh, including before mutations.
 pub fn scan_for_links(root: &Path, config: &Config) -> Result<Snapshot> {
-    scan_inventory(root, config, &mut hash_directory, false, false)
+    scan_inventory(root, config, &mut hash_directory, Verification::None, false)
 }
 
 #[cfg(test)]
@@ -344,14 +379,35 @@ fn scan_with_hash(
     config: &Config,
     hash: &mut dyn FnMut(&Path) -> Result<String>,
 ) -> Result<Snapshot> {
-    scan_inventory(root, config, hash, true, false)
+    scan_inventory(root, config, hash, Verification::All, false)
+}
+
+#[derive(Clone, Copy)]
+enum Verification<'a> {
+    None,
+    All,
+    Selected(&'a std::collections::HashSet<&'a str>),
+}
+
+impl Verification<'_> {
+    fn includes(self, key: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Selected(keys) => keys.contains(key),
+        }
+    }
+
+    fn is_full(self) -> bool {
+        matches!(self, Self::All)
+    }
 }
 
 fn scan_inventory(
     root: &Path,
     config: &Config,
     hash: &mut dyn FnMut(&Path) -> Result<String>,
-    verify_content: bool,
+    verification: Verification<'_>,
     parallel: bool,
 ) -> Result<Snapshot> {
     let mut hashes = HashMap::new();
@@ -624,7 +680,7 @@ fn scan_inventory(
 
     // Collect baseline work once, then share completed hashes with agent/shadow
     // comparisons. Limit concurrency to avoid an unbounded disk/FD fan-out.
-    if verify_content && parallel {
+    if parallel {
         let paths: Vec<_> = records
             .values()
             .filter(|r| {
@@ -633,6 +689,7 @@ fn scan_inventory(
                         .as_ref()
                         .is_some_and(crate::meta::Source::is_remote)
                     && r.baseline_hash.is_some()
+                    && verification.includes(&r.key)
             })
             .map(|r| r.path.clone())
             .collect();
@@ -644,20 +701,20 @@ fn scan_inventory(
                 .as_ref()
                 .is_some_and(crate::meta::Source::is_remote)
     }) {
-        if verify_content && rec.baseline_hash.is_some() {
+        if verification.includes(&rec.key) && rec.baseline_hash.is_some() {
             rec.current_hash = cached_hash(&rec.path, &mut hashes, hash);
         }
         rec.status = match (&rec.current_hash, &rec.baseline_hash) {
             (Some(cur), Some(base)) if cur == base => SkillStatus::Repository,
             (Some(_), Some(_)) => SkillStatus::Modified,
-            _ if rec.baseline_hash.is_some() => SkillStatus::Repository,
+            _ if rec.baseline_hash.is_some() => SkillStatus::Unchecked,
             _ => SkillStatus::MissingBaseline,
         };
     }
 
     // 3. Only hash unidentified directories when a missing baseline needs rename candidates.
     // The candidates still have to be unique in both directions.
-    if verify_content
+    if verification.is_full()
         && records
             .values()
             .any(|r| r.status == SkillStatus::Missing && r.baseline_hash.is_some())
@@ -1126,7 +1183,7 @@ mod scan_cost_tests {
             &root,
             &config,
             &mut |_| panic!("link planning must not hash unrelated baselines"),
-            false,
+            Verification::None,
             false,
         )
         .unwrap();
@@ -1213,6 +1270,168 @@ mod scan_cost_tests {
                 SkillStatus::Modified
             );
         }
+    }
+
+    #[test]
+    fn inventory_defers_baselines_until_full_verification() {
+        let tmp = crate::ops::DownloadDir::new("deferred-baselines").unwrap();
+        let root = tmp.path();
+        let clean = skill(root, "repos/demo/clean");
+        let changed = skill(root, "repos/demo/changed");
+        for (key, path) in [
+            ("repos/demo/clean", &clean),
+            ("repos/demo/changed", &changed),
+        ] {
+            MetaStore::new(root)
+                .save(
+                    key,
+                    &SkillMeta {
+                        source: Some(crate::meta::Source::Archive {
+                            url: "https://example.com/demo.tar.gz".into(),
+                            subpath: Some(key.into()),
+                            revision: Some("v1".into()),
+                        }),
+                        baseline: Some(Baseline {
+                            hash: hash_directory(path).unwrap(),
+                            hash_algo: crate::hash::HASH_ALGO,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        std::fs::write(changed.join("edit"), b"changed").unwrap();
+        let config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+
+        let inventory = scan_inventory(
+            root,
+            &config,
+            &mut |path| panic!("inventory hashed baseline {}", path.display()),
+            Verification::None,
+            false,
+        )
+        .unwrap();
+        for key in ["repos/demo/clean", "repos/demo/changed"] {
+            let record = inventory.get(key).unwrap();
+            assert_eq!(record.status, SkillStatus::Unchecked);
+            assert!(record.current_hash.is_none());
+            assert!(record.status.is_browsable());
+            assert!(!record.status.is_healthy());
+        }
+
+        let verified = scan(root, &config).unwrap();
+        assert_eq!(
+            verified.get("repos/demo/clean").unwrap().status,
+            SkillStatus::Repository
+        );
+        assert_eq!(
+            verified.get("repos/demo/changed").unwrap().status,
+            SkillStatus::Modified
+        );
+        std::fs::remove_file(changed.join("edit")).unwrap();
+        assert_eq!(
+            scan(root, &config)
+                .unwrap()
+                .get("repos/demo/changed")
+                .unwrap()
+                .status,
+            SkillStatus::Repository
+        );
+    }
+
+    #[test]
+    fn selected_scan_hashes_only_the_requested_remote_skill() {
+        let tmp = crate::ops::DownloadDir::new("selected-baseline").unwrap();
+        let root = tmp.path();
+        for key in ["repos/demo/one", "repos/demo/two"] {
+            let path = skill(root, key);
+            MetaStore::new(root)
+                .save(
+                    key,
+                    &SkillMeta {
+                        source: Some(crate::meta::Source::Archive {
+                            url: "https://example.com/demo.tar.gz".into(),
+                            subpath: Some(key.into()),
+                            revision: Some("v1".into()),
+                        }),
+                        baseline: Some(Baseline {
+                            hash: hash_directory(&path).unwrap(),
+                            hash_algo: crate::hash::HASH_ALGO,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+        let selected = std::collections::HashSet::from(["repos/demo/two"]);
+        let mut hashed = Vec::new();
+        let snapshot = scan_inventory(
+            root,
+            &config,
+            &mut |path| {
+                hashed.push(path.to_path_buf());
+                hash_directory(path)
+            },
+            Verification::Selected(&selected),
+            false,
+        )
+        .unwrap();
+        assert_eq!(hashed, vec![root.join("repos/demo/two")]);
+        assert_eq!(
+            snapshot.get("repos/demo/one").unwrap().status,
+            SkillStatus::Unchecked
+        );
+        assert_eq!(
+            snapshot.get("repos/demo/two").unwrap().status,
+            SkillStatus::Repository
+        );
+    }
+
+    #[test]
+    fn failed_content_hash_is_unchecked_instead_of_repository() {
+        let tmp = crate::ops::DownloadDir::new("failed-baseline-hash").unwrap();
+        let root = tmp.path();
+        let key = "repos/demo/one";
+        let path = skill(root, key);
+        MetaStore::new(root)
+            .save(
+                key,
+                &SkillMeta {
+                    source: Some(crate::meta::Source::Archive {
+                        url: "https://example.com/demo.tar.gz".into(),
+                        subpath: Some("one".into()),
+                        revision: Some("v1".into()),
+                    }),
+                    baseline: Some(Baseline {
+                        hash: hash_directory(&path).unwrap(),
+                        hash_algo: crate::hash::HASH_ALGO,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+        let snapshot = scan_inventory(
+            root,
+            &config,
+            &mut |_| anyhow::bail!("injected read failure"),
+            Verification::All,
+            false,
+        )
+        .unwrap();
+        let record = snapshot.get(key).unwrap();
+        assert_eq!(record.status, SkillStatus::Unchecked);
+        assert!(record.current_hash.is_none());
     }
 
     #[test]

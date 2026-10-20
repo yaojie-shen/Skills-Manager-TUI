@@ -15,9 +15,12 @@ skills agents status claude
 
 `skills status`（也可写为 `skills rescan`）会检查 Library 内容、元数据和 Agent 目录。它不会修复报告的问题，但打开旧版本写入的元数据时，仍可能先备份再升级格式，详见[元数据格式升级](../configuration/#元数据格式升级)。
 
+TUI 会先加载快速清单。仓库技能在打开 Health 或从命令面板运行 **Verify local content** 前显示为 `unchecked`；在 Health 中也可按 Ctrl-R 检查。验证会将本地目录与记录的基线比较，并报告 `repository` 或 `modified`。如果文件无法读取，技能会继续显示为 `unchecked`。为了保持部署判断最新，清单仍会比较 Agent 中的 shadow 副本与 Library 技能，因此可能需要读取这些副本。在 Health 之外按 Ctrl-R 或由文件系统变化触发自动刷新时，只会重建清单，并把仓库技能恢复为 `unchecked`；TUI 空闲时不会在后台执行完整内容检查。已验证状态反映的是上一次完成检查时的结果；轻量轮询不会遍历技能中的所有文件，因此只有辅助文件发生变化时，需要再次显式验证。
+
 | 状态 | 处理方式 |
 | --- | --- |
 | `local`、`repository` | 无需处理；Library 条目正常。 |
+| `unchecked` | 运行 **Verify local content**；若仍未检查，请检查文件访问权限。 |
 | `modified` | 审阅差异，再接受或更新。 |
 | `missing-baseline`、`missing-source` | 检查记录的来源和元数据。 |
 | `missing`、`renamed?` | 确认内容是否被移动或删除。 |

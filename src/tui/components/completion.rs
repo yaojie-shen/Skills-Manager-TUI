@@ -153,7 +153,7 @@ impl Completion {
             !choice.starts_with("status:")
                 || matches!(
                     choice.as_str(),
-                    "status:" | "status:local" | "status:repository"
+                    "status:" | "status:local" | "status:repository" | "status:unchecked"
                 )
         });
         self.selected = self.selected.min(self.choices.len().saturating_sub(1));
@@ -339,6 +339,29 @@ fn score(query: &str, value: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_completion_keeps_browsable_unchecked_status() {
+        let mut popup = Completion {
+            choices: [
+                "status:local",
+                "status:repository",
+                "status:unchecked",
+                "status:modified",
+                "status:invalid",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            ..Default::default()
+        };
+        popup.healthy_only();
+        assert_eq!(
+            popup.choices,
+            ["status:local", "status:repository", "status:unchecked"]
+        );
+    }
+
     #[test]
     fn completes_source_names_with_substrings_subsequences_and_typos() {
         let values = ["sampleorg/kit", "other/tools"]

@@ -496,17 +496,10 @@ impl View for ReposView {
                     Err(error) => vec![Action::Error(format!("discover {alias}: {error:#}"))],
                 },
                 Command::Remove => {
-                    match skills::ops::edit::RepositoryRemoveSummary::from_snapshot(ctx.snap, alias)
-                    {
-                        Ok(summary) => vec![Action::OpenModal(Box::new(Modal::remove_source(
-                            alias,
-                            &project.name,
-                            &summary,
-                        )))],
-                        Err(error) => {
-                            vec![Action::Error(format!("remove source {alias}: {error:#}"))]
-                        }
-                    }
+                    vec![Action::Spawn(Task::ReviewRepositoryRemoval {
+                        alias: alias.clone(),
+                        name: project.name.clone(),
+                    })]
                 }
                 _ => vec![Action::Error(
                     "Action is no longer available; reopen the actions menu".into(),
@@ -940,6 +933,12 @@ mod tests {
     #[test]
     fn source_remove_is_enabled_with_installed_skills_and_opens_confirmation() {
         let tmp = skills::ops::DownloadDir::new("repos-source-remove").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
         let ws = Workspace::open(tmp.path()).unwrap();
         let repository = Repository {
             alias: "demo".into(),
@@ -985,7 +984,8 @@ mod tests {
         assert!(matches!(
             view.context_execute(&request.target, Command::Remove, &ctx)
                 .as_slice(),
-            [Action::OpenModal(_)]
+            [Action::Spawn(Task::ReviewRepositoryRemoval { alias, name })]
+                if alias == "demo" && name == "Demo skills"
         ));
     }
 

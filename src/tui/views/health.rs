@@ -73,6 +73,8 @@ struct Row {
 #[derive(Default)]
 pub struct HealthView {
     rows: Vec<Row>,
+    verifying: bool,
+    verification_error: Option<String>,
     filter: super::filter::Filter,
     total_issues: usize,
     class_counts: [usize; 3],
@@ -99,6 +101,14 @@ fn short_hash(h: &str) -> &str {
 }
 
 impl HealthView {
+    pub fn set_verifying(&mut self, verifying: bool) {
+        self.verifying = verifying;
+    }
+
+    pub fn set_verification_error(&mut self, error: Option<String>) {
+        self.verification_error = error;
+    }
+
     pub fn focus_input(&mut self) {
         self.filter.editing = true;
     }
@@ -546,6 +556,16 @@ impl HealthView {
         lines.push(heading("why it is here"));
         let mut actions: Vec<Line<'static>> = Vec::new();
         match &r.status {
+            SkillStatus::Unchecked => {
+                lines.push(text(
+                    "Local content has not been verified against its recorded baseline. This is \
+                     normally deferred while loading the Library; if verification leaves it \
+                     unchecked, a file could not be read. Run Verify local content again after \
+                     checking file access."
+                        .into(),
+                ));
+                source_line(&mut lines);
+            }
             SkillStatus::Modified => {
                 lines.push(text(
                     "The directory's content hash differs from the baseline recorded when \
@@ -963,13 +983,29 @@ impl View for HealthView {
     }
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        let help = if self.verifying {
+            "Checking local content… · : commands · Filter health entries".to_string()
+        } else if let Some(error) = &self.verification_error {
+            format!("Verification failed: {error} · Ctrl-R retry · : commands")
+        } else {
+            "Ctrl-R verify content · : commands · Filter health entries".to_string()
+        };
         let area = self.filter.draw(
             f,
             area,
-            "Ctrl-R rescan · : commands · Filter health entries",
+            &help,
             &format!(
-                "health · {} faults · {} review · {} independent",
-                self.class_counts[0], self.class_counts[1], self.class_counts[2]
+                "health · {} faults · {} review · {} independent{}",
+                self.class_counts[0],
+                self.class_counts[1],
+                self.class_counts[2],
+                if self.verifying {
+                    " · checking local content…"
+                } else if self.verification_error.is_some() {
+                    " · verification failed"
+                } else {
+                    ""
+                }
             ),
             true,
             ctx,
@@ -1432,6 +1468,69 @@ mod tests {
         assert!(!text.contains("everything is healthy"));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unchecked_content_is_review_only_and_never_claimed_healthy() {
+        let root = skills::ops::DownloadDir::new("health-unchecked").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        let skill = root.path().join("repos/demo/sample");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: sample\ndescription: sample\n---\nBody",
+        )
+        .unwrap();
+        let ws = Workspace::open(root.path()).unwrap();
+        ws.meta
+            .save(
+                "repos/demo/sample",
+                &skills::meta::SkillMeta {
+                    source: Some(skills::meta::Source::Archive {
+                        url: "https://example.test/demo.tar.gz".into(),
+                        subpath: Some("sample".into()),
+                        revision: Some("v1".into()),
+                    }),
+                    baseline: Some(skills::meta::Baseline {
+                        hash: "sha256:recorded".into(),
+                        hash_algo: skills::hash::HASH_ALGO,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let snap = ws.inventory().unwrap();
+        let record = snap.get("repos/demo/sample").unwrap();
+        assert_eq!(record.status, SkillStatus::Unchecked);
+        assert_eq!(Caps::of(record, None), Caps::default());
+
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut view = HealthView::default();
+        view.refresh(&ctx);
+        assert_eq!(view.class_counts, [0, 1, 0]);
+        let (text, _, _) = render(&mut view, &ctx, 100, 24);
+        assert!(text.contains("unchecked"));
+        assert!(!text.contains("everything is healthy"));
+
+        view.set_verifying(true);
+        let (checking, _, _) = render(&mut view, &ctx, 100, 24);
+        assert!(checking.contains("Checking local content"));
+
+        view.set_verifying(false);
+        view.set_verification_error(Some("disk offline".into()));
+        let (failed, _, _) = render(&mut view, &ctx, 100, 24);
+        assert!(failed.contains("Verification failed: disk offline"));
+        assert!(failed.contains("verification failed"));
     }
 }
 

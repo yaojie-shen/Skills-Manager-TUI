@@ -263,7 +263,7 @@ impl SearchView {
             && (self.is_picker()
                 || self.scope.is_some()
                 || self.panel.is_some()
-                || record.status.is_healthy())
+                || record.status.is_browsable())
     }
 
     pub fn panel(options: SkillPanelOptions, ctx: &Ctx) -> Self {
@@ -964,7 +964,7 @@ impl SearchView {
                         .snap
                         .skills
                         .iter()
-                        .filter(|record| !record.status.is_healthy())
+                        .filter(|record| !record.status.is_browsable())
                         .count();
                     if hidden > 0 {
                         title.push_str(&format!(" · {hidden} in Health"));
@@ -1026,7 +1026,7 @@ impl SearchView {
                     .searcher
                     .search(&ctx.snap.skills, &query)
                     .iter()
-                    .any(|hit| !ctx.snap.skills[hit.index].status.is_healthy());
+                    .any(|hit| !ctx.snap.skills[hit.index].status.is_browsable());
             let msg = if ctx.snap.skills.is_empty() {
                 "no skills in this root"
             } else if hidden_status_match {
@@ -2766,7 +2766,31 @@ mod tests {
         .save(&root)
         .unwrap();
         let ws = skills::Workspace::open(&root).unwrap();
-        let snap = skills::reconcile::scan(&root, &ws.config).unwrap();
+        let remote = root.join("repos/demo/unchecked");
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::write(
+            remote.join("SKILL.md"),
+            "---\nname: unchecked\ndescription: deferred\n---\nBody",
+        )
+        .unwrap();
+        ws.meta
+            .save(
+                "repos/demo/unchecked",
+                &skills::meta::SkillMeta {
+                    source: Some(skills::meta::Source::Archive {
+                        url: "https://example.test/demo.tar.gz".into(),
+                        subpath: Some("unchecked".into()),
+                        revision: Some("v1".into()),
+                    }),
+                    baseline: Some(skills::meta::Baseline {
+                        hash: "sha256:recorded".into(),
+                        hash_algo: skills::hash::HASH_ALGO,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let snap = ws.inventory().unwrap();
         let theme = crate::tui::theme::Theme::default();
         let ctx = Ctx {
             ws: &ws,
@@ -2815,6 +2839,14 @@ mod tests {
             !view.search_panel.completion.active(),
             "Library must not suggest hidden problem statuses"
         );
+        view.set_query("status:unch", &ctx);
+        view.update_completion(&ctx);
+        assert!(
+            view.search_panel.completion.active(),
+            "Library should suggest its browsable unchecked status"
+        );
+        view.handle_key(key(KeyCode::Enter), &ctx);
+        assert_eq!(view.query(), "status:unchecked ");
         std::fs::remove_dir_all(root).unwrap();
     }
 }
