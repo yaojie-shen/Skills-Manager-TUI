@@ -1,8 +1,10 @@
 //! Read-only reconciliation of the skills root, its metadata and every agent
 //! directory. Scanning never writes anything.
+//! Baseline hashes share one bounded pool of at most 32 workers across directory
+//! discovery and file batches; completed hashes are reused only within this scan.
 
 use crate::config::{AgentConfig, Config};
-use crate::hash::hash_directory;
+use crate::hash::{hash_directories, hash_directory};
 use crate::meta::{MetaStore, SkillMeta};
 use crate::skill::SkillDoc;
 use crate::util::{is_symlink, link_target_abs, valid_skill_key};
@@ -310,28 +312,11 @@ pub fn rescope(snapshot: &Snapshot, destinations: &[AgentConfig]) -> Result<Snap
 }
 
 fn parallel_hashes(paths: &[PathBuf]) -> HashMap<PathBuf, Option<String>> {
-    if paths.is_empty() {
-        return HashMap::new();
-    }
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(4);
-    std::thread::scope(|scope| {
-        let jobs: Vec<_> = paths
-            .chunks(paths.len().div_ceil(workers))
-            .map(|chunk| {
-                scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|path| (path.clone(), hash_directory(path).ok()))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        jobs.into_iter()
-            .flat_map(|job| job.join().expect("hash worker panicked"))
-            .collect()
-    })
+    paths
+        .iter()
+        .cloned()
+        .zip(hash_directories(paths, 32).into_iter().map(Result::ok))
+        .collect()
 }
 
 // Cache only within this scan: a later scan must observe every content change.
@@ -1183,14 +1168,19 @@ mod scan_cost_tests {
     fn parallel_scan_matches_serial_health_and_observes_later_content_changes() {
         let tmp = crate::ops::DownloadDir::new("parallel-scan").unwrap();
         let root = tmp.path();
-        for i in 0..12 {
-            let key = format!("skill-{i}");
+        for i in 0..40 {
+            let key = format!("repos/demo/skill-{i}");
             let path = skill(root, &key);
             std::fs::write(path.join("unique"), key.as_bytes()).unwrap();
             MetaStore::new(root)
                 .save(
                     &key,
                     &SkillMeta {
+                        source: Some(crate::meta::Source::Archive {
+                            url: "https://example.com/demo.tar.gz".into(),
+                            subpath: Some(format!("skill-{i}")),
+                            revision: Some("sha256:archive-version".into()),
+                        }),
                         baseline: Some(Baseline {
                             hash: hash_directory(&path).unwrap(),
                             hash_algo: crate::hash::HASH_ALGO,
@@ -1200,21 +1190,28 @@ mod scan_cost_tests {
                 )
                 .unwrap();
         }
-        std::fs::rename(root.join("skill-0"), root.join("moved")).unwrap();
-        std::fs::remove_dir_all(root.join("skill-1")).unwrap();
+        std::fs::rename(
+            root.join("repos/demo/skill-0"),
+            root.join("repos/demo/moved"),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(root.join("repos/demo/skill-1")).unwrap();
         let config = Config {
             agents: vec![],
             ..Default::default()
         };
         for body in ["edit one", "edit two, different bytes"] {
-            std::fs::write(root.join("skill-2/unique"), body).unwrap();
+            std::fs::write(root.join("repos/demo/skill-2/unique"), body).unwrap();
             let parallel = scan(root, &config).unwrap();
             let serial = scan_with_hash(root, &config, &mut hash_directory).unwrap();
             assert_eq!(
                 serde_json::to_value(&parallel).unwrap(),
                 serde_json::to_value(&serial).unwrap()
             );
-            assert_eq!(parallel.get("skill-2").unwrap().status, SkillStatus::Local);
+            assert_eq!(
+                parallel.get("repos/demo/skill-2").unwrap().status,
+                SkillStatus::Modified
+            );
         }
     }
 
