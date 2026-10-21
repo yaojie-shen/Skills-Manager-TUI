@@ -242,6 +242,9 @@ pub struct AgentReport {
     /// Successfully parsed skills; invalid entries remain in `entries` for Health.
     #[serde(skip)]
     pub documents: BTreeMap<String, crate::skill::SkillDoc>,
+    /// Exact entry paths awaiting the best-effort fallback document read.
+    #[serde(skip)]
+    pending_documents: Vec<(String, PathBuf)>,
     /// Canonical target for entries classified as deployed, keyed by entry name.
     #[serde(skip)]
     deployed_targets: BTreeMap<String, PathBuf>,
@@ -331,6 +334,7 @@ pub fn rescope(snapshot: &Snapshot, destinations: &[AgentConfig]) -> Result<Snap
             &mut hash_directory,
         )?);
     }
+    load_agent_documents(&mut agents, true);
     for record in records.values_mut() {
         record.deploy.clear();
         for agent in &agents {
@@ -779,7 +783,7 @@ fn scan_inventory(
     // 4. Agents. Build lookup tables once so each entry and record path is
     // canonicalized at most once during reconciliation.
     let index = ScanIndex::new(&records);
-    let agents = if parallel {
+    let mut agents = if parallel {
         let (agents, agent_hashes) = scan_agents_parallel(root, &config.agents, &index)?;
         hashes.extend(agent_hashes);
         agents
@@ -790,6 +794,7 @@ fn scan_inventory(
         }
         agents
     };
+    load_agent_documents(&mut agents, parallel);
     for rec in records.values_mut() {
         if rec.current_hash.is_none() {
             rec.current_hash = hashes.get(&rec.path).cloned().flatten();
@@ -906,6 +911,7 @@ fn scan_agent(
         mode: AgentDirMode::Missing,
         entries: BTreeMap::new(),
         documents: BTreeMap::new(),
+        pending_documents: Vec::new(),
         deployed_targets: BTreeMap::new(),
     };
     if normalized_dir == root
@@ -1009,14 +1015,44 @@ fn scan_agent(
         } else {
             continue;
         };
-        if !report.documents.contains_key(&name)
-            && let Ok(doc) = crate::skill::SkillDoc::load(&p)
-        {
-            report.documents.insert(name.clone(), doc);
+        if !report.documents.contains_key(&name) {
+            report.pending_documents.push((name.clone(), p));
         }
         report.entries.insert(name, state);
     }
     Ok(report)
+}
+
+/// Load only documents that classification could not reuse from the Library.
+/// Work is collected across every agent so one bounded pool serves the scan.
+/// Keep this pool small because Agent paths may be on network storage where
+/// many concurrent document opens increase tail latency.
+fn load_agent_documents(agents: &mut [AgentReport], parallel: bool) {
+    let pending: Vec<_> = agents
+        .iter()
+        .enumerate()
+        .flat_map(|(agent_index, report)| {
+            report
+                .pending_documents
+                .iter()
+                .map(move |(name, path)| (agent_index, name.clone(), path.clone()))
+        })
+        .collect();
+    let documents =
+        crate::scan_io::map_ordered_with_limit(&pending, parallel, 2, |(_, _, path)| {
+            SkillDoc::load(path).ok()
+        });
+    for ((agent_index, name, _), document) in pending.into_iter().zip(documents) {
+        if let Some(document) = document {
+            agents[agent_index]
+                .documents
+                .entry(name)
+                .or_insert(document);
+        }
+    }
+    for report in agents {
+        report.pending_documents.clear();
+    }
 }
 
 /// Resolve the nearest existing ancestor, then append the missing suffix.
@@ -1072,14 +1108,194 @@ mod scan_cost_tests {
     use crate::meta::{Baseline, SkillMeta};
 
     fn skill(root: &Path, key: &str) -> PathBuf {
+        named_skill(root, key, "example", "test", "Body\n")
+    }
+
+    fn named_skill(root: &Path, key: &str, name: &str, description: &str, body: &str) -> PathBuf {
         let path = root.join(key);
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(
             path.join("SKILL.md"),
-            "---\nname: example\ndescription: test\n---\nBody\n",
+            format!("---\nname: {name}\ndescription: {description}\n---\n{body}"),
         )
         .unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pooled_agent_documents_match_serial_and_refresh_on_rescope() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = crate::ops::DownloadDir::new("agent-document-pool").unwrap();
+        let root = tmp.path().join("root");
+        let deployed = named_skill(&root, "one", "example", "central", "Central\n");
+        named_skill(&root, "shadow-source", "shadow", "shadow", "Shadow\n");
+        let external = named_skill(
+            tmp.path(),
+            "external",
+            "foreign",
+            "external one",
+            "External one\n",
+        );
+        let agent = tmp.path().join("agent");
+        named_skill(&agent, "agent-only", "agent-only", "agent", "Agent\n");
+        named_skill(&agent, "shadow", "shadow", "shadow", "Shadow\n");
+        std::fs::create_dir_all(agent.join("invalid")).unwrap();
+        symlink(&deployed, agent.join("example")).unwrap();
+        symlink(&external, agent.join("foreign")).unwrap();
+        symlink(tmp.path().join("missing"), agent.join("broken")).unwrap();
+        let config = Config {
+            agents: vec![AgentConfig {
+                key: "a".into(),
+                name: "A".into(),
+                skills_dir: agent.display().to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let parallel = scan_inventory(
+            &root,
+            &config,
+            &mut hash_directory,
+            Verification::None,
+            true,
+        )
+        .unwrap();
+        let serial = scan_inventory(
+            &root,
+            &config,
+            &mut hash_directory,
+            Verification::None,
+            false,
+        )
+        .unwrap();
+        let signature = |report: &AgentReport| {
+            report
+                .documents
+                .iter()
+                .map(|(name, doc)| {
+                    (
+                        name.clone(),
+                        doc.key.clone(),
+                        doc.path.clone(),
+                        doc.external,
+                        doc.description.clone(),
+                        doc.body.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let parallel_agent = parallel.agent("a").unwrap();
+        let serial_agent = serial.agent("a").unwrap();
+        assert_eq!(parallel_agent.entries, serial_agent.entries);
+        assert_eq!(signature(parallel_agent), signature(serial_agent));
+        assert_eq!(parallel_agent.documents.len(), 4);
+        assert_eq!(parallel_agent.valid_count(|_| true), 4);
+        assert_eq!(parallel_agent.entries["example"], EntryState::Deployed);
+        assert!(matches!(
+            parallel_agent.entries.get("foreign"),
+            Some(EntryState::Foreign { .. })
+        ));
+        assert_eq!(
+            parallel_agent.entries["shadow"],
+            EntryState::Shadow { same_content: true }
+        );
+        assert_eq!(parallel_agent.entries["agent-only"], EntryState::AgentOnly);
+        assert!(matches!(
+            parallel_agent.entries.get("broken"),
+            Some(EntryState::Broken { .. })
+        ));
+        assert!(!parallel_agent.documents.contains_key("broken"));
+        assert!(!parallel_agent.documents.contains_key("invalid"));
+        for (name, external) in [
+            ("example", true),
+            ("foreign", true),
+            ("shadow", false),
+            ("agent-only", false),
+        ] {
+            let document = &parallel_agent.documents[name];
+            assert_eq!(document.key, name);
+            assert_eq!(document.path, agent.join(name));
+            assert_eq!(document.external, external);
+        }
+
+        named_skill(
+            tmp.path(),
+            "external",
+            "foreign",
+            "external two",
+            "External two\n",
+        );
+        std::fs::remove_file(deployed.join("SKILL.md")).unwrap();
+        let rescoped = rescope(&parallel, &config.agents).unwrap();
+        let refreshed = &rescoped.agent("a").unwrap().documents["foreign"];
+        assert_eq!(refreshed.description, "external two");
+        assert_eq!(refreshed.body, "External two\n");
+        assert_eq!(
+            rescoped.agent("a").unwrap().documents["example"].description,
+            "central"
+        );
+    }
+
+    #[test]
+    fn pooled_agent_documents_keep_first_successful_candidate_and_cached_document() {
+        let tmp = crate::ops::DownloadDir::new("agent-document-collisions").unwrap();
+        let first = named_skill(tmp.path(), "first/same", "first", "first", "First\n");
+        let second = named_skill(tmp.path(), "second/same", "second", "second", "Second\n");
+        let invalid = tmp.path().join("invalid/same");
+        std::fs::create_dir_all(&invalid).unwrap();
+        let cached_path = named_skill(tmp.path(), "cached/same", "cached", "cached", "Cached\n");
+        let fallback = named_skill(
+            tmp.path(),
+            "fallback/same",
+            "fallback",
+            "fallback",
+            "Fallback\n",
+        );
+
+        let report = |key: &str, pending_documents, documents| AgentReport {
+            key: key.into(),
+            name: key.into(),
+            skills_dir: tmp.path().join(key),
+            mode: AgentDirMode::Real,
+            entries: BTreeMap::new(),
+            documents,
+            pending_documents,
+            deployed_targets: BTreeMap::new(),
+        };
+        let mut cached_documents = BTreeMap::new();
+        cached_documents.insert("same".into(), SkillDoc::load(&cached_path).unwrap());
+        let mut agents = vec![
+            report(
+                "first-success",
+                vec![
+                    ("same".into(), first.clone()),
+                    ("same".into(), second.clone()),
+                ],
+                BTreeMap::new(),
+            ),
+            report(
+                "later-success",
+                vec![("same".into(), invalid), ("same".into(), second.clone())],
+                BTreeMap::new(),
+            ),
+            report("cached", vec![("same".into(), fallback)], cached_documents),
+        ];
+
+        load_agent_documents(&mut agents, true);
+
+        assert_eq!(agents[0].documents["same"].path, first);
+        assert_eq!(agents[0].documents["same"].description, "first");
+        assert_eq!(agents[1].documents["same"].path, second);
+        assert_eq!(agents[1].documents["same"].description, "second");
+        assert_eq!(agents[2].documents["same"].path, cached_path);
+        assert_eq!(agents[2].documents["same"].description, "cached");
+        assert!(
+            agents
+                .iter()
+                .all(|report| report.pending_documents.is_empty())
+        );
     }
 
     #[cfg(unix)]

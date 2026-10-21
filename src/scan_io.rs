@@ -2,9 +2,11 @@
 //!
 //! Tasks borrow the input, claim small batches from one shared counter, and
 //! process each batch serially. Results retain input order, including errors.
-//! At most 32 threads are created per call; empty/small or explicitly serial
-//! calls run on the caller. Nothing is cached across calls, and this module
-//! performs no filesystem writes. Content hashing keeps its own bounded pool.
+//! At most 32 threads are created per call. Callers may select a lower limit
+//! for storage paths that degrade under larger I/O bursts. Empty/small,
+//! single-worker or explicitly serial calls run on the caller. Nothing is
+//! cached across calls, and this module performs no filesystem writes. Content
+//! hashing keeps its own bounded pool.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -16,7 +18,17 @@ pub(crate) fn map_ordered<T: Sync, R: Send>(
     parallel: bool,
     f: impl Fn(&T) -> R + Sync,
 ) -> Vec<R> {
-    let workers = items.len().div_ceil(BATCH_SIZE).min(MAX_WORKERS);
+    map_ordered_with_limit(items, parallel, MAX_WORKERS, f)
+}
+
+pub(crate) fn map_ordered_with_limit<T: Sync, R: Send>(
+    items: &[T],
+    parallel: bool,
+    worker_limit: usize,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    let worker_limit = worker_limit.clamp(1, MAX_WORKERS);
+    let workers = items.len().div_ceil(BATCH_SIZE).min(worker_limit);
     if !parallel || workers <= 1 {
         return items.iter().map(f).collect();
     }
@@ -115,6 +127,36 @@ mod tests {
                     Ok(value * 2)
                 })
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn custom_worker_limit_reuses_two_threads_and_keeps_input_order() {
+        let threads = Mutex::new(HashSet::new());
+        let calls = AtomicUsize::new(0);
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let first_batches = std::sync::Barrier::new(2);
+        let input: Vec<_> = (0..BATCH_SIZE * 4).rev().collect();
+        let results = map_ordered_with_limit(&input, true, 2, |value| {
+            threads.lock().unwrap().insert(std::thread::current().id());
+            calls.fetch_add(1, Ordering::Relaxed);
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(current, Ordering::Relaxed);
+            if *value == BATCH_SIZE * 4 - 1 || *value == BATCH_SIZE * 3 - 1 {
+                first_batches.wait();
+            }
+            active.fetch_sub(1, Ordering::SeqCst);
+            value * 2
+        });
+
+        assert_eq!(calls.load(Ordering::Relaxed), input.len());
+        assert_eq!(threads.into_inner().unwrap().len(), 2);
+        assert_eq!(peak.load(Ordering::Relaxed), 2);
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            results,
+            input.iter().map(|value| value * 2).collect::<Vec<_>>()
         );
     }
 
