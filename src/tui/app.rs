@@ -250,6 +250,7 @@ pub struct App {
     agents_dirty: bool,
     pub health: HealthView,
     pub repos: ReposView,
+    repos_dirty: bool,
     pub modal: Option<Modal>,
     context_menu: Option<ContextMenu>,
     command_palette: Option<CommandPalette>,
@@ -437,6 +438,7 @@ impl App {
             agents_dirty: true,
             health: HealthView::default(),
             repos: ReposView::default(),
+            repos_dirty: true,
             modal: None,
             context_menu: None,
             command_palette: None,
@@ -514,7 +516,12 @@ impl App {
             self.agents_dirty = false;
         }
         self.health.refresh(&ctx);
-        self.repos.refresh(&ctx);
+        self.repos.invalidate_snapshot();
+        self.repos_dirty = true;
+        if self.tab == Tab::Repos {
+            self.repos.refresh(&ctx);
+            self.repos_dirty = false;
+        }
         if let Some(m) = self.modal.as_mut() {
             m.refresh(&ctx);
         }
@@ -2157,6 +2164,14 @@ impl App {
             });
             self.agents_dirty = false;
         }
+        if t == Tab::Repos && self.repos_dirty {
+            self.repos.refresh(&Ctx {
+                ws: &self.ws,
+                snap: &self.snap,
+                settings: &self.settings,
+            });
+            self.repos_dirty = false;
+        }
         let view: &mut dyn View = match t {
             Tab::Search => &mut self.search,
             Tab::Tags => &mut self.tags,
@@ -2878,6 +2893,124 @@ fn wait_for_msg_matching(
         if matches(&message) {
             return message;
         }
+    }
+}
+
+#[cfg(test)]
+mod lazy_repositories_tests {
+    use super::*;
+
+    fn app() -> (skills::ops::DownloadDir, App) {
+        let root = skills::ops::DownloadDir::new("lazy-repositories").unwrap();
+        let mut workspace = Workspace::open_local(root.path(), true).unwrap();
+        workspace.config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+        workspace.config.save(&workspace.root).unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let app = App::new_with_launch_directory(workspace, tx, Some(root.path())).unwrap();
+        (root, app)
+    }
+
+    fn write_repo_skill(root: &std::path::Path, name: &str) {
+        let directory = root.join("repos/demo").join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {name}\n---\nBody"),
+        )
+        .unwrap();
+    }
+
+    fn take_snapshot(app: &mut App) {
+        app.snap = app.ws.scan().unwrap();
+        app.on_snapshot();
+    }
+
+    fn panel_keys(app: &App) -> Vec<String> {
+        app.repos.panel_keys(&Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        })
+    }
+
+    #[test]
+    fn hidden_repositories_skip_the_panel_and_first_open_uses_latest_snapshot() {
+        let (_root, mut app) = app();
+        assert_eq!(app.tab, Tab::Search);
+        assert!(app.repos_dirty);
+        assert!(!app.repos.panel_initialized());
+
+        write_repo_skill(&app.ws.root, "old");
+        take_snapshot(&mut app);
+        assert!(!app.repos.panel_initialized());
+
+        std::fs::remove_dir_all(app.ws.root.join("repos/demo/old")).unwrap();
+        write_repo_skill(&app.ws.root, "latest");
+        take_snapshot(&mut app);
+        assert!(app.repos_dirty);
+        assert!(!app.repos.panel_initialized());
+
+        app.apply(Action::SwitchTab(Tab::Repos));
+        assert!(!app.repos_dirty);
+        assert!(app.repos.panel_initialized());
+        assert_eq!(panel_keys(&app), ["repos/demo/latest"]);
+
+        assert_eq!(app.focus, AppFocus::Tabs);
+        app.enter_page();
+        assert_eq!(app.focus, AppFocus::Page);
+        assert!(app.on_key(KeyCode::Enter.into()).is_empty());
+        assert!(app.on_key(KeyCode::Char('a').into()).is_empty());
+        assert!(matches!(
+            app.context_menu.as_ref().map(|menu| &menu.request.target),
+            Some(crate::tui::components::context_menu::Target::Skill(key))
+                if key == "repos/demo/latest"
+        ));
+
+        // Re-selecting the active tab is a no-op for the view. Its member
+        // focus remains usable after the app returns focus to the tab strip.
+        app.apply(Action::SwitchTab(Tab::Repos));
+        assert_eq!(app.focus, AppFocus::Tabs);
+        assert!(app.context_menu.is_none());
+        app.focus = AppFocus::Page;
+        assert!(app.on_key(KeyCode::Char('a').into()).is_empty());
+        assert!(matches!(
+            app.context_menu.as_ref().map(|menu| &menu.request.target),
+            Some(crate::tui::components::context_menu::Target::Skill(key))
+                if key == "repos/demo/latest"
+        ));
+    }
+
+    #[test]
+    fn hidden_snapshots_invalidate_inventory_and_visible_snapshots_refresh_panel() {
+        let (_root, mut app) = app();
+        write_repo_skill(&app.ws.root, "first");
+        take_snapshot(&mut app);
+        app.apply(Action::SwitchTab(Tab::Repos));
+        assert_eq!(panel_keys(&app), ["repos/demo/first"]);
+
+        app.repos.refreshing("demo");
+        app.apply(Action::SwitchTab(Tab::Search));
+        std::fs::remove_dir_all(app.ws.root.join("repos/demo/first")).unwrap();
+        write_repo_skill(&app.ws.root, "hidden-latest");
+        take_snapshot(&mut app);
+        assert!(app.repos_dirty);
+        assert!(!app.repos.inventory_result(
+            "demo",
+            &Ok(skills::repository::RepositoryInventory { entries: vec![] })
+        ));
+
+        app.apply(Action::SwitchTab(Tab::Repos));
+        assert_eq!(panel_keys(&app), ["repos/demo/hidden-latest"]);
+
+        std::fs::remove_dir_all(app.ws.root.join("repos/demo/hidden-latest")).unwrap();
+        write_repo_skill(&app.ws.root, "visible-latest");
+        take_snapshot(&mut app);
+        assert_eq!(app.tab, Tab::Repos);
+        assert!(!app.repos_dirty);
+        assert_eq!(panel_keys(&app), ["repos/demo/visible-latest"]);
     }
 }
 
