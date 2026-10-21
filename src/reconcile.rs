@@ -391,6 +391,17 @@ enum Verification<'a> {
     Selected(&'a std::collections::HashSet<&'a str>),
 }
 
+/// Use the directory stream's cached type for ordinary entries. Symlink
+/// directories retain the previous follow-target behavior, and a transient
+/// `file_type` error falls back to the same best-effort path check.
+fn entry_is_dir(entry: &std::fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(file_type) if file_type.is_symlink() => entry.path().is_dir(),
+        Ok(file_type) => file_type.is_dir(),
+        Err(_) => entry.path().is_dir(),
+    }
+}
+
 impl Verification<'_> {
     fn includes(self, key: &str) -> bool {
         match self {
@@ -431,7 +442,7 @@ fn scan_inventory(
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !valid_skill_key(&name) || !entry.path().is_dir() {
+        if !valid_skill_key(&name) || !entry_is_dir(&entry) {
             continue;
         }
         if name == "local" && !entry.path().join("SKILL.md").exists() && !is_symlink(&entry.path())
@@ -479,8 +490,7 @@ fn scan_inventory(
                 }
                 for skill in std::fs::read_dir(repo.path())? {
                     let skill = skill?;
-                    if skill.path().is_dir()
-                        && valid_skill_key(&skill.file_name().to_string_lossy())
+                    if entry_is_dir(&skill) && valid_skill_key(&skill.file_name().to_string_lossy())
                     {
                         discovered.push((
                             skill
@@ -1070,6 +1080,35 @@ mod scan_cost_tests {
         )
         .unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_directory_entry_types_preserve_symlink_discovery() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = crate::ops::DownloadDir::new("scan-entry-file-types").unwrap();
+        let root = tmp.path().join("root");
+        skill(&root, "repos/demo/real");
+        let external_skill = skill(tmp.path(), "external-skill");
+        symlink(&external_skill, root.join("flat-link")).unwrap();
+        symlink(&external_skill, root.join("repos/demo/linked")).unwrap();
+        std::fs::write(root.join("ordinary-file"), "ignored").unwrap();
+
+        let external_repository = tmp.path().join("external-repository");
+        skill(&external_repository, "hidden");
+        symlink(&external_repository, root.join("repos/repository-link")).unwrap();
+
+        let config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+        let snapshot = inventory(&root, &config).unwrap();
+        assert!(snapshot.get("flat-link").is_some());
+        assert!(snapshot.get("repos/demo/real").is_some());
+        assert!(snapshot.get("repos/demo/linked").is_some());
+        assert!(snapshot.get("ordinary-file").is_none());
+        assert!(snapshot.get("repos/repository-link/hidden").is_none());
     }
 
     #[test]
