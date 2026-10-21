@@ -522,6 +522,7 @@ mod tests {
             paths.push(dir);
         }
         use std::os::unix::ffi::OsStrExt;
+        #[cfg(target_os = "linux")]
         std::fs::write(
             paths[0].join(std::ffi::OsStr::from_bytes(b"raw-\xff")),
             b"raw",

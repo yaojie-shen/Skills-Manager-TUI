@@ -1639,7 +1639,10 @@ mod scan_cost_tests {
             false,
         )
         .unwrap();
-        assert_eq!(hashed, vec![root.join("repos/demo/two")]);
+        assert_eq!(
+            hashed,
+            vec![root.join("repos/demo/two").canonicalize().unwrap()]
+        );
         assert_eq!(
             snapshot.get("repos/demo/one").unwrap().status,
             SkillStatus::Unchecked
