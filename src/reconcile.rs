@@ -859,8 +859,7 @@ fn scan_agents_parallel(
     if agents.is_empty() {
         return Ok((Vec::new(), HashMap::new()));
     }
-    // Two workers gave the best network-storage median in the required 2/4/8
-    // benchmark while keeping directory streams and transient file handles bounded.
+    // Limit concurrent Agent scans to bound directory streams and open files.
     let workers = agents.len().min(2);
     let batches = std::thread::scope(|scope| {
         agents
@@ -1025,8 +1024,7 @@ fn scan_agent(
 
 /// Load only documents that classification could not reuse from the Library.
 /// Work is collected across every agent so one bounded pool serves the scan.
-/// Keep this pool small because Agent paths may be on network storage where
-/// many concurrent document opens increase tail latency.
+/// Keep this pool small to limit simultaneous document opens and tail latency.
 fn load_agent_documents(agents: &mut [AgentReport], parallel: bool) {
     let pending: Vec<_> = agents
         .iter()

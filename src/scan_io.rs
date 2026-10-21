@@ -3,9 +3,9 @@
 //! Tasks borrow the input, claim small batches from one shared counter, and
 //! process each batch serially. Results retain input order, including errors.
 //! At most 32 threads are created per call. Callers may select a lower limit
-//! for storage paths that degrade under larger I/O bursts. Empty/small,
-//! single-worker or explicitly serial calls run on the caller. Nothing is
-//! cached across calls, and this module performs no filesystem writes. Content
+//! for their read phase. Empty, small, single-worker, or explicitly serial
+//! calls run on the caller. Nothing is cached across calls, and this module
+//! performs no filesystem writes. Content
 //! hashing keeps its own bounded pool.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
