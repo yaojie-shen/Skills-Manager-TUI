@@ -281,6 +281,77 @@ fn every_scan_observes_external_repository_metadata_edits() {
     ));
 }
 
+#[test]
+fn parallel_successful_documents_and_skills_are_fresh_and_deterministic() {
+    let fixture = Fixture::new("startup-inventory-parallel-success");
+    for index in 0..7 {
+        let alias = format!("repo-{index:02}");
+        let skill = format!("skill-{index:02}");
+        fixture.write_skill(&format!("repos/{alias}/{skill}"), &skill);
+        fixture.write_metadata(
+            &format!("{alias}.toml"),
+            &parallel_repository_document(
+                &alias,
+                &format!("Repository {index:02}"),
+                &skill,
+                &format!("note-{index:02}"),
+            ),
+        );
+    }
+
+    let first = fixture.scan().unwrap();
+    assert_eq!(
+        first
+            .repositories
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "repo-00", "repo-01", "repo-02", "repo-03", "repo-04", "repo-05", "repo-06",
+        ]
+    );
+    assert_eq!(
+        first
+            .skills
+            .iter()
+            .map(|record| record.key.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "repos/repo-00/skill-00",
+            "repos/repo-01/skill-01",
+            "repos/repo-02/skill-02",
+            "repos/repo-03/skill-03",
+            "repos/repo-04/skill-04",
+            "repos/repo-05/skill-05",
+            "repos/repo-06/skill-06",
+        ]
+    );
+    assert_eq!(
+        first.get("repos/repo-03/skill-03").unwrap().note.as_deref(),
+        Some("note-03")
+    );
+
+    fixture.write_metadata(
+        "repo-03.toml",
+        &parallel_repository_document("repo-03", "Repository changed", "skill-03", "changed note"),
+    );
+    std::fs::write(
+        fixture.root().join("repos/repo-03/skill-03/SKILL.md"),
+        "---\nname: skill-03\ndescription: changed\n---\nChanged body\n",
+    )
+    .unwrap();
+
+    let second = fixture.scan().unwrap();
+    assert_eq!(
+        second.repositories["repo-03"].display_name(),
+        "Repository changed"
+    );
+    let changed = second.get("repos/repo-03/skill-03").unwrap();
+    assert_eq!(changed.note.as_deref(), Some("changed note"));
+    assert_eq!(changed.description.as_deref(), Some("changed"));
+    assert_eq!(changed.body.as_deref(), Some("Changed body\n"));
+}
+
 fn repository_document(name: &str, url: &str, branch: &str, note: &str) -> String {
     format!(
         r#"schema = 1
@@ -296,6 +367,25 @@ note = "{note}"
 type = "git"
 subpath = "skill"
 revision = "revision"
+"#
+    )
+}
+
+fn parallel_repository_document(alias: &str, name: &str, skill: &str, note: &str) -> String {
+    format!(
+        r#"schema = 1
+alias = "{alias}"
+name = "{name}"
+url = "https://example.com/{alias}.git"
+kind = "git"
+branch = "main"
+
+[skills.{skill}]
+note = "{note}"
+[skills.{skill}.source]
+type = "git"
+subpath = "skills/{skill}"
+revision = "revision-{skill}"
 "#
     )
 }

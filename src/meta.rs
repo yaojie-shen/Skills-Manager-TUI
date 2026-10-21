@@ -411,14 +411,14 @@ impl MetaStore {
     /// Load repository identities and skill metadata from one fresh snapshot of
     /// every repository TOML file. Document/index errors remain global; errors
     /// decoding an individual skill are retained on that skill.
-    pub(crate) fn inventory(&self) -> Result<RepositoryMetadataInventory> {
-        let documents: Vec<_> = self
-            .repository_paths()?
+    pub(crate) fn inventory(&self, parallel: bool) -> Result<RepositoryMetadataInventory> {
+        let paths = self.repository_paths()?;
+        let documents =
+            crate::scan_io::map_ordered(&paths, parallel, |path| Self::read_value(path));
+        let documents: Vec<_> = paths
             .into_iter()
-            .map(|path| {
-                let value = Self::read_value(&path)?;
-                Ok((path, value))
-            })
+            .zip(documents)
+            .map(|(path, document)| Ok((path, document?)))
             .collect::<Result<_>>()?;
 
         let mut repositories = Vec::new();

@@ -17,6 +17,7 @@ pub mod paths;
 pub mod preset;
 pub mod reconcile;
 pub mod repository;
+mod scan_io;
 pub(crate) mod schema;
 pub mod search;
 pub mod skill;

@@ -1,5 +1,7 @@
 //! Read-only reconciliation of the skills root, its metadata and every agent
 //! directory. Scanning never writes anything.
+//! Repository metadata and skill documents use a short-lived ordered pool of
+//! at most 32 workers, each claiming batches of four reads.
 //! Baseline hashes share one bounded pool of at most 32 workers across directory
 //! discovery and file batches; completed hashes are reused only within this scan.
 
@@ -370,7 +372,7 @@ fn cached_hash(
 /// use `scan` for display, health checks and content updates. Shadow comparisons
 /// and actual destination inspection remain fresh, including before mutations.
 pub fn scan_for_links(root: &Path, config: &Config) -> Result<Snapshot> {
-    scan_inventory(root, config, &mut hash_directory, Verification::None, false)
+    scan_inventory(root, config, &mut hash_directory, Verification::None, true)
 }
 
 #[cfg(test)]
@@ -416,7 +418,7 @@ fn scan_inventory(
     let root = crate::paths::resolve_root(Some(root))?;
     let root = root.as_path();
     let store = MetaStore::new(root);
-    let metadata = store.inventory()?;
+    let metadata = store.inventory(parallel)?;
     let repositories: BTreeMap<_, _> = metadata
         .repositories
         .into_iter()
@@ -497,14 +499,13 @@ fn scan_inventory(
     }
     // Parse every discovered document once. Per-skill aliases into repository
     // storage are deployments, not second skills.
+    let loaded_documents = crate::scan_io::map_ordered(&discovered, parallel, |(_, path)| {
+        SkillDoc::load(path).map_err(|error| error.to_string())
+    });
     let mut documents: HashMap<PathBuf, Result<SkillDoc, String>> = discovered
         .iter()
-        .map(|(_, path)| {
-            (
-                path.clone(),
-                SkillDoc::load(path).map_err(|error| error.to_string()),
-            )
-        })
+        .map(|(_, path)| path.clone())
+        .zip(loaded_documents)
         .collect();
     let aliases: std::collections::BTreeSet<PathBuf> = discovered
         .iter()
