@@ -416,7 +416,9 @@ fn scan_inventory(
     let root = crate::paths::resolve_root(Some(root))?;
     let root = root.as_path();
     let store = MetaStore::new(root);
-    let repositories: BTreeMap<_, _> = crate::repository::Repository::list(root)?
+    let metadata = store.inventory()?;
+    let repositories: BTreeMap<_, _> = metadata
+        .repositories
         .into_iter()
         .map(|repository| (repository.alias.clone(), repository))
         .collect();
@@ -554,8 +556,8 @@ fn scan_inventory(
     }
 
     // 2. Metadata files.
-    for key in store.list_keys()? {
-        match store.load(&key) {
+    for (key, meta) in metadata.skills {
+        match meta {
             Ok(Some(meta)) => {
                 let rec = records.entry(key.clone()).or_insert_with(|| SkillRecord {
                     key: key.clone(),

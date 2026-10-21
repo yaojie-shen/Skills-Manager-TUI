@@ -1,7 +1,8 @@
 //! Repository metadata only; local skills do not have metadata records.
 //!
-//! Reading uses serde; writing goes through `toml_edit` so that comments and
-//! key order written by hand survive round trips.
+//! Read-only inventory parses each repository file once, then decodes the
+//! parsed tree with serde. Writing goes through `toml_edit` so that comments
+//! and key order written by hand survive round trips.
 
 use crate::paths::meta_dir;
 use crate::util::write_atomic;
@@ -264,6 +265,19 @@ pub struct MetaStore {
     pub dir: PathBuf,
 }
 
+/// One fresh read of all repository documents, decoded for reconciliation.
+pub(crate) struct RepositoryMetadataInventory {
+    pub repositories: Vec<crate::repository::Repository>,
+    pub skills: Vec<(String, Result<Option<SkillMeta>>)>,
+}
+
+/// A repository document parsed once, retaining the one syntax distinction
+/// needed by the on-disk contract before serde decoding normalizes it.
+pub(crate) struct RepositoryDocument {
+    pub value: toml::Value,
+    skills_is_table: Option<bool>,
+}
+
 impl MetaStore {
     pub fn new(root: &Path) -> Self {
         Self {
@@ -316,6 +330,145 @@ impl MetaStore {
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
     }
+    /// Read and parse one current repository metadata document once.
+    pub(crate) fn read_value(path: &Path) -> Result<RepositoryDocument> {
+        let document = Self::read(path)?;
+        let skills_is_table = document.get("skills").map(Item::is_table);
+        let value = toml_edit::de::from_document(document)
+            .with_context(|| format!("invalid metadata: {}", path.display()))?;
+        Ok(RepositoryDocument {
+            value,
+            skills_is_table,
+        })
+    }
+
+    /// Repository document paths in deterministic order.
+    pub(crate) fn repository_paths(&self) -> Result<Vec<PathBuf>> {
+        let dir = self.dir.join("repos");
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if crate::util::is_repository_document_name(&entry.file_name()) {
+                paths.push(entry.path());
+            }
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    fn decode_skill(document: &toml::Value, key: &str) -> Result<Option<SkillMeta>> {
+        let Some(mut value) = document
+            .get("skills")
+            .and_then(|skills| skills.get(Self::entry(key)))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if let Some(source) = value.get_mut("source").and_then(toml::Value::as_table_mut)
+            && matches!(
+                source.get("type").and_then(toml::Value::as_str),
+                Some("git" | "archive")
+            )
+            && crate::repository::alias_of(key).is_some()
+        {
+            let kind = document
+                .get("kind")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("git");
+            anyhow::ensure!(
+                source.get("type").and_then(toml::Value::as_str) == Some(kind),
+                "repository kind differs from skill source"
+            );
+            source.insert(
+                "url".into(),
+                document
+                    .get("url")
+                    .and_then(toml::Value::as_str)
+                    .context("repository URL missing")?
+                    .into(),
+            );
+            if kind == "git"
+                && let Some(branch) = document.get("branch").and_then(toml::Value::as_str)
+            {
+                source.insert("branch".into(), branch.into());
+            }
+        }
+        let mut meta: SkillMeta = value.try_into()?;
+        if !meta.source.as_ref().is_some_and(Source::is_remote) {
+            meta.baseline = None;
+        }
+        if crate::repository::alias_of(key).is_none()
+            && !meta.source.as_ref().is_some_and(Source::is_remote)
+        {
+            return Ok(None);
+        }
+        Ok(Some(meta))
+    }
+
+    /// Load repository identities and skill metadata from one fresh snapshot of
+    /// every repository TOML file. Document/index errors remain global; errors
+    /// decoding an individual skill are retained on that skill.
+    pub(crate) fn inventory(&self) -> Result<RepositoryMetadataInventory> {
+        let documents: Vec<_> = self
+            .repository_paths()?
+            .into_iter()
+            .map(|path| {
+                let value = Self::read_value(&path)?;
+                Ok((path, value))
+            })
+            .collect::<Result<_>>()?;
+
+        let mut repositories = Vec::new();
+        for (path, document) in &documents {
+            if let Some(repository) =
+                crate::repository::Repository::from_metadata_value(path, &document.value)?
+            {
+                repositories.push(repository);
+            }
+        }
+        repositories.sort_by(|a, b| a.alias.cmp(&b.alias));
+
+        let mut skills = Vec::new();
+        for (path, document) in &documents {
+            let filename_alias = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .context("repository metadata filename is not valid UTF-8")?;
+            let prefix = if filename_alias == ".root" {
+                String::new()
+            } else {
+                anyhow::ensure!(
+                    crate::util::valid_skill_key(filename_alias),
+                    "invalid repository alias"
+                );
+                format!("repos/{filename_alias}/")
+            };
+            let Some(entries) = document.value.get("skills") else {
+                continue;
+            };
+            anyhow::ensure!(
+                document.skills_is_table == Some(true),
+                "skills must be a table"
+            );
+            let entries = entries.as_table().context("skills must be a table")?;
+            for name in entries.keys() {
+                let key = format!("{prefix}{name}");
+                anyhow::ensure!(
+                    crate::repository::valid_id(&key),
+                    "invalid skill identity: {key}"
+                );
+                skills.push((key.clone(), Self::decode_skill(&document.value, &key)));
+            }
+        }
+        skills.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(RepositoryMetadataInventory {
+            repositories,
+            skills,
+        })
+    }
     /// Parse one current repository metadata document.
     pub(crate) fn parse_document(path: &Path, text: &str) -> Result<DocumentMut> {
         let doc = text
@@ -334,76 +487,36 @@ impl MetaStore {
         self.load(key).map(|m| m.is_some()).unwrap_or(true)
     }
     pub fn load(&self, key: &str) -> Result<Option<SkillMeta>> {
-        let doc = Self::read(&self.path(key))?;
-        let document: toml::Value = toml::from_str(&doc.to_string())?;
-        let Some(mut value) = document
-            .get("skills")
-            .and_then(|s| s.get(Self::entry(key)))
-            .cloned()
-        else {
-            return Ok(None);
-        };
-        if let Some(source) = value.get_mut("source").and_then(toml::Value::as_table_mut)
-            && matches!(
-                source.get("type").and_then(toml::Value::as_str),
-                Some("git" | "archive")
-            )
-            && crate::repository::alias_of(key).is_some()
-        {
-            let kind = doc.get("kind").and_then(Item::as_str).unwrap_or("git");
-            anyhow::ensure!(
-                source.get("type").and_then(toml::Value::as_str) == Some(kind),
-                "repository kind differs from skill source"
-            );
-            source.insert(
-                "url".into(),
-                doc.get("url")
-                    .and_then(Item::as_str)
-                    .context("repository URL missing")?
-                    .into(),
-            );
-            if kind == "git"
-                && let Some(branch) = doc.get("branch").and_then(Item::as_str)
-            {
-                source.insert("branch".into(), branch.into());
-            }
-        }
-        let mut meta: SkillMeta = value.try_into()?;
-        if !meta.source.as_ref().is_some_and(Source::is_remote) {
-            meta.baseline = None;
-        }
-        if crate::repository::alias_of(key).is_none()
-            && !meta.source.as_ref().is_some_and(Source::is_remote)
-        {
-            return Ok(None);
-        }
-        Ok(Some(meta))
+        let document = Self::read_value(&self.path(key))?;
+        Self::decode_skill(&document.value, key)
     }
     pub fn list_keys(&self) -> Result<Vec<String>> {
         let mut files = Vec::new();
         let repos = self.dir.join("repos");
         if repos.is_dir() {
-            for entry in std::fs::read_dir(repos)? {
-                let entry = entry?;
-                let path = entry.path();
-                if crate::util::is_repository_document_name(&entry.file_name()) && path.is_file() {
-                    let alias = path.file_stem().unwrap().to_string_lossy();
+            for path in self.repository_paths()? {
+                if path.is_file() {
+                    let alias = path.file_stem().unwrap().to_string_lossy().into_owned();
                     if alias == ".root" {
-                        files.push((path.clone(), String::new()));
+                        files.push((path, String::new()));
                         continue;
                     }
                     anyhow::ensure!(
                         crate::util::valid_skill_key(&alias),
                         "invalid repository alias"
                     );
-                    files.push((path.clone(), format!("repos/{alias}/")));
+                    files.push((path, format!("repos/{alias}/")));
                 }
             }
         }
         let mut keys = Vec::new();
         for (path, prefix) in files {
-            let doc = Self::read(&path)?;
-            if let Some(skills) = doc.get("skills") {
+            let document = Self::read_value(&path)?;
+            if let Some(skills) = document.value.get("skills") {
+                anyhow::ensure!(
+                    document.skills_is_table == Some(true),
+                    "skills must be a table"
+                );
                 let skills = skills.as_table().context("skills must be a table")?;
                 for (name, _) in skills {
                     let key = format!("{prefix}{name}");
