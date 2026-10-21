@@ -198,44 +198,45 @@ impl Repository {
             .join("repos")
             .join(format!("{alias}.toml"))
     }
-    pub fn list(root: &Path) -> Result<Vec<Self>> {
-        let dir = crate::paths::meta_dir(root).join("repos");
-        if !dir.exists() {
-            return Ok(vec![]);
+    /// Decode and validate the repository identity from one already parsed
+    /// metadata document. `.root.toml` contains standalone skill metadata and
+    /// intentionally has no repository identity.
+    pub(crate) fn from_metadata_value(path: &Path, document: &toml::Value) -> Result<Option<Self>> {
+        if path.file_name().is_some_and(|name| name == ".root.toml") {
+            return Ok(None);
         }
+        anyhow::ensure!(
+            document.get("url").is_some(),
+            "repository URL missing in {}",
+            path.display()
+        );
+        let repository: Self = document.clone().try_into()?;
+        if !valid_skill_key(&repository.alias) {
+            bail!("invalid repository alias")
+        }
+        let filename_alias = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .context("repository metadata filename is not valid UTF-8")?;
+        if filename_alias != repository.alias {
+            bail!(
+                "repository metadata filename {filename_alias:?} does not match alias {:?}",
+                repository.alias
+            )
+        }
+        if let Some(name) = &repository.name {
+            validate_name(name)?;
+        }
+        Ok(Some(repository))
+    }
+
+    pub fn list(root: &Path) -> Result<Vec<Self>> {
+        let store = crate::meta::MetaStore::new(root);
         let mut out = Vec::new();
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if crate::util::is_repository_document_name(&entry.file_name()) {
-                let document = crate::meta::MetaStore::read(&path)?;
-                let doc: toml::Value = toml::from_str(&document.to_string())?;
-                if path.file_name().is_some_and(|name| name == ".root.toml") {
-                    continue;
-                }
-                anyhow::ensure!(
-                    doc.get("url").is_some(),
-                    "repository URL missing in {}",
-                    path.display()
-                );
-                let repo: Self = doc.try_into()?;
-                if !valid_skill_key(&repo.alias) {
-                    bail!("invalid repository alias")
-                }
-                let filename_alias = path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .context("repository metadata filename is not valid UTF-8")?;
-                if filename_alias != repo.alias {
-                    bail!(
-                        "repository metadata filename {filename_alias:?} does not match alias {:?}",
-                        repo.alias
-                    )
-                }
-                if let Some(name) = &repo.name {
-                    validate_name(name)?;
-                }
-                out.push(repo);
+        for path in store.repository_paths()? {
+            let document = crate::meta::MetaStore::read_value(&path)?;
+            if let Some(repository) = Self::from_metadata_value(&path, &document.value)? {
+                out.push(repository);
             }
         }
         out.sort_by(|a, b| a.alias.cmp(&b.alias));

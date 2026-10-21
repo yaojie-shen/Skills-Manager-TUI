@@ -27,8 +27,8 @@ pub fn stamp(root: &Path, config: &Config) -> Result<Stamp> {
     }
     for agent in &config.agents {
         let dir = agent.skills_path();
-        record(&dir, &mut out)?;
-        if dir.is_dir() {
+        let file_type = record(&dir, &mut out)?;
+        if recorded_is_dir(&dir, file_type) {
             for entry in std::fs::read_dir(&dir)? {
                 record(&entry?.path(), &mut out)?;
             }
@@ -37,28 +37,44 @@ pub fn stamp(root: &Path, config: &Config) -> Result<Stamp> {
     Ok(out)
 }
 
-fn record(path: &Path, out: &mut Stamp) -> Result<()> {
+fn record(path: &Path, out: &mut Stamp) -> Result<Option<std::fs::FileType>> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
+            let file_type = meta.file_type();
+            let target = if file_type.is_symlink() {
+                std::fs::read_link(path).ok()
+            } else {
+                None
+            };
             out.0.insert(
                 path.to_path_buf(),
-                (
-                    meta.len(),
-                    meta.modified().ok(),
-                    std::fs::read_link(path).ok(),
-                ),
+                (meta.len(), meta.modified().ok(), target),
             );
+            return Ok(Some(file_type));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    Ok(())
+    Ok(None)
 }
 
 fn containers(path: &Path, depth: usize, out: &mut Stamp) -> Result<()> {
-    record(path, out)?;
-    record(&path.join("SKILL.md"), out)?;
-    if depth > 0 && (path.join("SKILL.md").is_file() || crate::util::is_symlink(path)) {
+    let file_type = record(path, out)?;
+    containers_recorded(path, depth, file_type, out)
+}
+
+fn containers_recorded(
+    path: &Path,
+    depth: usize,
+    file_type: Option<std::fs::FileType>,
+    out: &mut Stamp,
+) -> Result<()> {
+    let skill = path.join("SKILL.md");
+    let skill_type = record(&skill, out)?;
+    if depth > 0
+        && (recorded_is_file(&skill, skill_type)
+            || file_type.is_some_and(|file_type| file_type.is_symlink()))
+    {
         return Ok(());
     }
     for entry in std::fs::read_dir(path)? {
@@ -68,10 +84,10 @@ fn containers(path: &Path, depth: usize, out: &mut Stamp) -> Result<()> {
             continue;
         }
         let child = entry.path();
-        record(&child, out)?;
-        if child.is_dir() {
+        let child_type = record(&child, out)?;
+        if recorded_is_dir(&child, child_type) {
             if depth > 0 || name == "local" || name == "repos" {
-                containers(&child, depth + 1, out)?;
+                containers_recorded(&child, depth + 1, child_type, out)?;
             } else {
                 record(&child.join("SKILL.md"), out)?;
             }
@@ -80,9 +96,33 @@ fn containers(path: &Path, depth: usize, out: &mut Stamp) -> Result<()> {
     Ok(())
 }
 
+fn recorded_is_dir(path: &Path, file_type: Option<std::fs::FileType>) -> bool {
+    file_type.is_some_and(|file_type| {
+        if file_type.is_symlink() {
+            path.is_dir()
+        } else {
+            file_type.is_dir()
+        }
+    })
+}
+
+fn recorded_is_file(path: &Path, file_type: Option<std::fs::FileType>) -> bool {
+    file_type.is_some_and(|file_type| {
+        if file_type.is_symlink() {
+            path.is_file()
+        } else {
+            file_type.is_file()
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn watched_paths(stamp: &Stamp) -> std::collections::BTreeSet<PathBuf> {
+        stamp.0.keys().cloned().collect()
+    }
 
     #[test]
     fn detects_moves_deletes_and_document_edits_without_reading_payloads() {
@@ -107,5 +147,123 @@ mod tests {
         assert_ne!(edited, moved);
         std::fs::remove_dir_all(root.join("local/group/two")).unwrap();
         assert_ne!(moved, stamp(root, &config).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_contract_covers_real_and_symlink_topologies() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = crate::ops::DownloadDir::new("watch-file-types").unwrap();
+        let root = tmp.path().join("root");
+        for path in [
+            root.join("flat"),
+            root.join("local/group/one"),
+            root.join("local/empty"),
+            root.join("local/group/linked-document"),
+            root.join("repos/demo/one"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        for path in [
+            root.join("flat/SKILL.md"),
+            root.join("local/group/one/SKILL.md"),
+            root.join("repos/demo/one/SKILL.md"),
+        ] {
+            std::fs::write(path, "document").unwrap();
+        }
+        std::fs::create_dir_all(root.join("flat/scripts")).unwrap();
+        std::fs::write(root.join("flat/scripts/payload"), "ignored").unwrap();
+
+        let external = tmp.path().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("SKILL.md"), "external document").unwrap();
+        symlink(&external, root.join("linked")).unwrap();
+        symlink(
+            external.join("SKILL.md"),
+            root.join("local/group/linked-document/SKILL.md"),
+        )
+        .unwrap();
+        symlink(tmp.path().join("missing"), root.join("dangling")).unwrap();
+
+        let agent = tmp.path().join("agent");
+        std::fs::create_dir_all(agent.join("one")).unwrap();
+        std::fs::write(agent.join("one/SKILL.md"), "agent document").unwrap();
+        let agent_link = tmp.path().join("agent-link");
+        symlink(&agent, &agent_link).unwrap();
+        let config = Config {
+            agents: vec![
+                crate::config::AgentConfig {
+                    key: "real".into(),
+                    name: "Real".into(),
+                    skills_dir: agent.display().to_string(),
+                },
+                crate::config::AgentConfig {
+                    key: "linked".into(),
+                    name: "Linked".into(),
+                    skills_dir: agent_link.display().to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let before = stamp(&root, &config).unwrap();
+        let expected: std::collections::BTreeSet<_> = [
+            root.clone(),
+            root.join("flat"),
+            root.join("flat/SKILL.md"),
+            root.join("local"),
+            root.join("local/group"),
+            root.join("local/group/one"),
+            root.join("local/group/one/SKILL.md"),
+            root.join("local/group/linked-document"),
+            root.join("local/group/linked-document/SKILL.md"),
+            root.join("local/empty"),
+            root.join("repos"),
+            root.join("repos/demo"),
+            root.join("repos/demo/one"),
+            root.join("repos/demo/one/SKILL.md"),
+            root.join("linked"),
+            root.join("linked/SKILL.md"),
+            root.join("dangling"),
+            agent.clone(),
+            agent.join("one"),
+            agent_link.clone(),
+            agent_link.join("one"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(watched_paths(&before), expected);
+        assert_eq!(before.0[&root.join("linked")].2.as_ref(), Some(&external));
+        assert_eq!(
+            before.0[&root.join("local/group/linked-document/SKILL.md")]
+                .2
+                .as_ref(),
+            Some(&external.join("SKILL.md"))
+        );
+        assert_eq!(
+            before.0[&root.join("dangling")].2.as_ref(),
+            Some(&tmp.path().join("missing"))
+        );
+        assert_eq!(before.0[&agent_link].2.as_ref(), Some(&agent));
+        assert!(!before.0.contains_key(&root.join("flat/scripts")));
+        assert!(!before.0.contains_key(&root.join("flat/scripts/payload")));
+
+        std::fs::write(external.join("SKILL.md"), "changed external document").unwrap();
+        assert_ne!(before, stamp(&root, &config).unwrap());
+
+        let before_retarget = stamp(&root, &config).unwrap();
+        let replacement = tmp.path().join("replacement");
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(replacement.join("SKILL.md"), "replacement").unwrap();
+        std::fs::remove_file(root.join("linked")).unwrap();
+        symlink(&replacement, root.join("linked")).unwrap();
+        let retargeted = stamp(&root, &config).unwrap();
+        assert_ne!(before_retarget, retargeted);
+        assert_eq!(watched_paths(&retargeted), expected);
+        assert_eq!(
+            retargeted.0[&root.join("linked")].2.as_ref(),
+            Some(&replacement)
+        );
     }
 }

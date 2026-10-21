@@ -15,9 +15,12 @@ skills agents status claude
 
 `skills status` (also available as `skills rescan`) checks Library content, metadata, and Agent directories. It reports problems without repairing them. Opening metadata written by an older version can still upgrade it, with a backup; see [metadata format upgrades](../configuration/#metadata-format-upgrades).
 
+The TUI loads a fast inventory first. Repository skills appear as `unchecked` until you open Health or run **Verify local content** from the command palette; Health also uses Ctrl-R for this check. Verification compares each local directory with its recorded baseline and reports `repository` or `modified`. A skill stays `unchecked` if its files cannot be read. Inventory still compares Agent shadow copies with Library skills so deployment safety stays current, which can require reading those copies. Ctrl-R outside Health and automatic filesystem refreshes rebuild only the inventory, returning repository skills to `unchecked`; the TUI does not run full content checks while idle. A verified status reflects the last completed check, so changes limited to auxiliary files require another explicit verification because lightweight polling does not walk every skill file.
+
 | State | Action |
 | --- | --- |
 | `local`, `repository` | No action; the Library entry is healthy. |
+| `unchecked` | Run **Verify local content**; if it remains unchecked, check file access. |
 | `modified` | Review the difference, then accept or update it. |
 | `missing-baseline`, `missing-source` | Check the recorded source and metadata. |
 | `missing`, `renamed?` | Confirm whether the content moved or was removed. |

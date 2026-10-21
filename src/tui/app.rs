@@ -46,6 +46,10 @@ pub enum Tab {
     Health,
 }
 
+#[cfg(test)]
+#[path = "verification_tests.rs"]
+mod verification_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppFocus {
     Tabs,
@@ -110,6 +114,10 @@ pub enum Action {
     Error(String),
     /// Re-scan in the background.
     Rescan,
+    /// Verify repository content against recorded baselines.
+    VerifyContent {
+        explicit: bool,
+    },
     /// Refresh cached root backup status without blocking interaction.
     RefreshSyncStatus {
         remote: bool,
@@ -242,6 +250,7 @@ pub struct App {
     agents_dirty: bool,
     pub health: HealthView,
     pub repos: ReposView,
+    repos_dirty: bool,
     pub modal: Option<Modal>,
     context_menu: Option<ContextMenu>,
     command_palette: Option<CommandPalette>,
@@ -257,6 +266,11 @@ pub struct App {
     sync: SyncCoordinator,
     next_task_id: u64,
     latest_scan_task: Option<u64>,
+    verification_task: Option<u64>,
+    verification_explicit: bool,
+    verification_attempted: bool,
+    verification_queued: bool,
+    verification_queued_explicit: bool,
     repository_refresh_tasks: BTreeMap<String, u64>,
     spinner: usize,
     last_root_poll: std::time::Instant,
@@ -407,7 +421,7 @@ impl App {
             .unwrap_or(std::env::current_dir()?);
         let mut agents = AgentsView::default();
         agents.discover(&local_project)?;
-        let snap = ws.scan()?;
+        let snap = ws.inventory()?;
         let root_stamp = skills::reconcile::watch::stamp(&ws.root, &ws.config).ok();
         let settings = RuntimeSettings::new(&ws.config);
         let mut app = Self {
@@ -424,6 +438,7 @@ impl App {
             agents_dirty: true,
             health: HealthView::default(),
             repos: ReposView::default(),
+            repos_dirty: true,
             modal: None,
             context_menu: None,
             command_palette: None,
@@ -438,6 +453,11 @@ impl App {
             sync: SyncCoordinator::default(),
             next_task_id: 0,
             latest_scan_task: None,
+            verification_task: None,
+            verification_explicit: false,
+            verification_attempted: false,
+            verification_queued: false,
+            verification_queued_explicit: false,
             repository_refresh_tasks: BTreeMap::new(),
             spinner: 0,
             last_root_poll: std::time::Instant::now(),
@@ -496,7 +516,12 @@ impl App {
             self.agents_dirty = false;
         }
         self.health.refresh(&ctx);
-        self.repos.refresh(&ctx);
+        self.repos.invalidate_snapshot();
+        self.repos_dirty = true;
+        if self.tab == Tab::Repos {
+            self.repos.refresh(&ctx);
+            self.repos_dirty = false;
+        }
         if let Some(m) = self.modal.as_mut() {
             m.refresh(&ctx);
         }
@@ -1098,6 +1123,16 @@ impl App {
                     Err(error) => vec![Action::Error(format!("refresh {alias}: {error:#}"))],
                 }
             }
+            TaskOutput::RepositoryRemovalReviewed {
+                alias,
+                name,
+                result,
+            } => match result {
+                Ok(summary) => vec![Action::OpenModal(Box::new(Modal::remove_source(
+                    &alias, &name, &summary,
+                )))],
+                Err(error) => vec![Action::Error(format!("remove source {alias}: {error:#}"))],
+            },
             TaskOutput::RepositoryInstalled(selection, result) => match result {
                 Ok(keys) => {
                     let aliases: Vec<_> = selection
@@ -1164,14 +1199,52 @@ impl App {
             // A move can temporarily remove a directory while it is being polled.
             // Keep the last good snapshot and retry; explicit rescans report errors.
             TaskOutput::RootStamp(Err(_)) => Vec::new(),
-            TaskOutput::Scan(outcome) if self.latest_scan_task == Some(id) => {
+            TaskOutput::Verified(outcome) => {
+                let owns_marker = self.verification_task == Some(id);
+                if owns_marker {
+                    self.verification_task = None;
+                    self.verification_explicit = false;
+                    self.health.set_verifying(false);
+                }
+                if self.latest_scan_task != Some(id) {
+                    return self.queued_verification_action();
+                }
                 self.latest_scan_task = None;
                 let mut actions: Vec<_> = outcome.warnings.into_iter().map(Action::Error).collect();
                 self.ws.config = outcome.config;
                 match outcome.snapshot {
                     Ok(snapshot) => {
+                        self.health.set_verification_error(None);
                         self.root_stamp = outcome.stamp;
                         self.snap = snapshot;
+                        self.ws.inventory_products = outcome.inventory_products;
+                        self.ws.inventory_configured_agents = outcome.inventory_configured_agents;
+                        self.verification_attempted = true;
+                        self.on_snapshot();
+                    }
+                    Err(error) => {
+                        let error = format!("{error:#}");
+                        self.root_stamp = None;
+                        self.verification_attempted = true;
+                        self.health.set_verification_error(Some(error.clone()));
+                        actions.push(Action::Error(format!(
+                            "content verification failed: {error}"
+                        )));
+                    }
+                }
+                actions.extend(self.queued_verification_action());
+                actions
+            }
+            TaskOutput::Scan(outcome) if self.latest_scan_task == Some(id) => {
+                self.latest_scan_task = None;
+                let mut actions: Vec<_> = outcome.warnings.into_iter().map(Action::Error).collect();
+                self.ws.config = outcome.config;
+                let scan_succeeded = match outcome.snapshot {
+                    Ok(snapshot) => {
+                        self.health.set_verification_error(None);
+                        self.root_stamp = outcome.stamp;
+                        self.snap = snapshot;
+                        self.verification_attempted = false;
                         self.ws.inventory_products = outcome.inventory_products;
                         self.ws.inventory_configured_agents = outcome.inventory_configured_agents;
                         if !self.single_write_running
@@ -1180,13 +1253,31 @@ impl App {
                         {
                             batch.reconcile_tags();
                         }
+                        true
                     }
                     Err(error) => {
                         self.root_stamp = None;
                         actions.push(Action::Error(format!("scan failed: {error:#}")));
+                        false
                     }
-                }
+                };
                 self.on_snapshot();
+                let queued = if scan_succeeded || self.verification_queued_explicit {
+                    self.queued_verification_action()
+                } else {
+                    self.verification_queued = false;
+                    Vec::new()
+                };
+                if scan_succeeded
+                    && queued.is_empty()
+                    && !self.verification_queued
+                    && self.tab == Tab::Health
+                    && self.needs_content_verification()
+                    && self.verification_task.is_none()
+                {
+                    actions.push(Action::VerifyContent { explicit: false });
+                }
+                actions.extend(queued);
                 actions
             }
             TaskOutput::Scan(..) => Vec::new(),
@@ -1355,7 +1446,14 @@ impl App {
         }
         match k.code {
             KeyCode::Char('r') if keymap::control(k, 'r') => {
-                return vec![Action::Rescan, Action::Toast("rescanning".into())];
+                return if self.tab == Tab::Health {
+                    vec![
+                        Action::VerifyContent { explicit: true },
+                        Action::Toast("checking local content".into()),
+                    ]
+                } else {
+                    vec![Action::Rescan, Action::Toast("rescanning".into())]
+                };
             }
             KeyCode::Char('o') if keymap::control(k, 'o') => {
                 let enabled = !self.settings.tags_enabled;
@@ -1536,6 +1634,9 @@ impl App {
                 };
                 match command {
                     AppCommand::Rescan => vec![Action::Rescan, Action::Toast("rescanning".into())],
+                    AppCommand::VerifyContent => {
+                        vec![Action::VerifyContent { explicit: true }]
+                    }
                     AppCommand::Install => vec![Action::OpenModal(Box::new(Modal::install()))],
                     AppCommand::Repositories => {
                         vec![Action::OpenModal(Box::new(Modal::repositories(&ctx)))]
@@ -1732,6 +1833,9 @@ impl App {
             let tab = *tab;
             self.switch_tab(tab);
             self.focus = AppFocus::Page;
+            if tab == Tab::Health && self.needs_content_verification() {
+                self.verify_content(false);
+            }
             return vec![];
         }
         if !self.body.contains((m.column, m.row).into()) {
@@ -1836,6 +1940,7 @@ impl App {
             Action::Toast(t) => self.toast(t, Level::Ok),
             Action::Error(t) => self.toast(t, Level::Error),
             Action::Rescan => self.rescan(),
+            Action::VerifyContent { explicit } => self.verify_content(explicit),
             Action::RefreshSyncStatus { remote, reason } => {
                 self.refresh_sync_status(remote, reason)
             }
@@ -1891,6 +1996,9 @@ impl App {
             Action::SwitchTab(t) => {
                 self.switch_tab(t);
                 self.focus = AppFocus::Tabs;
+                if t == Tab::Health && self.needs_content_verification() {
+                    self.verify_content(false);
+                }
             }
             Action::SelectPreset(name) => self.presets.select(&name),
             Action::SelectTag(name) => self.tags.select(&name, &self.snap),
@@ -2056,6 +2164,14 @@ impl App {
             });
             self.agents_dirty = false;
         }
+        if t == Tab::Repos && self.repos_dirty {
+            self.repos.refresh(&Ctx {
+                ws: &self.ws,
+                snap: &self.snap,
+                settings: &self.settings,
+            });
+            self.repos_dirty = false;
+        }
         let view: &mut dyn View = match t {
             Tab::Search => &mut self.search,
             Tab::Tags => &mut self.tags,
@@ -2090,16 +2206,13 @@ impl App {
         let what = intent.describe();
         // Time has passed since the step was taken, so plan against the tree as
         // it is now rather than the snapshot on screen.
-        let snap = match self.ws.scan() {
-            Ok(s) => {
-                self.snap = s;
-                &self.snap
-            }
+        let snap = match self.ws.scan_for_links() {
+            Ok(s) => s,
             Err(e) => return vec![Action::Error(format!("scan failed: {e:#}"))],
         };
         let plan = match dir {
-            Step::Undo => history::undo_plan(&self.ws, snap, &intent),
-            Step::Redo => history::redo_plan(&self.ws, snap, &intent),
+            Step::Undo => history::undo_plan(&self.ws, &snap, &intent),
+            Step::Redo => history::redo_plan(&self.ws, &snap, &intent),
         };
         match plan {
             Ok(Plan::Links(actions)) => {
@@ -2246,7 +2359,22 @@ impl App {
             self.root_tasks_running.insert(id);
         }
         match &task {
-            Task::Scan => self.latest_scan_task = Some(id),
+            Task::Scan => {
+                self.latest_scan_task = Some(id);
+                self.verification_attempted = false;
+                if self.verification_task.is_some()
+                    && (self.verification_explicit || self.tab == Tab::Health)
+                {
+                    self.verification_queued = true;
+                    self.verification_queued_explicit |= self.verification_explicit;
+                }
+            }
+            Task::Verify => {
+                self.latest_scan_task = Some(id);
+                self.verification_task = Some(id);
+                self.health.set_verification_error(None);
+                self.health.set_verifying(true);
+            }
             Task::RefreshRepository(alias) => {
                 self.repository_refresh_tasks.insert(alias.clone(), id);
                 self.repos.refreshing(alias);
@@ -2264,6 +2392,52 @@ impl App {
         // Configuration and discovered local agents belong to the same coherent
         // inventory as the replacement snapshot, so load all three in the worker.
         self.spawn(Task::Scan);
+    }
+
+    fn needs_content_verification(&self) -> bool {
+        !self.verification_attempted
+            && self.snap.skills.iter().any(|record| {
+                matches!(record.status, skills::reconcile::SkillStatus::Unchecked)
+                    || (matches!(record.status, skills::reconcile::SkillStatus::Missing)
+                        && record.baseline_hash.is_some())
+            })
+    }
+
+    fn verify_content(&mut self, explicit: bool) {
+        if let Some(verification) = self.verification_task {
+            if self.latest_scan_task != Some(verification) {
+                self.verification_queued = true;
+                self.verification_queued_explicit |= explicit || self.verification_explicit;
+            }
+            return;
+        }
+        if self.latest_scan_task.is_some() {
+            self.verification_queued = true;
+            self.verification_queued_explicit |= explicit;
+            return;
+        }
+        if !explicit && !self.needs_content_verification() {
+            return;
+        }
+        self.verification_explicit = explicit;
+        self.spawn(Task::Verify);
+    }
+
+    fn queued_verification_action(&mut self) -> Vec<Action> {
+        if !self.verification_queued
+            || self.latest_scan_task.is_some()
+            || self.verification_task.is_some()
+        {
+            return Vec::new();
+        }
+        let explicit = self.verification_queued_explicit;
+        self.verification_queued = false;
+        self.verification_queued_explicit = false;
+        if explicit || (self.tab == Tab::Health && self.needs_content_verification()) {
+            vec![Action::VerifyContent { explicit }]
+        } else {
+            Vec::new()
+        }
     }
 
     fn library_changed(&mut self) {
@@ -2511,7 +2685,7 @@ impl App {
             snap: &self.snap,
             settings: &self.settings,
         };
-        let status = if self.modal.is_some() || self.quit_prompt.is_some() {
+        let mut status = if self.modal.is_some() || self.quit_prompt.is_some() {
             String::new()
         } else {
             match self.tab {
@@ -2521,6 +2695,28 @@ impl App {
                 _ => String::new(),
             }
         };
+        if self.modal.is_none() && self.quit_prompt.is_none() && self.tab == Tab::Search {
+            let content = if self.verification_task.is_some() {
+                Some("Checking content…".to_string())
+            } else {
+                let unchecked = self
+                    .snap
+                    .skills
+                    .iter()
+                    .filter(|record| {
+                        matches!(record.status, skills::reconcile::SkillStatus::Unchecked)
+                    })
+                    .count();
+                (unchecked > 0).then(|| format!("{unchecked} unchecked · Health to verify"))
+            };
+            if let Some(content) = content {
+                status = if status.is_empty() {
+                    format!(" {content} ")
+                } else {
+                    format!(" {content} · {}", status.trim())
+                };
+            }
+        }
         let status = fit(&status, area.width as usize / 3);
         let status_width = width(&status);
         let budget = area.width as usize - status_width;
@@ -2697,6 +2893,124 @@ fn wait_for_msg_matching(
         if matches(&message) {
             return message;
         }
+    }
+}
+
+#[cfg(test)]
+mod lazy_repositories_tests {
+    use super::*;
+
+    fn app() -> (skills::ops::DownloadDir, App) {
+        let root = skills::ops::DownloadDir::new("lazy-repositories").unwrap();
+        let mut workspace = Workspace::open_local(root.path(), true).unwrap();
+        workspace.config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+        workspace.config.save(&workspace.root).unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let app = App::new_with_launch_directory(workspace, tx, Some(root.path())).unwrap();
+        (root, app)
+    }
+
+    fn write_repo_skill(root: &std::path::Path, name: &str) {
+        let directory = root.join("repos/demo").join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {name}\n---\nBody"),
+        )
+        .unwrap();
+    }
+
+    fn take_snapshot(app: &mut App) {
+        app.snap = app.ws.scan().unwrap();
+        app.on_snapshot();
+    }
+
+    fn panel_keys(app: &App) -> Vec<String> {
+        app.repos.panel_keys(&Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        })
+    }
+
+    #[test]
+    fn hidden_repositories_skip_the_panel_and_first_open_uses_latest_snapshot() {
+        let (_root, mut app) = app();
+        assert_eq!(app.tab, Tab::Search);
+        assert!(app.repos_dirty);
+        assert!(!app.repos.panel_initialized());
+
+        write_repo_skill(&app.ws.root, "old");
+        take_snapshot(&mut app);
+        assert!(!app.repos.panel_initialized());
+
+        std::fs::remove_dir_all(app.ws.root.join("repos/demo/old")).unwrap();
+        write_repo_skill(&app.ws.root, "latest");
+        take_snapshot(&mut app);
+        assert!(app.repos_dirty);
+        assert!(!app.repos.panel_initialized());
+
+        app.apply(Action::SwitchTab(Tab::Repos));
+        assert!(!app.repos_dirty);
+        assert!(app.repos.panel_initialized());
+        assert_eq!(panel_keys(&app), ["repos/demo/latest"]);
+
+        assert_eq!(app.focus, AppFocus::Tabs);
+        app.enter_page();
+        assert_eq!(app.focus, AppFocus::Page);
+        assert!(app.on_key(KeyCode::Enter.into()).is_empty());
+        assert!(app.on_key(KeyCode::Char('a').into()).is_empty());
+        assert!(matches!(
+            app.context_menu.as_ref().map(|menu| &menu.request.target),
+            Some(crate::tui::components::context_menu::Target::Skill(key))
+                if key == "repos/demo/latest"
+        ));
+
+        // Re-selecting the active tab is a no-op for the view. Its member
+        // focus remains usable after the app returns focus to the tab strip.
+        app.apply(Action::SwitchTab(Tab::Repos));
+        assert_eq!(app.focus, AppFocus::Tabs);
+        assert!(app.context_menu.is_none());
+        app.focus = AppFocus::Page;
+        assert!(app.on_key(KeyCode::Char('a').into()).is_empty());
+        assert!(matches!(
+            app.context_menu.as_ref().map(|menu| &menu.request.target),
+            Some(crate::tui::components::context_menu::Target::Skill(key))
+                if key == "repos/demo/latest"
+        ));
+    }
+
+    #[test]
+    fn hidden_snapshots_invalidate_inventory_and_visible_snapshots_refresh_panel() {
+        let (_root, mut app) = app();
+        write_repo_skill(&app.ws.root, "first");
+        take_snapshot(&mut app);
+        app.apply(Action::SwitchTab(Tab::Repos));
+        assert_eq!(panel_keys(&app), ["repos/demo/first"]);
+
+        app.repos.refreshing("demo");
+        app.apply(Action::SwitchTab(Tab::Search));
+        std::fs::remove_dir_all(app.ws.root.join("repos/demo/first")).unwrap();
+        write_repo_skill(&app.ws.root, "hidden-latest");
+        take_snapshot(&mut app);
+        assert!(app.repos_dirty);
+        assert!(!app.repos.inventory_result(
+            "demo",
+            &Ok(skills::repository::RepositoryInventory { entries: vec![] })
+        ));
+
+        app.apply(Action::SwitchTab(Tab::Repos));
+        assert_eq!(panel_keys(&app), ["repos/demo/hidden-latest"]);
+
+        std::fs::remove_dir_all(app.ws.root.join("repos/demo/hidden-latest")).unwrap();
+        write_repo_skill(&app.ws.root, "visible-latest");
+        take_snapshot(&mut app);
+        assert_eq!(app.tab, Tab::Repos);
+        assert!(!app.repos_dirty);
+        assert_eq!(panel_keys(&app), ["repos/demo/visible-latest"]);
     }
 }
 

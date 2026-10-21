@@ -43,8 +43,13 @@ pub enum Task {
         reference: skills::ops::install::InstallRef,
     },
     RefreshRepository(String),
+    ReviewRepositoryRemoval {
+        alias: String,
+        name: String,
+    },
     InstallRepository(Box<super::repository_picker::InstallSelection>),
     Scan,
+    Verify,
     PollRoot,
     Check(Vec<String>),
     Prepare(String),
@@ -96,11 +101,15 @@ impl Task {
             Self::AutoSync(_) => Some("Root sync".into()),
             Self::DiscoverRepository { label, .. } => Some(format!("Fetch {label}")),
             Self::RefreshRepository(alias) => Some(format!("Refresh source {alias}")),
+            Self::ReviewRepositoryRemoval { alias, .. } => {
+                Some(format!("Review source removal: {alias}"))
+            }
             Self::InstallRepository(selection) => Some(format!(
                 "Install {}",
                 selection.fetched.repository.display_name()
             )),
             Self::Scan | Self::PollRoot => None,
+            Self::Verify => Some("Checking local content".into()),
             Self::Check(keys) => Some(format!("Check upstream: {} skills", keys.len())),
             Self::Prepare(key) => Some(format!("Prepare update: {key}")),
             Self::Install { reference, .. } => Some(format!("Install {reference}")),
@@ -144,11 +153,17 @@ pub enum TaskOutput {
     Batch(BatchOutcome),
     RepositoryFetched(String, Result<skills::repository::FetchedRepository>),
     RepositoryRefreshed(String, Result<skills::repository::RepositoryInventory>),
+    RepositoryRemovalReviewed {
+        alias: String,
+        name: String,
+        result: Result<skills::ops::edit::RepositoryRemoveSummary>,
+    },
     RepositoryInstalled(
         Box<super::repository_picker::InstallSelection>,
         Result<Vec<String>>,
     ),
     Scan(ScanOutcome),
+    Verified(ScanOutcome),
     RootStamp(Result<skills::reconcile::watch::Stamp>),
     Check(Vec<CheckOutput>),
     Prepared(String, Result<Prepared>),
@@ -335,6 +350,40 @@ pub fn spawn_task(mut ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                     })();
                     TaskOutput::RepositoryRefreshed(alias, result)
                 }
+                Task::ReviewRepositoryRemoval { alias, name } => {
+                    let result = (|| {
+                        let inventory = ws.inventory()?;
+                        let keys: Vec<_> = inventory
+                            .skills
+                            .iter()
+                            .filter(|record| {
+                                skills::repository::alias_of(&record.key) == Some(alias.as_str())
+                            })
+                            .map(|record| record.key.clone())
+                            .collect();
+                        let verified = ws.scan_selected(&keys)?;
+                        let unreadable: Vec<_> = verified
+                            .skills
+                            .iter()
+                            .filter(|record| {
+                                skills::repository::alias_of(&record.key) == Some(alias.as_str())
+                                    && record.status == skills::reconcile::SkillStatus::Unchecked
+                            })
+                            .map(|record| record.key.as_str())
+                            .collect();
+                        anyhow::ensure!(
+                            unreadable.is_empty(),
+                            "could not verify local changes for: {}",
+                            unreadable.join(", ")
+                        );
+                        skills::ops::edit::RepositoryRemoveSummary::from_snapshot(&verified, &alias)
+                    })();
+                    TaskOutput::RepositoryRemovalReviewed {
+                        alias,
+                        name,
+                        result,
+                    }
+                }
                 Task::InstallRepository(selection) => {
                     let result =
                         skills::ops::sync::MutationGuard::acquire(&ws, "repository install")
@@ -348,38 +397,8 @@ pub fn spawn_task(mut ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                             });
                     TaskOutput::RepositoryInstalled(selection, result)
                 }
-                Task::Scan => {
-                    let mut warnings = Vec::new();
-                    match ws.load_config() {
-                        Ok(config) => {
-                            ws.config = config;
-                            // The worker clone carries the previous successful
-                            // inventory. A fresh config needs a fresh explicit set.
-                            ws.inventory_configured_agents = None;
-                        }
-                        Err(error) => warnings.push(format!("{error:#}")),
-                    }
-                    let project = ws
-                        .inventory_project
-                        .clone()
-                        .or_else(|| ws.project.clone())
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    if let Err(error) = skills::ops::targets::discover(&mut ws, &project) {
-                        warnings.push(format!("{error:#}"));
-                    }
-                    // Capture before scanning: changes during the scan must still
-                    // invalidate the next poll, while our own writes need no second scan.
-                    let stamp = skills::reconcile::watch::stamp(&ws.root, &ws.config).ok();
-                    let snapshot = ws.scan();
-                    TaskOutput::Scan(ScanOutcome {
-                        snapshot,
-                        stamp,
-                        config: ws.config,
-                        inventory_products: ws.inventory_products,
-                        inventory_configured_agents: ws.inventory_configured_agents,
-                        warnings,
-                    })
-                }
+                Task::Scan => TaskOutput::Scan(scan_workspace(&mut ws, false)),
+                Task::Verify => TaskOutput::Verified(scan_workspace(&mut ws, true)),
                 Task::PollRoot => {
                     TaskOutput::RootStamp(skills::reconcile::watch::stamp(&ws.root, &ws.config))
                 }
@@ -420,9 +439,11 @@ pub fn spawn_task(mut ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                 }
                 Task::Prepare(key) => {
                     progress("Update: inspecting local files and fetching upstream…");
-                    let r = ws.scan().and_then(|snap| {
-                        update::UpdateSession::default().prepare(&snap, &key, &mut progress)
-                    });
+                    let r = ws
+                        .scan_selected(std::slice::from_ref(&key))
+                        .and_then(|snap| {
+                            update::UpdateSession::default().prepare(&snap, &key, &mut progress)
+                        });
                     TaskOutput::Prepared(key, r)
                 }
             };
@@ -438,6 +459,39 @@ pub struct ScanOutcome {
     pub inventory_products: Option<std::collections::BTreeSet<String>>,
     pub inventory_configured_agents: Option<std::collections::BTreeSet<String>>,
     pub warnings: Vec<String>,
+}
+
+fn scan_workspace(ws: &mut Workspace, verify: bool) -> ScanOutcome {
+    let mut warnings = Vec::new();
+    match ws.load_config() {
+        Ok(config) => {
+            ws.config = config;
+            // The worker clone carries the previous successful inventory. A
+            // fresh config needs a fresh explicit set.
+            ws.inventory_configured_agents = None;
+        }
+        Err(error) => warnings.push(format!("{error:#}")),
+    }
+    let project = ws
+        .inventory_project
+        .clone()
+        .or_else(|| ws.project.clone())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    if let Err(error) = skills::ops::targets::discover(ws, &project) {
+        warnings.push(format!("{error:#}"));
+    }
+    // Capture before scanning: changes during the scan must still invalidate
+    // the next poll, while our own writes need no second scan.
+    let stamp = skills::reconcile::watch::stamp(&ws.root, &ws.config).ok();
+    let snapshot = if verify { ws.scan() } else { ws.inventory() };
+    ScanOutcome {
+        snapshot,
+        stamp,
+        config: ws.config.clone(),
+        inventory_products: ws.inventory_products.clone(),
+        inventory_configured_agents: ws.inventory_configured_agents.clone(),
+        warnings,
+    }
 }
 
 pub struct WriteOutcome {
@@ -707,6 +761,96 @@ fn apply_batch_link(action: &skills::ops::deploy::Action) -> Result<usize> {
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn removal_review(
+        ws: &Workspace,
+        id: u64,
+    ) -> Result<skills::ops::edit::RepositoryRemoveSummary> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_task(
+            ws.clone(),
+            Task::ReviewRepositoryRemoval {
+                alias: "demo".into(),
+                name: "Demo".into(),
+            },
+            id,
+            tx,
+        );
+        loop {
+            match rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+                Msg::Task(output_id, output) if output_id == id => match *output {
+                    TaskOutput::RepositoryRemovalReviewed { result, .. } => return result,
+                    _ => panic!("unexpected task output"),
+                },
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn repository_removal_review_verifies_modifications_and_refuses_unreadable_content() {
+        let tmp = skills::ops::DownloadDir::new("repository-removal-review").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        skills::repository::Repository {
+            alias: "demo".into(),
+            name: Some("Demo".into()),
+            kind: skills::meta::SourceKind::Archive,
+            url: "https://example.test/demo.tar.gz".into(),
+            branch: String::new(),
+        }
+        .save(&ws)
+        .unwrap();
+        let key = "repos/demo/sample";
+        let skill = ws.root.join(key);
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: sample\ndescription: sample\n---\nBody",
+        )
+        .unwrap();
+        let payload = skill.join("payload");
+        std::fs::write(&payload, "baseline").unwrap();
+        ws.meta
+            .save(
+                key,
+                &skills::meta::SkillMeta {
+                    source: Some(skills::meta::Source::Archive {
+                        url: "https://example.test/demo.tar.gz".into(),
+                        subpath: Some("sample".into()),
+                        revision: Some("v1".into()),
+                    }),
+                    baseline: Some(skills::meta::Baseline {
+                        hash: skills::hash::hash_directory(&skill).unwrap(),
+                        hash_algo: skills::hash::HASH_ALGO,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        std::fs::write(&payload, "locally changed").unwrap();
+        let summary = removal_review(&ws, 1).unwrap();
+        assert_eq!(summary.modified, 1);
+        assert_eq!(summary.keys, [key]);
+
+        let mut permissions = std::fs::metadata(&payload).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(&payload, permissions).unwrap();
+        let error = removal_review(&ws, 2).unwrap_err().to_string();
+        assert!(error.contains("could not verify local changes"), "{error}");
+        assert!(error.contains(key), "{error}");
+        let mut permissions = std::fs::metadata(&payload).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&payload, permissions).unwrap();
+    }
+
     #[test]
     fn batch_keeps_foreign_links_and_records_only_successful_targets() {
         let root = std::env::temp_dir().join(format!("skills-batch-links-{}", std::process::id()));

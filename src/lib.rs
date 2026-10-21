@@ -17,6 +17,7 @@ pub mod paths;
 pub mod preset;
 pub mod reconcile;
 pub mod repository;
+mod scan_io;
 pub(crate) mod schema;
 pub mod search;
 pub mod skill;
@@ -122,6 +123,16 @@ impl Workspace {
     /// replacing `config`; scanning never discards in-memory scope overrides.
     pub fn scan(&self) -> Result<reconcile::Snapshot> {
         reconcile::scan(&self.root, &self.config)
+    }
+
+    /// Read the current filesystem without verifying repository baselines.
+    pub fn inventory(&self) -> Result<reconcile::Snapshot> {
+        reconcile::inventory(&self.root, &self.config)
+    }
+
+    /// Verify selected repository skills while leaving all others unchecked.
+    pub fn scan_selected(&self, keys: &[String]) -> Result<reconcile::Snapshot> {
+        reconcile::scan_selected(&self.root, &self.config, keys)
     }
 
     /// Fresh source/destination inventory for link planning, without unrelated

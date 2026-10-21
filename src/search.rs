@@ -306,15 +306,18 @@ const MIN_FUZZY_CHARS: usize = 3;
 
 const K1: f32 = 1.2;
 const B: f32 = 0.75;
+const MAX_INDEX_WORKERS: usize = 8;
+const MIN_PARALLEL_INDEX_BYTES: usize = 256 * 1024;
+const MIN_PARALLEL_INDEX_DOCUMENTS: usize = 8;
 
 /// Term frequency of one term inside one document, per field.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Posting {
     doc: usize,
     tf: [u16; 6],
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Doc {
     /// Tokens per field (for length normalization).
     len: [u32; 6],
@@ -336,6 +339,112 @@ pub struct Index {
 struct IndexDocument<'a> {
     names: Vec<&'a str>,
     fields: Vec<(Field, &'a str)>,
+}
+
+impl IndexDocument<'_> {
+    fn indexed_bytes(&self) -> usize {
+        self.names
+            .iter()
+            .map(|value| value.len())
+            .chain(self.fields.iter().map(|(_, value)| value.len()))
+            .sum()
+    }
+}
+
+struct IndexShard {
+    start: usize,
+    docs: Vec<Doc>,
+    postings: HashMap<String, Vec<Posting>>,
+    totals: [u64; 6],
+}
+
+/// Contiguous ranges keep every shard's postings in document order. Weighting
+/// by indexed bytes avoids assigning one worker most of the long documents.
+fn index_shard_ranges(
+    records: &[IndexDocument<'_>],
+    workers: usize,
+    indexed_bytes: usize,
+) -> Vec<Range<usize>> {
+    let workers = workers.max(1).min(records.len());
+    let mut ranges = Vec::with_capacity(workers);
+    let mut start = 0;
+    let mut remaining_bytes = indexed_bytes;
+    let mut remaining_workers = workers;
+    while remaining_workers > 1 {
+        let target = remaining_bytes.div_ceil(remaining_workers);
+        let max_end = records.len() - (remaining_workers - 1);
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < max_end {
+            if end > start && bytes >= target {
+                break;
+            }
+            bytes = bytes.saturating_add(records[end].indexed_bytes());
+            end += 1;
+        }
+        ranges.push(start..end);
+        remaining_bytes = remaining_bytes.saturating_sub(bytes);
+        remaining_workers -= 1;
+        start = end;
+    }
+    ranges.push(start..records.len());
+    ranges
+}
+
+fn index_worker_count(record_count: usize, indexed_bytes: usize, worker_limit: usize) -> usize {
+    if record_count < MIN_PARALLEL_INDEX_DOCUMENTS
+        || indexed_bytes < MIN_PARALLEL_INDEX_BYTES
+        || worker_limit <= 1
+    {
+        1
+    } else {
+        worker_limit.max(1).min(record_count)
+    }
+}
+
+/// Build one contiguous piece of the final index. Only the current document's
+/// term-frequency map is transient; the shard immediately folds it into its
+/// postings, bounding those transient maps by the worker count rather than the
+/// number of documents. The completed index still scales with the corpus.
+fn build_index_shard(records: &[IndexDocument<'_>], range: Range<usize>) -> IndexShard {
+    let mut shard = IndexShard {
+        start: range.start,
+        docs: Vec::with_capacity(range.len()),
+        postings: HashMap::new(),
+        totals: [0; 6],
+    };
+    for (offset, r) in records[range].iter().enumerate() {
+        let doc_id = shard.start + offset;
+        let mut doc = Doc::default();
+        doc.names = r.names.iter().map(|name| name.to_lowercase()).collect();
+        doc.name_terms = doc
+            .names
+            .iter()
+            .flat_map(|name| tokenize(name).into_iter().map(|token| token.term))
+            .collect();
+        let mut tf: HashMap<String, [u16; 6]> = HashMap::new();
+        let mut add = |field: Field, text: &str, doc: &mut Doc| {
+            for token in tokenize(text) {
+                doc.len[field.idx()] += 1;
+                let counts = tf.entry(token.term).or_default();
+                counts[field.idx()] = counts[field.idx()].saturating_add(1);
+            }
+        };
+        for (field, text) in &r.fields {
+            add(*field, text, &mut doc);
+        }
+        for field in Field::ALL {
+            shard.totals[field.idx()] += doc.len[field.idx()] as u64;
+        }
+        for (term, counts) in tf {
+            shard.postings.entry(term).or_default().push(Posting {
+                doc: doc_id,
+                tf: counts,
+            });
+        }
+        shard.docs.push(doc);
+    }
+    shard
 }
 
 /// Plain text data for navigation lists. No skill identity or query syntax is implied.
@@ -409,6 +518,18 @@ impl TextSearcher {
 
 impl Index {
     pub fn build(records: &[SkillRecord], w: &FieldWeights) -> Self {
+        let workers = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .min(MAX_INDEX_WORKERS);
+        Self::build_with_worker_limit(records, w, workers)
+    }
+
+    fn build_with_worker_limit(
+        records: &[SkillRecord],
+        w: &FieldWeights,
+        worker_limit: usize,
+    ) -> Self {
         let documents: Vec<_> = records
             .iter()
             .map(|r| {
@@ -441,43 +562,63 @@ impl Index {
                 IndexDocument { names, fields }
             })
             .collect();
-        Self::build_documents(&documents, w)
+        Self::build_documents_with_worker_limit(&documents, w, worker_limit)
     }
 
     fn build_documents(records: &[IndexDocument<'_>], w: &FieldWeights) -> Self {
+        let workers = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .min(MAX_INDEX_WORKERS);
+        Self::build_documents_with_worker_limit(records, w, workers)
+    }
+
+    fn build_documents_with_worker_limit(
+        records: &[IndexDocument<'_>],
+        w: &FieldWeights,
+        worker_limit: usize,
+    ) -> Self {
         let weights = [w.name, w.tag, w.description, w.note, w.heading, w.body];
-        let mut docs = Vec::with_capacity(records.len());
-        let mut postings: HashMap<String, Vec<Posting>> = HashMap::new();
-        let mut totals = [0u64; 6];
-        for (doc_id, r) in records.iter().enumerate() {
-            let mut doc = Doc::default();
-            doc.names = r.names.iter().map(|name| name.to_lowercase()).collect();
-            doc.name_terms = doc
-                .names
-                .iter()
-                .flat_map(|name| tokenize(name).into_iter().map(|t| t.term))
-                .collect();
-            let mut tf: HashMap<String, [u16; 6]> = HashMap::new();
-            let mut add = |field: Field, text: &str, doc: &mut Doc| {
-                for t in tokenize(text) {
-                    doc.len[field.idx()] += 1;
-                    let e = tf.entry(t.term).or_default();
-                    e[field.idx()] = e[field.idx()].saturating_add(1);
-                }
-            };
-            for (field, text) in &r.fields {
-                add(*field, text, &mut doc);
-            }
+        let indexed_bytes: usize = records.iter().map(IndexDocument::indexed_bytes).sum();
+        let workers = index_worker_count(records.len(), indexed_bytes, worker_limit);
+        let shards = if workers > 1 {
+            let ranges = index_shard_ranges(records, workers, indexed_bytes);
+            std::thread::scope(|scope| {
+                ranges
+                    .into_iter()
+                    .map(|range| scope.spawn(move || build_index_shard(records, range)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|worker| worker.join().expect("search index worker panicked"))
+                    .collect()
+            })
+        } else {
+            vec![build_index_shard(records, 0..records.len())]
+        };
+
+        let mut shards = shards.into_iter();
+        let first = shards.next().expect("at least one search index shard");
+        debug_assert_eq!(first.start, 0);
+        let mut docs = first.docs;
+        docs.reserve(records.len().saturating_sub(docs.len()));
+        let mut postings = first.postings;
+        let mut totals = first.totals;
+        for mut shard in shards {
+            debug_assert_eq!(shard.start, docs.len());
+            docs.append(&mut shard.docs);
             for f in Field::ALL {
-                totals[f.idx()] += doc.len[f.idx()] as u64;
+                totals[f.idx()] += shard.totals[f.idx()];
             }
-            for (term, counts) in tf {
-                postings.entry(term).or_default().push(Posting {
-                    doc: doc_id,
-                    tf: counts,
-                });
+            for (term, mut values) in shard.postings {
+                match postings.entry(term) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().append(&mut values);
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(values);
+                    }
+                }
             }
-            docs.push(doc);
         }
         let n = records.len().max(1) as f32;
         let mut avg_len = [0f32; 6];
@@ -1342,6 +1483,313 @@ mod tests {
 
     fn keys(records: &[SkillRecord], hits: &[Hit]) -> Vec<String> {
         hits.iter().map(|h| records[h.index].key.clone()).collect()
+    }
+
+    fn parallel_records(count: usize, body_bytes: usize) -> Vec<SkillRecord> {
+        let line = "printer driver 文件系统 searchable repeated-token\n";
+        (0..count)
+            .map(|i| {
+                let mut body = format!("# Heading {i}\n");
+                while body.len() < body_bytes {
+                    body.push_str(line);
+                }
+                let mut record = rec(
+                    &format!("repos/fixture/skill-{i:04}"),
+                    if i % 3 == 0 {
+                        "Printer utility"
+                    } else {
+                        "General utility"
+                    },
+                    &body,
+                    if i % 2 == 0 {
+                        &["tools", "打印"][..]
+                    } else {
+                        &["misc"][..]
+                    },
+                );
+                record.name = (i % 7 != 0).then(|| format!("skill-{i:04}"));
+                record.note = (i % 5 == 0).then(|| "printer note 打印机".into());
+                record
+            })
+            .collect()
+    }
+
+    fn assert_same_index(expected: &Index, actual: &Index) {
+        assert_eq!(actual.docs, expected.docs);
+        assert_eq!(actual.postings, expected.postings);
+        assert_eq!(actual.vocab, expected.vocab);
+        assert_eq!(
+            actual.avg_len.map(f32::to_bits),
+            expected.avg_len.map(f32::to_bits)
+        );
+        assert_eq!(
+            actual.weights.map(f32::to_bits),
+            expected.weights.map(f32::to_bits)
+        );
+        for postings in actual.postings.values() {
+            assert!(postings.windows(2).all(|pair| pair[0].doc < pair[1].doc));
+        }
+    }
+
+    fn assert_same_raw_hits(expected: &[RawHit], actual: &[RawHit]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.doc, expected.doc);
+            assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+            assert_eq!(actual.matched_words, expected.matched_words);
+            assert_eq!(actual.fields, expected.fields);
+            assert_eq!(actual.terms, expected.terms);
+        }
+    }
+
+    fn assert_same_hits(expected: &[Hit], actual: &[Hit]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.key, expected.key);
+            assert_eq!(actual.index, expected.index);
+            assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+            assert_eq!(actual.fields, expected.fields);
+            assert_eq!(actual.terms, expected.terms);
+            match (&actual.excerpt, &expected.excerpt) {
+                (Some(actual), Some(expected)) => {
+                    assert_eq!(actual.field, expected.field);
+                    assert_eq!(actual.text, expected.text);
+                    assert_eq!(actual.ranges, expected.ranges);
+                }
+                (None, None) => {}
+                _ => panic!("excerpt mismatch"),
+            }
+        }
+    }
+
+    fn searcher_with_workers(
+        records: &[SkillRecord],
+        config: &SearchConfig,
+        dictionaries: Dictionaries,
+        workers: usize,
+    ) -> Searcher {
+        Searcher {
+            index: Index::build_with_worker_limit(records, &config.weights, workers),
+            indexed_text: records.iter().map(IndexedText::from_record).collect(),
+            len: records.len(),
+            cfg: config.clone(),
+            dict: dictionaries,
+        }
+    }
+
+    #[test]
+    fn parallel_index_is_structurally_and_semantically_identical() {
+        let mut records = parallel_records(37, 12 * 1024);
+        records[1].description = Some(String::new());
+        records[1].body = None;
+        records[2].tags.clear();
+        records[2].note = Some(String::new());
+        let dictionaries = dict("printer\t打印机\ndriver\t驱动\nfilesystem\t文件系统\n");
+        let configs = [
+            SearchConfig::default(),
+            SearchConfig {
+                weights: FieldWeights {
+                    name: 0.0,
+                    tag: 3.5,
+                    description: 0.0,
+                    note: 2.25,
+                    heading: 0.0,
+                    body: 0.5,
+                },
+                ..Default::default()
+            },
+            SearchConfig {
+                weights: FieldWeights {
+                    name: 0.0,
+                    tag: 0.0,
+                    description: 0.0,
+                    note: 0.0,
+                    heading: 0.0,
+                    body: 0.0,
+                },
+                ..Default::default()
+            },
+        ];
+        for config in configs {
+            let serial = Index::build_with_worker_limit(&records, &config.weights, 1);
+            for workers in [4, 8, 16] {
+                let parallel = Index::build_with_worker_limit(&records, &config.weights, workers);
+                assert_same_index(&serial, &parallel);
+                for query in [
+                    "printer",
+                    "print",
+                    "prnter",
+                    "printer driver",
+                    "打印机",
+                    "文件系统",
+                    "filesystem",
+                    "missing term",
+                ] {
+                    assert_same_raw_hits(
+                        &serial.query(query, &config, &dictionaries),
+                        &parallel.query(query, &config, &dictionaries),
+                    );
+                }
+                let mut serial_searcher =
+                    searcher_with_workers(&records, &config, dictionaries.clone(), 1);
+                let mut parallel_searcher =
+                    searcher_with_workers(&records, &config, dictionaries.clone(), workers);
+                for query in [
+                    Query::parse("printer"),
+                    Query::parse("printer tag:tools"),
+                    Query::parse("prnter source:repository"),
+                    Query::parse("打印机"),
+                    Query::parse("filesystem untagged"),
+                ] {
+                    assert_same_hits(
+                        &serial_searcher.search(&records, &query),
+                        &parallel_searcher.search(&records, &query),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shard_ranges_cover_inputs_and_handle_thresholds_and_skew() {
+        let empty: Vec<IndexDocument<'_>> = Vec::new();
+        assert_same_index(
+            &Index::build_documents_with_worker_limit(&empty, &FieldWeights::default(), 1),
+            &Index::build_documents_with_worker_limit(&empty, &FieldWeights::default(), 16),
+        );
+
+        let names: Vec<String> = (0..11).map(|i| format!("doc-{i}")).collect();
+        let bodies: Vec<String> = (0..11)
+            .map(|i| {
+                if i == 3 {
+                    "巨大文档".repeat(30_000)
+                } else {
+                    format!("small-{i}")
+                }
+            })
+            .collect();
+        let documents: Vec<_> = names
+            .iter()
+            .zip(&bodies)
+            .map(|(name, body)| IndexDocument {
+                names: vec![name],
+                fields: vec![(Field::Name, name), (Field::Body, body)],
+            })
+            .collect();
+        let total: usize = documents.iter().map(IndexDocument::indexed_bytes).sum();
+        let ranges = index_shard_ranges(&documents, 8, total);
+        assert_eq!(ranges.len(), 8);
+        assert_eq!(ranges.first().unwrap().start, 0);
+        assert_eq!(ranges.last().unwrap().end, documents.len());
+        assert!(ranges.iter().all(|range| !range.is_empty()));
+        assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+        assert!(ranges.iter().any(|range| range.clone().contains(&3)));
+
+        let serial =
+            Index::build_documents_with_worker_limit(&documents, &FieldWeights::default(), 1);
+        for workers in [4, 8, 16] {
+            assert_same_index(
+                &serial,
+                &Index::build_documents_with_worker_limit(
+                    &documents,
+                    &FieldWeights::default(),
+                    workers,
+                ),
+            );
+        }
+
+        let tiny = &documents[..4];
+        assert!(tiny.iter().map(IndexDocument::indexed_bytes).sum::<usize>() > 256 * 1024);
+        assert_same_index(
+            &Index::build_documents_with_worker_limit(tiny, &FieldWeights::default(), 1),
+            &Index::build_documents_with_worker_limit(tiny, &FieldWeights::default(), usize::MAX),
+        );
+        assert_same_index(
+            &Index::build_documents_with_worker_limit(&documents[..1], &FieldWeights::default(), 1),
+            &Index::build_documents_with_worker_limit(
+                &documents[..1],
+                &FieldWeights::default(),
+                usize::MAX,
+            ),
+        );
+
+        assert_eq!(index_worker_count(1, usize::MAX, usize::MAX), 1);
+        assert_eq!(
+            index_worker_count(8, MIN_PARALLEL_INDEX_BYTES - 1, usize::MAX),
+            1
+        );
+        assert_eq!(index_worker_count(8, MIN_PARALLEL_INDEX_BYTES, 16), 8);
+        assert_eq!(index_worker_count(8, usize::MAX, 1), 1);
+        assert_eq!(index_worker_count(8, usize::MAX, usize::MAX), 8);
+    }
+
+    #[test]
+    fn parallel_index_preserves_saturated_term_frequency() {
+        let mut records = parallel_records(8, 32 * 1024);
+        records[4].body = Some("saturated ".repeat(usize::from(u16::MAX) + 100));
+        let serial = Index::build_with_worker_limit(&records, &FieldWeights::default(), 1);
+        let parallel = Index::build_with_worker_limit(&records, &FieldWeights::default(), 8);
+        assert_same_index(&serial, &parallel);
+        let posting = parallel
+            .postings
+            .get("saturated")
+            .unwrap()
+            .iter()
+            .find(|posting| posting.doc == 4)
+            .unwrap();
+        assert_eq!(posting.tf[Field::Body.idx()], u16::MAX);
+    }
+
+    #[test]
+    #[ignore = "release-mode search index benchmark; run with --ignored --nocapture"]
+    fn representative_search_index_latency() {
+        let count = std::env::var("SKILLS_SEARCH_BENCH_COUNT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(747);
+        let runs = std::env::var("SKILLS_SEARCH_BENCH_RUNS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(7);
+        let worker_limits: Vec<usize> = std::env::var("SKILLS_SEARCH_BENCH_WORKERS")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|worker| worker.parse().expect("worker count is an integer"))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![1, 4, 8, 16]);
+        let records = parallel_records(count, 13 * 1024);
+        let bytes: usize = records
+            .iter()
+            .map(|record| {
+                record.key.len()
+                    + record.name.as_ref().map_or(0, String::len)
+                    + record.description.as_ref().map_or(0, String::len)
+                    + record.note.as_ref().map_or(0, String::len)
+                    + record.body.as_ref().map_or(0, String::len)
+                    + record.tags.iter().map(String::len).sum::<usize>()
+            })
+            .sum();
+        for workers in worker_limits {
+            let mut samples = Vec::with_capacity(runs);
+            for _ in 0..runs {
+                let start = std::time::Instant::now();
+                let index = Index::build_with_worker_limit(
+                    std::hint::black_box(&records),
+                    &FieldWeights::default(),
+                    workers,
+                );
+                std::hint::black_box(index.vocab.len());
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "SEARCH_INDEX workers={workers} records={count} bytes={bytes} median_ms={:.3} samples_ms={samples:?}",
+                samples[samples.len() / 2]
+            );
+        }
     }
 
     #[test]

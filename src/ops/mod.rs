@@ -144,7 +144,7 @@ pub fn require_existing_keys(ws: &crate::Workspace, keys: &[String]) -> Result<(
     if keys.is_empty() {
         return Ok(());
     }
-    let snap = ws.scan()?;
+    let snap = ws.inventory()?;
     let missing: std::collections::BTreeSet<_> =
         keys.iter().filter(|key| snap.get(key).is_none()).collect();
     if !missing.is_empty() {

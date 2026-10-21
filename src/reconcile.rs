@@ -1,8 +1,12 @@
 //! Read-only reconciliation of the skills root, its metadata and every agent
 //! directory. Scanning never writes anything.
+//! Repository metadata and skill documents use a short-lived ordered pool of
+//! at most 32 workers, each claiming batches of four reads.
+//! Baseline hashes share one bounded pool of at most 32 workers across directory
+//! discovery and file batches; completed hashes are reused only within this scan.
 
 use crate::config::{AgentConfig, Config};
-use crate::hash::hash_directory;
+use crate::hash::{hash_directories, hash_directory};
 use crate::meta::{MetaStore, SkillMeta};
 use crate::skill::SkillDoc;
 use crate::util::{is_symlink, link_target_abs, valid_skill_key};
@@ -25,7 +29,7 @@ impl SkillStatus {
     pub fn health_class(&self) -> Option<HealthClass> {
         match self {
             Self::Repository | Self::Local => None,
-            Self::Modified | Self::Renamed { .. } => Some(HealthClass::Review),
+            Self::Unchecked | Self::Modified | Self::Renamed { .. } => Some(HealthClass::Review),
             _ => Some(HealthClass::Fault),
         }
     }
@@ -56,13 +60,22 @@ impl AgentDirMode {
 pub enum SkillStatus {
     Local,
     Repository,
+    /// Present remote skill whose local content has not been verified, or could
+    /// not be read during verification.
+    Unchecked,
     MissingBaseline,
     Modified,
     MissingSource,
     Missing,
-    Renamed { to: String },
-    Invalid { reason: String },
-    CorruptMeta { error: String },
+    Renamed {
+        to: String,
+    },
+    Invalid {
+        reason: String,
+    },
+    CorruptMeta {
+        error: String,
+    },
 }
 
 impl SkillStatus {
@@ -70,6 +83,7 @@ impl SkillStatus {
         match self {
             SkillStatus::Local => "local",
             SkillStatus::Repository => "repository",
+            SkillStatus::Unchecked => "unchecked",
             SkillStatus::MissingBaseline => "missing-baseline",
             SkillStatus::Modified => "modified",
             SkillStatus::MissingSource => "missing-source",
@@ -82,12 +96,18 @@ impl SkillStatus {
     pub fn is_healthy(&self) -> bool {
         matches!(self, SkillStatus::Local | SkillStatus::Repository)
     }
+    /// Safe to show in ordinary Library browsing even when content verification
+    /// has been deferred. Health still treats `Unchecked` as review work.
+    pub fn is_browsable(&self) -> bool {
+        self.is_healthy() || matches!(self, SkillStatus::Unchecked)
+    }
     /// Skill directory exists with a readable SKILL.md.
     pub fn is_present(&self) -> bool {
         matches!(
             self,
             SkillStatus::Local
                 | SkillStatus::Repository
+                | SkillStatus::Unchecked
                 | SkillStatus::MissingBaseline
                 | SkillStatus::Modified
                 | SkillStatus::MissingSource
@@ -222,6 +242,9 @@ pub struct AgentReport {
     /// Successfully parsed skills; invalid entries remain in `entries` for Health.
     #[serde(skip)]
     pub documents: BTreeMap<String, crate::skill::SkillDoc>,
+    /// Exact entry paths awaiting the best-effort fallback document read.
+    #[serde(skip)]
+    pending_documents: Vec<(String, PathBuf)>,
     /// Canonical target for entries classified as deployed, keyed by entry name.
     #[serde(skip)]
     deployed_targets: BTreeMap<String, PathBuf>,
@@ -268,7 +291,26 @@ impl Snapshot {
 
 /// Scan the root and every agent. Pure read.
 pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
-    scan_inventory(root, config, &mut hash_directory, true, true)
+    scan_inventory(root, config, &mut hash_directory, Verification::All, true)
+}
+
+/// Read Library and deployment inventory without verifying remote baselines or
+/// inferring content-based renames. Shadow copies are still compared freshly.
+pub fn inventory(root: &Path, config: &Config) -> Result<Snapshot> {
+    scan_inventory(root, config, &mut hash_directory, Verification::None, true)
+}
+
+/// Verify only the selected remote skills. Other present remote skills remain
+/// `Unchecked`; content-based rename inference is reserved for a full scan.
+pub fn scan_selected(root: &Path, config: &Config, keys: &[String]) -> Result<Snapshot> {
+    let keys: std::collections::HashSet<&str> = keys.iter().map(String::as_str).collect();
+    scan_inventory(
+        root,
+        config,
+        &mut hash_directory,
+        Verification::Selected(&keys),
+        true,
+    )
 }
 
 /// Refresh deployment reports against an existing library snapshot. Scope browsing
@@ -292,6 +334,7 @@ pub fn rescope(snapshot: &Snapshot, destinations: &[AgentConfig]) -> Result<Snap
             &mut hash_directory,
         )?);
     }
+    load_agent_documents(&mut agents, true);
     for record in records.values_mut() {
         record.deploy.clear();
         for agent in &agents {
@@ -310,28 +353,11 @@ pub fn rescope(snapshot: &Snapshot, destinations: &[AgentConfig]) -> Result<Snap
 }
 
 fn parallel_hashes(paths: &[PathBuf]) -> HashMap<PathBuf, Option<String>> {
-    if paths.is_empty() {
-        return HashMap::new();
-    }
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(4);
-    std::thread::scope(|scope| {
-        let jobs: Vec<_> = paths
-            .chunks(paths.len().div_ceil(workers))
-            .map(|chunk| {
-                scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|path| (path.clone(), hash_directory(path).ok()))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        jobs.into_iter()
-            .flat_map(|job| job.join().expect("hash worker panicked"))
-            .collect()
-    })
+    paths
+        .iter()
+        .cloned()
+        .zip(hash_directories(paths, 32).into_iter().map(Result::ok))
+        .collect()
 }
 
 // Cache only within this scan: a later scan must observe every content change.
@@ -350,7 +376,7 @@ fn cached_hash(
 /// use `scan` for display, health checks and content updates. Shadow comparisons
 /// and actual destination inspection remain fresh, including before mutations.
 pub fn scan_for_links(root: &Path, config: &Config) -> Result<Snapshot> {
-    scan_inventory(root, config, &mut hash_directory, false, false)
+    scan_inventory(root, config, &mut hash_directory, Verification::None, true)
 }
 
 #[cfg(test)]
@@ -359,14 +385,46 @@ fn scan_with_hash(
     config: &Config,
     hash: &mut dyn FnMut(&Path) -> Result<String>,
 ) -> Result<Snapshot> {
-    scan_inventory(root, config, hash, true, false)
+    scan_inventory(root, config, hash, Verification::All, false)
+}
+
+#[derive(Clone, Copy)]
+enum Verification<'a> {
+    None,
+    All,
+    Selected(&'a std::collections::HashSet<&'a str>),
+}
+
+/// Use the directory stream's cached type for ordinary entries. Symlink
+/// directories retain the previous follow-target behavior, and a transient
+/// `file_type` error falls back to the same best-effort path check.
+fn entry_is_dir(entry: &std::fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(file_type) if file_type.is_symlink() => entry.path().is_dir(),
+        Ok(file_type) => file_type.is_dir(),
+        Err(_) => entry.path().is_dir(),
+    }
+}
+
+impl Verification<'_> {
+    fn includes(self, key: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::Selected(keys) => keys.contains(key),
+        }
+    }
+
+    fn is_full(self) -> bool {
+        matches!(self, Self::All)
+    }
 }
 
 fn scan_inventory(
     root: &Path,
     config: &Config,
     hash: &mut dyn FnMut(&Path) -> Result<String>,
-    verify_content: bool,
+    verification: Verification<'_>,
     parallel: bool,
 ) -> Result<Snapshot> {
     let mut hashes = HashMap::new();
@@ -375,7 +433,9 @@ fn scan_inventory(
     let root = crate::paths::resolve_root(Some(root))?;
     let root = root.as_path();
     let store = MetaStore::new(root);
-    let repositories: BTreeMap<_, _> = crate::repository::Repository::list(root)?
+    let metadata = store.inventory(parallel)?;
+    let repositories: BTreeMap<_, _> = metadata
+        .repositories
         .into_iter()
         .map(|repository| (repository.alias.clone(), repository))
         .collect();
@@ -386,7 +446,7 @@ fn scan_inventory(
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !valid_skill_key(&name) || !entry.path().is_dir() {
+        if !valid_skill_key(&name) || !entry_is_dir(&entry) {
             continue;
         }
         if name == "local" && !entry.path().join("SKILL.md").exists() && !is_symlink(&entry.path())
@@ -434,8 +494,7 @@ fn scan_inventory(
                 }
                 for skill in std::fs::read_dir(repo.path())? {
                     let skill = skill?;
-                    if skill.path().is_dir()
-                        && valid_skill_key(&skill.file_name().to_string_lossy())
+                    if entry_is_dir(&skill) && valid_skill_key(&skill.file_name().to_string_lossy())
                     {
                         discovered.push((
                             skill
@@ -454,14 +513,13 @@ fn scan_inventory(
     }
     // Parse every discovered document once. Per-skill aliases into repository
     // storage are deployments, not second skills.
+    let loaded_documents = crate::scan_io::map_ordered(&discovered, parallel, |(_, path)| {
+        SkillDoc::load(path).map_err(|error| error.to_string())
+    });
     let mut documents: HashMap<PathBuf, Result<SkillDoc, String>> = discovered
         .iter()
-        .map(|(_, path)| {
-            (
-                path.clone(),
-                SkillDoc::load(path).map_err(|error| error.to_string()),
-            )
-        })
+        .map(|(_, path)| path.clone())
+        .zip(loaded_documents)
         .collect();
     let aliases: std::collections::BTreeSet<PathBuf> = discovered
         .iter()
@@ -513,8 +571,8 @@ fn scan_inventory(
     }
 
     // 2. Metadata files.
-    for key in store.list_keys()? {
-        match store.load(&key) {
+    for (key, meta) in metadata.skills {
+        match meta {
             Ok(Some(meta)) => {
                 let rec = records.entry(key.clone()).or_insert_with(|| SkillRecord {
                     key: key.clone(),
@@ -639,7 +697,7 @@ fn scan_inventory(
 
     // Collect baseline work once, then share completed hashes with agent/shadow
     // comparisons. Limit concurrency to avoid an unbounded disk/FD fan-out.
-    if verify_content && parallel {
+    if parallel {
         let paths: Vec<_> = records
             .values()
             .filter(|r| {
@@ -648,6 +706,7 @@ fn scan_inventory(
                         .as_ref()
                         .is_some_and(crate::meta::Source::is_remote)
                     && r.baseline_hash.is_some()
+                    && verification.includes(&r.key)
             })
             .map(|r| r.path.clone())
             .collect();
@@ -659,20 +718,20 @@ fn scan_inventory(
                 .as_ref()
                 .is_some_and(crate::meta::Source::is_remote)
     }) {
-        if verify_content && rec.baseline_hash.is_some() {
+        if verification.includes(&rec.key) && rec.baseline_hash.is_some() {
             rec.current_hash = cached_hash(&rec.path, &mut hashes, hash);
         }
         rec.status = match (&rec.current_hash, &rec.baseline_hash) {
             (Some(cur), Some(base)) if cur == base => SkillStatus::Repository,
             (Some(_), Some(_)) => SkillStatus::Modified,
-            _ if rec.baseline_hash.is_some() => SkillStatus::Repository,
+            _ if rec.baseline_hash.is_some() => SkillStatus::Unchecked,
             _ => SkillStatus::MissingBaseline,
         };
     }
 
     // 3. Only hash unidentified directories when a missing baseline needs rename candidates.
     // The candidates still have to be unique in both directions.
-    if verify_content
+    if verification.is_full()
         && records
             .values()
             .any(|r| r.status == SkillStatus::Missing && r.baseline_hash.is_some())
@@ -724,7 +783,7 @@ fn scan_inventory(
     // 4. Agents. Build lookup tables once so each entry and record path is
     // canonicalized at most once during reconciliation.
     let index = ScanIndex::new(&records);
-    let agents = if parallel {
+    let mut agents = if parallel {
         let (agents, agent_hashes) = scan_agents_parallel(root, &config.agents, &index)?;
         hashes.extend(agent_hashes);
         agents
@@ -735,6 +794,7 @@ fn scan_inventory(
         }
         agents
     };
+    load_agent_documents(&mut agents, parallel);
     for rec in records.values_mut() {
         if rec.current_hash.is_none() {
             rec.current_hash = hashes.get(&rec.path).cloned().flatten();
@@ -799,8 +859,7 @@ fn scan_agents_parallel(
     if agents.is_empty() {
         return Ok((Vec::new(), HashMap::new()));
     }
-    // Two workers gave the best network-storage median in the required 2/4/8
-    // benchmark while keeping directory streams and transient file handles bounded.
+    // Limit concurrent Agent scans to bound directory streams and open files.
     let workers = agents.len().min(2);
     let batches = std::thread::scope(|scope| {
         agents
@@ -851,6 +910,7 @@ fn scan_agent(
         mode: AgentDirMode::Missing,
         entries: BTreeMap::new(),
         documents: BTreeMap::new(),
+        pending_documents: Vec::new(),
         deployed_targets: BTreeMap::new(),
     };
     if normalized_dir == root
@@ -954,14 +1014,43 @@ fn scan_agent(
         } else {
             continue;
         };
-        if !report.documents.contains_key(&name)
-            && let Ok(doc) = crate::skill::SkillDoc::load(&p)
-        {
-            report.documents.insert(name.clone(), doc);
+        if !report.documents.contains_key(&name) {
+            report.pending_documents.push((name.clone(), p));
         }
         report.entries.insert(name, state);
     }
     Ok(report)
+}
+
+/// Load only documents that classification could not reuse from the Library.
+/// Work is collected across every agent so one bounded pool serves the scan.
+/// Keep this pool small to limit simultaneous document opens and tail latency.
+fn load_agent_documents(agents: &mut [AgentReport], parallel: bool) {
+    let pending: Vec<_> = agents
+        .iter()
+        .enumerate()
+        .flat_map(|(agent_index, report)| {
+            report
+                .pending_documents
+                .iter()
+                .map(move |(name, path)| (agent_index, name.clone(), path.clone()))
+        })
+        .collect();
+    let documents =
+        crate::scan_io::map_ordered_with_limit(&pending, parallel, 2, |(_, _, path)| {
+            SkillDoc::load(path).ok()
+        });
+    for ((agent_index, name, _), document) in pending.into_iter().zip(documents) {
+        if let Some(document) = document {
+            agents[agent_index]
+                .documents
+                .entry(name)
+                .or_insert(document);
+        }
+    }
+    for report in agents {
+        report.pending_documents.clear();
+    }
 }
 
 /// Resolve the nearest existing ancestor, then append the missing suffix.
@@ -1017,14 +1106,223 @@ mod scan_cost_tests {
     use crate::meta::{Baseline, SkillMeta};
 
     fn skill(root: &Path, key: &str) -> PathBuf {
+        named_skill(root, key, "example", "test", "Body\n")
+    }
+
+    fn named_skill(root: &Path, key: &str, name: &str, description: &str, body: &str) -> PathBuf {
         let path = root.join(key);
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(
             path.join("SKILL.md"),
-            "---\nname: example\ndescription: test\n---\nBody\n",
+            format!("---\nname: {name}\ndescription: {description}\n---\n{body}"),
         )
         .unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pooled_agent_documents_match_serial_and_refresh_on_rescope() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = crate::ops::DownloadDir::new("agent-document-pool").unwrap();
+        let root = tmp.path().join("root");
+        let deployed = named_skill(&root, "one", "example", "central", "Central\n");
+        named_skill(&root, "shadow-source", "shadow", "shadow", "Shadow\n");
+        let external = named_skill(
+            tmp.path(),
+            "external",
+            "foreign",
+            "external one",
+            "External one\n",
+        );
+        let agent = tmp.path().join("agent");
+        named_skill(&agent, "agent-only", "agent-only", "agent", "Agent\n");
+        named_skill(&agent, "shadow", "shadow", "shadow", "Shadow\n");
+        std::fs::create_dir_all(agent.join("invalid")).unwrap();
+        symlink(&deployed, agent.join("example")).unwrap();
+        symlink(&external, agent.join("foreign")).unwrap();
+        symlink(tmp.path().join("missing"), agent.join("broken")).unwrap();
+        let config = Config {
+            agents: vec![AgentConfig {
+                key: "a".into(),
+                name: "A".into(),
+                skills_dir: agent.display().to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let parallel = scan_inventory(
+            &root,
+            &config,
+            &mut hash_directory,
+            Verification::None,
+            true,
+        )
+        .unwrap();
+        let serial = scan_inventory(
+            &root,
+            &config,
+            &mut hash_directory,
+            Verification::None,
+            false,
+        )
+        .unwrap();
+        let signature = |report: &AgentReport| {
+            report
+                .documents
+                .iter()
+                .map(|(name, doc)| {
+                    (
+                        name.clone(),
+                        doc.key.clone(),
+                        doc.path.clone(),
+                        doc.external,
+                        doc.description.clone(),
+                        doc.body.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let parallel_agent = parallel.agent("a").unwrap();
+        let serial_agent = serial.agent("a").unwrap();
+        assert_eq!(parallel_agent.entries, serial_agent.entries);
+        assert_eq!(signature(parallel_agent), signature(serial_agent));
+        assert_eq!(parallel_agent.documents.len(), 4);
+        assert_eq!(parallel_agent.valid_count(|_| true), 4);
+        assert_eq!(parallel_agent.entries["example"], EntryState::Deployed);
+        assert!(matches!(
+            parallel_agent.entries.get("foreign"),
+            Some(EntryState::Foreign { .. })
+        ));
+        assert_eq!(
+            parallel_agent.entries["shadow"],
+            EntryState::Shadow { same_content: true }
+        );
+        assert_eq!(parallel_agent.entries["agent-only"], EntryState::AgentOnly);
+        assert!(matches!(
+            parallel_agent.entries.get("broken"),
+            Some(EntryState::Broken { .. })
+        ));
+        assert!(!parallel_agent.documents.contains_key("broken"));
+        assert!(!parallel_agent.documents.contains_key("invalid"));
+        for (name, external) in [
+            ("example", true),
+            ("foreign", true),
+            ("shadow", false),
+            ("agent-only", false),
+        ] {
+            let document = &parallel_agent.documents[name];
+            assert_eq!(document.key, name);
+            assert_eq!(document.path, agent.join(name));
+            assert_eq!(document.external, external);
+        }
+
+        named_skill(
+            tmp.path(),
+            "external",
+            "foreign",
+            "external two",
+            "External two\n",
+        );
+        std::fs::remove_file(deployed.join("SKILL.md")).unwrap();
+        let rescoped = rescope(&parallel, &config.agents).unwrap();
+        let refreshed = &rescoped.agent("a").unwrap().documents["foreign"];
+        assert_eq!(refreshed.description, "external two");
+        assert_eq!(refreshed.body, "External two\n");
+        assert_eq!(
+            rescoped.agent("a").unwrap().documents["example"].description,
+            "central"
+        );
+    }
+
+    #[test]
+    fn pooled_agent_documents_keep_first_successful_candidate_and_cached_document() {
+        let tmp = crate::ops::DownloadDir::new("agent-document-collisions").unwrap();
+        let first = named_skill(tmp.path(), "first/same", "first", "first", "First\n");
+        let second = named_skill(tmp.path(), "second/same", "second", "second", "Second\n");
+        let invalid = tmp.path().join("invalid/same");
+        std::fs::create_dir_all(&invalid).unwrap();
+        let cached_path = named_skill(tmp.path(), "cached/same", "cached", "cached", "Cached\n");
+        let fallback = named_skill(
+            tmp.path(),
+            "fallback/same",
+            "fallback",
+            "fallback",
+            "Fallback\n",
+        );
+
+        let report = |key: &str, pending_documents, documents| AgentReport {
+            key: key.into(),
+            name: key.into(),
+            skills_dir: tmp.path().join(key),
+            mode: AgentDirMode::Real,
+            entries: BTreeMap::new(),
+            documents,
+            pending_documents,
+            deployed_targets: BTreeMap::new(),
+        };
+        let mut cached_documents = BTreeMap::new();
+        cached_documents.insert("same".into(), SkillDoc::load(&cached_path).unwrap());
+        let mut agents = vec![
+            report(
+                "first-success",
+                vec![
+                    ("same".into(), first.clone()),
+                    ("same".into(), second.clone()),
+                ],
+                BTreeMap::new(),
+            ),
+            report(
+                "later-success",
+                vec![("same".into(), invalid), ("same".into(), second.clone())],
+                BTreeMap::new(),
+            ),
+            report("cached", vec![("same".into(), fallback)], cached_documents),
+        ];
+
+        load_agent_documents(&mut agents, true);
+
+        assert_eq!(agents[0].documents["same"].path, first);
+        assert_eq!(agents[0].documents["same"].description, "first");
+        assert_eq!(agents[1].documents["same"].path, second);
+        assert_eq!(agents[1].documents["same"].description, "second");
+        assert_eq!(agents[2].documents["same"].path, cached_path);
+        assert_eq!(agents[2].documents["same"].description, "cached");
+        assert!(
+            agents
+                .iter()
+                .all(|report| report.pending_documents.is_empty())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_directory_entry_types_preserve_symlink_discovery() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = crate::ops::DownloadDir::new("scan-entry-file-types").unwrap();
+        let root = tmp.path().join("root");
+        skill(&root, "repos/demo/real");
+        let external_skill = skill(tmp.path(), "external-skill");
+        symlink(&external_skill, root.join("flat-link")).unwrap();
+        symlink(&external_skill, root.join("repos/demo/linked")).unwrap();
+        std::fs::write(root.join("ordinary-file"), "ignored").unwrap();
+
+        let external_repository = tmp.path().join("external-repository");
+        skill(&external_repository, "hidden");
+        symlink(&external_repository, root.join("repos/repository-link")).unwrap();
+
+        let config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+        let snapshot = inventory(&root, &config).unwrap();
+        assert!(snapshot.get("flat-link").is_some());
+        assert!(snapshot.get("repos/demo/real").is_some());
+        assert!(snapshot.get("repos/demo/linked").is_some());
+        assert!(snapshot.get("ordinary-file").is_none());
+        assert!(snapshot.get("repos/repository-link/hidden").is_none());
     }
 
     #[test]
@@ -1141,7 +1439,7 @@ mod scan_cost_tests {
             &root,
             &config,
             &mut |_| panic!("link planning must not hash unrelated baselines"),
-            false,
+            Verification::None,
             false,
         )
         .unwrap();
@@ -1183,14 +1481,19 @@ mod scan_cost_tests {
     fn parallel_scan_matches_serial_health_and_observes_later_content_changes() {
         let tmp = crate::ops::DownloadDir::new("parallel-scan").unwrap();
         let root = tmp.path();
-        for i in 0..12 {
-            let key = format!("skill-{i}");
+        for i in 0..40 {
+            let key = format!("repos/demo/skill-{i}");
             let path = skill(root, &key);
             std::fs::write(path.join("unique"), key.as_bytes()).unwrap();
             MetaStore::new(root)
                 .save(
                     &key,
                     &SkillMeta {
+                        source: Some(crate::meta::Source::Archive {
+                            url: "https://example.com/demo.tar.gz".into(),
+                            subpath: Some(format!("skill-{i}")),
+                            revision: Some("sha256:archive-version".into()),
+                        }),
                         baseline: Some(Baseline {
                             hash: hash_directory(&path).unwrap(),
                             hash_algo: crate::hash::HASH_ALGO,
@@ -1200,22 +1503,194 @@ mod scan_cost_tests {
                 )
                 .unwrap();
         }
-        std::fs::rename(root.join("skill-0"), root.join("moved")).unwrap();
-        std::fs::remove_dir_all(root.join("skill-1")).unwrap();
+        std::fs::rename(
+            root.join("repos/demo/skill-0"),
+            root.join("repos/demo/moved"),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(root.join("repos/demo/skill-1")).unwrap();
         let config = Config {
             agents: vec![],
             ..Default::default()
         };
         for body in ["edit one", "edit two, different bytes"] {
-            std::fs::write(root.join("skill-2/unique"), body).unwrap();
+            std::fs::write(root.join("repos/demo/skill-2/unique"), body).unwrap();
             let parallel = scan(root, &config).unwrap();
             let serial = scan_with_hash(root, &config, &mut hash_directory).unwrap();
             assert_eq!(
                 serde_json::to_value(&parallel).unwrap(),
                 serde_json::to_value(&serial).unwrap()
             );
-            assert_eq!(parallel.get("skill-2").unwrap().status, SkillStatus::Local);
+            assert_eq!(
+                parallel.get("repos/demo/skill-2").unwrap().status,
+                SkillStatus::Modified
+            );
         }
+    }
+
+    #[test]
+    fn inventory_defers_baselines_until_full_verification() {
+        let tmp = crate::ops::DownloadDir::new("deferred-baselines").unwrap();
+        let root = tmp.path();
+        let clean = skill(root, "repos/demo/clean");
+        let changed = skill(root, "repos/demo/changed");
+        for (key, path) in [
+            ("repos/demo/clean", &clean),
+            ("repos/demo/changed", &changed),
+        ] {
+            MetaStore::new(root)
+                .save(
+                    key,
+                    &SkillMeta {
+                        source: Some(crate::meta::Source::Archive {
+                            url: "https://example.com/demo.tar.gz".into(),
+                            subpath: Some(key.into()),
+                            revision: Some("v1".into()),
+                        }),
+                        baseline: Some(Baseline {
+                            hash: hash_directory(path).unwrap(),
+                            hash_algo: crate::hash::HASH_ALGO,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        std::fs::write(changed.join("edit"), b"changed").unwrap();
+        let config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+
+        let inventory = scan_inventory(
+            root,
+            &config,
+            &mut |path| panic!("inventory hashed baseline {}", path.display()),
+            Verification::None,
+            false,
+        )
+        .unwrap();
+        for key in ["repos/demo/clean", "repos/demo/changed"] {
+            let record = inventory.get(key).unwrap();
+            assert_eq!(record.status, SkillStatus::Unchecked);
+            assert!(record.current_hash.is_none());
+            assert!(record.status.is_browsable());
+            assert!(!record.status.is_healthy());
+        }
+
+        let verified = scan(root, &config).unwrap();
+        assert_eq!(
+            verified.get("repos/demo/clean").unwrap().status,
+            SkillStatus::Repository
+        );
+        assert_eq!(
+            verified.get("repos/demo/changed").unwrap().status,
+            SkillStatus::Modified
+        );
+        std::fs::remove_file(changed.join("edit")).unwrap();
+        assert_eq!(
+            scan(root, &config)
+                .unwrap()
+                .get("repos/demo/changed")
+                .unwrap()
+                .status,
+            SkillStatus::Repository
+        );
+    }
+
+    #[test]
+    fn selected_scan_hashes_only_the_requested_remote_skill() {
+        let tmp = crate::ops::DownloadDir::new("selected-baseline").unwrap();
+        let root = tmp.path();
+        for key in ["repos/demo/one", "repos/demo/two"] {
+            let path = skill(root, key);
+            MetaStore::new(root)
+                .save(
+                    key,
+                    &SkillMeta {
+                        source: Some(crate::meta::Source::Archive {
+                            url: "https://example.com/demo.tar.gz".into(),
+                            subpath: Some(key.into()),
+                            revision: Some("v1".into()),
+                        }),
+                        baseline: Some(Baseline {
+                            hash: hash_directory(&path).unwrap(),
+                            hash_algo: crate::hash::HASH_ALGO,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+        let selected = std::collections::HashSet::from(["repos/demo/two"]);
+        let mut hashed = Vec::new();
+        let snapshot = scan_inventory(
+            root,
+            &config,
+            &mut |path| {
+                hashed.push(path.to_path_buf());
+                hash_directory(path)
+            },
+            Verification::Selected(&selected),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            hashed,
+            vec![root.join("repos/demo/two").canonicalize().unwrap()]
+        );
+        assert_eq!(
+            snapshot.get("repos/demo/one").unwrap().status,
+            SkillStatus::Unchecked
+        );
+        assert_eq!(
+            snapshot.get("repos/demo/two").unwrap().status,
+            SkillStatus::Repository
+        );
+    }
+
+    #[test]
+    fn failed_content_hash_is_unchecked_instead_of_repository() {
+        let tmp = crate::ops::DownloadDir::new("failed-baseline-hash").unwrap();
+        let root = tmp.path();
+        let key = "repos/demo/one";
+        let path = skill(root, key);
+        MetaStore::new(root)
+            .save(
+                key,
+                &SkillMeta {
+                    source: Some(crate::meta::Source::Archive {
+                        url: "https://example.com/demo.tar.gz".into(),
+                        subpath: Some("one".into()),
+                        revision: Some("v1".into()),
+                    }),
+                    baseline: Some(Baseline {
+                        hash: hash_directory(&path).unwrap(),
+                        hash_algo: crate::hash::HASH_ALGO,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let config = Config {
+            agents: vec![],
+            ..Default::default()
+        };
+        let snapshot = scan_inventory(
+            root,
+            &config,
+            &mut |_| anyhow::bail!("injected read failure"),
+            Verification::All,
+            false,
+        )
+        .unwrap();
+        let record = snapshot.get(key).unwrap();
+        assert_eq!(record.status, SkillStatus::Unchecked);
+        assert!(record.current_hash.is_none());
     }
 
     #[test]

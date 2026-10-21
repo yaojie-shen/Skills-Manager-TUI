@@ -1,4 +1,8 @@
 //! Installed sources with an embedded, shared Library skill panel.
+//!
+//! Snapshot invalidation is cheap: the app refreshes this view only while it
+//! is visible or when it is next entered, so the embedded search index stays
+//! out of the startup path.
 use super::search::{SearchView, SkillPanelOptions};
 use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
@@ -53,6 +57,29 @@ pub struct ReposView {
 }
 
 impl ReposView {
+    /// Drop results tied to a concrete snapshot without rebuilding the view.
+    ///
+    /// A late inventory worker must not publish classifications computed for
+    /// the previous snapshot while this view is hidden and waiting to refresh.
+    pub fn invalidate_snapshot(&mut self) {
+        self.inventories.clear();
+        self.inventory_errors.clear();
+        self.refreshing.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panel_initialized(&self) -> bool {
+        self.skill_search.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panel_keys(&self, ctx: &Ctx) -> Vec<String> {
+        self.skill_search
+            .as_ref()
+            .map(|view| view.panel_keys(ctx))
+            .unwrap_or_default()
+    }
+
     pub fn batch_finished(&mut self, failed: &[String]) {
         if let Some(view) = self.skill_search.as_mut() {
             view.batch_finished(failed);
@@ -496,17 +523,10 @@ impl View for ReposView {
                     Err(error) => vec![Action::Error(format!("discover {alias}: {error:#}"))],
                 },
                 Command::Remove => {
-                    match skills::ops::edit::RepositoryRemoveSummary::from_snapshot(ctx.snap, alias)
-                    {
-                        Ok(summary) => vec![Action::OpenModal(Box::new(Modal::remove_source(
-                            alias,
-                            &project.name,
-                            &summary,
-                        )))],
-                        Err(error) => {
-                            vec![Action::Error(format!("remove source {alias}: {error:#}"))]
-                        }
-                    }
+                    vec![Action::Spawn(Task::ReviewRepositoryRemoval {
+                        alias: alias.clone(),
+                        name: project.name.clone(),
+                    })]
                 }
                 _ => vec![Action::Error(
                     "Action is no longer available; reopen the actions menu".into(),
@@ -535,9 +555,7 @@ impl View for ReposView {
         // Inventory is computed against one concrete Library snapshot. Any new
         // snapshot can change local hashes, installed paths, or source records,
         // so never present the old comparison as current.
-        self.inventories.clear();
-        self.inventory_errors.clear();
-        self.refreshing.clear();
+        self.invalidate_snapshot();
         let mut groups = std::collections::BTreeMap::<Option<String>, Project>::new();
         for repo in ctx.snap.repositories.values() {
             let kind = match repo.kind {
@@ -940,6 +958,12 @@ mod tests {
     #[test]
     fn source_remove_is_enabled_with_installed_skills_and_opens_confirmation() {
         let tmp = skills::ops::DownloadDir::new("repos-source-remove").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
         let ws = Workspace::open(tmp.path()).unwrap();
         let repository = Repository {
             alias: "demo".into(),
@@ -985,7 +1009,8 @@ mod tests {
         assert!(matches!(
             view.context_execute(&request.target, Command::Remove, &ctx)
                 .as_slice(),
-            [Action::OpenModal(_)]
+            [Action::Spawn(Task::ReviewRepositoryRemoval { alias, name })]
+                if alias == "demo" && name == "Demo skills"
         ));
     }
 

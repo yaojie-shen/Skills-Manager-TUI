@@ -945,7 +945,7 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 fn cmd_show(ctx: &Ctx, key: &str) -> Result<()> {
-    let snap = ctx.ws.scan()?;
+    let snap = ctx.ws.scan_selected(&[key.to_string()])?;
     let r = snap
         .get(key)
         .with_context(|| format!("no such skill: {key}"))?;
