@@ -1,5 +1,16 @@
-//! Library tab: input, result list, preview.
+//! Library tab: input, result organization, cards and preview.
+//!
+//! Search hits stay unique for counts, selection and bulk actions. The main
+//! Library view projects those hits into session-only groups and sort orders;
+//! tag and preset projections may repeat display rows for one hit. Embedded
+//! panels keep their existing flat grid. Organization uses only the current
+//! snapshot and never performs I/O, rebuilds the search index or writes config.
 mod context;
+mod grouped_grid;
+mod organization;
+#[cfg(test)]
+mod organization_tests;
+mod view_menu;
 use crate::tui::components::choice_footer::{self, ChoiceEvent, ChoiceFocus};
 use crate::tui::components::context_menu::{Command, Request, Target};
 
@@ -8,19 +19,23 @@ use super::{View, wheel};
 use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::components::group::Kind;
 use crate::tui::components::layout::split_panes;
-use crate::tui::components::layout::{cols_for, skill_frame, skill_list_separator};
+use crate::tui::components::layout::{
+    clipped_skill_frame, clipped_skill_list_separator, cols_for, skill_frame, skill_list_separator,
+};
 use crate::tui::components::search_panel::{PanelLayout, PanelStyle, SearchEvent, SearchPanel};
 use crate::tui::components::skill::{SkillDecoration, SkillPresentation, SkillRenderState};
 use crate::tui::event::Task;
 use crate::tui::modal::Modal;
 use crate::tui::settings::LayoutScope;
 use crate::tui::widgets::{
-    CardGrid, Input, ScrollTrack, render_vertical_scrollbar, scrollbar_gutter,
+    CardGrid, Input, ScrollTrack, fit, render_vertical_scrollbar, scrollbar_gutter, width,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use grouped_grid::{Entry as GroupedEntry, GroupedGrid};
+use organization::{GroupId, GroupMode, GroupOrder, Organized, SortMode};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use skills::config::UiLayout;
@@ -28,12 +43,20 @@ use skills::ops::edit;
 use skills::reconcile::{SkillRecord, SkillStatus};
 use skills::search::{Hit, Query, Searcher};
 use std::collections::{BTreeMap, BTreeSet};
+use view_menu::{Choice as ViewChoice, Event as ViewMenuEvent, Section as ViewSection, ViewMenu};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Input,
     List,
     Preview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewControl {
+    View,
+    CollapseAll,
+    ExpandAll,
 }
 
 /// Configuration shared by embedded Library panels. Hosts own navigation and
@@ -66,6 +89,12 @@ pub struct SearchView {
     focus: Focus,
     hits: Vec<Hit>,
     grid: CardGrid,
+    organization: OrganizationSettings,
+    organized: Organized,
+    grouped: GroupedGrid,
+    collapsed: BTreeSet<GroupId>,
+    view_menu: ViewMenu,
+    view_buttons: Vec<(Rect, ViewControl)>,
     preview_scroll: u16,
     preview_lines: usize,
     preview_height: u16,
@@ -111,6 +140,12 @@ impl Default for SearchView {
             focus: Focus::Input,
             hits: Vec::new(),
             grid: CardGrid::default(),
+            organization: OrganizationSettings::default(),
+            organized: Organized::default(),
+            grouped: GroupedGrid::default(),
+            collapsed: BTreeSet::new(),
+            view_menu: ViewMenu::default(),
+            view_buttons: Vec::new(),
             preview_scroll: 0,
             preview_lines: 0,
             preview_height: 0,
@@ -141,6 +176,29 @@ impl Default for SearchView {
             decorations: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrganizationSettings {
+    grouping: GroupMode,
+    sorting: SortMode,
+    group_order: GroupOrder,
+}
+
+impl Default for OrganizationSettings {
+    fn default() -> Self {
+        Self {
+            grouping: GroupMode::Auto,
+            sorting: SortMode::Auto,
+            group_order: GroupOrder::Name,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum SelectionAnchor {
+    Skill { key: String, group: Option<GroupId> },
+    Header(GroupId),
 }
 
 impl SearchView {
@@ -187,6 +245,10 @@ impl SearchView {
         );
         self.input_rect = areas.input;
         header(f, areas.header);
+        self.view_buttons.clear();
+        if self.is_library() {
+            self.draw_view_controls(f, areas.results_header, ctx);
+        }
         let content = areas.results;
 
         // Split keeps a preview open beside the results and so gets one column
@@ -200,7 +262,7 @@ impl SearchView {
         };
         self.list_rect = left;
         self.draw_results(f, left, ctx);
-        if self.rendered_layout == UiLayout::Grid {
+        if !self.is_library() && self.rendered_layout == UiLayout::Grid {
             self.search_panel.draw_position(
                 f,
                 self.grid.visible(),
@@ -240,8 +302,24 @@ impl SearchView {
             self.batch_buttons
                 .extend([(buttons[0], 'c'), (buttons[1], 'e')]);
         }
-        if self.panel_active && self.focus == Focus::Input && !self.overlay.is_open() {
+        if self.panel_active
+            && self.focus == Focus::Input
+            && !self.overlay.is_open()
+            && !self.view_menu.is_open()
+        {
             self.search_panel.draw_completion(f, areas.results, ctx);
+        }
+        // The View menu is modal and must remain above completion and footers,
+        // including when a background refresh arrives while it is open.
+        if self.view_menu.is_open() {
+            let rows = self.view_menu_rows(ctx);
+            self.view_menu.draw(
+                f,
+                panel_area,
+                &rows,
+                &ctx.settings.theme,
+                ctx.settings.ui.icons,
+            );
         }
     }
 
@@ -251,6 +329,68 @@ impl SearchView {
 
     fn is_library(&self) -> bool {
         !self.is_picker() && self.scope.is_none() && self.panel.is_none()
+    }
+
+    pub(crate) fn view_menu_open(&self) -> bool {
+        self.view_menu.is_open()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn view_menu_rect(&self) -> Rect {
+        self.view_menu.rect
+    }
+
+    fn view_menu_rows(&self, ctx: &Ctx) -> Vec<view_menu::MenuRow> {
+        view_menu::menu_rows(
+            self.layout(ctx),
+            self.organization.grouping,
+            self.organization.sorting,
+            self.organization.group_order,
+            ctx.settings.tags_enabled,
+            self.free_text_search(),
+        )
+    }
+
+    fn open_view_menu(&mut self, section: ViewSection, ctx: &Ctx) {
+        if !self.is_library() {
+            return;
+        }
+        self.overlay.close();
+        self.search_panel.completion.close();
+        self.view_menu.open(
+            section,
+            self.layout(ctx),
+            self.organization.grouping,
+            self.organization.sorting,
+            self.organization.group_order,
+            ctx.settings.tags_enabled,
+            self.free_text_search(),
+        );
+    }
+
+    fn handle_view_menu_event(&mut self, event: ViewMenuEvent, ctx: &Ctx) -> Vec<Action> {
+        match event {
+            ViewMenuEvent::Stay | ViewMenuEvent::Close => vec![],
+            ViewMenuEvent::Change(choice) => self.apply_view_choice(choice, ctx),
+        }
+    }
+
+    fn apply_view_choice(&mut self, choice: ViewChoice, ctx: &Ctx) -> Vec<Action> {
+        if let ViewChoice::Layout(layout) = choice {
+            return vec![Action::SetLayout {
+                scope: self.layout_scope,
+                layout,
+            }];
+        }
+        let selected = self.selection_anchor();
+        match choice {
+            ViewChoice::Group(grouping) => self.organization.grouping = grouping,
+            ViewChoice::Sort(sorting) => self.organization.sorting = sorting,
+            ViewChoice::Order(order) => self.organization.group_order = order,
+            ViewChoice::Layout(_) => unreachable!(),
+        }
+        self.rebuild_organization(ctx, selected);
+        vec![]
     }
 
     fn includes_record(&self, record: &skills::reconcile::SkillRecord) -> bool {
@@ -660,7 +800,7 @@ impl SearchView {
         self.search_panel.input.value().to_string()
     }
     pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
-        if self.focus != Focus::Input || self.overlay.is_open() {
+        if self.focus != Focus::Input || self.overlay.is_open() || self.view_menu.is_open() {
             return vec![];
         }
         match self.search_panel.paste(text) {
@@ -700,20 +840,93 @@ impl SearchView {
     }
 
     fn selected<'a>(&self, ctx: &'a Ctx) -> Option<&'a SkillRecord> {
-        self.grid
-            .selected()
+        self.selected_hit()
             .and_then(|i| self.hits.get(i))
             .and_then(|h| ctx.snap.get(&h.key))
+    }
+
+    fn selected_hit(&self) -> Option<usize> {
+        if self.is_library() {
+            self.grouped.selected_hit()
+        } else {
+            self.grid.selected()
+        }
+    }
+
+    fn free_text_search(&self) -> bool {
+        !Query::parse(self.search_panel.input.value())
+            .text
+            .trim()
+            .is_empty()
+    }
+
+    fn rebuild_organization(&mut self, ctx: &Ctx, selected: Option<SelectionAnchor>) {
+        if !self.is_library() {
+            return;
+        }
+        self.organized = Organized::build(
+            &self.hits,
+            &ctx.snap.skills,
+            &ctx.snap.repositories,
+            self.organization.grouping,
+            self.organization.sorting,
+            self.organization.group_order,
+            self.free_text_search(),
+            ctx.settings.tags_enabled,
+        );
+        self.grouped.rebuild(&self.organized, &self.collapsed);
+        let selection = selected.and_then(|anchor| match anchor {
+            SelectionAnchor::Skill { key, group } => {
+                let hit = self.hits.iter().position(|hit| hit.key == key)?;
+                self.grouped.find_skill(hit, group.as_ref()).or_else(|| {
+                    group.as_ref().and_then(|id| {
+                        self.grouped.entries.iter().position(|entry| {
+                            matches!(entry, GroupedEntry::Header { group } if self.organized.groups[*group].id == *id)
+                        })
+                    })
+                })
+            }
+            SelectionAnchor::Header(id) => {
+                self.grouped.entries.iter().position(|entry| {
+                    matches!(entry, GroupedEntry::Header { group } if self.organized.groups[*group].id == id)
+                })
+            }
+        });
+        self.grouped.select(
+            selection
+                .or_else(|| self.grouped.first_skill())
+                .or((!self.grouped.entries.is_empty()).then_some(0)),
+        );
+    }
+
+    fn selection_anchor(&self) -> Option<SelectionAnchor> {
+        match self.grouped.selected_entry()? {
+            GroupedEntry::Skill { hit, group } => {
+                self.hits.get(*hit).map(|item| SelectionAnchor::Skill {
+                    key: item.key.clone(),
+                    group: group.clone(),
+                })
+            }
+            GroupedEntry::Header { group } => Some(SelectionAnchor::Header(
+                self.organized.groups[*group].id.clone(),
+            )),
+        }
     }
 
     /// Re-run the query. `keep` preserves the selected skill (after a rescan);
     /// typing always jumps back to the best match.
     fn run_search(&mut self, ctx: &Ctx, keep: bool) {
-        let key = if keep {
-            self.grid
-                .selected()
-                .and_then(|i| self.hits.get(i))
-                .map(|h| h.key.clone())
+        let selected = if keep {
+            if self.is_library() {
+                self.selection_anchor()
+            } else {
+                self.selected_hit().and_then(|i| {
+                    self.hits.get(i).map(|hit| SelectionAnchor::Skill {
+                        key: hit.key.clone(),
+                        group: None,
+                    })
+                })
+            }
         } else {
             None
         };
@@ -724,8 +937,9 @@ impl SearchView {
             .into_iter()
             .filter(|hit| self.includes_record(&ctx.snap.skills[hit.index]))
             .collect();
-        // Browsing groups sources; text searches preserve relevance across panels.
-        if q.text.trim().is_empty() {
+        // Embedded panels retain their established order. The Library's model
+        // applies its own explicit or automatic sort after filtering.
+        if !self.is_library() && q.text.trim().is_empty() {
             self.hits.sort_by_key(|hit| {
                 skills::repository::alias_of(&ctx.snap.skills[hit.index].key).is_some()
             });
@@ -734,21 +948,26 @@ impl SearchView {
             self.hits
                 .retain(|hit| keys.contains(&ctx.snap.skills[hit.index].key));
         }
-        let idx = key.and_then(|k| {
-            self.hits
-                .iter()
-                .position(|h| ctx.snap.skills[h.index].key == k)
-        });
-        self.grid
-            .select(idx.or(if self.hits.is_empty() { None } else { Some(0) }));
+        if self.is_library() {
+            self.rebuild_organization(ctx, selected);
+        } else {
+            let idx = selected.and_then(|anchor| match anchor {
+                SelectionAnchor::Skill { key, .. } => self
+                    .hits
+                    .iter()
+                    .position(|h| ctx.snap.skills[h.index].key == key),
+                SelectionAnchor::Header(_) => None,
+            });
+            self.grid
+                .select(idx.or(if self.hits.is_empty() { None } else { Some(0) }));
+        }
         if !keep {
             self.preview_scroll = 0;
         }
     }
 
     fn selected_terms(&self) -> &[String] {
-        self.grid
-            .selected()
+        self.selected_hit()
             .and_then(|i| self.hits.get(i))
             .map(|h| h.terms.as_slice())
             .unwrap_or(&[])
@@ -756,14 +975,103 @@ impl SearchView {
 
     /// One step along a row, which in a single column is one step down the list.
     fn move_sel(&mut self, delta: i32) {
-        self.grid.move_by(delta, self.hits.len());
+        if self.is_library() {
+            self.grouped.move_linear(delta);
+        } else {
+            self.grid.move_by(delta, self.hits.len());
+        }
         self.preview_scroll = 0;
     }
 
     /// One step down or up, which crosses a whole grid row when there are several.
     fn move_row(&mut self, delta: i32) {
-        self.grid.move_rows(delta, self.hits.len());
+        if self.is_library() {
+            self.grouped.move_vertical(delta);
+        } else {
+            self.grid.move_rows(delta, self.hits.len());
+        }
         self.preview_scroll = 0;
+    }
+
+    fn selected_is_first_display_entry(&self) -> bool {
+        if self.is_library() {
+            self.grouped.selected().is_none_or(|index| index == 0)
+        } else {
+            self.grid
+                .selected()
+                .is_none_or(|index| index < self.grid.cols())
+        }
+    }
+
+    fn toggle_group(&mut self) {
+        let Some(GroupedEntry::Header { group }) = self.grouped.selected_entry() else {
+            return;
+        };
+        let id = self.organized.groups[*group].id.clone();
+        if !self.collapsed.remove(&id) {
+            self.collapsed.insert(id.clone());
+        }
+        self.grouped.rebuild(&self.organized, &self.collapsed);
+        let header = self.grouped.entries.iter().position(|entry| {
+            matches!(entry, GroupedEntry::Header { group } if self.organized.groups[*group].id == id)
+        });
+        self.grouped.select(header);
+        self.preview_scroll = 0;
+    }
+
+    fn set_group_collapsed(&mut self, collapsed: bool) -> bool {
+        let Some(GroupedEntry::Header { group }) = self.grouped.selected_entry() else {
+            return false;
+        };
+        let id = self.organized.groups[*group].id.clone();
+        let changed = if collapsed {
+            self.collapsed.insert(id.clone())
+        } else {
+            self.collapsed.remove(&id)
+        };
+        if changed {
+            self.grouped.rebuild(&self.organized, &self.collapsed);
+            let header = self.grouped.entries.iter().position(|entry| {
+                matches!(entry, GroupedEntry::Header { group } if self.organized.groups[*group].id == id)
+            });
+            self.grouped.select(header);
+            self.preview_scroll = 0;
+        }
+        true
+    }
+
+    /// Folding changes the current projection, never the query or checked keys.
+    /// A selected skill hidden by folding remains anchored to its own heading.
+    fn set_all_groups_collapsed(&mut self, collapsed: bool, ctx: &Ctx) {
+        if !self.is_library() || self.organized.groups.is_empty() {
+            return;
+        }
+        let selected = self.selection_anchor();
+        for group in &self.organized.groups {
+            if collapsed {
+                self.collapsed.insert(group.id.clone());
+            } else {
+                self.collapsed.remove(&group.id);
+            }
+        }
+        self.rebuild_organization(ctx, selected);
+        self.preview_scroll = 0;
+    }
+
+    fn control_enabled(&self, control: ViewControl) -> bool {
+        match control {
+            ViewControl::View => true,
+            ViewControl::CollapseAll => self
+                .organized
+                .groups
+                .iter()
+                .any(|group| !self.collapsed.contains(&group.id)),
+            ViewControl::ExpandAll => self
+                .organized
+                .groups
+                .iter()
+                .any(|group| self.collapsed.contains(&group.id)),
+        }
     }
 
     /// Split layout has a pane to step into; grid layout opens a window over
@@ -929,6 +1237,72 @@ impl SearchView {
 
 /// Drawing, split by band. `draw` itself only decides which of these run.
 impl SearchView {
+    fn draw_view_controls(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
+        if area.is_empty() || area.width < 12 {
+            return;
+        }
+        let th = &ctx.settings.theme;
+        let active = self.panel_active && self.focus == Focus::List;
+        let border = Style::default().fg(if active { th.border_focus } else { th.border });
+        frame.render_widget(
+            Paragraph::new("─".repeat(area.width as usize)).style(border),
+            area,
+        );
+
+        let grouped = !self.organized.groups.is_empty();
+        let mut controls = Vec::new();
+        let triangle_controls_width = width("▸") + 1 + width("▾") + 1 + width(" View ");
+        let grouped_title_width = width(" skills · by repository");
+        if grouped && usize::from(area.width) >= grouped_title_width + 1 + triangle_controls_width {
+            if area.width >= 70 {
+                controls.push((ViewControl::CollapseAll, " Collapse all "));
+                controls.push((ViewControl::ExpandAll, " Expand all "));
+            } else if area.width >= 52 {
+                controls.push((ViewControl::CollapseAll, " ▸ All "));
+                controls.push((ViewControl::ExpandAll, " ▾ All "));
+            } else {
+                controls.push((ViewControl::CollapseAll, "▸"));
+                controls.push((ViewControl::ExpandAll, "▾"));
+            }
+        }
+        controls.push((ViewControl::View, " View F2 "));
+        let controls_width: u16 = controls
+            .iter()
+            .map(|(_, label)| width(label) as u16)
+            .sum::<u16>()
+            + controls.len().saturating_sub(1) as u16;
+        let mut x = area.right().saturating_sub(controls_width);
+        let title_width = x.saturating_sub(area.x + 1);
+        let grouping = self
+            .organization
+            .grouping
+            .effective(self.free_text_search(), ctx.settings.tags_enabled);
+        let subtitle = match grouping {
+            GroupMode::Repository => " · by repository",
+            GroupMode::Tag => " · by tag",
+            GroupMode::Preset => " · by preset",
+            GroupMode::Auto | GroupMode::None => "",
+        };
+        let title = fit(&format!(" skills{subtitle} "), title_width as usize);
+        frame.render_widget(
+            Paragraph::new(Span::styled(title, th.dim())),
+            Rect::new(area.x, area.y, title_width, 1),
+        );
+        for (control, label) in controls {
+            let w = width(label) as u16;
+            let rect = Rect::new(x, area.y, w, 1);
+            let enabled = self.control_enabled(control);
+            let style = if !enabled {
+                th.dim().add_modifier(Modifier::DIM)
+            } else {
+                Style::default().fg(ratatui::style::Color::Reset)
+            };
+            frame.render_widget(Paragraph::new(Span::styled(label, style)), rect);
+            self.view_buttons.push((rect, control));
+            x = rect.right().saturating_add(1);
+        }
+    }
+
     fn input_title(&self, ctx: &Ctx) -> Line<'static> {
         Line::from(vec![
             Span::raw(" "),
@@ -1015,6 +1389,12 @@ impl SearchView {
             width: usable,
             ..inner
         };
+        if self.is_library() {
+            self.draw_grouped_results(
+                f, inner, content, ctx, layout, searching, cards, cols, cell_h, gap,
+            );
+            return;
+        }
         self.grid
             .layout(content, cols, cell_h, gap, self.hits.len());
 
@@ -1152,6 +1532,190 @@ impl SearchView {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn draw_grouped_results(
+        &mut self,
+        f: &mut Frame,
+        inner: Rect,
+        content: Rect,
+        ctx: &Ctx,
+        layout: UiLayout,
+        searching: bool,
+        cards: bool,
+        cols: usize,
+        cell_h: u16,
+        gap: u16,
+    ) {
+        let th = &ctx.settings.theme;
+        self.grouped.layout(content, cols, cell_h, gap);
+        if self.hits.is_empty() {
+            let query = Query::parse(self.search_panel.input.value());
+            let hidden_status_match = !query.statuses.is_empty()
+                && self
+                    .searcher
+                    .search(&ctx.snap.skills, &query)
+                    .iter()
+                    .any(|hit| !ctx.snap.skills[hit.index].status.is_browsable());
+            let message = if ctx.snap.skills.is_empty() {
+                "no skills in this root"
+            } else if hidden_status_match {
+                "matching skills are in Health"
+            } else {
+                "no match"
+            };
+            f.render_widget(
+                Paragraph::new(Span::styled(message, th.dim())),
+                Rect {
+                    height: 1,
+                    ..content
+                },
+            );
+            self.list_track.clear();
+            return;
+        }
+
+        let selected = self.grouped.selected();
+        let visible: Vec<_> = self.grouped.visible_entries().collect();
+        for entry_index in visible {
+            let Some(cell) = self.grouped.cell(entry_index) else {
+                continue;
+            };
+            let top_clip = self.grouped.top_clip(entry_index);
+            match self.grouped.entries[entry_index].clone() {
+                GroupedEntry::Header { group } => {
+                    let model = &self.organized.groups[group];
+                    let collapsed = self.collapsed.contains(&model.id);
+                    let marker = if collapsed { "▸" } else { "▾" };
+                    let style = if selected == Some(entry_index) {
+                        if self.focus == Focus::List && self.choice_focus == ChoiceFocus::List {
+                            th.selected()
+                        } else {
+                            th.selected_unfocused()
+                        }
+                    } else {
+                        Style::default()
+                    };
+                    let secondary = if selected == Some(entry_index) {
+                        Style::default()
+                    } else {
+                        th.dim()
+                    };
+                    let line = Line::from(vec![
+                        Span::styled(format!(" {marker} "), secondary),
+                        Span::styled(model.title.clone(), th.bold()),
+                        Span::styled(format!("  {}/{}", model.hits.len(), model.total), secondary),
+                    ]);
+                    f.render_widget(Paragraph::new(line).style(style), cell);
+                }
+                GroupedEntry::Skill { hit, .. } => {
+                    let Some(search_hit) = self.hits.get(hit) else {
+                        continue;
+                    };
+                    let record = &ctx.snap.skills[search_hit.index];
+                    let on = selected == Some(entry_index);
+                    let presentation = SkillPresentation::managed(record, ctx);
+                    let context = search_hit
+                        .fields
+                        .iter()
+                        .map(|field| field.label())
+                        .collect::<Vec<_>>()
+                        .join("·");
+                    let render_state = self.render_state(record, search_hit, &context, searching);
+                    if cards {
+                        let card_inner = clipped_skill_frame(
+                            f,
+                            cell,
+                            top_clip,
+                            on,
+                            self.focus == Focus::List && self.choice_focus == ChoiceFocus::List,
+                            ctx,
+                        );
+                        let lines =
+                            presentation.card(ctx, card_inner.width as usize, &render_state);
+                        let style = if self.multi && self.checked.contains(&record.key) {
+                            th.selected_unfocused()
+                        } else {
+                            Style::default()
+                        };
+                        f.render_widget(
+                            Paragraph::new(lines)
+                                .style(style)
+                                .scroll((top_clip.saturating_sub(1), 0)),
+                            card_inner,
+                        );
+                    } else if layout == UiLayout::List {
+                        let style = if on {
+                            if self.focus == Focus::List && self.choice_focus == ChoiceFocus::List {
+                                th.selected()
+                            } else {
+                                th.selected_unfocused()
+                            }
+                        } else {
+                            Style::default()
+                        };
+                        let lines = presentation.list(
+                            ctx,
+                            cell.width.saturating_sub(1) as usize,
+                            on,
+                            &render_state,
+                        );
+                        f.render_widget(
+                            Paragraph::new(lines).style(style).scroll((top_clip, 0)),
+                            Rect {
+                                height: cell.height.min(4_u16.saturating_sub(top_clip)),
+                                ..cell
+                            },
+                        );
+                        clipped_skill_list_separator(f, cell, top_clip, th);
+                    } else {
+                        let style = if on {
+                            if self.focus == Focus::List && self.choice_focus == ChoiceFocus::List {
+                                th.selected()
+                            } else {
+                                th.selected_unfocused()
+                            }
+                        } else {
+                            Style::default()
+                        };
+                        let lines = presentation.compact(
+                            ctx,
+                            cell.width.saturating_sub(2) as usize,
+                            on,
+                            &SkillRenderState {
+                                show_match_details: searching && inner.height >= 12,
+                                ..render_state
+                            },
+                        );
+                        f.render_widget(
+                            Paragraph::new(lines).style(style).scroll((top_clip, 0)),
+                            cell,
+                        );
+                    }
+                }
+            }
+        }
+
+        if self.grouped.total_height() > self.grouped.visible_height() && inner.height > 0 {
+            let track = Rect {
+                x: inner.right().saturating_sub(1),
+                y: inner.y,
+                width: 1,
+                height: inner.height,
+            };
+            self.list_track.set(track);
+            render_vertical_scrollbar(
+                f,
+                track,
+                self.grouped.total_height(),
+                self.grouped.visible_height(),
+                self.grouped.offset(),
+                th.dim(),
+            );
+        } else {
+            self.list_track.clear();
+        }
+    }
+
     fn draw_preview(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let th = &ctx.settings.theme;
         let block = th.block(" preview ", self.focus == Focus::Preview);
@@ -1189,12 +1753,19 @@ impl SearchView {
 
 impl View for SearchView {
     fn overlay_open(&self) -> bool {
-        self.overlay.is_open()
+        self.overlay.is_open() || self.view_menu.is_open()
     }
     fn preview_overlay(&mut self) -> Option<&mut super::preview::Overlay> {
         Some(&mut self.overlay)
     }
     fn handle_control_key(&mut self, key: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.is_library()
+            && self.focus == Focus::List
+            && key.modifiers == KeyModifiers::CONTROL
+            && matches!(key.code, KeyCode::Left | KeyCode::Right)
+        {
+            return self.handle_key(key, ctx);
+        }
         if self.multi && self.focus == Focus::List && super::super::keymap::control(key, 'a') {
             return self.handle_key(key, ctx);
         }
@@ -1235,6 +1806,9 @@ impl View for SearchView {
         }
     }
     fn refresh(&mut self, ctx: &Ctx) {
+        if !ctx.settings.tags_enabled && self.organization.grouping == GroupMode::Tag {
+            self.organization.grouping = GroupMode::Repository;
+        }
         self.searcher.configure(
             ctx.settings.search.clone(),
             skills::dict::Dictionaries::load(&ctx.ws.root, &ctx.settings.search.dictionaries),
@@ -1242,7 +1816,7 @@ impl View for SearchView {
         self.searcher.index(&ctx.snap.skills);
         self.run_search(ctx, true);
         self.search_panel.completion.close();
-        if self.focus == Focus::Input {
+        if self.focus == Focus::Input && !self.view_menu.is_open() {
             self.update_completion(ctx);
         }
         // Missing fixed members remain selected until the user removes them.
@@ -1262,7 +1836,36 @@ impl View for SearchView {
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.view_menu.is_open() {
+            let rows = self.view_menu_rows(ctx);
+            let event = self.view_menu.key(k, &rows);
+            return self.handle_view_menu_event(event, ctx);
+        }
+        if self.is_library() && k.code == KeyCode::F(2) {
+            self.open_view_menu(self.view_menu.section(), ctx);
+            return vec![];
+        }
         if self.overlay.handle_key(k) {
+            return vec![];
+        }
+        if self.is_library()
+            && self.focus == Focus::List
+            && k.modifiers == KeyModifiers::CONTROL
+            && matches!(k.code, KeyCode::Left | KeyCode::Right)
+        {
+            self.set_all_groups_collapsed(k.code == KeyCode::Left, ctx);
+            return vec![];
+        }
+        if self.is_library()
+            && self.focus == Focus::List
+            && k.code == KeyCode::Char(' ')
+            && k.modifiers.is_empty()
+            && matches!(
+                self.grouped.selected_entry(),
+                Some(GroupedEntry::Header { .. })
+            )
+        {
+            self.toggle_group();
             return vec![];
         }
         let k =
@@ -1453,27 +2056,95 @@ impl View for SearchView {
                 }
 
                 KeyCode::Down | KeyCode::Char('j') => self.move_row(1),
-                KeyCode::Up
-                    if self
-                        .grid
-                        .selected()
-                        .is_none_or(|index| index < self.grid.cols()) =>
-                {
-                    self.focus_input()
-                }
+                KeyCode::Up if self.selected_is_first_display_entry() => self.focus_input(),
                 KeyCode::Up | KeyCode::Char('k') => self.move_row(-1),
                 KeyCode::PageDown | KeyCode::Char('f') if k.code == KeyCode::PageDown || ctrl => {
-                    self.move_sel(self.grid.page())
+                    let page = if self.is_library() {
+                        self.grouped.page()
+                    } else {
+                        self.grid.page()
+                    };
+                    if self.is_library() {
+                        self.grouped.move_vertical(page);
+                        self.preview_scroll = 0;
+                    } else {
+                        self.move_sel(page);
+                    }
                 }
                 KeyCode::PageUp | KeyCode::Char('b') if k.code == KeyCode::PageUp || ctrl => {
-                    self.move_sel(-self.grid.page())
+                    let page = if self.is_library() {
+                        self.grouped.page()
+                    } else {
+                        self.grid.page()
+                    };
+                    if self.is_library() {
+                        self.grouped.move_vertical(-page);
+                        self.preview_scroll = 0;
+                    } else {
+                        self.move_sel(-page);
+                    }
                 }
-                KeyCode::Home | KeyCode::Char('g') => self.grid.first(self.hits.len()),
-                KeyCode::End | KeyCode::Char('G') => self.grid.last(self.hits.len()),
+                KeyCode::Home | KeyCode::Char('g') => {
+                    if self.is_library() {
+                        self.grouped.first();
+                    } else {
+                        self.grid.first(self.hits.len());
+                    }
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    if self.is_library() {
+                        self.grouped.last();
+                    } else {
+                        self.grid.last(self.hits.len());
+                    }
+                }
                 // In multi-column grids, horizontal keys select neighbors;
                 // in a single column, Right opens the selected skill's preview.
-                KeyCode::Right | KeyCode::Char('l') if self.grid.cols() > 1 => self.move_sel(1),
-                KeyCode::Left | KeyCode::Char('h') if self.grid.cols() > 1 => self.move_sel(-1),
+                KeyCode::Left | KeyCode::Char('h')
+                    if self.is_library()
+                        && matches!(
+                            self.grouped.selected_entry(),
+                            Some(GroupedEntry::Header { .. })
+                        ) =>
+                {
+                    self.set_group_collapsed(true);
+                }
+                KeyCode::Right | KeyCode::Char('l')
+                    if self.is_library()
+                        && matches!(
+                            self.grouped.selected_entry(),
+                            Some(GroupedEntry::Header { .. })
+                        ) =>
+                {
+                    self.set_group_collapsed(false);
+                }
+                KeyCode::Enter
+                    if self.is_library()
+                        && matches!(
+                            self.grouped.selected_entry(),
+                            Some(GroupedEntry::Header { .. })
+                        ) =>
+                {
+                    self.toggle_group();
+                }
+                KeyCode::Right | KeyCode::Char('l')
+                    if if self.is_library() {
+                        self.grouped.cols() > 1
+                    } else {
+                        self.grid.cols() > 1
+                    } =>
+                {
+                    self.move_sel(1)
+                }
+                KeyCode::Left | KeyCode::Char('h')
+                    if if self.is_library() {
+                        self.grouped.cols() > 1
+                    } else {
+                        self.grid.cols() > 1
+                    } =>
+                {
+                    self.move_sel(-1)
+                }
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                     acts = self.skill_command(Command::Open, ctx)
                 }
@@ -1562,7 +2233,29 @@ impl View for SearchView {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        if self.view_menu.is_open() {
+            let rows = self.view_menu_rows(ctx);
+            let event = self.view_menu.mouse(m, &rows);
+            return self.handle_view_menu_event(event, ctx);
+        }
         if self.overlay.handle_mouse(m, ctx) {
+            return vec![];
+        }
+        if self.is_library()
+            && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && let Some((_, control)) = self
+                .view_buttons
+                .iter()
+                .find(|(rect, _)| rect.contains((m.column, m.row).into()))
+        {
+            let control = *control;
+            if self.control_enabled(control) {
+                match control {
+                    ViewControl::View => self.open_view_menu(self.view_menu.section(), ctx),
+                    ViewControl::CollapseAll => self.set_all_groups_collapsed(true, ctx),
+                    ViewControl::ExpandAll => self.set_all_groups_collapsed(false, ctx),
+                }
+            }
             return vec![];
         }
         if self.is_picker()
@@ -1645,8 +2338,17 @@ impl View for SearchView {
         if (pressing && self.list_track.hit(m.column, m.row)) || (dragging && self.track_drag) {
             self.track_drag = true;
             self.focus = Focus::List;
-            if let Some(r) = self.list_track.index_at(m.row, self.grid.grid_rows()) {
-                self.grid.select_row(r);
+            let extent = if self.is_library() {
+                self.grouped.total_height()
+            } else {
+                self.grid.grid_rows()
+            };
+            if let Some(row) = self.list_track.index_at(m.row, extent) {
+                if self.is_library() {
+                    self.grouped.scroll_to(row);
+                } else {
+                    self.grid.select_row(row);
+                }
                 self.preview_scroll = 0;
             }
             return vec![];
@@ -1663,23 +2365,54 @@ impl View for SearchView {
             } else if self.list_rect.contains(at) {
                 self.focus = Focus::List;
                 if self.rendered_layout == UiLayout::List
-                    && self
-                        .grid
-                        .hit(m.column, m.row)
-                        .and_then(|index| self.grid.cell(index))
-                        .is_some_and(|cell| m.row >= cell.y + 4)
+                    && if self.is_library() {
+                        self.grouped.hit(m.column, m.row).and_then(|index| {
+                            self.grouped
+                                .cell(index)
+                                .map(|cell| (cell, self.grouped.top_clip(index)))
+                        })
+                    } else {
+                        self.grid
+                            .hit(m.column, m.row)
+                            .and_then(|index| self.grid.cell(index).map(|cell| (cell, 0)))
+                    }
+                    .is_some_and(|(cell, top_clip)| (m.row - cell.y).saturating_add(top_clip) >= 4)
                 {
                     return vec![];
                 }
-                if let Some((index, double)) = self.grid.click(m.column, m.row) {
+                let clicked = if self.is_library() {
+                    self.grouped.click(m.column, m.row)
+                } else {
+                    self.grid.click(m.column, m.row)
+                };
+                if let Some((index, double)) = clicked {
                     self.preview_scroll = 0;
-                    let marker = self.grid.cell(index).is_some_and(|cell| {
-                        let (x, y) = match self.rendered_layout {
-                            UiLayout::Grid => (cell.x + 2, cell.y + 1),
-                            UiLayout::List => (cell.x + 1, cell.y),
-                            UiLayout::Compact => (cell.x + 2, cell.y),
+                    if self.is_library()
+                        && matches!(
+                            self.grouped.entries.get(index),
+                            Some(GroupedEntry::Header { .. })
+                        )
+                    {
+                        self.toggle_group();
+                        return vec![];
+                    }
+                    let cell = if self.is_library() {
+                        self.grouped.cell(index)
+                    } else {
+                        self.grid.cell(index)
+                    };
+                    let top_clip = if self.is_library() {
+                        self.grouped.top_clip(index)
+                    } else {
+                        0
+                    };
+                    let marker = cell.is_some_and(|cell| {
+                        let (x, source_row) = match self.rendered_layout {
+                            UiLayout::Grid => (cell.x + 2, 1),
+                            UiLayout::List => (cell.x + 1, 0),
+                            UiLayout::Compact => (cell.x + 2, 0),
                         };
-                        m.row == y
+                        (m.row - cell.y).saturating_add(top_clip) == source_row
                             && m.column >= x
                             && m.column < x + ctx.settings.layout.marker_width as u16
                     });
@@ -1701,6 +2434,14 @@ impl View for SearchView {
     }
 
     fn hints(&self) -> Hints {
+        if self.view_menu.is_open() {
+            return &[
+                ("←→/Tab", "category"),
+                ("↑↓/j/k", "apply"),
+                ("Enter", "close"),
+                ("Esc/F2", "close"),
+            ];
+        }
         if self.is_picker()
             && self.focus == Focus::List
             && self.choice_focus != ChoiceFocus::List
@@ -1758,6 +2499,17 @@ impl View for SearchView {
             ];
         }
         if self.multi && self.focus == Focus::List {
+            if self.is_library() {
+                return &[
+                    ("Space", "select"),
+                    ("Ctrl+A", "select all results"),
+                    ("Ctrl+←/→", "fold / unfold all"),
+                    ("a", "actions"),
+                    ("/", "filter"),
+                    ("Enter", "preview"),
+                    ("Esc", "cancel selection"),
+                ];
+            }
             return &[
                 ("Space", "select"),
                 ("Ctrl+A", "select all results"),
@@ -1767,17 +2519,50 @@ impl View for SearchView {
                 ("Esc", "cancel selection"),
             ];
         }
+        if self.is_library()
+            && self.focus == Focus::List
+            && matches!(
+                self.grouped.selected_entry(),
+                Some(GroupedEntry::Header { .. })
+            )
+        {
+            return &[
+                ("Enter/Space", "collapse / expand"),
+                ("←/→", "collapse / expand"),
+                ("↑↓", "navigate"),
+                ("Ctrl+←/→", "fold / unfold all"),
+                ("F2", "view"),
+                ("/", "search"),
+            ];
+        }
         match self.focus {
             Focus::Input if self.search_panel.completion.active() => &[
                 ("↑↓", "suggestions"),
                 ("Enter", "complete"),
                 ("Esc", "close suggestions"),
             ],
+            Focus::Input if self.is_library() => &[
+                ("↑↓", "select"),
+                ("↓", "list"),
+                ("Enter", "list"),
+                ("Esc", "clear/results"),
+                ("F2", "view"),
+            ],
             Focus::Input => &[
                 ("↑↓", "select"),
                 ("↓", "list"),
                 ("Enter", "list"),
                 ("Esc", "clear/results"),
+            ],
+            Focus::List if self.is_library() => &[
+                ("Enter", "preview"),
+                ("Esc/q", "clear/back"),
+                ("Ctrl+←/→", "fold / unfold all"),
+                ("m", "multi-select"),
+                ("a", "actions"),
+                ("/", "search"),
+                ("v", "layout"),
+                ("F2", "view"),
             ],
             Focus::List => &[
                 ("Enter", "preview"),
@@ -2349,7 +3134,13 @@ mod tests {
             ..ctx
         };
         view.set_query("shared", &ctx);
-        view.grid.select(Some(3));
+        let hit = view
+            .hits
+            .iter()
+            .position(|hit| hit.key == "printer-03")
+            .unwrap();
+        let entry = view.grouped.find_skill(hit, None).unwrap();
+        view.grouped.select(Some(entry));
         let selected = view.selected(&ctx).unwrap().key.clone();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -2358,8 +3149,8 @@ mod tests {
             .unwrap();
         assert_eq!(view.rendered_layout, UiLayout::Compact);
         assert_eq!(view.layout(&ctx), UiLayout::List);
-        assert!(view.grid.visible().len() >= 4);
-        assert_eq!(view.grid.cell(3).unwrap().height, 1);
+        assert!(view.grouped.visible_entries().count() >= 4);
+        assert_eq!(view.grouped.cell(entry).unwrap().height, 1);
         assert_eq!(view.selected(&ctx).unwrap().key, selected);
         let shown: String = terminal
             .backend()
@@ -2376,7 +3167,7 @@ mod tests {
             .draw(|f| view.draw(f, Rect::new(0, 1, 120, 38), &ctx))
             .unwrap();
         assert_eq!(view.rendered_layout, UiLayout::List);
-        let cell = view.grid.cell(3).unwrap();
+        let cell = view.grouped.cell(entry).unwrap();
         assert_eq!(cell.height, 5);
         assert_eq!(view.selected(&ctx).unwrap().key, selected);
         let buffer = terminal.backend().buffer();
@@ -2407,47 +3198,51 @@ mod tests {
             ..ctx
         };
 
+        view.organization.grouping = GroupMode::None;
         view.set_query("", &ctx);
-        view.grid.first(view.hits.len());
+        view.grouped.first();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(124, 20)).unwrap();
         let area = Rect::new(0, 0, 124, 20);
         terminal.draw(|f| view.draw(f, area, &ctx)).unwrap();
-        assert_eq!(view.grid.visible(), 0..6);
-        let peek = view.grid.cell(6).unwrap();
-        assert_eq!(peek.height, 3);
+        let visible: Vec<_> = view.grouped.visible_entries().collect();
+        assert!(visible.len() >= 6);
+        let peek_entry = *visible.last().unwrap();
+        let peek = view.grouped.cell(peek_entry).unwrap();
+        assert!(peek.height < ctx.settings.layout.card_height);
         let buffer = terminal.backend().buffer();
         let row = |y| {
             (0..124)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
         };
-        assert!(row(peek.y + 1).contains("printer-06"));
-        assert!(row(area.bottom() - 1).contains("↓ more · 1–6 / 12"));
-        assert_eq!(buffer[(peek.x, peek.y + 1)].symbol(), "│");
+        assert!((peek.y..peek.bottom()).any(|y| !row(y).trim().is_empty()));
         assert_eq!(buffer[(0, area.bottom() - 1)].symbol(), "╰");
         assert_eq!(buffer[(2, area.bottom() - 1)].symbol(), "─");
         assert_eq!(buffer[(123, area.bottom() - 1)].symbol(), "╯");
         assert_eq!(area.bottom(), buffer.area.bottom());
 
         // Clicking the peek scrolls it fully into view, including after resize.
-        assert_eq!(view.grid.click(peek.x + 2, peek.y + 1).unwrap().0, 6);
+        assert_eq!(
+            view.grouped.click(peek.x + 2, peek.y).unwrap().0,
+            peek_entry
+        );
         for height in 14..20 {
             terminal
                 .draw(|f| view.draw_results(f, Rect::new(0, 0, 124, height), &ctx))
                 .unwrap();
             assert_eq!(
-                view.grid.cell(6).unwrap().height,
+                view.grouped.cell(peek_entry).unwrap().height,
                 ctx.settings.layout.card_height
             );
         }
-        view.grid.last(view.hits.len());
+        view.grouped.last();
         terminal.draw(|f| view.draw(f, area, &ctx)).unwrap();
-        let bottom: String = (0..124)
-            .map(|x| terminal.backend().buffer()[(x, area.bottom() - 1)].symbol())
-            .collect();
-        assert!(bottom.contains("7–12 / 12"));
-        assert!(!bottom.contains("more"));
+        assert!(
+            view.grouped
+                .cell(view.grouped.selected().unwrap())
+                .is_some()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

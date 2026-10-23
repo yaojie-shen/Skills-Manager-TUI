@@ -22,11 +22,25 @@ pub fn frame(f: &mut Frame, cell: Rect, on: bool, focused: bool, th: &Theme) -> 
 
 /// A clipped skill card keeps an open lower edge to show that it continues.
 pub fn skill_frame(f: &mut Frame, cell: Rect, on: bool, focused: bool, ctx: &Ctx) -> Rect {
-    let borders = if cell.height < ctx.settings.layout.card_height {
-        Borders::TOP | Borders::LEFT | Borders::RIGHT
-    } else {
-        Borders::ALL
-    };
+    clipped_skill_frame(f, cell, 0, on, focused, ctx)
+}
+
+/// Draw the visible source rows of a card clipped at its logical top.
+pub fn clipped_skill_frame(
+    f: &mut Frame,
+    cell: Rect,
+    top_clip: u16,
+    on: bool,
+    focused: bool,
+    ctx: &Ctx,
+) -> Rect {
+    let mut borders = Borders::LEFT | Borders::RIGHT;
+    if top_clip == 0 {
+        borders |= Borders::TOP;
+    }
+    if top_clip.saturating_add(cell.height) >= ctx.settings.layout.card_height {
+        borders |= Borders::BOTTOM;
+    }
     draw_frame(
         f,
         cell,
@@ -38,10 +52,15 @@ pub fn skill_frame(f: &mut Frame, cell: Rect, on: bool, focused: bool, ctx: &Ctx
 /// Draw a subdued divider inside a list item's reserved spacer row.
 /// The inset keeps the rule clear of the item marker and the scrollbar.
 pub fn skill_list_separator(f: &mut Frame, cell: Rect, th: &Theme) {
-    if cell.height < 5 || cell.width <= 4 {
+    clipped_skill_list_separator(f, cell, 0, th);
+}
+
+/// Draw the list separator when its logical row survives top clipping.
+pub fn clipped_skill_list_separator(f: &mut Frame, cell: Rect, top_clip: u16, th: &Theme) {
+    if top_clip > 4 || top_clip.saturating_add(cell.height) <= 4 || cell.width <= 4 {
         return;
     }
-    let separator = Rect::new(cell.x + 2, cell.y + 4, cell.width - 4, 1);
+    let separator = Rect::new(cell.x + 2, cell.y + 4 - top_clip, cell.width - 4, 1);
     f.render_widget(
         Paragraph::new(Span::styled(
             "─".repeat(separator.width as usize),

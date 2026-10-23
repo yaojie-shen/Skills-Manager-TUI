@@ -1,1740 +1,1804 @@
 {
-  "schema_version": 1,
-  "width": 112,
-  "height": 32,
-  "provenance": {
-    "renderer": "ratatui::backend::TestBackend",
-    "component": "tui::app::App",
-    "fixture": "isolated-synthetic-hero-grid-v2",
-    "interaction": "Library rendered with UiLayout::Grid after the startup status probe settled",
-    "privacy": "all data is synthetic in a disposable directory; HOME, user libraries, Agent directories, network remotes, and sync operations are not used",
-    "layout": "grid"
-  },
   "frame": {
+    "hash": "sha256:ad704caee26106ecdbc88704fbaee450017dff92577370c9fee1e4a02d631a9e",
     "name": "library-card",
-    "hash": "sha256:51f6be41b4020936b79d542ad5ddc022add3d84231dfc92a46df5d2fab91edca",
     "rows": [
       [
         {
-          "text": " skills ",
+          "bg": "reset",
           "cells": 8,
           "fg": "cyan",
-          "bg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": " skills "
         },
         {
-          "text": " 1 Library ",
+          "bg": "#2c323c",
           "cells": 11,
-          "fg": "reset",
-          "bg": "reset",
+          "fg": "#f0f2f6",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": " 1 Library "
         },
         {
-          "text": "  2 Tags   3 Presets   4 Agents   5 Repos   6 Health  ",
+          "bg": "reset",
           "cells": 54,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "  2 Tags   3 Presets   4 Agents   5 Repos   6 Health  "
         },
         {
-          "text": " Tab ↔ ",
+          "bg": "reset",
           "cells": 7,
           "fg": "#8c8c8c",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " Tab ↔ "
         },
         {
-          "text": "               ",
+          "bg": "reset",
           "cells": 15,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "               "
         },
         {
-          "text": "[○ Set up backup]",
+          "bg": "reset",
           "cells": 17,
           "fg": "yellow",
-          "bg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "[○ Set up backup]"
         }
       ],
       [
         {
-          "text": "╭ 4/4 local · 0/0 repository installs ─────────────────────────────────────────────────────────────────────────╮",
+          "bg": "reset",
           "cells": 112,
           "fg": "cyan",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "╭ 4/4 local · 0/0 repository installs ─────────────────────────────────────────────────────────────────────────╮"
         }
       ],
       [
         {
-          "text": "│ › ",
+          "bg": "reset",
           "cells": 4,
           "fg": "cyan",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│ › "
         },
         {
-          "text": "search skills…",
+          "bg": "reset",
           "cells": 14,
           "fg": "#8c8c8c",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "search skills…"
         },
         {
-          "text": "   repo:owner/repo  tag:x  preset:y  agent:z  source:local  untagged",
+          "bg": "reset",
           "cells": 68,
           "fg": "#b87e54",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "   repo:owner/repo  tag:x  preset:y  agent:z  source:local  untagged"
         },
         {
-          "text": "                         ",
+          "bg": "reset",
           "cells": 25,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                         "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "cyan",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
+          "bg": "reset",
           "cells": 112,
           "fg": "cyan",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────╯"
         }
       ],
       [
         {
-          "text": "╭ skills ──────────────────────────────────────────────────────────────────────────────────────────────────────╮",
-          "cells": 112,
-          "fg": "dark-gray",
           "bg": "reset",
-          "mods": []
-        }
-      ],
-      [
+          "cells": 74,
+          "fg": "dark-gray",
+          "mods": [],
+          "text": "╭ skills · by repository ─────────────────────────────────────────────────"
+        },
         {
-          "text": "│",
+          "bg": "reset",
+          "cells": 14,
+          "fg": "reset",
+          "mods": [],
+          "text": " Collapse all "
+        },
+        {
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "─"
         },
         {
-          "text": "╭───────────────────────────────────────────────────╮",
-          "cells": 53,
-          "fg": "reset",
           "bg": "reset",
-          "mods": [
-            "bold"
-          ]
-        },
-        {
-          "text": " ",
-          "cells": 1,
-          "fg": "reset",
-          "bg": "reset",
-          "mods": []
-        },
-        {
-          "text": "╭───────────────────────────────────────────────────╮",
-          "cells": 53,
-          "fg": "reset",
-          "bg": "reset",
+          "cells": 12,
+          "fg": "dark-gray",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": " Expand all "
         },
         {
-          "text": "   ",
+          "bg": "reset",
+          "cells": 1,
+          "fg": "dark-gray",
+          "mods": [],
+          "text": "─"
+        },
+        {
+          "bg": "reset",
+          "cells": 9,
+          "fg": "reset",
+          "mods": [],
+          "text": " View F2 "
+        },
+        {
+          "bg": "reset",
+          "cells": 1,
+          "fg": "dark-gray",
+          "mods": [],
+          "text": "╮"
+        }
+      ],
+      [
+        {
+          "bg": "reset",
+          "cells": 1,
+          "fg": "dark-gray",
+          "mods": [],
+          "text": "│"
+        },
+        {
+          "bg": "reset",
           "cells": 3,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " ▾ "
         },
         {
-          "text": "│",
+          "bg": "reset",
+          "cells": 5,
+          "fg": "reset",
+          "mods": [
+            "bold"
+          ],
+          "text": "Local"
+        },
+        {
+          "bg": "reset",
+          "cells": 102,
+          "fg": "reset",
+          "mods": [],
+          "text": "  4/4                                                                                                 "
+        },
+        {
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "│",
-          "cells": 1,
-          "fg": "reset",
           "bg": "reset",
+          "cells": 53,
+          "fg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "╭───────────────────────────────────────────────────╮"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": " ●  ",
-          "cells": 4,
-          "fg": "green",
           "bg": "reset",
-          "mods": []
-        },
-        {
-          "text": "api-design                                   ",
-          "cells": 45,
+          "cells": 53,
           "fg": "reset",
-          "bg": "reset",
-          "mods": [
-            "bold"
-          ]
-        },
-        {
-          "text": " ",
-          "cells": 1,
-          "fg": "reset",
-          "bg": "reset",
-          "mods": []
-        },
-        {
-          "text": "│",
-          "cells": 1,
-          "fg": "reset",
-          "bg": "reset",
-          "mods": [
-            "bold"
-          ]
-        },
-        {
-          "text": " ",
-          "cells": 1,
-          "fg": "reset",
-          "bg": "reset",
-          "mods": []
-        },
-        {
-          "text": "│",
-          "cells": 1,
-          "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "╭───────────────────────────────────────────────────╮"
         },
         {
-          "text": " ",
-          "cells": 1,
-          "fg": "reset",
           "bg": "reset",
-          "mods": []
-        },
-        {
-          "text": " ●  ",
-          "cells": 4,
-          "fg": "green",
-          "bg": "reset",
-          "mods": []
-        },
-        {
-          "text": "docs-editor                                  ",
-          "cells": 45,
-          "fg": "reset",
-          "bg": "reset",
-          "mods": [
-            "bold"
-          ]
-        },
-        {
-          "text": " ",
-          "cells": 1,
-          "fg": "reset",
-          "bg": "reset",
-          "mods": []
-        },
-        {
-          "text": "│",
-          "cells": 1,
-          "fg": "reset",
-          "bg": "reset",
-          "mods": [
-            "dim"
-          ]
-        },
-        {
-          "text": "   ",
           "cells": 3,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "Design consistent HTTP and event APIs",
+          "bg": "reset",
+          "cells": 4,
+          "fg": "green",
+          "mods": [],
+          "text": " ●  "
+        },
+        {
+          "bg": "reset",
+          "cells": 45,
+          "fg": "reset",
+          "mods": [
+            "bold"
+          ],
+          "text": "api-design                                   "
+        },
+        {
+          "bg": "reset",
+          "cells": 1,
+          "fg": "reset",
+          "mods": [],
+          "text": " "
+        },
+        {
+          "bg": "reset",
+          "cells": 1,
+          "fg": "reset",
+          "mods": [
+            "bold"
+          ],
+          "text": "│"
+        },
+        {
+          "bg": "reset",
+          "cells": 1,
+          "fg": "reset",
+          "mods": [],
+          "text": " "
+        },
+        {
+          "bg": "reset",
+          "cells": 1,
+          "fg": "reset",
+          "mods": [
+            "dim"
+          ],
+          "text": "│"
+        },
+        {
+          "bg": "reset",
+          "cells": 1,
+          "fg": "reset",
+          "mods": [],
+          "text": " "
+        },
+        {
+          "bg": "reset",
+          "cells": 4,
+          "fg": "green",
+          "mods": [],
+          "text": " ●  "
+        },
+        {
+          "bg": "reset",
+          "cells": 45,
+          "fg": "reset",
+          "mods": [
+            "bold"
+          ],
+          "text": "docs-editor                                  "
+        },
+        {
+          "bg": "reset",
+          "cells": 1,
+          "fg": "reset",
+          "mods": [],
+          "text": " "
+        },
+        {
+          "bg": "reset",
+          "cells": 1,
+          "fg": "reset",
+          "mods": [
+            "dim"
+          ],
+          "text": "│"
+        },
+        {
+          "bg": "reset",
+          "cells": 3,
+          "fg": "reset",
+          "mods": [],
+          "text": "   "
+        },
+        {
+          "bg": "reset",
+          "cells": 1,
+          "fg": "dark-gray",
+          "mods": [],
+          "text": "│"
+        }
+      ],
+      [
+        {
+          "bg": "reset",
+          "cells": 1,
+          "fg": "dark-gray",
+          "mods": [],
+          "text": "│"
+        },
+        {
+          "bg": "reset",
+          "cells": 1,
+          "fg": "reset",
+          "mods": [
+            "bold"
+          ],
+          "text": "│"
+        },
+        {
+          "bg": "reset",
+          "cells": 1,
+          "fg": "reset",
+          "mods": [],
+          "text": " "
+        },
+        {
+          "bg": "reset",
           "cells": 37,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "Design consistent HTTP and event APIs"
         },
         {
-          "text": "             ",
+          "bg": "reset",
           "cells": 13,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "             "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "Review documentation for structure and clarity",
+          "bg": "reset",
           "cells": 46,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "Review documentation for structure and clarity"
         },
         {
-          "text": "    ",
+          "bg": "reset",
           "cells": 4,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "    "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": "   ",
+          "bg": "reset",
           "cells": 3,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": "                                                   ",
+          "bg": "reset",
           "cells": 51,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": "                                                   ",
+          "bg": "reset",
           "cells": 51,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": "   ",
+          "bg": "reset",
           "cells": 3,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "󰉋 local",
+          "bg": "reset",
           "cells": 7,
           "fg": "#9b89ac",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "󰉋 local"
         },
         {
-          "text": "        ",
+          "bg": "reset",
           "cells": 8,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "        "
         },
         {
-          "text": "",
+          "bg": "reset",
           "cells": 1,
           "fg": "#70a0e0",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": ""
         },
         {
-          "text": " engineering ",
+          "bg": "#70a0e0",
           "cells": 13,
           "fg": "#000000",
-          "bg": "#70a0e0",
-          "mods": []
+          "mods": [],
+          "text": " engineering "
         },
         {
-          "text": "",
+          "bg": "reset",
           "cells": 1,
           "fg": "#70a0e0",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": ""
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "",
+          "bg": "reset",
           "cells": 1,
-          "fg": "#70a0e0",
-          "bg": "reset",
-          "mods": []
+          "fg": "#8c8c8c",
+          "mods": [],
+          "text": ""
         },
         {
-          "text": " Backend Launch ",
+          "bg": "#8c8c8c",
           "cells": 16,
           "fg": "#000000",
-          "bg": "#70a0e0",
-          "mods": []
+          "mods": [],
+          "text": " Backend Launch "
         },
         {
-          "text": "",
-          "cells": 1,
-          "fg": "#70a0e0",
           "bg": "reset",
-          "mods": []
-        },
-        {
-          "text": " ",
           "cells": 1,
-          "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "fg": "#8c8c8c",
+          "mods": [],
+          "text": ""
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
+          "mods": [],
+          "text": " "
+        },
+        {
           "bg": "reset",
+          "cells": 1,
+          "fg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "󰉋 local",
+          "bg": "reset",
           "cells": 7,
           "fg": "#9b89ac",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "󰉋 local"
         },
         {
-          "text": "                               ",
+          "bg": "reset",
           "cells": 31,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                               "
         },
         {
-          "text": "",
+          "bg": "reset",
           "cells": 1,
           "fg": "#c090c8",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": ""
         },
         {
-          "text": " writing ",
+          "bg": "#c090c8",
           "cells": 9,
           "fg": "#000000",
-          "bg": "#c090c8",
-          "mods": []
+          "mods": [],
+          "text": " writing "
         },
         {
-          "text": "",
+          "bg": "reset",
           "cells": 1,
           "fg": "#c090c8",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": ""
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": "   ",
+          "bg": "reset",
           "cells": 3,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "╰───────────────────────────────────────────────────╯",
+          "bg": "reset",
           "cells": 53,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "╰───────────────────────────────────────────────────╯"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "╰───────────────────────────────────────────────────╯",
+          "bg": "reset",
           "cells": 53,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "╰───────────────────────────────────────────────────╯"
         },
         {
-          "text": "   ",
+          "bg": "reset",
           "cells": 3,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "╭───────────────────────────────────────────────────╮",
+          "bg": "reset",
           "cells": 53,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "╭───────────────────────────────────────────────────╮"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "╭───────────────────────────────────────────────────╮",
+          "bg": "reset",
           "cells": 53,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "╭───────────────────────────────────────────────────╮"
         },
         {
-          "text": "   ",
+          "bg": "reset",
           "cells": 3,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": " ●  ",
+          "bg": "reset",
           "cells": 4,
           "fg": "green",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " ●  "
         },
         {
-          "text": "incident-triage                              ",
+          "bg": "reset",
           "cells": 45,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "incident-triage                              "
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": " ●  ",
+          "bg": "reset",
           "cells": 4,
           "fg": "green",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " ●  "
         },
         {
-          "text": "release-notes                                ",
+          "bg": "reset",
           "cells": 45,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "release-notes                                "
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": "   ",
+          "bg": "reset",
           "cells": 3,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "Triage production incidents with safe checklists",
+          "bg": "reset",
           "cells": 48,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "Triage production incidents with safe checklists"
         },
         {
-          "text": "  ",
+          "bg": "reset",
           "cells": 2,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "  "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "Turn merged changes into concise release notes",
+          "bg": "reset",
           "cells": 46,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "Turn merged changes into concise release notes"
         },
         {
-          "text": "    ",
+          "bg": "reset",
           "cells": 4,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "    "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": "   ",
+          "bg": "reset",
           "cells": 3,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": "                                                   ",
+          "bg": "reset",
           "cells": 51,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": "                                                   ",
+          "bg": "reset",
           "cells": 51,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": "   ",
+          "bg": "reset",
           "cells": 3,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "󰉋 local",
+          "bg": "reset",
           "cells": 7,
           "fg": "#9b89ac",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "󰉋 local"
         },
         {
-          "text": "                            ",
+          "bg": "reset",
           "cells": 28,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                            "
         },
         {
-          "text": "",
+          "bg": "reset",
           "cells": 1,
           "fg": "#e0b850",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": ""
         },
         {
-          "text": " operations ",
+          "bg": "#e0b850",
           "cells": 12,
           "fg": "#000000",
-          "bg": "#e0b850",
-          "mods": []
+          "mods": [],
+          "text": " operations "
         },
         {
-          "text": "",
+          "bg": "reset",
           "cells": 1,
           "fg": "#e0b850",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": ""
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "󰉋 local",
+          "bg": "reset",
           "cells": 7,
           "fg": "#9b89ac",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "󰉋 local"
         },
         {
-          "text": "        ",
+          "bg": "reset",
           "cells": 8,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "        "
         },
         {
-          "text": "",
+          "bg": "reset",
           "cells": 1,
           "fg": "#70a0e0",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": ""
         },
         {
-          "text": " engineering ",
+          "bg": "#70a0e0",
           "cells": 13,
           "fg": "#000000",
-          "bg": "#70a0e0",
-          "mods": []
+          "mods": [],
+          "text": " engineering "
         },
         {
-          "text": "",
+          "bg": "reset",
           "cells": 1,
           "fg": "#70a0e0",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": ""
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "",
+          "bg": "reset",
           "cells": 1,
-          "fg": "#70a0e0",
-          "bg": "reset",
-          "mods": []
+          "fg": "#8c8c8c",
+          "mods": [],
+          "text": ""
         },
         {
-          "text": " Backend Launch ",
+          "bg": "#8c8c8c",
           "cells": 16,
           "fg": "#000000",
-          "bg": "#70a0e0",
-          "mods": []
+          "mods": [],
+          "text": " Backend Launch "
         },
         {
-          "text": "",
-          "cells": 1,
-          "fg": "#70a0e0",
           "bg": "reset",
-          "mods": []
-        },
-        {
-          "text": " ",
           "cells": 1,
-          "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "fg": "#8c8c8c",
+          "mods": [],
+          "text": ""
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
+          "mods": [],
+          "text": " "
+        },
+        {
           "bg": "reset",
+          "cells": 1,
+          "fg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "│"
         },
         {
-          "text": "   ",
+          "bg": "reset",
           "cells": 3,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "╰───────────────────────────────────────────────────╯",
+          "bg": "reset",
           "cells": 53,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "╰───────────────────────────────────────────────────╯"
         },
         {
-          "text": " ",
+          "bg": "reset",
           "cells": 1,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " "
         },
         {
-          "text": "╰───────────────────────────────────────────────────╯",
+          "bg": "reset",
           "cells": 53,
           "fg": "reset",
-          "bg": "reset",
           "mods": [
             "dim"
-          ]
+          ],
+          "text": "╰───────────────────────────────────────────────────╯"
         },
         {
-          "text": "   ",
+          "bg": "reset",
           "cells": 3,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "   "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "                                                                                                              ",
+          "bg": "reset",
           "cells": 110,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                                                                              "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "                                                                                                              ",
+          "bg": "reset",
           "cells": 110,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                                                                              "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "                                                                                                              ",
+          "bg": "reset",
           "cells": 110,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                                                                              "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "                                                                                                              ",
+          "bg": "reset",
           "cells": 110,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                                                                              "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "                                                                                                              ",
+          "bg": "reset",
           "cells": 110,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                                                                              "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "                                                                                                              ",
+          "bg": "reset",
           "cells": 110,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                                                                              "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "                                                                                                              ",
+          "bg": "reset",
           "cells": 110,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                                                                              "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "                                                                                                              ",
+          "bg": "reset",
           "cells": 110,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                                                                              "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "                                                                                                              ",
+          "bg": "reset",
           "cells": 110,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                                                                              "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "                                                                                                              ",
+          "bg": "reset",
           "cells": 110,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                                                                              "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "                                                                                                              ",
+          "bg": "reset",
           "cells": 110,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                                                                              "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         },
         {
-          "text": "                                                                                                              ",
+          "bg": "reset",
           "cells": 110,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                                                                              "
         },
         {
-          "text": "│",
+          "bg": "reset",
           "cells": 1,
           "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "│"
         }
       ],
       [
         {
-          "text": "│",
-          "cells": 1,
-          "fg": "dark-gray",
           "bg": "reset",
-          "mods": []
-        },
+          "cells": 112,
+          "fg": "dark-gray",
+          "mods": [],
+          "text": "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────╯"
+        }
+      ],
+      [
         {
-          "text": "                                                                                                              ",
-          "cells": 110,
+          "bg": "reset",
+          "cells": 53,
           "fg": "reset",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": "                                                     "
         },
         {
-          "text": "│",
-          "cells": 1,
-          "fg": "dark-gray",
           "bg": "reset",
-          "mods": []
-        }
-      ],
-      [
-        {
-          "text": "╰────────────────────────────────────────────────────────────────────────────────────────────────────",
-          "cells": 101,
-          "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
-        },
-        {
-          "text": " 1–4 / 4 ",
-          "cells": 9,
-          "fg": "#9b89ac",
-          "bg": "reset",
-          "mods": []
-        },
-        {
-          "text": "─╯",
-          "cells": 2,
-          "fg": "dark-gray",
-          "bg": "reset",
-          "mods": []
-        }
-      ],
-      [
-        {
-          "text": "                                                              ",
-          "cells": 62,
-          "fg": "reset",
-          "bg": "reset",
-          "mods": []
-        },
-        {
-          "text": "↑↓",
           "cells": 2,
           "fg": "cyan",
-          "bg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "↑↓"
         },
         {
-          "text": " select  ",
+          "bg": "reset",
           "cells": 9,
           "fg": "#8c8c8c",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " select  "
         },
         {
-          "text": "↓",
+          "bg": "reset",
           "cells": 1,
           "fg": "cyan",
-          "bg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "↓"
         },
         {
-          "text": " list  ",
+          "bg": "reset",
           "cells": 7,
           "fg": "#8c8c8c",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " list  "
         },
         {
-          "text": "Enter",
+          "bg": "reset",
           "cells": 5,
           "fg": "cyan",
-          "bg": "reset",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "Enter"
         },
         {
-          "text": " list  ",
+          "bg": "reset",
           "cells": 7,
           "fg": "#8c8c8c",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " list  "
         },
         {
-          "text": "Esc",
-          "cells": 3,
-          "fg": "cyan",
           "bg": "reset",
+          "cells": 2,
+          "fg": "cyan",
           "mods": [
             "bold"
-          ]
+          ],
+          "text": "F2"
         },
         {
-          "text": " clear/results  ",
+          "bg": "reset",
+          "cells": 7,
+          "fg": "#8c8c8c",
+          "mods": [],
+          "text": " view  "
+        },
+        {
+          "bg": "reset",
+          "cells": 3,
+          "fg": "cyan",
+          "mods": [
+            "bold"
+          ],
+          "text": "Esc"
+        },
+        {
+          "bg": "reset",
           "cells": 16,
           "fg": "#8c8c8c",
-          "bg": "reset",
-          "mods": []
+          "mods": [],
+          "text": " clear/results  "
         }
       ]
     ]
-  }
+  },
+  "height": 32,
+  "provenance": {
+    "component": "tui::app::App",
+    "fixture": "isolated-synthetic-hero-grid-v3",
+    "hashInput": "for each cell row-major: u64 little-endian byte length and bytes for symbol, foreground, background, and comma-joined ordered modifiers",
+    "interaction": "Library rendered with UiLayout::Grid after the startup status probe settled",
+    "layout": "grid",
+    "privacy": "all data is synthetic in a disposable local project; HOME, user libraries, Agent directories, network, and sync are not used",
+    "renderer": "ratatui::backend::TestBackend",
+    "sourceRevision": "69da2f0+tui-e6d933ec63ed"
+  },
+  "schema_version": 1,
+  "width": 112
 }

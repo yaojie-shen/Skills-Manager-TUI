@@ -35,6 +35,22 @@ Before a remote skill is copied into the Library, Skills Manager checks the sele
 
 <DocsTuiCapture frame="repos" caption="The Repos view shows each source and the skills installed from it." />
 
+## Arrange the Library view
+
+The Library View controls can group skills automatically or by repository, tag, or preset. Choose **None** for one flat list. Groups can be ordered by name or by the number of skills they contain, and skills can be sorted by name, Library path, or search relevance. Name and path sorting support both ascending and descending order. The same grouping and sorting choices work in card, list, and compact layouts.
+
+**Auto** adapts to what you are doing. While browsing, it groups skills by source and sorts them by name. Filters such as `tag:` still count as browsing. A query with free text becomes a flat relevance-ranked list so the strongest matches stay together. If you explicitly choose a grouping mode, the Library keeps those groups during a free-text search; with **Auto** sorting, it ranks the matches within each group.
+
+Repository, tag, and preset headers can be collapsed. Grouping by tag or preset may show the same skill in more than one group when it belongs to several of them. Counts, multi-selection, and actions still identify a skill by its Library key, so a repeated skill is counted or acted on only once. **Select all** includes every matching skill, including matches inside collapsed groups.
+
+Grouping, sorting, collapsed groups, and layout choices last for the current TUI session. They do not change Library files, metadata, or the saved configuration, and arranging the display does not rescan or hash skill content.
+
+The results frame keeps its View controls in the top border. Click **View** or press `F2` from anywhere in Library to open the menu. `←`/`→` switches among **Layout**, **Group by**, **Sort**, and **Group order**; `Tab` advances to the next category and `Shift+Tab` returns to the previous one. `↑`/`↓`, `j`/`k`, and the scroll wheel apply settings immediately while keeping the menu open. `Enter`, `Esc`, or `F2` closes the menu without reverting changes. Clicking an option also applies it without closing the menu; clicking outside closes it. The category tabs and options work with the mouse, while wheel events outside the popup are ignored. **Group order** is dimmed and skipped while the results are flat, but its previous value returns when grouping is enabled again. **Relevance** is unavailable without a free-text search. With a skill focused, `v` or `V` still cycles the card, list, and compact layouts.
+
+The filled category tab identifies the open page. An arrow and a highlighted row mark the keyboard choice; `●` marks the applied value and `○` marks the other values. The popup contains settings only. Shortcut hints appear only at the bottom of the screen.
+
+Group headers show the matching and total skill counts. Select a header and press `Enter` or `Space` to toggle it, `←`/`h` to collapse it, or `→`/`l` to expand it. Clicking a header also toggles it. To change every current matching group at once, use the collapse-all and expand-all controls in the frame border. Their labels shorten to compact text and then triangle markers as the terminal narrows. With the results focused, `Ctrl+←` collapses them all and `Ctrl+→` expands them all; the same keys keep their normal text-editing behavior while the search input is focused.
+
 ## Browse a skill's files
 
 Open a skill preview from any TUI view to see compact metadata, the skill's file tree, and the selected file together on wider terminals. The preview starts on `SKILL.md` with the file content focused. Press `←` in the content to focus the tree, or `→` in the tree to focus the content; `Tab` also switches between them. `↑`/`↓` or `j`/`k` move through the tree or scroll the focused content. Use `Enter`/`l` to open a file or toggle a directory, `←`/`h` in the tree to collapse or move to its parent, `gg`/`G` to jump, and `Ctrl-d`/`Ctrl-u` to page. Directories load when first expanded; hidden entries are omitted until you press `.`. Press `e` to expand the metadata header; scroll it with `j`/`k`, arrows, `PgUp`/`PgDn`, `Home`, or `End`, then press `Tab` to return to the file content. The preview uses about 80% of the terminal width up to 160 columns. On terminals narrower than 64 columns, it starts with content only; press `←` or `Tab` to show the tree, and `→` or `Tab` to return to the content. `Esc` or `q` closes the preview without changing the page beneath it.

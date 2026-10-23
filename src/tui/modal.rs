@@ -2235,9 +2235,18 @@ Library
   tag:x preset:y    filters; also agent:codex  status:modified  source:repository  untagged
   Enter             accept a suggestion / open results / preview
   arrows            navigate panels and lists (Esc goes back)
+  F2 / View         categorized options: layout, group by, skill sort, group order
+                    Left/Right or Tab switches category; Up/Down applies settings immediately
+                    Enter, Esc, or F2 closes the menu and keeps applied settings
+  v / V             cycle skill layout while browsing results
+  Enter / click     on a group header: collapse / expand; Left closes, Right opens
+  Ctrl-Left/Right   collapse / expand all matching groups while results are focused
+                    or use the title-bar buttons
+  Auto view         browse by repository; text searches are flat and relevance-ranked
   a                 Actions: tags, presets, deploy, notes, source, updates, remove
   m                 enter multi-select (status marker also starts selection)
   Space  Ctrl-A     toggle skill / select current results in multi-select
+                    all matching skills are included, even inside collapsed groups
   t  d  p           selected skills: tags / deploy / add to preset
   Esc               cancel multi-select; Preset actions include selections outside the filter
   u  U              check upstream / update from upstream (Git or archive sources)

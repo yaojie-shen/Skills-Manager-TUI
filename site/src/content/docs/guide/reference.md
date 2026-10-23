@@ -71,10 +71,12 @@ Filters include `tag:`, `preset:`, `repo:`, `agent:`, `status:`, and `source:`. 
 | `Tab` / `Shift+Tab` | Move to the next or previous page after closing edit dialogs |
 | `1` to `6` | Select a visible tab outside text inputs; hiding Tags changes the order |
 | `Enter` / Down | Enter from the tab strip; elsewhere activate the focused control |
+| `F2` | Open the Library View menu for layout, grouping, sorting, and group order |
+| `Ctrl+←` / `Ctrl+→` | Collapse or expand all current Library groups while results are focused |
 | `Esc` / `q` | Go back; quit from the tab strip; `q` types text while editing |
 | `Ctrl+R` | Rescan the workspace |
 | `Ctrl+Z` / `Ctrl+Y` | Undo or redo supported session actions |
 | `m`, Space, `Ctrl+A` | Enter multi-select, toggle one skill, or add the current results |
 | `u` / `U` | Check or update upstream content |
 
-The command palette filters as you type. Arrow keys select a command; Enter runs it; Esc closes it. Tag-picker changes apply immediately, while staged membership selectors require Apply. Closing a tag picker does not undo changes already written. The footer shows controls for the current context.
+The command palette filters as you type. Arrow keys select a command; Enter runs it; Esc closes it. In the settings-only Library View menu, use `←`/`→` to switch categories, `Tab` to advance, or `Shift+Tab` to go back. `↑`/`↓`, `j`/`k`, clicks, and the scroll wheel apply settings immediately without closing the menu. `Enter`, `Esc`, or `F2` closes it and keeps applied changes. Collapse-all and expand-all remain in the results-frame border and on `Ctrl+←` / `Ctrl+→`. View-menu shortcuts appear only in the screen footer. Tag-picker changes apply immediately, while staged membership selectors require Apply. Closing a tag picker does not undo changes already written. The footer shows controls for the current context.

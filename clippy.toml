@@ -1,0 +1,3 @@
+disallowed-types = [
+  { path = "ratatui::widgets::Clear", reason = "TUI overlays must use crate::tui::widgets::OverlayClear so Buffer.diff repairs wide-glyph edges" },
+]
