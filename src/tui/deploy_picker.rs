@@ -2,7 +2,7 @@
 use super::components::choice_footer::{self, ChoiceEvent, ChoiceFocus};
 use super::{
     app::{Action, Ctx, Hints},
-    widgets::{Input, ListNav, OverlayClear, fit},
+    widgets::{Input, ListNav, PopupClass, PopupSurface, fit, popup_size, popup_too_small},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -143,7 +143,7 @@ impl DeployPicker {
     }
     fn apply(&mut self) -> Vec<Action> {
         if self.editing {
-            self.error = Some("Press Enter to confirm the project path first".into());
+            self.error = Some("Confirm the project path first".into());
             return vec![];
         }
         if self.pending_count() == 0 {
@@ -188,6 +188,17 @@ impl DeployPicker {
         ]
     }
     pub fn hints(&self) -> Hints {
+        if self.editing {
+            return &[
+                ("type", "project path"),
+                ("Enter/Tab", "targets"),
+                ("Esc", "stop editing"),
+            ];
+        }
+        if let Some(hints) = self.focus.button_hints() {
+            return hints;
+        }
+
         &[
             ("Tab/Shift+Tab", "list / buttons"),
             ("Enter/Space", "select / activate"),
@@ -196,6 +207,23 @@ impl DeployPicker {
             ("Esc", "cancel"),
         ]
     }
+    pub fn footer_help(&self) -> crate::tui::footer::Help<'_> {
+        if self.editing {
+            return crate::tui::footer::Help::new(self.hints())
+                .detail("Choose an existing project directory for local deployments");
+        }
+        self.focus.help(
+            self.hints(),
+            "Shared directories affect every agent reading them",
+            if self.pending_count() == 0 {
+                "No pending changes; select a destination first"
+            } else {
+                "Apply the staged deployment changes"
+            },
+            "Discard pending deployment changes and close",
+        )
+    }
+
     pub fn paste(&mut self, text: &str) -> Vec<Action> {
         if self.editing
             && let Err(e) = self.project.paste(text)
@@ -242,13 +270,23 @@ impl DeployPicker {
         vec![]
     }
     pub fn mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        match super::widgets::popup_mouse(m, self.rect) {
+            super::widgets::PopupMouse::OutsidePress => return vec![Action::CloseModal],
+            super::widgets::PopupMouse::Inside => {}
+            _ => return vec![],
+        }
         let at = Position::new(m.column, m.row);
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.project_rect.contains(at) {
+                    self.focus = ChoiceFocus::List;
                     self.editing = true;
                     self.project.click(m.column);
                 } else if self.buttons[0].contains(at) {
+                    if self.editing {
+                        self.editing = false;
+                        self.reload(ctx);
+                    }
                     self.focus = ChoiceFocus::Apply;
                     return self.apply();
                 } else if self.buttons[1].contains(at) {
@@ -266,25 +304,36 @@ impl DeployPicker {
                     }
                 }
             }
-            MouseEventKind::ScrollDown => self.list.move_by(3, self.rows.len()),
-            MouseEventKind::ScrollUp => self.list.move_by(-3, self.rows.len()),
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                if self.list.rows.contains(at) =>
+            {
+                if self.editing {
+                    self.editing = false;
+                    self.reload(ctx);
+                }
+                self.focus = ChoiceFocus::List;
+                self.list.move_by(
+                    if m.kind == MouseEventKind::ScrollDown {
+                        3
+                    } else {
+                        -3
+                    },
+                    self.rows.len(),
+                );
+            }
             _ => {}
         }
         vec![]
     }
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let w = area.width.saturating_sub(2).min(100);
-        let h = area.height.saturating_sub(2).min(26);
-        self.rect = Rect::new(
-            area.x + (area.width - w) / 2,
-            area.y + (area.height - h) / 2,
-            w,
-            h,
-        );
+        let height = (self.rows.len().min(12) as u16 + 14).min(26);
+        let size = popup_size(area, PopupClass::Choice, height, (12, 3));
+        self.rect = size.outer;
         self.buttons = [Rect::default(); 2];
         self.list.rows = Rect::default();
         self.project_rect = Rect::default();
-        f.render_widget(OverlayClear, self.rect);
+        self.project.clear_area();
+        f.render_widget(PopupSurface, self.rect);
         let block = ctx.settings.theme.block(
             format!(
                 " Install to agents · {} {} ",
@@ -299,13 +348,28 @@ impl DeployPicker {
         );
         let inner = block.inner(self.rect);
         f.render_widget(block, self.rect);
+        if !size.usable {
+            popup_too_small(f, size, &ctx.settings.theme);
+            return;
+        }
         if inner.height < 12 || inner.width < 26 {
             let footer_height = inner.height.min(2);
+            let field_height = u16::from(self.editing && inner.height >= 4);
+            if field_height > 0 {
+                self.project_rect = Rect::new(inner.x, inner.y, inner.width, 1);
+                self.project.render(
+                    f,
+                    self.project_rect,
+                    true,
+                    "Project directory",
+                    &ctx.settings.theme,
+                );
+            }
             self.list.rows = Rect::new(
                 inner.x,
-                inner.y,
+                inner.y + field_height,
                 inner.width,
-                inner.height.saturating_sub(footer_height),
+                inner.height.saturating_sub(footer_height + field_height),
             );
             let rows: Vec<_> = self
                 .rows
@@ -332,6 +396,12 @@ impl DeployPicker {
                 self.list.rows,
                 &mut self.list.state,
             );
+            if self.rows.is_empty() {
+                f.render_widget(
+                    Paragraph::new("No agent destinations").style(ctx.settings.theme.dim()),
+                    self.list.rows,
+                );
+            }
             self.buttons = choice_footer::draw(
                 f,
                 Rect::new(
@@ -458,24 +528,17 @@ impl DeployPicker {
             Paragraph::new(destination).wrap(Wrap { trim: false }),
             Rect::new(inner.x, inner.bottom() - 6, inner.width, 2),
         );
-        let info = self
-            .error
-            .clone()
-            .unwrap_or_else(|| "Shared directories affect every agent reading them.".into());
-        f.render_widget(
-            Paragraph::new(if self.error.is_some() {
-                format!(" {info}")
-            } else {
-                info
-            })
-            .wrap(Wrap { trim: false })
-            .style(if self.error.is_some() {
-                ctx.settings.theme.err()
-            } else {
-                ctx.settings.theme.dim()
-            }),
-            Rect::new(inner.x, inner.bottom() - 4, inner.width, 2),
-        );
+        if let Some(error) = &self.error {
+            f.render_widget(
+                Paragraph::new(format!(
+                    "{} {error}",
+                    super::icons::decoration(ctx.settings.ui.icons, "", "!")
+                ))
+                .wrap(Wrap { trim: false })
+                .style(ctx.settings.theme.err()),
+                Rect::new(inner.x, inner.bottom() - 4, inner.width, 2),
+            );
+        }
         let pending = self.pending_count();
         let summary = if pending == 0 {
             "No pending changes".into()
@@ -497,6 +560,52 @@ impl DeployPicker {
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+    #[test]
+    fn icon_mode_covers_whole_deployment_error_menu() {
+        use skills::config::Icons;
+        let root = skills::ops::DownloadDir::new("deploy-icon-mode").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        let mut ws = skills::Workspace::open(root.path()).unwrap();
+        ws.project = Some(root.path().to_path_buf());
+        let snap = ws.scan().unwrap();
+        let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        for mode in [Icons::Text, Icons::Nerd] {
+            settings.ui.icons = mode;
+            let ctx = Ctx {
+                ws: &ws,
+                snap: &snap,
+                settings: &settings,
+            };
+            let mut picker = DeployPicker::with_home(vec![], &ctx, root.path().join("fake-home"));
+            picker.error = Some("Destination unavailable".into());
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| picker.draw(f, f.area(), &ctx)).unwrap();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(screen.contains("Destination unavailable"));
+            assert!(screen.contains("Cancel"));
+            assert_eq!(
+                crate::tui::icons::tests::has_pua(&screen),
+                mode == Icons::Nerd
+            );
+            assert!(screen.contains(if mode == Icons::Text {
+                "! Destination"
+            } else {
+                " Destination"
+            }));
+        }
+    }
+
     #[test]
     fn picker_stages_shared_agent_choices_and_supports_mouse_cancel() {
         let project = std::env::temp_dir().join(format!("skills-picker-{}", std::process::id()));
@@ -548,6 +657,31 @@ mod tests {
         picker.toggle();
         assert!(!project.join(".cursor").exists());
         assert_eq!(picker.rows[cursor].2, Some(true));
+        picker.rect = Rect::new(10, 5, 70, 20);
+        picker.list.rows = Rect::new(11, 8, 68, 12);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: picker.list.rows.x,
+            row: picker.list.rows.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let pending_before = picker.pending_count();
+        assert!(picker.mouse(click, &ctx).is_empty());
+        assert_ne!(picker.pending_count(), pending_before);
+        assert!(!project.join(".cursor").exists());
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            let outside = MouseEvent {
+                kind: MouseEventKind::Down(button),
+                column: 0,
+                row: 0,
+                ..click
+            };
+            assert!(matches!(
+                picker.mouse(outside, &ctx).as_slice(),
+                [Action::CloseModal]
+            ));
+            assert!(!project.join(".cursor").exists());
+        }
         assert!(
             picker
                 .rows

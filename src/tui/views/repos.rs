@@ -138,6 +138,9 @@ impl ReposView {
     }
 
     pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
+        if self.overlay_open() {
+            return vec![];
+        }
         if self.focus_skills
             && let Some(view) = self.skill_search.as_mut()
         {
@@ -279,26 +282,31 @@ impl ReposView {
         }
     }
 
-    fn repository_status(&self, project: &Project) -> String {
+    fn repository_status(&self, project: &Project, icons: skills::config::Icons) -> String {
+        let icon = |nerd, text| crate::tui::icons::decoration(icons, nerd, text);
         let Some(alias) = project.alias.as_deref() else {
             return "Local".into();
         };
         if self.refreshing.contains(alias) {
-            return " Refreshing…".into();
+            return format!("{} Refreshing…", icon("", "↻"));
         }
         if self.inventory_errors.contains_key(alias) {
-            return " Refresh failed".into();
+            return format!("{} Refresh failed", icon("", "!"));
         }
         let Some(inventory) = self.inventories.get(alias) else {
             return "Not checked".into();
         };
         let (summary, _) = Self::inventory_presentation(inventory);
         match (summary.updates, summary.attention) {
-            (0, 0) => " Current".into(),
-            (updates, 0) => format!(" {updates} updates"),
-            (0, attention) => format!(" {attention} attention"),
+            (0, 0) => format!("{} Current", icon("", "✓")),
+            (updates, 0) => format!("{} {updates} updates", icon("", "↑")),
+            (0, attention) => format!("{} {attention} attention", icon("", "!")),
             (updates, attention) => {
-                format!(" {updates} updates ·  {attention} attention")
+                format!(
+                    "{} {updates} updates · {} {attention} attention",
+                    icon("", "↑"),
+                    icon("", "!")
+                )
             }
         }
     }
@@ -394,7 +402,7 @@ impl ReposView {
                 };
                 field("Remote", remote);
             } else {
-                field("Remote", "not checked · press f".into());
+                field("Remote", "not checked".into());
             }
         }
         lines
@@ -403,7 +411,12 @@ impl ReposView {
 
 impl View for ReposView {
     fn overlay_open(&self) -> bool {
-        self.focus_skills && self.skill_search.as_ref().is_some_and(View::overlay_open)
+        self.skill_search.as_ref().is_some_and(View::overlay_open)
+    }
+    fn mouse_overlay_open(&self) -> bool {
+        self.skill_search
+            .as_ref()
+            .is_some_and(View::mouse_overlay_open)
     }
     fn preview_overlay(&mut self) -> Option<&mut super::preview::Overlay> {
         self.skill_search.as_mut().and_then(View::preview_overlay)
@@ -604,6 +617,13 @@ impl View for ReposView {
     }
 
     fn handle_key(&mut self, k: KeyEvent, ctx: &Ctx) -> Vec<Action> {
+        if let Some(view) = self
+            .skill_search
+            .as_mut()
+            .filter(|view| view.overlay_open())
+        {
+            return view.handle_key(k, ctx);
+        }
         if !self.focus_skills
             && self.filter.editing
             && k.code == KeyCode::Right
@@ -689,6 +709,13 @@ impl View for ReposView {
     }
 
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        if let Some(view) = self
+            .skill_search
+            .as_mut()
+            .filter(|view| view.mouse_overlay_open())
+        {
+            return view.handle_mouse(m, ctx);
+        }
         let point = (m.column, m.row).into();
         if self.skills.contains(point) {
             if m.kind == MouseEventKind::Down(MouseButton::Left) || wheel(&m, ctx).is_some() {
@@ -753,7 +780,7 @@ impl View for ReposView {
             );
             let columns = ci.width as usize;
             let count = fit(&format!("{} skills", project.keys.len()), columns);
-            let status = self.repository_status(project);
+            let status = self.repository_status(project, ctx.settings.ui.icons);
             let icon = fit(&format!("{} ", self.source_icon(project, ctx)), columns);
             let room = columns.saturating_sub(width(&count) + 1);
             let name = fit(&project.name, room.saturating_sub(width(&icon)));
@@ -809,6 +836,13 @@ impl View for ReposView {
     }
 
     fn hints(&self) -> Hints {
+        if let Some(view) = self
+            .skill_search
+            .as_ref()
+            .filter(|view| view.overlay_open())
+        {
+            return view.hints();
+        }
         if self.filter.editing {
             return &[("Enter/↓", "sources"), ("Esc", "clear filter")];
         }
@@ -835,6 +869,106 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::Config, repository::Repository};
+
+    #[test]
+    fn icon_mode_covers_repository_status_buffers() {
+        use skills::config::Icons;
+        let root = skills::ops::DownloadDir::new("repo-icon-mode").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        let ws = Workspace::open(root.path()).unwrap();
+        Repository {
+            name: None,
+            kind: Default::default(),
+            alias: "demo".into(),
+            url: "https://example.test/demo.git".into(),
+            branch: "main".into(),
+        }
+        .save(&ws)
+        .unwrap();
+        let snap = ws.scan().unwrap();
+        let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        for mode in [Icons::Text, Icons::Nerd] {
+            settings.ui.icons = mode;
+            let ctx = Ctx {
+                ws: &ws,
+                snap: &snap,
+                settings: &settings,
+            };
+            let mut view = ReposView::default();
+            view.refresh(&ctx);
+            for variant in 0..7 {
+                view.refreshing.clear();
+                view.inventory_errors.clear();
+                view.inventories.clear();
+                let expected = match variant {
+                    0 => {
+                        view.refreshing.insert("demo".into());
+                        "Refreshing…"
+                    }
+                    1 => {
+                        view.inventory_errors
+                            .insert("demo".into(), "offline".into());
+                        "Refresh failed"
+                    }
+                    2 => "Not checked",
+                    _ => {
+                        let mut entries = vec![];
+                        if variant == 4 || variant == 6 {
+                            entries.push(skills::repository::RepositoryInventoryEntry {
+                                path: "example".into(),
+                                skill: None,
+                                state: RepositoryInventoryState::Update {
+                                    key: "repos/demo/example".into(),
+                                },
+                            });
+                        }
+                        if variant == 5 || variant == 6 {
+                            entries.push(skills::repository::RepositoryInventoryEntry {
+                                path: "missing".into(),
+                                skill: None,
+                                state: RepositoryInventoryState::MissingUpstream {
+                                    key: "repos/demo/missing".into(),
+                                },
+                            });
+                        }
+                        view.inventories
+                            .insert("demo".into(), RepositoryInventory { entries });
+                        match variant {
+                            3 => "Current",
+                            4 => "1 updates",
+                            5 => "1 attention",
+                            _ => "1 updates",
+                        }
+                    }
+                };
+                for columns in [100, 180] {
+                    let mut terminal = Terminal::new(TestBackend::new(columns, 30)).unwrap();
+                    terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
+                    let screen: String = terminal
+                        .backend()
+                        .buffer()
+                        .content
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect();
+                    assert!(screen.contains(expected), "variant={variant}: {screen}");
+                    if variant == 6 {
+                        assert!(screen.contains("1 attention"));
+                    }
+                    if mode == Icons::Text {
+                        assert!(!crate::tui::icons::tests::has_pua(&screen), "{screen}");
+                    } else {
+                        assert!(crate::tui::icons::tests::has_pua(&screen));
+                    }
+                }
+            }
+        }
+    }
 
     fn context_request<V: crate::tui::views::View>(
         view: &mut V,
@@ -1332,12 +1466,12 @@ mod tests {
         view.refreshing("demo");
         assert!(!view.inventories.contains_key("demo"));
         assert_eq!(
-            view.repository_status(view.selected().unwrap()),
+            view.repository_status(view.selected().unwrap(), settings.ui.icons),
             " Refreshing…"
         );
         assert!(view.inventory_result("demo", &Err(anyhow::anyhow!("offline"))));
         assert_eq!(
-            view.repository_status(view.selected().unwrap()),
+            view.repository_status(view.selected().unwrap(), settings.ui.icons),
             " Refresh failed"
         );
         assert!(!view.inventories.contains_key("demo"));

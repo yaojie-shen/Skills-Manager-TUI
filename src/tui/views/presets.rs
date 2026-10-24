@@ -126,6 +126,9 @@ impl PresetsView {
         if let Some(prompt) = self.group_prompt.as_mut() {
             return prompt.paste(text);
         }
+        if self.overlay_open() {
+            return vec![];
+        }
         if self.filter.editing {
             let actions = self.filter.paste(text);
             self.refilter(ctx);
@@ -181,9 +184,7 @@ impl PresetsView {
     fn with_selected(&self, open: impl FnOnce(&Preset) -> Modal) -> Vec<Action> {
         match self.selected() {
             Some(p) => vec![Action::OpenModal(Box::new(open(p)))],
-            None => vec![Action::Error(
-                "no preset selected; press c to create one".into(),
-            )],
+            None => vec![Action::Error("no preset selected".into())],
         }
     }
 
@@ -283,9 +284,9 @@ impl PresetsView {
             f.render_widget(
                 Paragraph::new(Span::styled(
                     if self.all_presets.is_empty() {
-                        "no presets yet — press c to create one"
+                        "no presets yet"
                     } else {
-                        "No matching presets · / to edit · Esc to clear"
+                        "No matching presets"
                     },
                     th.dim(),
                 )),
@@ -322,11 +323,18 @@ impl View for PresetsView {
     fn overlay_open(&self) -> bool {
         self.group_prompt.is_some()
             || self.matrix.hints().is_some()
-            || (self.focus == SplitFocus::Members
-                && self
-                    .skill_search
-                    .as_ref()
-                    .is_some_and(|(_, view)| view.overlay_open()))
+            || self
+                .skill_search
+                .as_ref()
+                .is_some_and(|(_, view)| view.overlay_open())
+    }
+    fn mouse_overlay_open(&self) -> bool {
+        self.group_prompt.is_some()
+            || self.matrix.hints().is_some()
+            || self
+                .skill_search
+                .as_ref()
+                .is_some_and(|(_, view)| view.mouse_overlay_open())
     }
     fn preview_overlay(&mut self) -> Option<&mut super::preview::Overlay> {
         self.skill_search
@@ -545,6 +553,13 @@ impl View for PresetsView {
         if let Some(actions) = self.matrix.handle_key(k, ctx) {
             return actions;
         }
+        if let Some((_, view)) = self
+            .skill_search
+            .as_mut()
+            .filter(|(_, view)| view.overlay_open())
+        {
+            return view.handle_key(k, ctx);
+        }
         self.refresh_groups(ctx);
         self.ensure_skill_search(ctx);
         if self.focus != SplitFocus::Members
@@ -679,6 +694,13 @@ impl View for PresetsView {
         if let Some(actions) = self.matrix.handle_mouse(m, ctx) {
             return actions;
         }
+        if let Some((_, view)) = self
+            .skill_search
+            .as_mut()
+            .filter(|(_, view)| view.mouse_overlay_open())
+        {
+            return view.handle_mouse(m, ctx);
+        }
         self.refresh_groups(ctx);
         self.ensure_skill_search(ctx);
         let at = (m.column, m.row).into();
@@ -762,11 +784,18 @@ impl View for PresetsView {
     }
 
     fn hints(&self) -> Hints {
-        if let Some(prompt) = self.group_prompt.as_ref() {
-            return match prompt.kind() {
-                Ask::Merge => &[("↑↓", "target"), ("Enter", "merge"), ("Esc", "cancel")],
-                Ask::Color => &[("↑↓", "colour"), ("Enter", "apply"), ("Esc", "cancel")],
-            };
+        if let Some(prompt) = &self.group_prompt {
+            return prompt.hints();
+        }
+        if let Some(hints) = self.matrix.hints() {
+            return hints;
+        }
+        if let Some((_, view)) = self
+            .skill_search
+            .as_ref()
+            .filter(|(_, view)| view.overlay_open())
+        {
+            return view.hints();
         }
         if self.filter.editing {
             return &[("Enter/↓", "presets"), ("Esc", "clear filter")];
@@ -775,9 +804,6 @@ impl View for PresetsView {
             && let Some((_, view)) = self.skill_search.as_ref()
         {
             return view.preset_panel_hints();
-        }
-        if let Some(hints) = self.matrix.hints() {
-            return hints;
         }
         if self.focus == SplitFocus::Members {
             &[

@@ -72,7 +72,7 @@ icons = "text"
 | --- | --- |
 | `layout` | `grid`、`list`、`compact`；`split` 是兼容别名。 |
 | `pill_caps` | 默认使用圆形 Powerline 端帽；缺字时改为 `block` 或 `none`。 |
-| `icons` | 默认使用 Nerd Font 图标；缺字时改为 `text`。 |
+| `icons` | 默认使用 Nerd Font 图标；`text` 在菜单和状态标签中使用普通符号，标签使用括号、预设使用斜杠，不受 `pill_caps` 影响。 |
 | `tags_enabled` | 显示或隐藏标签分类，不删除标签或预设数据。 |
 
 仅在当前会话切换布局，不会更新启动配置。

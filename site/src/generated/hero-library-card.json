@@ -1,6 +1,6 @@
 {
   "frame": {
-    "hash": "sha256:ad704caee26106ecdbc88704fbaee450017dff92577370c9fee1e4a02d631a9e",
+    "hash": "sha256:03955dc1b6b04b75a5eeeefeae615118c99f174870793f08e3d9f4f5ed2b86f8",
     "name": "library-card",
     "rows": [
       [
@@ -15,33 +15,19 @@
         },
         {
           "bg": "#2c323c",
-          "cells": 11,
+          "cells": 9,
           "fg": "#f0f2f6",
           "mods": [
             "bold"
           ],
-          "text": " 1 Library "
+          "text": " Library "
         },
         {
           "bg": "reset",
-          "cells": 54,
+          "cells": 78,
           "fg": "reset",
           "mods": [],
-          "text": "  2 Tags   3 Presets   4 Agents   5 Repos   6 Health  "
-        },
-        {
-          "bg": "reset",
-          "cells": 7,
-          "fg": "#8c8c8c",
-          "mods": [],
-          "text": " Tab ↔ "
-        },
-        {
-          "bg": "reset",
-          "cells": 15,
-          "fg": "reset",
-          "mods": [],
-          "text": "               "
+          "text": "  Tags   Presets   Agents   Repos   Health      local: ~/demo/.agents/skills  "
         },
         {
           "bg": "reset",
@@ -111,10 +97,10 @@
       [
         {
           "bg": "reset",
-          "cells": 74,
+          "cells": 77,
           "fg": "dark-gray",
           "mods": [],
-          "text": "╭ skills · by repository ─────────────────────────────────────────────────"
+          "text": "╭ skills · by repository ────────────────────────────────────────────────────"
         },
         {
           "bg": "reset",
@@ -148,10 +134,10 @@
         },
         {
           "bg": "reset",
-          "cells": 9,
+          "cells": 6,
           "fg": "reset",
           "mods": [],
-          "text": " View F2 "
+          "text": " View "
         },
         {
           "bg": "reset",
@@ -1700,26 +1686,26 @@
       [
         {
           "bg": "reset",
-          "cells": 53,
-          "fg": "reset",
+          "cells": 49,
+          "fg": "#8c8c8c",
           "mods": [],
-          "text": "                                                     "
+          "text": "Context help                                     "
         },
         {
           "bg": "reset",
-          "cells": 2,
+          "cells": 7,
           "fg": "cyan",
           "mods": [
             "bold"
           ],
-          "text": "↑↓"
+          "text": "Enter/↓"
         },
         {
           "bg": "reset",
-          "cells": 9,
+          "cells": 10,
           "fg": "#8c8c8c",
           "mods": [],
-          "text": " select  "
+          "text": " results  "
         },
         {
           "bg": "reset",
@@ -1728,30 +1714,14 @@
           "mods": [
             "bold"
           ],
-          "text": "↓"
+          "text": "↑"
         },
         {
           "bg": "reset",
           "cells": 7,
           "fg": "#8c8c8c",
           "mods": [],
-          "text": " list  "
-        },
-        {
-          "bg": "reset",
-          "cells": 5,
-          "fg": "cyan",
-          "mods": [
-            "bold"
-          ],
-          "text": "Enter"
-        },
-        {
-          "bg": "reset",
-          "cells": 7,
-          "fg": "#8c8c8c",
-          "mods": [],
-          "text": " list  "
+          "text": " tabs  "
         },
         {
           "bg": "reset",
@@ -1784,6 +1754,29 @@
           "fg": "#8c8c8c",
           "mods": [],
           "text": " clear/results  "
+        },
+        {
+          "bg": "reset",
+          "cells": 1,
+          "fg": "reset",
+          "mods": [],
+          "text": " "
+        },
+        {
+          "bg": "reset",
+          "cells": 2,
+          "fg": "cyan",
+          "mods": [
+            "bold"
+          ],
+          "text": "F1"
+        },
+        {
+          "bg": "reset",
+          "cells": 7,
+          "fg": "#8c8c8c",
+          "mods": [],
+          "text": " help  "
         }
       ]
     ]
@@ -1797,7 +1790,7 @@
     "layout": "grid",
     "privacy": "all data is synthetic in a disposable local project; HOME, user libraries, Agent directories, network, and sync are not used",
     "renderer": "ratatui::backend::TestBackend",
-    "sourceRevision": "69da2f0+tui-e6d933ec63ed"
+    "sourceRevision": "single-row-footer+tui-650f364d9f90"
   },
   "schema_version": 1,
   "width": 112

@@ -1,7 +1,10 @@
-//! Keyboard focus and footer shared by staged selection dialogs.
+//! Button focus and action rows shared by staged selection dialogs.
+//! Action rows contain controls and selection counts, never explanatory help.
+//! `help` routes the current control description to the app-owned footer.
 use crate::tui::theme::Theme;
+use crate::tui::widgets::{ButtonSpec, draw_button_row};
 use crossterm::event::KeyCode;
-use ratatui::{Frame, layout::Rect, style::Modifier, widgets::Paragraph};
+use ratatui::{Frame, layout::Rect, widgets::Paragraph};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ChoiceFocus {
@@ -17,6 +20,31 @@ pub(crate) enum ChoiceEvent {
     Cancel,
 }
 impl ChoiceFocus {
+    /// Button focus consumes navigation before the dialog's list or input.
+    pub fn button_hints(self) -> Option<crate::tui::app::Hints> {
+        (self != Self::List).then_some(&[
+            ("←→", "buttons"),
+            ("Enter/Space", "activate"),
+            ("↑", "content"),
+            ("Tab/Shift+Tab", "next / previous"),
+            ("Esc", "back/cancel"),
+        ])
+    }
+
+    pub fn help<'a>(
+        self,
+        keys: crate::tui::app::Hints,
+        list: impl Into<std::borrow::Cow<'a, str>>,
+        apply: impl Into<std::borrow::Cow<'a, str>>,
+        cancel: impl Into<std::borrow::Cow<'a, str>>,
+    ) -> crate::tui::footer::Help<'a> {
+        crate::tui::footer::Help::new(keys).detail(match self {
+            Self::List => list.into(),
+            Self::Apply => apply.into(),
+            Self::Cancel => cancel.into(),
+        })
+    }
+
     pub fn key(&mut self, key: KeyCode, at_end: bool) -> Option<ChoiceEvent> {
         use ChoiceFocus::*;
         *self = match (key, *self) {
@@ -67,44 +95,27 @@ pub(crate) fn draw_with_labels(
             Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1),
         );
     }
-    let labels = [format!("[ {} ]", labels.0), format!("[ {} ]", labels.1)];
-    let widths = labels
-        .each_ref()
-        .map(|label| (label.len() as u16).min(area.width / 2));
-    let total_width = widths[0].saturating_add(widths[1]);
-    let x = area.right().saturating_sub(total_width);
+    let focused = match focus {
+        ChoiceFocus::List => None,
+        ChoiceFocus::Apply => Some(0),
+        ChoiceFocus::Cancel => Some(1),
+    };
+    let mut apply = ButtonSpec::new(labels.0);
+    apply.enabled = enabled;
+    let rects = draw_button_row(f, area, &[apply, ButtonSpec::new(labels.1)], focused, th);
+    let x = rects[0].x;
     let y = area.bottom() - 1;
     f.render_widget(
         Paragraph::new(summary).style(th.dim()),
         Rect::new(area.x, y, x - area.x, 1),
     );
-    let rects = [
-        Rect::new(x, y, widths[0], 1),
-        Rect::new(x + widths[0], y, widths[1], 1),
-    ];
-    for (i, label) in labels.iter().enumerate() {
-        let active = focus
-            == if i == 0 {
-                ChoiceFocus::Apply
-            } else {
-                ChoiceFocus::Cancel
-            };
-        let mut style = if active {
-            th.selected().add_modifier(Modifier::BOLD)
-        } else {
-            th.dim()
-        };
-        if i == 0 && !enabled {
-            style = style.fg(th.placeholder);
-        }
-        f.render_widget(Paragraph::new(label.as_str()).style(style), rects[i]);
-    }
-    rects
+    [rects[0], rects[1]]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Modifier;
     #[test]
     fn footer_clips_to_small_windows_and_highlights_only_focused_button() {
         use ratatui::{Terminal, backend::TestBackend};
@@ -184,6 +195,6 @@ mod tests {
             .unwrap();
         assert_eq!(rects[0].width, "[ Analyze ]".len() as u16);
         assert_eq!(rects[1].width, "[ Back ]".len() as u16);
-        assert_eq!(rects[0].right(), rects[1].x);
+        assert_eq!(rects[0].right() + 2, rects[1].x);
     }
 }

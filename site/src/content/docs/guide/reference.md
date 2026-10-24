@@ -63,11 +63,14 @@ Filters include `tag:`, `preset:`, `repo:`, `agent:`, `status:`, and `source:`. 
 
 ## TUI controls
 
+Keyboard hints appear only in the bottom bar and follow the focused page, panel, or dialog.
+
 | Key | Action |
 | --- | --- |
 | `:` | Open the command palette outside text inputs |
 | `a` / right-click | Open actions for the selected item |
 | `?` / `Ctrl+G` | Open help; `?` types text while editing |
+| `F1` | Show complete help for the current focus, including inside dialogs; press again to close |
 | `Tab` / `Shift+Tab` | Move to the next or previous page after closing edit dialogs |
 | `1` to `6` | Select a visible tab outside text inputs; hiding Tags changes the order |
 | `Enter` / Down | Enter from the tab strip; elsewhere activate the focused control |
@@ -79,4 +82,4 @@ Filters include `tag:`, `preset:`, `repo:`, `agent:`, `status:`, and `source:`. 
 | `m`, Space, `Ctrl+A` | Enter multi-select, toggle one skill, or add the current results |
 | `u` / `U` | Check or update upstream content |
 
-The command palette filters as you type. Arrow keys select a command; Enter runs it; Esc closes it. In the settings-only Library View menu, use `←`/`→` to switch categories, `Tab` to advance, or `Shift+Tab` to go back. `↑`/`↓`, `j`/`k`, clicks, and the scroll wheel apply settings immediately without closing the menu. `Enter`, `Esc`, or `F2` closes it and keeps applied changes. Collapse-all and expand-all remain in the results-frame border and on `Ctrl+←` / `Ctrl+→`. View-menu shortcuts appear only in the screen footer. Tag-picker changes apply immediately, while staged membership selectors require Apply. Closing a tag picker does not undo changes already written. The footer shows controls for the current context.
+The command palette filters as you type. Arrow keys select a command; Enter runs it; Esc closes it. A single left click runs an enabled command in Actions or Commands. In the settings-only Library View menu, use `←`/`→` to switch categories, `Tab` to advance, or `Shift+Tab` to go back. `↑`/`↓`, `j`/`k`, clicks, and the scroll wheel apply settings immediately without closing the menu. `Enter`, `Esc`, or `F2` closes it and keeps applied changes. Collapse-all and expand-all remain in the results-frame border and on `Ctrl+←` / `Ctrl+→`. View-menu shortcuts appear only in the screen footer. Tag-picker changes apply immediately, while staged membership selectors require Apply. Closing a tag picker does not undo changes already written. A left, right, or middle button press outside a popup closes only the top overlay and consumes the event; scrolling outside is ignored. Completion popovers close before their parent dialog. Busy staged operations remain open while writing. Clicking Help or message content keeps it open; press outside or use its keyboard close shortcut. In backup settings, an outside press closes the whole dialog, while Esc returns to the previous step. The single-line bottom bar combines the focused control’s description or disabled reason with its shortcuts. Long messages are shortened to fit. Click the message area or press `F1` to read the full description and shortcuts in a scrollable notification, including while editing or inside another popup. Press `F1`, `Esc`, or `Enter` to close it and return to the previous focus. Keyboard and mouse focus share the same help.

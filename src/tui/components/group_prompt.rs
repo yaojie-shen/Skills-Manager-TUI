@@ -1,10 +1,13 @@
 //! Shared group colour and merge chooser, independent of page implementations.
+//! Colour preview and acceptance both use the selected candidate. Editing the
+//! filter selects an exact colour match or exposes a selected custom candidate.
+//! Filtering preserves the choice viewport; terminal resizing still refits it.
 
 use super::group::{self, Kind, tag_fill};
-use crate::tui::app::{Action, Ctx};
+use crate::tui::app::{Action, Ctx, Hints};
 use crate::tui::theme::Theme;
-use crate::tui::widgets::OverlayClear as Clear;
-use crate::tui::widgets::{Input, ListNav, fit, width};
+use crate::tui::widgets::PopupSurface;
+use crate::tui::widgets::{Input, ListNav, PopupClass, fit, popup_size, popup_too_small, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -33,7 +36,9 @@ pub struct Prompt {
     preset: Option<Preset>,
     input: Input,
     choices: Vec<String>,
-    /// Indices into `choices` matching the filter, in display order.
+    custom: Option<String>,
+    /// Indices into `choices` matching the filter, in display order;
+    /// `choices.len()` denotes the custom candidate.
     shown: Vec<usize>,
     list: ListNav,
     rect: Rect,
@@ -46,6 +51,23 @@ impl Prompt {
 
     pub fn kind(&self) -> Ask {
         self.ask
+    }
+
+    pub fn hints(&self) -> Hints {
+        match self.ask {
+            Ask::Merge => &[
+                ("↑↓", "target"),
+                ("Enter", "merge"),
+                ("type", "filter"),
+                ("Esc", "cancel"),
+            ],
+            Ask::Color => &[
+                ("↑↓", "colour"),
+                ("Enter", "apply"),
+                ("type", "name / #rrggbb"),
+                ("Esc", "cancel"),
+            ],
+        }
     }
 
     pub fn value(&self) -> &str {
@@ -112,16 +134,18 @@ impl Prompt {
     }
 
     pub fn mouse(&mut self, m: MouseEvent) -> Option<bool> {
+        match crate::tui::widgets::popup_mouse(m, self.rect) {
+            crate::tui::widgets::PopupMouse::OutsidePress => return Some(false),
+            crate::tui::widgets::PopupMouse::Inside => {}
+            _ => return None,
+        }
         match m.kind {
             MouseEventKind::ScrollDown => self.list.move_by(1, self.shown.len()),
             MouseEventKind::ScrollUp => self.list.move_by(-1, self.shown.len()),
-            MouseEventKind::Down(MouseButton::Left)
-                if !self.rect.contains((m.column, m.row).into()) =>
-            {
-                return Some(false);
-            }
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some((_, true)) = self.list.click(m.row, self.shown.len()) {
+                if self.list.rows.contains((m.column, m.row).into())
+                    && let Some((_, true)) = self.list.click(m.row, self.shown.len())
+                {
                     return Some(true);
                 }
                 self.input.click(m.column);
@@ -140,23 +164,19 @@ impl Prompt {
         };
         let package = (p.identity == Kind::Preset).then(|| p.preview_preset(None));
         let preview_height = package.as_ref().map_or(1, group::preset_card_height);
-        let want = p.shown.len() as u16 + 5 + preview_height;
-        let w = 56.min(area.width.saturating_sub(2));
-        let h = want.max(8).min(area.height.saturating_sub(2));
-        let rect = Rect::new(
-            area.x + (area.width - w) / 2,
-            area.y + (area.height - h) / 2,
-            w,
-            h,
-        );
+        let want =
+            (p.choices.len().min(u16::MAX as usize) as u16).saturating_add(5 + preview_height);
+        p.list.rows = Rect::default();
+        p.input.clear_area();
+        let size = popup_size(area, PopupClass::Choice, want, (4, 4));
+        let rect = size.outer;
         p.rect = rect;
-        f.render_widget(Clear, rect);
+        f.render_widget(PopupSurface, rect);
         let block = th.block(title, true);
         let inner = block.inner(rect);
         f.render_widget(block, rect);
-        if inner.height < 4 || inner.width < 4 {
-            p.list.rows = Rect::default();
-            f.render_widget(Paragraph::new("Resize · Esc closes").style(th.dim()), inner);
+        if !size.usable {
+            popup_too_small(f, size, th);
             return;
         }
         let field = Rect {
@@ -231,7 +251,7 @@ impl Prompt {
             .shown
             .iter()
             .map(|&i| {
-                let name = &p.choices[i];
+                let name = p.choice(i);
                 let spans = match p.ask {
                     Ask::Merge => group::Badge::for_kind(p.identity, name, p.group_fill(name, ctx))
                         .render(ctx, row_width),
@@ -240,7 +260,12 @@ impl Prompt {
                     }
                     Ask::Color => {
                         let fill = group::color(Some(name), th);
-                        let suffix = fit(&format!("  {name}"), row_width / 2);
+                        let label = if i == p.choices.len() {
+                            format!("  {name} (custom)")
+                        } else {
+                            format!("  {name}")
+                        };
+                        let suffix = fit(&label, row_width / 2);
                         let available = row_width.saturating_sub(width(&suffix));
                         let mut s = group::Badge::for_kind(p.identity, &p.name, fill)
                             .render(ctx, available);
@@ -277,6 +302,7 @@ impl Prompt {
             preset: None,
             input: Input::default(),
             choices,
+            custom: None,
             shown,
             list,
             rect: Rect::default(),
@@ -311,39 +337,52 @@ impl Prompt {
         self.shown = (0..self.choices.len())
             .filter(|&i| q.is_empty() || self.choices[i].to_lowercase().contains(&q))
             .collect();
+        self.custom = None;
+        if self.ask == Ask::Color {
+            let exact = self
+                .shown
+                .iter()
+                .position(|&i| self.choices[i].eq_ignore_ascii_case(&q));
+            if let Some(i) = exact {
+                self.list.select(Some(i));
+            } else if self.input.value().trim().parse::<Color>().is_ok() {
+                self.custom = Some(self.input.value().trim().to_string());
+                self.shown.push(self.choices.len());
+                self.list.select(Some(self.shown.len() - 1));
+            }
+        }
         self.list.clamp(self.shown.len());
+    }
+
+    fn choice(&self, i: usize) -> &str {
+        if i == self.choices.len() {
+            self.custom.as_deref().unwrap_or_default()
+        } else {
+            &self.choices[i]
+        }
     }
 
     pub fn chosen(&self) -> Option<&str> {
         self.list
             .selected()
             .and_then(|i| self.shown.get(i))
-            .map(|&i| self.choices[i].as_str())
+            .map(|&i| self.choice(i))
     }
 
-    /// The colour the prompt would apply now: what was typed when that names
-    /// one, else the highlighted row. `Some(None)` is "no colour".
+    /// The selected colour used by both preview and acceptance.
+    /// `Some(None)` is "no colour".
     fn color(&self) -> Option<Option<Color>> {
-        let typed = self.input.value().trim();
-        if let Ok(c) = typed.parse::<Color>() {
-            return Some(Some(c));
-        }
-        match self.chosen() {
-            Some(NO_COLOR) => Some(None),
+        match self.color_text()? {
             Some(name) => name.parse::<Color>().ok().map(Some),
-            None => None,
+            None => Some(None),
         }
     }
 
-    /// The text written to the config for `color()`, as typed or as listed.
+    /// The selected candidate's text written to the config for `color()`.
     pub fn color_text(&self) -> Option<Option<String>> {
-        let typed = self.input.value().trim();
-        if typed.parse::<Color>().is_ok() {
-            return Some(Some(typed.to_string()));
-        }
         match self.chosen() {
             Some(NO_COLOR) => Some(None),
-            Some(name) => Some(Some(name.to_string())),
+            Some(name) => name.parse::<Color>().ok().map(|_| Some(name.to_string())),
             None => None,
         }
     }
@@ -352,6 +391,272 @@ impl Prompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(prompt: &mut Prompt, code: KeyCode) -> Option<bool> {
+        prompt.key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn draw(prompt: &mut Prompt) -> ratatui::buffer::Buffer {
+        let tmp = skills::ops::DownloadDir::new("group-colour").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = skills::Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
+        term.draw(|f| prompt.draw(f, f.area(), &ctx)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    #[test]
+    fn group_filter_geometry_stays_stable_and_selection_scrolls_after_resize() {
+        let tmp = skills::ops::DownloadDir::new("group-filter-geometry").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = skills::Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        for identity in [Kind::Tag, Kind::Preset] {
+            for ask in [Ask::Color, Ask::Merge] {
+                let mut prompt = match ask {
+                    Ask::Color => Prompt::for_color(identity, "example", None, &settings.theme),
+                    Ask::Merge => Prompt::for_merge(
+                        identity,
+                        "example",
+                        (0..30).map(|i| format!("target-{i:02}")).collect(),
+                    ),
+                };
+                let one = if ask == Ask::Color {
+                    "none"
+                } else {
+                    "target-29"
+                };
+                let mut previous = None;
+                for (width, height) in [(100, 40), (60, 18), (100, 40)] {
+                    let mut term =
+                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                            .unwrap();
+                    let mut geometry = None;
+                    for (query, count) in [
+                        ("", prompt.choices.len()),
+                        (one, 1),
+                        ("no-such-choice", 0),
+                        ("", prompt.choices.len()),
+                    ] {
+                        prompt.input = Input::with_value(query);
+                        prompt.refilter();
+                        assert_eq!(prompt.shown.len(), count);
+                        key(&mut prompt, KeyCode::PageDown);
+                        term.draw(|f| prompt.draw(f, Rect::new(0, 0, width, height - 2), &ctx))
+                            .unwrap();
+                        let current = (
+                            prompt.rect,
+                            prompt.list.rows,
+                            term.get_cursor_position().unwrap().y,
+                        );
+                        if let Some(expected) = geometry {
+                            assert_eq!(current, expected, "{ask:?} {identity:?} {query}");
+                        } else {
+                            geometry = Some(current);
+                        }
+                        if let Some(selected) = prompt.list.selected() {
+                            let offset = prompt.list.state.offset();
+                            assert!(
+                                selected >= offset
+                                    && selected < offset + prompt.list.rows.height as usize
+                            );
+                            let y = prompt.list.rows.y + (selected - offset) as u16;
+                            assert_eq!(
+                                term.backend().buffer()[(prompt.list.rows.x, y)].symbol(),
+                                "▸"
+                            );
+                        }
+                    }
+                    if let Some(before) = previous {
+                        assert_ne!(geometry.unwrap().0, before);
+                    }
+                    previous = Some(geometry.unwrap().0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responsive_group_prompts_preserve_selected_color_and_visible_rows() {
+        let tmp = skills::ops::DownloadDir::new("group-responsive").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = skills::Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        for identity in [Kind::Tag, Kind::Preset] {
+            let mut prompt = Prompt::for_color(identity, "example", Some("red"), &Theme::default());
+            let selected = prompt.color_text();
+            for (width, height) in [(160, 40), (112, 32), (60, 20), (40, 12), (4, 3), (1, 1)] {
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                        .unwrap();
+                let area = Rect::new(0, 0, width, height.saturating_sub(2));
+                terminal
+                    .draw(|frame| prompt.draw(frame, area, &ctx))
+                    .unwrap();
+                assert!(
+                    prompt.list.rows.is_empty()
+                        || prompt.list.rows.intersection(area) == prompt.list.rows
+                );
+                if width == 40 {
+                    assert!(prompt.list.rows.height > 0);
+                }
+                if width < 4 {
+                    assert_eq!(prompt.list.rows, Rect::default());
+                }
+                assert_eq!(prompt.color_text(), selected);
+            }
+        }
+    }
+
+    #[test]
+    fn typed_named_colour_selects_exact_match_then_navigation_controls_acceptance() {
+        for identity in [Kind::Tag, Kind::Preset] {
+            let mut prompt =
+                Prompt::for_color(identity, "test", Some("lightred"), &Theme::default());
+            for c in "red".chars() {
+                assert_eq!(key(&mut prompt, KeyCode::Char(c)), None);
+            }
+            assert_eq!(prompt.chosen(), Some("red"));
+            assert_eq!(prompt.color(), Some(Some(Color::Red)));
+            assert_eq!(key(&mut prompt, KeyCode::Down), None);
+            assert_eq!(prompt.value(), "red");
+            assert_eq!(prompt.chosen(), Some("lightred"));
+            assert_eq!(prompt.color(), Some(Some(Color::LightRed)));
+            assert_eq!(key(&mut prompt, KeyCode::Enter), Some(true));
+            assert_eq!(prompt.color_text(), Some(Some("lightred".into())));
+            key(&mut prompt, KeyCode::Up);
+            assert_eq!(prompt.color_text(), Some(Some("red".into())));
+        }
+    }
+
+    #[test]
+    fn pasted_colour_reselects_exact_match_after_navigation() {
+        let mut prompt = Prompt::for_color(Kind::Tag, "test", None, &Theme::default());
+        prompt.paste("red");
+        key(&mut prompt, KeyCode::Down);
+        prompt.input.clear();
+        prompt.paste(" RED ");
+        assert_eq!(prompt.chosen(), Some("red"));
+        assert_eq!(prompt.color_text(), Some(Some("red".into())));
+    }
+
+    #[test]
+    fn custom_colour_is_a_visible_selected_candidate() {
+        for identity in [Kind::Tag, Kind::Preset] {
+            for (value, color) in [
+                ("#b87e54", Color::Rgb(184, 126, 84)),
+                ("0", Color::Indexed(0)),
+                ("255", Color::Indexed(255)),
+                ("reset", Color::Reset),
+            ] {
+                let mut prompt = Prompt::for_color(identity, "test", None, &Theme::default());
+                prompt.paste(value);
+                let buffer = draw(&mut prompt);
+                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert!(text.contains(&format!("{value} (custom)")));
+                assert!(text.contains("▸ "));
+                assert_eq!(prompt.chosen(), Some(value));
+                assert_eq!(prompt.color(), Some(Some(color)));
+                key(&mut prompt, KeyCode::Up);
+                key(&mut prompt, KeyCode::Down);
+                assert_eq!(key(&mut prompt, KeyCode::Enter), Some(true));
+                assert_eq!(prompt.color_text(), Some(Some(value.into())));
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_selection_and_double_click_apply_highlighted_colour() {
+        for identity in [Kind::Tag, Kind::Preset] {
+            let mut prompt = Prompt::for_color(identity, "test", None, &Theme::default());
+            prompt.paste("red");
+            draw(&mut prompt);
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: prompt.list.rows.x + 2,
+                row: prompt.list.rows.y + 1,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert_eq!(prompt.mouse(click), None);
+            assert_eq!(prompt.chosen(), Some("lightred"));
+            assert_eq!(prompt.color(), Some(Some(Color::LightRed)));
+            assert_eq!(key(&mut prompt, KeyCode::Enter), Some(true));
+            assert_eq!(prompt.color_text(), Some(Some("lightred".into())));
+            assert_eq!(prompt.mouse(click), Some(true));
+            assert_eq!(prompt.color_text(), Some(Some("lightred".into())));
+        }
+    }
+
+    #[test]
+    fn invalid_colour_clears_selection_and_preview_without_applying_stale_value() {
+        for value in ["#12345z", "256", "not-a-colour"] {
+            let mut prompt = Prompt::for_color(Kind::Tag, "test", None, &Theme::default());
+            prompt.paste("#b87e54");
+            prompt.input.clear();
+            prompt.paste(value);
+            key(&mut prompt, KeyCode::Down);
+            let buffer = draw(&mut prompt);
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains("not a colour"));
+            assert!(text.contains("nothing matches"));
+            assert_eq!(prompt.chosen(), None);
+            assert_eq!(prompt.color(), None);
+            assert_eq!(key(&mut prompt, KeyCode::Enter), Some(true));
+            assert_eq!(prompt.color_text(), None);
+        }
+    }
+
+    #[test]
+    fn default_and_merge_choices_keep_their_meanings() {
+        let mut prompt = Prompt::for_color(Kind::Tag, "test", Some("blue"), &Theme::default());
+        prompt.paste("none");
+        assert_eq!(prompt.color(), Some(None));
+        assert_eq!(prompt.color_text(), Some(None));
+        let mut merge = Prompt::for_merge(Kind::Tag, "test", vec!["lightred".into(), "red".into()]);
+        merge.paste("red");
+        assert_eq!(merge.chosen(), Some("lightred"));
+        key(&mut merge, KeyCode::Down);
+        assert_eq!(merge.chosen(), Some("red"));
+        assert_eq!(key(&mut merge, KeyCode::Enter), Some(true));
+        merge.input.clear();
+        merge.paste("#b87e54");
+        assert_eq!(merge.chosen(), None);
+        assert!(merge.custom.is_none());
+    }
 
     #[test]
     fn colour_picker_starts_at_current_or_default_colour() {
@@ -369,6 +674,12 @@ mod tests {
     #[test]
     fn colour_and_merge_prompts_survive_tiny_terminal_resize() {
         let tmp = skills::ops::DownloadDir::new("group-resize").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
         let ws = skills::Workspace::open(tmp.path()).unwrap();
         let snap = ws.scan().unwrap();
         let theme = crate::tui::theme::Theme::default();

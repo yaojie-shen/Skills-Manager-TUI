@@ -6,6 +6,15 @@ interface Props { locale: 'en' | 'zh-cn' }
 const { locale } = Astro.props;
 const c = copy[locale].capture;
 const zh = locale === 'zh-cn';
+// The header is part of the real capture; derive click targets from its cells.
+const captureHeader = captures.frames.library.rows[0].map(run => run.text).join('');
+const tabTitles = { library: 'Library', tags: 'Tags', presets: 'Presets', agents: 'Agents', repos: 'Repos', health: 'Health' };
+const tabRects = Object.fromEntries(captureTabs.map(tab => {
+  const label = ` ${tabTitles[tab]} `;
+  const column = captureHeader.indexOf(label);
+  if (column < 0) throw new Error(`Missing capture tab: ${tab}`);
+  return [tab, { column, width: label.length }];
+}));
 const colors: Record<string, [string, string]> = {
   black: ['#111214', '#11161b'], red: ['#a5251c', '#ff7b72'], green: ['#25733a', '#7ee787'],
   yellow: ['#805600', '#e3b341'], blue: ['#315eaa', '#79c0ff'], magenta: ['#833a9c', '#d2a8ff'],
@@ -25,7 +34,7 @@ const background = (value: string) => value === 'reset' ? undefined : `light-dar
     <div class="capture-stage">
       <div class="capture-selected" data-selected-frame>
         {captureTabs.map((name, index) => { const frame=captures.frames[name], item=c.screens[name]; return <figure class="capture-frame" data-frame={name} hidden={index !== 0} aria-label={`${c.names[name]}, ${index + 1} / 6. ${item.title}. ${item.text}`}>
-          <div class="capture-terminal-scroller"><div class="capture-terminal-wrap"><pre class="capture-pre" aria-hidden="true">{frame.rows.map(row => <>{row.map(run => { const fg=color(run.fg,run.text), bg=background(run.bg); return <span class:list={run.mods} style={`${fg?`color:${fg};`:''}${bg?`background:${bg};`:''}`}>{run.text}</span> })}{'\n'}</>)}</pre><div class="capture-hotspots" data-hotspots={name} aria-hidden={index ? 'true' : 'false'} inert={index ? true : undefined}>{captureTabs.map(tab => <button type="button" data-tab={tab} aria-label={zh ? `显示 ${c.names[tab]} 画面` : `Show ${c.names[tab]} screen`}></button>)}</div></div></div>
+          <div class="capture-terminal-scroller"><div class="capture-terminal-wrap"><pre class="capture-pre" aria-hidden="true">{frame.rows.map(row => <>{row.map(run => { const fg=color(run.fg,run.text), bg=background(run.bg); return <span class:list={run.mods} style={`${fg?`color:${fg};`:''}${bg?`background:${bg};`:''}`}>{run.text}</span> })}{'\n'}</>)}</pre><div class="capture-hotspots" data-hotspots={name} aria-hidden={index ? 'true' : 'false'} inert={index ? true : undefined}>{captureTabs.map(tab => <button type="button" data-tab={tab} style={`left:calc(var(--terminal-pad) + ${tabRects[tab].column}ch);width:${tabRects[tab].width}ch`} aria-label={zh ? `显示 ${c.names[tab]} 画面` : `Show ${c.names[tab]} screen`}></button>)}</div></div></div>
           <figcaption class="capture-caption"><span class="capture-frame-number" aria-hidden="true">{String(index + 1).padStart(2,'0')}</span><div><p class="capture-label">SCREEN {String(index + 1).padStart(2,'0')} / 06 · {c.names[name]}</p><h3>{item.title}</h3><p>{item.text}</p></div></figcaption>
         </figure> })}
       </div>

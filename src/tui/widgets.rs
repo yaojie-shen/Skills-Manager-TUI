@@ -1,18 +1,102 @@
 //! Small reusable pieces: a unicode-aware single-line input, list navigation
-//! with mouse hit-testing, text fitting, spinner frames.
+//! with mouse hit-testing, text fitting, spinner frames and overlay surfaces.
+//! Focus-taking popups start with `PopupSurface`, after drawing their background.
+//! Passive notifications and clipping use `OverlayClear` alone.
+//! Dialog buttons share cell-aware clipped geometry and explicit semantic intent.
+//! Popup sizing uses content budgets within the already footer-excluded area.
+//! Mouse classification leaves dismissal and cancellation cleanup to the owner.
 
 use super::theme::Theme;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::buffer::CellWidth;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopupMouse {
+    Inside,
+    OutsidePress,
+    OutsideWheel,
+    Inert,
+}
+
+/// Classify against the outer border after routing any child popup first.
+pub fn popup_mouse(event: MouseEvent, outer: Rect) -> PopupMouse {
+    if outer.contains((event.column, event.row).into()) {
+        PopupMouse::Inside
+    } else {
+        match event.kind {
+            MouseEventKind::Down(_) => PopupMouse::OutsidePress,
+            MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => PopupMouse::OutsideWheel,
+            _ => PopupMouse::Inert,
+        }
+    }
+}
+
+/// De-emphasize inactive content using the terminal's own foreground/background.
+/// Remove colored fills and emphasis so this works on both light and dark themes.
+/// Filled badge caps become outline delimiters when their adjoining fill is removed.
+/// Applying it again for a nested popup has no cumulative effect.
+pub fn dim_inactive(area: Rect, buf: &mut ratatui::buffer::Buffer) {
+    let area = area.intersection(*buf.area());
+    // Inspect the original colors before resetting any cells: a cap is part of
+    // a filled badge only when its ink matches the adjacent body's background.
+    // The same glyph in ordinary content must remain untouched.
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &buf[(x, y)];
+            let (outline, body_x) = match cell.symbol() {
+                "\u{e0b6}" => ("(", x.checked_add(1)),
+                "\u{e0b4}" => (")", x.checked_sub(1)),
+                "\u{258c}" => ("[", x.checked_add(1)),
+                "\u{2590}" => ("]", x.checked_sub(1)),
+                "\u{e0ba}" => ("/", x.checked_add(1)),
+                "\u{e0bc}" => ("/", x.checked_sub(1)),
+                _ => continue,
+            };
+            if cell.fg != ratatui::style::Color::Reset
+                && body_x.is_some_and(|body_x| {
+                    area.contains((body_x, y).into()) && buf[(body_x, y)].bg == cell.fg
+                })
+            {
+                buf[(x, y)].set_symbol(outline);
+            }
+        }
+    }
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buf[(x, y)];
+            let hidden = cell.modifier & Modifier::HIDDEN;
+            cell.set_style(Style::reset().add_modifier(Modifier::DIM | hidden));
+        }
+    }
+}
+
+/// Start a focus-taking popup: dim everything drawn beneath it, then clear its
+/// surface with wide-character edge repair. Draw popup content after this widget
+/// and the app-owned shortcut footer after all popups, keeping both fully legible.
+pub struct PopupSurface;
+
+impl Widget for PopupSurface {
+    fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
+        let area = area.intersection(*buf.area());
+        if area.is_empty() {
+            return;
+        }
+        dim_inactive(*buf.area(), buf);
+        OverlayClear.render(area, buf);
+    }
+}
 
 /// Clear an overlay without leaving half of a wide background character at its edge.
 pub struct OverlayClear;
@@ -118,14 +202,91 @@ pub fn pad(s: &str, cols: usize) -> String {
 /// Center a dialog within the available screen while retaining a one-cell
 /// margin whenever the terminal is large enough.
 pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let w = width.min(area.width.saturating_sub(2)).max(1);
-    let h = height.min(area.height.saturating_sub(2)).max(1);
+    let w = width
+        .min(area.width.saturating_sub(2))
+        .max(u16::from(area.width > 0));
+    let h = height
+        .min(area.height.saturating_sub(2))
+        .max(u16::from(area.height > 0));
     Rect::new(
         area.x + area.width.saturating_sub(w) / 2,
         area.y + area.height.saturating_sub(h) / 2,
         w,
         h,
     )
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PopupClass {
+    Input,
+    Choice,
+    Preview,
+}
+
+impl PopupClass {
+    pub fn width(self) -> u16 {
+        match self {
+            Self::Input | Self::Choice => 72,
+            Self::Preview => 112,
+        }
+    }
+}
+
+/// Borders are included in desired height; minimum dimensions describe content.
+/// Margins yield to the caller's minimum usable budget, independently per axis.
+#[derive(Clone, Copy, Debug)]
+pub struct PopupSize {
+    pub outer: Rect,
+    pub inner: Rect,
+    pub usable: bool,
+}
+
+pub fn popup_size(area: Rect, class: PopupClass, height: u16, minimum: (u16, u16)) -> PopupSize {
+    let fit_axis = |available: u16, desired: u16, minimum: u16| {
+        let margin = if available >= minimum.saturating_add(4) {
+            2
+        } else {
+            0
+        };
+        desired
+            .max(minimum.saturating_add(2))
+            .min(available.saturating_sub(margin))
+    };
+    let w = fit_axis(area.width, class.width(), minimum.0);
+    let h = fit_axis(area.height, height, minimum.1);
+    let outer = Rect::new(
+        area.x + area.width.saturating_sub(w) / 2,
+        area.y + area.height.saturating_sub(h) / 2,
+        w,
+        h,
+    );
+    let inner = Rect::new(
+        outer.x + u16::from(w > 0),
+        outer.y + u16::from(h > 0),
+        w.saturating_sub(2),
+        h.saturating_sub(2),
+    );
+    PopupSize {
+        outer,
+        inner,
+        usable: inner.width >= minimum.0 && inner.height >= minimum.1,
+    }
+}
+
+/// Render on the surface itself when even a bordered content row cannot fit.
+/// Escape remains in the app-owned footer; this never takes that space away.
+pub fn popup_too_small(f: &mut Frame, size: PopupSize, theme: &Theme) {
+    let text = if size.outer.width >= 27 {
+        "Too small · resize terminal"
+    } else {
+        "Resize terminal"
+    };
+    let area = if size.inner.is_empty() {
+        size.outer
+    } else {
+        size.inner
+    };
+    f.render_widget(Paragraph::new(text).style(theme.dim()), area);
 }
 
 /// Reserve the rightmost column for a scrollbar so content never shares its cells.
@@ -189,6 +350,10 @@ pub struct Input {
 }
 
 impl Input {
+    pub fn clear_area(&mut self) {
+        self.area = Rect::default();
+    }
+
     pub fn with_value(v: &str) -> Self {
         Self {
             value: v.to_string(),
@@ -421,6 +586,9 @@ impl Input {
         theme: &Theme,
     ) {
         self.area = area;
+        if area.is_empty() {
+            return;
+        }
         let w = area.width as usize;
         // Keep the cursor visible.
         let cursor_col = |from: usize, to: usize| -> usize {
@@ -518,27 +686,115 @@ impl ListNav {
         (i < len).then_some(i)
     }
     /// Select the clicked row. Returns `(index, is_double_click)`.
+    /// A recognized pair is consumed, so a third press starts a new pair.
     pub fn click(&mut self, y: u16, len: usize) -> Option<(usize, bool)> {
         let i = self.row_at(y, len)?;
         let now = std::time::Instant::now();
         let double = matches!(self.last_click, Some((t, j)) if j == i && now.duration_since(t).as_millis() < 400);
-        self.last_click = Some((now, i));
+        self.last_click = (!double).then_some((now, i));
         self.state.select(Some(i));
         Some((i, double))
     }
 }
 
-/// A clickable button label like `[ Apply ]`.
-pub fn button(label: &str, active: bool, theme: &Theme) -> Span<'static> {
-    let text = format!("[ {label} ]");
-    let style = if active {
-        Style::default()
-            .fg(theme.accent)
-            .add_modifier(ratatui::style::Modifier::BOLD)
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ButtonIntent {
+    #[default]
+    Normal,
+    Danger,
+}
+
+pub struct ButtonSpec<'a> {
+    pub label: &'a str,
+    pub enabled: bool,
+    pub intent: ButtonIntent,
+}
+
+impl<'a> ButtonSpec<'a> {
+    pub fn new(label: &'a str) -> Self {
+        Self {
+            label,
+            enabled: true,
+            intent: ButtonIntent::Normal,
+        }
+    }
+}
+
+/// Right-align controls on the area's last row. Render each label into exactly
+/// its returned hit rectangle, with two cells between present buttons when space
+/// permits. Empty labels remain absent; narrow areas shrink the widest controls
+/// first. Owners retain focus, enabled checks and input dispatch.
+pub fn draw_button_row(
+    f: &mut Frame,
+    area: Rect,
+    buttons: &[ButtonSpec<'_>],
+    focused: Option<usize>,
+    theme: &Theme,
+) -> Vec<Rect> {
+    let area = area.intersection(f.area());
+    if area.is_empty() {
+        return vec![Rect::default(); buttons.len()];
+    }
+    let labels: Vec<String> = buttons
+        .iter()
+        .map(|b| {
+            if b.label.is_empty() {
+                String::new()
+            } else {
+                format!("[ {} ]", b.label)
+            }
+        })
+        .collect();
+    let mut widths: Vec<usize> = labels
+        .iter()
+        .map(|l| width(l).min(area.width as usize))
+        .collect();
+    let present = widths.iter().filter(|w| **w > 0).count();
+    let gap = if area.width as usize >= present + present.saturating_sub(1) * 2 {
+        2
     } else {
-        theme.dim()
+        0
     };
-    Span::styled(text, style)
+    let budget = area.width as usize - gap * present.saturating_sub(1);
+    let mut total: usize = widths.iter().sum();
+    while total > budget {
+        // Shrink later buttons first on ties so a one-cell row still has a hit.
+        let i = (0..widths.len()).max_by_key(|i| widths[*i]).unwrap();
+        widths[i] -= 1;
+        total -= 1;
+    }
+    let mut x = area.right() - (total + gap * present.saturating_sub(1)) as u16;
+    let mut previous = false;
+    buttons
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            if widths[i] == 0 {
+                return Rect::new(x, area.bottom() - 1, 0, 1);
+            }
+            if previous {
+                x += gap as u16;
+            }
+            previous = true;
+            let rect = Rect::new(x, area.bottom() - 1, widths[i] as u16, 1);
+            x = rect.right();
+            let mut style = if focused == Some(i) {
+                theme.selected().add_modifier(Modifier::BOLD)
+            } else {
+                theme.dim()
+            };
+            if !b.enabled {
+                style = style.fg(theme.placeholder).add_modifier(Modifier::DIM);
+            } else if b.intent == ButtonIntent::Danger {
+                style = style.fg(theme.err);
+            }
+            f.render_widget(
+                Paragraph::new(fit(&labels[i], widths[i])).style(style),
+                rect,
+            );
+            rect
+        })
+        .collect()
 }
 
 // ---- scrollbar track ------------------------------------------------------
@@ -585,6 +841,176 @@ impl ScrollTrack {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mouse_double_click_consumes_pairs_and_popup_classifies_all_buttons() {
+        use super::*;
+        use crossterm::event::MouseButton;
+        let outer = Rect::new(10, 5, 30, 10);
+        let mut nav = ListNav {
+            rows: outer,
+            ..Default::default()
+        };
+        assert_eq!(nav.click(5, 3), Some((0, false)));
+        assert_eq!(nav.click(5, 3), Some((0, true)));
+        assert_eq!(nav.click(5, 3), Some((0, false)));
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            let event = MouseEvent {
+                kind: MouseEventKind::Down(button),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert_eq!(popup_mouse(event, outer), PopupMouse::OutsidePress);
+            assert_eq!(
+                popup_mouse(
+                    MouseEvent {
+                        column: 10,
+                        row: 5,
+                        ..event
+                    },
+                    outer
+                ),
+                PopupMouse::Inside
+            );
+            assert_eq!(
+                popup_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        ..event
+                    },
+                    outer
+                ),
+                PopupMouse::OutsideWheel
+            );
+            assert_eq!(
+                popup_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Up(button),
+                        ..event
+                    },
+                    outer
+                ),
+                PopupMouse::Inert
+            );
+        }
+    }
+
+    #[test]
+    fn popup_sizing_caps_content_and_yields_margins_without_leaving_bounds() {
+        use super::*;
+        for (w, h) in [
+            (40, 10),
+            (60, 18),
+            (112, 30),
+            (160, 38),
+            (0, 0),
+            (1, 1),
+            (4, 2),
+        ] {
+            let available = Rect::new(3, 5, w, h);
+            for class in [PopupClass::Input, PopupClass::Choice, PopupClass::Preview] {
+                for desired in [3, 7, 32, u16::MAX] {
+                    let size = popup_size(available, class, desired, (4, 3));
+                    assert_eq!(size.outer.intersection(available), size.outer);
+                    assert!(size.outer.width <= class.width());
+                    assert_eq!(size.usable, size.inner.width >= 4 && size.inner.height >= 3);
+                }
+            }
+        }
+        let size = popup_size(Rect::new(0, 0, 40, 7), PopupClass::Choice, 12, (4, 5));
+        assert_eq!(size.outer.height, 7);
+        assert!(size.usable);
+        assert_eq!(
+            popup_size(Rect::new(0, 0, 160, 40), PopupClass::Choice, 6, (4, 3))
+                .outer
+                .height,
+            6
+        );
+        assert_eq!(centered(Rect::default(), 72, 3), Rect::default());
+    }
+
+    #[test]
+    fn button_rows_share_clipped_cell_geometry_and_semantic_styles() {
+        use super::*;
+        use ratatui::{Terminal, backend::TestBackend};
+        let th = Theme::default();
+        for w in [1, 2, 3, 7, 12, 24, 80] {
+            for focused in [None, Some(0), Some(1), Some(2)] {
+                let mut terminal = Terminal::new(TestBackend::new(w + 4, 3)).unwrap();
+                let area = Rect::new(2, 1, w, 1);
+                let specs = [
+                    ButtonSpec {
+                        label: "删除 👩‍💻",
+                        enabled: true,
+                        intent: ButtonIntent::Danger,
+                    },
+                    ButtonSpec {
+                        label: "Apply",
+                        enabled: false,
+                        intent: ButtonIntent::Normal,
+                    },
+                    ButtonSpec::new("Cancel"),
+                    ButtonSpec::new(""),
+                ];
+                let mut rects = vec![];
+                terminal
+                    .draw(|f| rects = draw_button_row(f, area, &specs, focused, &th))
+                    .unwrap();
+                assert_eq!(rects[3].width, 0, "absent buttons have no hit target");
+                for (i, r) in rects.iter().enumerate() {
+                    assert!(r.x >= area.x && r.right() <= area.right());
+                    assert_eq!(r.y, area.y);
+                    for x in r.x..r.right() {
+                        assert!(r.contains((x, r.y).into()));
+                        for (j, other) in rects.iter().enumerate() {
+                            if i != j {
+                                assert!(!other.contains((x, r.y).into()));
+                            }
+                        }
+                        let cell = &terminal.backend().buffer()[(x, r.y)];
+                        if (r.x..x).any(|start| {
+                            start + terminal.backend().buffer()[(start, r.y)].cell_width() > x
+                        }) {
+                            continue;
+                        }
+                        assert_eq!(cell.modifier.contains(Modifier::BOLD), focused == Some(i));
+                        if focused == Some(i) {
+                            assert_eq!(cell.bg, th.selection_bg);
+                        }
+                        if i == 0 {
+                            assert_eq!(cell.fg, th.err);
+                        } else if i == 1 {
+                            assert_eq!(cell.fg, th.placeholder);
+                            assert!(cell.modifier.contains(Modifier::DIM));
+                        }
+                    }
+                    if r.width > 0 {
+                        assert_eq!(
+                            terminal.backend().buffer()[(r.x, r.y)].symbol(),
+                            if r.width == 1 { "…" } else { "[" }
+                        );
+                    }
+                }
+                if w == 80 {
+                    assert_eq!(rects[0].width as usize, width("[ 删除 👩‍💻 ]"));
+                    assert_eq!(rects[1].x - rects[0].right(), 2);
+                    assert_eq!(rects[2].x - rects[1].right(), 2);
+                }
+            }
+        }
+        let mut terminal = Terminal::new(TestBackend::new(10, 2)).unwrap();
+        terminal
+            .draw(|f| {
+                for area in [Rect::new(0, 0, 0, 1), Rect::new(0, 0, 10, 0)] {
+                    assert!(
+                        draw_button_row(f, area, &[ButtonSpec::new("Done")], Some(0), &th)[0]
+                            .is_empty()
+                    );
+                }
+                assert!(draw_button_row(f, f.area(), &[], None, &th).is_empty());
+            })
+            .unwrap();
+    }
     #[test]
     fn typed_scalars_keep_a_grapheme_cursor() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -770,6 +1196,45 @@ mod tests {
         assert_eq!(input.paste(""), Ok(false));
         input.paste("!").unwrap();
         assert_eq!(input.value(), "a中文🙂!尾");
+    }
+
+    #[test]
+    fn popup_surface_dims_nested_background_without_changing_symbols() {
+        use ratatui::{buffer::Buffer, style::Color};
+
+        for (fg, bg) in [(Color::White, Color::Black), (Color::Black, Color::White)] {
+            let mut background = Buffer::empty(Rect::new(4, 2, 30, 10));
+            background.set_style(*background.area(), Style::default().fg(fg).bg(bg));
+            background.set_string(4, 2, "Library", Theme::default().selected());
+            background.set_string(4, 3, "colored tag", Theme::default().match_hit());
+            let mut buffer = background.clone();
+            let outer = Rect::new(8, 4, 20, 6);
+            PopupSurface.render(outer, &mut buffer);
+            for position in [(4, 2), (4, 3)] {
+                assert_eq!(buffer[position].symbol(), background[position].symbol());
+                assert_eq!(buffer[position].fg, Color::Reset);
+                assert_eq!(buffer[position].bg, Color::Reset);
+                assert_eq!(buffer[position].modifier, Modifier::DIM);
+            }
+            assert_eq!(buffer[(8, 4)].fg, Color::Reset);
+            assert_eq!(buffer[(8, 4)].bg, Color::Reset);
+            assert!(buffer[(8, 4)].modifier.is_empty());
+            buffer.set_string(8, 4, "Parent", Theme::default().accent());
+            let inactive = buffer[(4, 2)].clone();
+            PopupSurface.render(Rect::new(10, 6, 10, 2), &mut buffer);
+            assert_eq!(buffer[(4, 2)], inactive, "nested dimming is idempotent");
+            assert_eq!(buffer[(8, 4)].symbol(), "P");
+            assert_eq!(buffer[(8, 4)].modifier, Modifier::DIM);
+            buffer.set_string(10, 6, "Child", Theme::default().accent());
+            assert_eq!(buffer[(10, 6)].fg, Theme::default().accent);
+            assert!(!buffer[(10, 6)].modifier.contains(Modifier::DIM));
+
+            let mut plain_clear = background.clone();
+            OverlayClear.render(outer, &mut plain_clear);
+            assert_eq!(plain_clear[(4, 2)], background[(4, 2)]);
+            PopupSurface.render(Rect::default(), &mut plain_clear);
+            assert_eq!(plain_clear[(4, 2)], background[(4, 2)]);
+        }
     }
 
     #[test]
@@ -1084,11 +1549,12 @@ impl CardGrid {
     }
 
     /// Select what was clicked. Returns `(index, is_double_click)`.
+    /// A recognized pair is consumed, so a third press starts a new pair.
     pub fn click(&mut self, x: u16, y: u16) -> Option<(usize, bool)> {
         let i = self.hit(x, y)?;
         let now = std::time::Instant::now();
         let double = matches!(self.last_click, Some((t, j)) if j == i && now.duration_since(t).as_millis() < 400);
-        self.last_click = Some((now, i));
+        self.last_click = (!double).then_some((now, i));
         self.sel = Some(i);
         Some((i, double))
     }

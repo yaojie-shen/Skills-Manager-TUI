@@ -1,9 +1,10 @@
 //! Health tab: skill problems and update checks.
 //!
 //! The list on the left says *that* something is wrong; the pane on the right
-//! says *why* the selected item is here and which keys can do something about
-//! it. The footer shows only those keys, so the user never has to guess which
-//! of `a`, `m`, `x` and `U` fits the row under the cursor.
+//! says *why* the selected item is here and what can be done about it. The
+//! footer shows only the applicable keys, so the user never has to guess which
+//! repair fits the row under the cursor.
+//! Replacement-skill filtering preserves the eligible choices' bounded viewport.
 
 mod context;
 use super::preview::{Overlay, kv};
@@ -460,9 +461,9 @@ impl HealthView {
                     Box::new(move |ws| plan.apply(ws)),
                 );
                 let modal = if matches!(operation, Repair::Remove) {
-                    modal.deployment_only()
+                    modal.destructive("Remove").deployment_only()
                 } else {
-                    modal
+                    modal.apply_label("Adopt")
                 };
                 return Some(vec![Action::OpenModal(Box::new(modal))]);
             }
@@ -493,8 +494,8 @@ impl HealthView {
     }
 
     /// The right pane: what the record actually carries for this status and
-    /// which keys act on it. Nothing here is guessed; where the record
-    /// cannot answer a question, the text says so.
+    /// which actions apply. Nothing here is guessed; where the record cannot
+    /// answer a question, the text says so.
     fn agent_action(&self, code: KeyCode, ctx: &Ctx) -> Option<Vec<Action>> {
         let command = match code {
             KeyCode::Enter => Command::Open,
@@ -511,12 +512,7 @@ impl HealthView {
         let key = r.key.clone();
         let heading = |s: &'static str| Line::from(Span::styled(s, th.bold().fg(th.accent)));
         let text = |s: String| Line::from(Span::raw(s));
-        let action = |k: &'static str, what: String| {
-            Line::from(vec![
-                Span::styled(format!("{k:<7}"), th.key_hint()),
-                Span::raw(what),
-            ])
-        };
+        let action = |what: String| Line::from(Span::raw(what));
         let source_line = |lines: &mut Vec<Line<'static>>| {
             lines.push(kv(
                 "source",
@@ -595,8 +591,7 @@ impl HealthView {
                     ));
                 }
                 actions.push(action(
-                    "a",
-                    "accept the current content as the new baseline".into(),
+                    "Accept the current content as the new baseline.".into(),
                 ));
             }
             SkillStatus::MissingBaseline => {
@@ -612,8 +607,7 @@ impl HealthView {
                 ));
                 source_line(&mut lines);
                 actions.push(action(
-                    "a",
-                    "record the current content hash as the baseline".into(),
+                    "Accept the current content hash as the baseline.".into(),
                 ));
             }
             SkillStatus::Local | SkillStatus::Repository => {
@@ -636,21 +630,17 @@ impl HealthView {
                 meta_lines(&mut lines);
                 match &r.source {
                     Some(Source::Git { .. } | Source::Archive { .. }) => actions.push(action(
-                        "",
-                        "or reinstall it from the Library tab with i, from the source above".into(),
+                        "Reinstall it from the source above in the Library tab.".into(),
                     )),
-                    Some(Source::Local { path: Some(p) }) => actions.push(action(
-                        "",
-                        format!("or reinstall it from the Library tab with i, from {p}"),
-                    )),
+                    Some(Source::Local { path: Some(p) }) => {
+                        actions.push(action(format!("Reinstall it from {p} in the Library tab.")))
+                    }
                     Some(Source::Local { path: None }) => actions.push(action(
-                        "",
                         "the local source has no path recorded, so the tool cannot reinstall it"
                             .into(),
                     )),
                     None => actions.push(action(
-                        "",
-                        "no source is recorded, so the tool cannot reinstall it".into(),
+                        "No source is recorded, so the tool cannot reinstall it.".into(),
                     )),
                 }
             }
@@ -672,7 +662,6 @@ impl HealthView {
                 ));
                 meta_lines(&mut lines);
                 actions.push(action(
-                    "",
                     "This possible move is informational only; no automatic migration is available."
                         .into(),
                 ));
@@ -691,8 +680,7 @@ impl HealthView {
                     meta_lines(&mut lines);
                 }
                 actions.push(action(
-                    "x",
-                    "discard: delete the directory and its metadata".into(),
+                    "Discard the invalid directory and its metadata.".into(),
                 ));
             }
             SkillStatus::CorruptMeta { error } => {
@@ -728,15 +716,12 @@ impl HealthView {
                     } else {
                         "update to the upstream revision"
                     };
-                    actions.push(action("U", what.into()));
+                    actions.push(action(format!("Update: {what}.")));
                 } else {
-                    actions.push(action(
-                        "",
-                        format!(
-                            "updating requires an existing skill with upstream information; it is {}",
-                            r.status.label()
-                        ),
-                    ));
+                    actions.push(action(format!(
+                        "Updating requires an existing skill with upstream information; it is {}.",
+                        r.status.label()
+                    )));
                 }
             }
             Some(Ok(c)) => {
@@ -759,10 +744,7 @@ impl HealthView {
         lines.push(Line::from(""));
         lines.push(heading("what you can do"));
         lines.extend(actions);
-        lines.push(action(
-            "Enter",
-            "open the skill in a window over this page".into(),
-        ));
+        lines.push(action("Open the skill in a window over this page.".into()));
         lines
     }
 
@@ -984,11 +966,11 @@ impl View for HealthView {
 
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let help = if self.verifying {
-            "Checking local content… · : commands · Filter health entries".to_string()
+            "Checking local content… · Filter health entries".to_string()
         } else if let Some(error) = &self.verification_error {
-            format!("Verification failed: {error} · Ctrl-R retry · : commands")
+            format!("Verification failed: {error} · Filter health entries")
         } else {
-            "Ctrl-R verify content · : commands · Filter health entries".to_string()
+            "Filter health entries".to_string()
         };
         let area = self.filter.draw(
             f,
@@ -1025,7 +1007,7 @@ impl View for HealthView {
                 )
             } else {
                 format!(
-                    "everything is healthy\n{} skills · {} agents checked\nPress c to check remote sources for updates.",
+                    "everything is healthy\n{} skills · {} agents checked\nRemote sources have not been checked for updates.",
                     ctx.snap.skills.len(),
                     ctx.snap.agents.len()
                 )
@@ -1093,11 +1075,11 @@ impl View for HealthView {
     }
 
     fn hints(&self) -> Hints {
-        if self.filter.editing {
-            return &[("Enter/↓", "issues"), ("Esc", "clear filter")];
-        }
         if let Some(hints) = self.preview.hints() {
             return hints;
+        }
+        if self.filter.editing {
+            return &[("Enter/↓", "issues"), ("Esc", "clear filter")];
         }
         if self.selected_row().is_none_or(|row| row.heading.is_some()) {
             return &[
@@ -1106,25 +1088,56 @@ impl View for HealthView {
                 ("Esc/q", "clear/back"),
             ];
         }
+        let row = self.selected_row().expect("selected issue checked above");
+        if row.agent.is_some() {
+            return match row.state {
+                Some(EntryState::Broken { .. } | EntryState::Foreign { .. }) => &[
+                    ("Enter", "open / resolve"),
+                    ("x", "remove link"),
+                    ("/", "filter"),
+                    ("c", "check updates"),
+                    ("Esc/q", "clear/back"),
+                ],
+                Some(EntryState::Shadow { same_content: true }) => &[
+                    ("Enter", "open / resolve"),
+                    ("r", "relink"),
+                    ("/", "filter"),
+                    ("c", "check updates"),
+                    ("Esc/q", "clear/back"),
+                ],
+                _ => &[
+                    ("Enter", "open / resolve"),
+                    ("/", "filter"),
+                    ("c", "check updates"),
+                    ("Esc/q", "clear/back"),
+                ],
+            };
+        }
+        if row.caps.clean {
+            return &[
+                ("Enter", "open"),
+                ("x", "discard invalid"),
+                ("/", "filter"),
+                ("c", "check updates"),
+                ("Esc/q", "clear/back"),
+            ];
+        }
+        if row.caps.update {
+            return &[
+                ("Enter", "open"),
+                ("U", "update repo"),
+                ("/", "filter"),
+                ("c", "check updates"),
+                ("Esc/q", "clear/back"),
+            ];
+        }
         &[
-            ("Enter", "open / resolve"),
-            ("a", "actions"),
+            ("Enter", "open"),
             ("/", "filter"),
             ("c", "check updates"),
             ("Esc/q", "clear/back"),
         ]
     }
-}
-
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
 }
 
 impl Row {
@@ -1154,29 +1167,29 @@ fn agent_description(row: &Row) -> (String, &'static str) {
     match &row.state {
         Some(EntryState::Broken { target }) => (
             format!("broken link → {}", target.display()),
-            "x / Enter: remove this broken link (confirmation required).",
+            "Remove this broken link after confirmation.",
         ),
         Some(EntryState::Foreign { target }) => (
             format!("links outside the root → {}", target.display()),
-            "x: remove only the symlink. a: copy a valid skill into the root and repoint this link. Both require confirmation and preserve the external target. Enter opens Agents.",
+            "Remove only the symlink, or adopt a valid skill into the root and repoint this link. Both require confirmation and preserve the external target.",
         ),
         Some(EntryState::Shadow { same_content: true }) => (
             "the agent's own copy, same content as root".into(),
-            "r / Enter: replace the matching copy with a root link (confirmation required).",
+            "Replace the matching copy with a root link after confirmation.",
         ),
         Some(EntryState::Shadow {
             same_content: false,
         }) => (
             "the agent's own copy differs from root".into(),
-            "Review both copies manually; relink is disabled to preserve different content. Enter opens Agents.",
+            "Review both copies manually; relink is disabled to preserve different content.",
         ),
         Some(EntryState::AgentOnly) => (
             "the agent's own directory, absent from root".into(),
-            "a / Enter: adopt into the root (confirmation required; only valid skills can be adopted).",
+            "Adopt into the root after confirmation; only valid skills can be adopted.",
         ),
         _ => (
             row.explanation.clone().unwrap_or_default(),
-            "Enter: review agent configuration in Agents.",
+            "Review agent configuration in Agents.",
         ),
     }
 }
@@ -1228,6 +1241,87 @@ mod tests {
             }
         }
         panic!("expected a context menu target for health row {index}");
+    }
+
+    #[test]
+    fn detail_actions_use_names_and_footer_hints_follow_capabilities() {
+        let root = skills::ops::DownloadDir::new("health-detail-actions").unwrap();
+        std::fs::create_dir_all(root.path().join("invalid-item")).unwrap();
+        let ws = Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let record = snap.get("invalid-item").unwrap();
+        let mut view = HealthView::default();
+        let detail = view
+            .detail_lines(record, Caps::of(record, None), &ctx)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(detail.contains("Discard the invalid directory and its metadata."));
+        assert!(detail.contains("Open the skill in a window over this page."));
+        for local_legend in ["x      ", "U      ", "a      ", "Enter  "] {
+            assert!(
+                !detail.contains(local_legend),
+                "detail pane must not contain a local key column: {detail:?}"
+            );
+        }
+
+        view.rows = vec![Row {
+            class: Some(HealthClass::Fault),
+            key: record.key.clone(),
+            caps: Caps {
+                clean: true,
+                ..Caps::default()
+            },
+            agent: None,
+            state: None,
+            heading: None,
+            explanation: None,
+        }];
+        view.list.select(Some(0));
+        assert_eq!(
+            view.hints(),
+            &[
+                ("Enter", "open"),
+                ("x", "discard invalid"),
+                ("/", "filter"),
+                ("c", "check updates"),
+                ("Esc/q", "clear/back"),
+            ]
+        );
+
+        view.rows[0].caps = Caps {
+            accept: true,
+            ..Caps::default()
+        };
+        assert!(
+            view.hints().iter().all(|(key, _)| *key != "a"),
+            "accept is reached through the App-owned Actions menu"
+        );
+
+        view.rows[0].caps = Caps {
+            update: true,
+            ..Caps::default()
+        };
+        assert!(view.hints().contains(&("U", "update repo")));
+
+        view.rows[0].agent = Some("sample".into());
+        view.rows[0].caps = Caps::default();
+        view.rows[0].state = Some(EntryState::Shadow { same_content: true });
+        assert!(view.hints().contains(&("r", "relink")));
+        assert!(view.hints().iter().all(|(key, _)| *key != "x"));
+
+        view.rows[0].state = Some(EntryState::Broken {
+            target: root.path().join("missing"),
+        });
+        assert!(view.hints().contains(&("x", "remove link")));
+        assert!(view.hints().iter().all(|(key, _)| *key != "r"));
     }
 
     #[test]
@@ -1551,8 +1645,30 @@ pub struct RepairDialog {
 struct RepairResolve {
     issue: usize,
     input: crate::tui::widgets::Input,
+    deployment_name: String,
+    eligible: usize,
     shown: Vec<String>,
     list: ListNav,
+    rect: Rect,
+}
+
+impl RepairResolve {
+    fn empty_message(&self) -> Option<String> {
+        if !self.shown.is_empty() {
+            return None;
+        }
+        Some(if self.eligible == 0 {
+            format!(
+                "No eligible Library skills. Repairs require a present skill with the same deployment name: {}.",
+                self.deployment_name
+            )
+        } else {
+            format!(
+                "No search matches. Clear or edit the query to find Library skills with the same deployment name: {}.",
+                self.deployment_name
+            )
+        })
+    }
 }
 
 impl RepairDialog {
@@ -1570,7 +1686,10 @@ impl RepairDialog {
     }
 
     pub fn hints(&self) -> Hints {
-        if self.resolve.is_some() {
+        if let Some(resolve) = &self.resolve {
+            if resolve.shown.is_empty() {
+                return &[("type", "search Library"), ("Esc", "back")];
+            }
             return &[
                 ("type", "search Library"),
                 ("↑↓", "choose"),
@@ -1578,17 +1697,55 @@ impl RepairDialog {
                 ("Esc", "back"),
             ];
         }
+        if let Some(hints) = self.focus.button_hints() {
+            return hints;
+        }
         if self.preview.is_some() {
             &[
                 ("↑↓", "review"),
                 ("Enter", "resolve"),
                 ("Space", "stage / skip"),
-                ("Tab", "Apply"),
+                ("Tab/Shift+Tab", "buttons"),
                 ("Esc", "cancel"),
             ]
         } else {
             &[("Enter", "analyze"), ("Esc", "cancel")]
         }
+    }
+
+    pub fn footer_help(&self) -> crate::tui::footer::Help<'_> {
+        if let Some(resolve) = &self.resolve {
+            return crate::tui::footer::Help::new(self.hints()).detail(
+                resolve.empty_message().unwrap_or_else(|| {
+                    "Select a Library skill as the replacement deployment target".into()
+                }),
+            );
+        }
+        let preview = self.preview.is_some();
+        self.focus.help(
+            self.hints(),
+            if preview {
+                "Review staged repairs; nothing is written until Apply"
+            } else {
+                "Analyze current managed Agent directories"
+            },
+            if self.preview.as_ref().is_some_and(|plan| {
+                plan.actions
+                    .iter()
+                    .all(|a| self.skipped.contains(action_id(a)))
+            }) {
+                "No staged repairs; close the review"
+            } else if preview {
+                "Apply the staged deployment repairs"
+            } else {
+                "Analyze current managed Agent directories"
+            },
+            if preview {
+                "Return to analysis without applying repairs"
+            } else {
+                "Close without analyzing"
+            },
+        )
     }
 
     fn row_count(&self) -> usize {
@@ -1642,18 +1799,21 @@ impl RepairDialog {
         else {
             return;
         };
+        resolve.eligible = 0;
         resolve.shown = ctx
             .snap
             .skills
             .iter()
             .filter(|skill| {
-                skill.status.is_present()
-                    && skill.deployment_name() == Some(link_name.as_str())
-                    && (skill.key.to_lowercase().contains(&query)
-                        || skill
-                            .name
-                            .as_deref()
-                            .is_some_and(|name| name.contains(&query)))
+                skill.status.is_present() && skill.deployment_name() == Some(link_name.as_str())
+            })
+            .inspect(|_| resolve.eligible += 1)
+            .filter(|skill| {
+                skill.key.to_lowercase().contains(&query)
+                    || skill
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.contains(&query))
             })
             .map(|skill| skill.key.clone())
             .collect();
@@ -1677,6 +1837,10 @@ impl RepairDialog {
         }
         self.resolve = Some(RepairResolve {
             issue: self.list.selected().unwrap_or(0),
+            deployment_name: match issue {
+                skills::ops::repair::RepairIssue::Broken { link_name, .. } => link_name.clone(),
+                _ => unreachable!(),
+            },
             ..Default::default()
         });
         self.refilter_resolve(ctx);
@@ -1781,20 +1945,71 @@ impl RepairDialog {
 
     pub fn mouse(&mut self, mouse: MouseEvent) -> Vec<Action> {
         let position = ratatui::layout::Position::new(mouse.column, mouse.row);
+        if let Some(resolve) = &mut self.resolve {
+            match crate::tui::widgets::popup_mouse(mouse, resolve.rect) {
+                crate::tui::widgets::PopupMouse::OutsidePress => {
+                    self.resolve = None;
+                    return vec![];
+                }
+                crate::tui::widgets::PopupMouse::Inside => {}
+                _ => return vec![],
+            }
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) if !resolve.rect.contains(position) => {
+                    self.resolve = None;
+                }
+                MouseEventKind::Down(MouseButton::Left) if resolve.list.rows.contains(position) => {
+                    resolve.list.click(mouse.row, resolve.shown.len());
+                }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    if resolve.list.rows.contains(position) =>
+                {
+                    resolve.list.move_by(
+                        if mouse.kind == MouseEventKind::ScrollDown {
+                            3
+                        } else {
+                            -3
+                        },
+                        resolve.shown.len(),
+                    );
+                }
+                _ => {}
+            }
+            return vec![];
+        }
+        match crate::tui::widgets::popup_mouse(mouse, self.rect) {
+            crate::tui::widgets::PopupMouse::OutsidePress => return vec![Action::CloseModal],
+            crate::tui::widgets::PopupMouse::Inside => {}
+            _ => return vec![],
+        }
         match mouse.kind {
-            MouseEventKind::ScrollDown => self.list.move_by(3, self.row_count()),
-            MouseEventKind::ScrollUp => self.list.move_by(-3, self.row_count()),
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                if self.list.rows.contains(position) =>
+            {
+                self.focus = ChoiceFocus::List;
+                self.list.move_by(
+                    if mouse.kind == MouseEventKind::ScrollDown {
+                        3
+                    } else {
+                        -3
+                    },
+                    self.row_count(),
+                );
+            }
             MouseEventKind::Down(MouseButton::Left) if !self.rect.contains(position) => {
                 return vec![Action::CloseModal];
             }
             MouseEventKind::Down(MouseButton::Left) if self.buttons[0].contains(position) => {
+                self.focus = ChoiceFocus::Apply;
                 return self.primary();
             }
             MouseEventKind::Down(MouseButton::Left) if self.buttons[1].contains(position) => {
+                self.focus = ChoiceFocus::Cancel;
                 return self.secondary();
             }
             MouseEventKind::Down(MouseButton::Left)
-                if self.list.click(mouse.row, self.row_count()).is_some() =>
+                if self.list.rows.contains(position)
+                    && self.list.click(mouse.row, self.row_count()).is_some() =>
             {
                 self.focus = ChoiceFocus::List;
             }
@@ -1804,18 +2019,24 @@ impl RepairDialog {
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
+        use crate::tui::widgets::{PopupClass, popup_size, popup_too_small};
+        self.buttons = [Rect::default(); 2];
+        self.list.rows = Rect::default();
         let preview = self.preview.is_some();
-        let area = centered(
+        let available = area;
+        let size = popup_size(
             area,
-            area.width.saturating_sub(8).min(112),
+            PopupClass::Preview,
             if preview {
-                area.height.saturating_sub(4).min(56)
+                (self.row_count().min(16) as u16 * 3).saturating_add(6)
             } else {
-                15.min(area.height.saturating_sub(4))
+                9
             },
+            (12, 3),
         );
+        let area = size.outer;
         self.rect = area;
-        frame.render_widget(crate::tui::widgets::OverlayClear, area);
+        frame.render_widget(crate::tui::widgets::PopupSurface, area);
         let theme = &ctx.settings.theme;
         let block = theme.block(
             if preview {
@@ -1827,19 +2048,27 @@ impl RepairDialog {
         );
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        if inner.height < 6 || inner.width < 30 {
-            frame.render_widget(Paragraph::new("Enlarge terminal · Esc cancel"), inner);
+        if !size.usable {
+            popup_too_small(frame, size, theme);
+            self.draw_resolve(frame, available, ctx);
             return;
         }
-        let footer_height = 2.min(inner.height.saturating_sub(2));
-        let summary_area = Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), 2);
+        let compact = inner.height < 7 || inner.width < 30;
+        let footer_height = if compact { 1 } else { 2 };
+        let summary_height = if compact { 1 } else { 2 };
+        let summary_area = Rect::new(
+            inner.x + 1,
+            inner.y,
+            inner.width.saturating_sub(2),
+            summary_height,
+        );
         self.list.rows = Rect::new(
             inner.x + 1,
-            inner.y + 2,
+            inner.y + summary_height,
             inner.width.saturating_sub(2),
-            inner.height.saturating_sub(2 + footer_height),
+            inner.height.saturating_sub(summary_height + footer_height),
         );
-        self.list.item_height = 3;
+        self.list.item_height = if compact { 1 } else { 3 };
         self.list.clamp(self.row_count());
         let (items, summary, primary, secondary, enabled) = if let Some(plan) = &self.preview {
             let items = plan
@@ -1887,7 +2116,7 @@ impl RepairDialog {
                                 )
                             } else {
                                 format!(
-                                    "broken: {} · {} Library matches; Enter to choose",
+                                    "broken: {} · {} Library matches; choose a replacement",
                                     target.display(),
                                     candidates.len()
                                 )
@@ -1903,7 +2132,7 @@ impl RepairDialog {
                             .clone()
                             .unwrap_or_else(|| format!("{link_name} → {name} · {skill}")),
                     };
-                    ListItem::new(vec![
+                    let mut lines = vec![
                         Line::from(vec![
                             Span::styled(format!("{label:<11}"), style),
                             Span::styled(issue.id(), theme.bold()),
@@ -1913,7 +2142,11 @@ impl RepairDialog {
                             theme.description(),
                         )),
                         Line::default(),
-                    ])
+                    ];
+                    if compact {
+                        lines.truncate(1);
+                    }
+                    ListItem::new(lines)
                 })
                 .collect::<Vec<_>>();
             let staged = plan
@@ -1933,15 +2166,19 @@ impl RepairDialog {
             )
         } else {
             (
-                vec![ListItem::new(vec![
-                    Line::from(
-                        "Find broken deployments and deployments using an outdated skill name.",
-                    ),
-                    Line::from(Span::styled(
-                        "Only independent, managed Agent directories are scanned.",
-                        theme.description(),
-                    )),
-                ])],
+                vec![ListItem::new(if compact {
+                    vec![Line::from("Find broken and outdated deployments.")]
+                } else {
+                    vec![
+                        Line::from(
+                            "Find broken deployments and deployments using an outdated skill name.",
+                        ),
+                        Line::from(Span::styled(
+                            "Only independent, managed Agent directories are scanned.",
+                            theme.description(),
+                        )),
+                    ]
+                })],
                 "Deployment links".into(),
                 "Analyze",
                 "Cancel",
@@ -1971,20 +2208,35 @@ impl RepairDialog {
             ),
             self.focus,
             enabled,
-            if preview {
-                "Nothing is written until Apply"
-            } else {
-                "Enter analyzes current managed Agent directories"
-            },
+            "",
             (primary, secondary),
             theme,
         );
+        self.draw_resolve(frame, available, ctx);
+    }
+
+    fn draw_resolve(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
+        use crate::tui::widgets::{PopupClass, popup_size, popup_too_small};
+        let theme = &ctx.settings.theme;
         if let Some(resolve) = &mut self.resolve {
-            let picker = centered(area, 72, 18);
-            frame.render_widget(crate::tui::widgets::OverlayClear, picker);
+            resolve.list.rows = Rect::default();
+            resolve.input.clear_area();
+            let size = popup_size(
+                area,
+                PopupClass::Choice,
+                resolve.eligible.clamp(1, 13) as u16 + 5,
+                (4, 3),
+            );
+            let picker = size.outer;
+            resolve.rect = picker;
+            frame.render_widget(crate::tui::widgets::PopupSurface, picker);
             let block = theme.block(" Choose Library skill ", true);
             let inside = block.inner(picker);
             frame.render_widget(block, picker);
+            if !size.usable {
+                popup_too_small(frame, size, theme);
+                return;
+            }
             frame.render_widget(
                 Paragraph::new(format!("Search: {}", resolve.input.value())).style(theme.accent()),
                 Rect::new(inside.x + 1, inside.y, inside.width.saturating_sub(2), 1),
@@ -1993,20 +2245,29 @@ impl RepairDialog {
                 inside.x + 1,
                 inside.y + 2,
                 inside.width.saturating_sub(2),
-                inside.height.saturating_sub(3),
+                inside.height.saturating_sub(2),
             );
-            let rows = resolve
-                .shown
-                .iter()
-                .map(|key| ListItem::new(key.clone()))
-                .collect::<Vec<_>>();
-            frame.render_stateful_widget(
-                List::new(rows)
-                    .highlight_style(theme.selected())
-                    .highlight_symbol("▸ "),
-                resolve.list.rows,
-                &mut resolve.list.state,
-            );
+            if let Some(message) = resolve.empty_message() {
+                frame.render_widget(
+                    Paragraph::new(message)
+                        .style(theme.dim())
+                        .wrap(Wrap { trim: false }),
+                    resolve.list.rows,
+                );
+            } else {
+                let rows = resolve
+                    .shown
+                    .iter()
+                    .map(|key| ListItem::new(key.clone()))
+                    .collect::<Vec<_>>();
+                frame.render_stateful_widget(
+                    List::new(rows)
+                        .highlight_style(theme.selected())
+                        .highlight_symbol("▸ "),
+                    resolve.list.rows,
+                    &mut resolve.list.state,
+                );
+            }
         }
     }
 }
@@ -2033,8 +2294,124 @@ mod deployment_repair_dialog_tests {
     use skills::ops::repair::{Candidate, RepairAction, RepairAnalysis, RepairIssue, RepairPlan};
     use std::path::PathBuf;
 
+    #[test]
+    fn responsive_repair_keeps_actions_and_child_empty_state_and_clears_hits() {
+        with_library(&[], |ctx| {
+            let mut dialog = RepairDialog::preview(Default::default(), plan(vec![]));
+            for (width, height) in [
+                (160, 40),
+                (112, 32),
+                (60, 20),
+                (40, 12),
+                (4, 3),
+                (1, 1),
+                (0, 0),
+            ] {
+                let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+                    width.max(1),
+                    height.max(1),
+                ))
+                .unwrap();
+                let area = Rect::new(0, 0, width, height.saturating_sub(2));
+                terminal
+                    .draw(|frame| dialog.draw(frame, area, ctx))
+                    .unwrap();
+                for hit in [dialog.list.rows, dialog.buttons[0], dialog.buttons[1]] {
+                    assert!(hit.is_empty() || hit.intersection(area) == hit);
+                }
+                if width == 40 {
+                    assert_eq!(dialog.list.item_height, 1);
+                    assert!(dialog.list.rows.height > 0);
+                    assert!(!dialog.buttons[0].is_empty());
+                    assert!(!dialog.buttons[1].is_empty());
+                }
+                if width < 4 {
+                    assert_eq!(dialog.list.rows, Rect::default());
+                    assert_eq!(dialog.buttons, [Rect::default(); 2]);
+                }
+            }
+            dialog.key(key(KeyCode::Enter), ctx);
+            assert!(dialog.resolve.is_some());
+            for (width, height) in [(40, 12), (1, 1), (160, 40)] {
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                        .unwrap();
+                let area = Rect::new(0, 0, width, height - 2.min(height));
+                terminal
+                    .draw(|frame| dialog.draw(frame, area, ctx))
+                    .unwrap();
+                let resolve = dialog.resolve.as_ref().unwrap();
+                assert!(
+                    resolve.list.rows.is_empty()
+                        || resolve.list.rows.intersection(area) == resolve.list.rows
+                );
+                if width >= 40 {
+                    let text: String = terminal
+                        .backend()
+                        .buffer()
+                        .content
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect();
+                    assert!(text.contains("Library"), "{text}");
+                    assert!(text.contains("No") || text.contains("no"), "{text}");
+                }
+            }
+        });
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::from(code)
+    }
+
+    #[test]
+    fn repair_filter_geometry_stays_stable_and_resize_scrolls_selection() {
+        let names: Vec<_> = (0..30).map(|i| format!("skill-{i:02}")).collect();
+        let skills: Vec<_> = names.iter().map(|name| (name.as_str(), "shared")).collect();
+        with_library(&skills, |ctx| {
+            let mut dialog = RepairDialog::preview(Default::default(), plan(vec![]));
+            dialog.open_resolve(ctx);
+            let mut previous = None;
+            for (width, height) in [(100, 30), (60, 12), (100, 30)] {
+                let mut term =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                        .unwrap();
+                let mut geometry = None;
+                for (query, count) in [("", 30), ("skill-29", 1), ("absent", 0), ("", 30)] {
+                    dialog.resolve.as_mut().unwrap().input =
+                        crate::tui::widgets::Input::with_value(query);
+                    dialog.refilter_resolve(ctx);
+                    let resolve = dialog.resolve.as_mut().unwrap();
+                    assert_eq!(resolve.shown.len(), count);
+                    resolve.list.last(count);
+                    term.draw(|f| dialog.draw_resolve(f, Rect::new(0, 0, width, height - 2), ctx))
+                        .unwrap();
+                    let resolve = dialog.resolve.as_ref().unwrap();
+                    let current = (resolve.rect, resolve.list.rows);
+                    if let Some(expected) = geometry {
+                        assert_eq!(current, expected);
+                    } else {
+                        geometry = Some(current);
+                    }
+                    if let Some(selected) = resolve.list.selected() {
+                        let offset = resolve.list.state.offset();
+                        assert!(
+                            selected >= offset
+                                && selected < offset + resolve.list.rows.height as usize
+                        );
+                        let y = resolve.list.rows.y + (selected - offset) as u16;
+                        assert_eq!(
+                            term.backend().buffer()[(resolve.list.rows.x, y)].symbol(),
+                            "▸"
+                        );
+                    }
+                }
+                if let Some(before) = previous {
+                    assert_ne!(geometry.unwrap().0, before);
+                }
+                previous = Some(geometry.unwrap().0);
+            }
+        });
     }
 
     fn plan(candidates: Vec<Candidate>) -> RepairPlan {
@@ -2073,6 +2450,60 @@ mod deployment_repair_dialog_tests {
     }
 
     #[test]
+    fn repair_resolver_contains_pointer_events_and_footer_follows_buttons() {
+        let mut dialog = RepairDialog {
+            rect: Rect::new(0, 0, 100, 30),
+            buttons: [Rect::new(80, 28, 8, 1), Rect::new(90, 28, 8, 1)],
+            ..Default::default()
+        };
+        dialog.focus = ChoiceFocus::Apply;
+        assert!(dialog.hints().contains(&("Enter/Space", "activate")));
+        let mut resolve = RepairResolve {
+            rect: Rect::new(20, 5, 60, 18),
+            shown: vec!["first".into(), "second".into()],
+            ..Default::default()
+        };
+        resolve.list.rows = Rect::new(21, 8, 58, 12);
+        resolve.list.first(2);
+        dialog.resolve = Some(resolve);
+        assert!(dialog.hints().contains(&("Enter", "stage")));
+        let mouse = |column, row, kind| MouseEvent {
+            column,
+            row,
+            kind,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(
+            dialog
+                .mouse(mouse(22, 9, MouseEventKind::Down(MouseButton::Left)))
+                .is_empty()
+        );
+        assert_eq!(dialog.resolve.as_ref().unwrap().list.selected(), Some(1));
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            if dialog.resolve.is_none() {
+                dialog.resolve = Some(RepairResolve {
+                    rect: Rect::new(20, 5, 60, 18),
+                    ..Default::default()
+                });
+            }
+            assert!(
+                dialog
+                    .mouse(mouse(120, 40, MouseEventKind::ScrollDown))
+                    .is_empty()
+            );
+            assert!(dialog.resolve.is_some());
+            // Even outside both rectangles, only the child closes.
+            assert!(
+                dialog
+                    .mouse(mouse(120, 40, MouseEventKind::Down(button)))
+                    .is_empty()
+            );
+            assert!(dialog.resolve.is_none());
+        }
+        assert!(dialog.hints().contains(&("Enter/Space", "activate")));
+    }
+
+    #[test]
     fn staged_repair_can_be_skipped_without_applying() {
         let mut dialog = RepairDialog::preview(
             Default::default(),
@@ -2103,12 +2534,180 @@ mod deployment_repair_dialog_tests {
         assert!(dialog.resolve.is_some());
     }
 
+    fn with_library(skills: &[(&str, &str)], test: impl FnOnce(&Ctx)) {
+        let tmp = skills::ops::DownloadDir::new("repair-empty-state").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        for (key, name) in skills {
+            let path = tmp.path().join(key);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Test skill\n---\nBody\n"),
+            )
+            .unwrap();
+        }
+        let ws = skills::Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        test(&Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        });
+    }
+
+    fn render_dialog(dialog: &mut RepairDialog, ctx: &Ctx) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| dialog.draw(frame, frame.area(), ctx))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn assert_empty_inert(dialog: &mut RepairDialog, ctx: &Ctx) {
+        assert_eq!(
+            dialog.hints(),
+            &[("type", "search Library"), ("Esc", "back")]
+        );
+        for code in [KeyCode::Enter, KeyCode::Down, KeyCode::Up] {
+            assert!(dialog.key(key(code), ctx).is_empty());
+        }
+        let rows = dialog.resolve.as_ref().unwrap().list.rows;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollUp,
+        ] {
+            assert!(
+                dialog
+                    .mouse(MouseEvent {
+                        column: rows.x,
+                        row: rows.y,
+                        kind,
+                        modifiers: crossterm::event::KeyModifiers::NONE,
+                    })
+                    .is_empty()
+            );
+        }
+        assert!(dialog.resolve.as_ref().unwrap().list.selected().is_none());
+        assert!(dialog.options.deployments.is_empty());
+        assert!(dialog.staged_plan().unwrap().actions.is_empty());
+    }
+
+    #[test]
+    fn repair_resolver_explains_no_same_deployment_name_and_keeps_back_working() {
+        // A storage key matching the broken link is insufficient: the declared
+        // deployment name must match, and the Library skill must be present.
+        with_library(&[("shared", "other"), ("invalid", "shared")], |ctx| {
+            let mut snap = ctx.snap.clone();
+            snap.skills
+                .iter_mut()
+                .find(|skill| skill.key == "invalid")
+                .unwrap()
+                .status = SkillStatus::Invalid {
+                reason: "Unreadable SKILL.md".into(),
+            };
+            let ctx = Ctx {
+                snap: &snap,
+                ..*ctx
+            };
+            let mut dialog = RepairDialog::preview(Default::default(), plan(vec![]));
+            assert!(dialog.key(key(KeyCode::Enter), &ctx).is_empty());
+            let text = render_dialog(&mut dialog, &ctx);
+            assert!(text.contains("No eligible Library skills."));
+            assert!(
+                dialog
+                    .footer_help()
+                    .detail
+                    .contains("same deployment name: shared")
+            );
+            assert_empty_inert(&mut dialog, &ctx);
+            assert!(dialog.paste("missing", &ctx).is_empty());
+            assert!(render_dialog(&mut dialog, &ctx).contains("No eligible Library skills."));
+            assert!(dialog.key(key(KeyCode::Esc), &ctx).is_empty());
+            assert!(dialog.resolve.is_none());
+            assert!(dialog.options.deployments.is_empty());
+        });
+    }
+
+    #[test]
+    fn repair_resolver_filter_empty_recovers_hints_and_stages_only_selected_skill() {
+        with_library(
+            &[("alpha", "shared"), ("beta", "shared"), ("shared", "other")],
+            |ctx| {
+                let mut dialog = RepairDialog::preview(Default::default(), plan(vec![]));
+                dialog.key(key(KeyCode::Enter), ctx);
+                assert_eq!(dialog.resolve.as_ref().unwrap().shown, ["alpha", "beta"]);
+                assert!(dialog.hints().contains(&("Enter", "stage")));
+                assert!(dialog.paste("z", ctx).is_empty());
+                let text = render_dialog(&mut dialog, ctx);
+                assert!(text.contains("No search matches."));
+                assert!(!text.contains("No eligible Library skills."));
+                assert!(
+                    dialog
+                        .footer_help()
+                        .detail
+                        .contains("Clear or edit the query")
+                );
+                assert!(
+                    dialog
+                        .footer_help()
+                        .detail
+                        .contains("same deployment name: shared")
+                );
+                assert_empty_inert(&mut dialog, ctx);
+
+                assert!(dialog.key(key(KeyCode::Backspace), ctx).is_empty());
+                let text = render_dialog(&mut dialog, ctx);
+                assert!(!text.contains("No search matches."));
+                assert_eq!(dialog.resolve.as_ref().unwrap().shown, ["alpha", "beta"]);
+                assert!(dialog.hints().contains(&("↑↓", "choose")));
+                assert!(dialog.hints().contains(&("Enter", "stage")));
+                assert_eq!(
+                    dialog.footer_help().detail,
+                    "Select a Library skill as the replacement deployment target"
+                );
+                assert!(dialog.key(key(KeyCode::Char('b')), ctx).is_empty());
+                assert_eq!(dialog.resolve.as_ref().unwrap().shown, ["beta"]);
+                assert!(dialog.options.deployments.is_empty());
+                let actions = dialog.key(key(KeyCode::Enter), ctx);
+                assert!(matches!(
+                    actions.as_slice(),
+                    [Action::CloseModal, Action::Spawn(Task::RepairPlan(options))]
+                        if options.deployments.get("test/shared").map(String::as_str) == Some("beta")
+                ));
+                assert!(dialog.resolve.is_none());
+                assert_eq!(dialog.options.deployments["test/shared"], "beta");
+                assert!(dialog.staged_plan().unwrap().actions.is_empty());
+            },
+        );
+    }
+
     fn test_ctx() -> Ctx<'static> {
         let tmp = Box::leak(Box::new(
             skills::ops::DownloadDir::new("repair-dialog").unwrap(),
         ));
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
         let ws = Box::leak(Box::new(skills::Workspace::open(&root).unwrap()));
         let snap = Box::leak(Box::new(ws.scan().unwrap()));
         let settings = Box::leak(Box::new(crate::tui::settings::RuntimeSettings::new(

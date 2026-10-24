@@ -334,7 +334,7 @@ impl AgentsView {
     }
 
     pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
-        if !self.filter_editing || self.preview.is_open() || self.matrix.hints().is_some() {
+        if !self.filter_editing || self.overlay_open() {
             return vec![];
         }
         match self.search_panel.paste(text) {
@@ -416,19 +416,40 @@ impl AgentsView {
                 Action::ConfirmLinks { title, actions } => {
                     let agent = agent.clone();
                     let project = project.clone();
-                    Action::OpenModal(Box::new(
-                        Modal::confirm_meta(
-                            title,
-                            actions.iter().map(|a| a.describe()).collect(),
-                            Box::new(move |ws| {
-                                skills::ops::targets::apply_actions(
-                                    ws,
-                                    &agent,
-                                    project.as_deref(),
-                                    &actions,
-                                )
-                            }),
+                    let removes = actions.iter().any(|action| {
+                        matches!(
+                            action,
+                            deploy::Action::Unlink { .. }
+                                | deploy::Action::Clean { .. }
+                                | deploy::Action::Relink { .. }
                         )
+                    });
+                    let label = if actions
+                        .iter()
+                        .any(|a| matches!(a, deploy::Action::Relink { .. }))
+                    {
+                        "Relink"
+                    } else {
+                        "Remove"
+                    };
+                    let modal = Modal::confirm_meta(
+                        title,
+                        actions.iter().map(|a| a.describe()).collect(),
+                        Box::new(move |ws| {
+                            skills::ops::targets::apply_actions(
+                                ws,
+                                &agent,
+                                project.as_deref(),
+                                &actions,
+                            )
+                        }),
+                    );
+                    Action::OpenModal(Box::new(
+                        (if removes {
+                            modal.destructive(label)
+                        } else {
+                            modal
+                        })
                         .deployment_only(),
                     ))
                 }
@@ -1459,7 +1480,7 @@ impl AgentsView {
                 layout: PanelLayout::Unified,
                 input_title: Line::default(),
                 results_title: title,
-                hint: ("/ filter skills…", "   tag:x  preset:y  repo:owner/repo"),
+                hint: ("filter skills…", "   tag:x  preset:y  repo:owner/repo"),
                 input_active: self.filter_editing,
                 results_active: matches!(self.focus(), Focus::Entries),
                 header_height: u16::from(self.has_visible_groups()),
@@ -1490,10 +1511,8 @@ impl AgentsView {
                 skills::config::Icons::Text => "!",
             };
             f.render_widget(
-                Paragraph::new(format!(
-                    " {warning} No matching skills deployed here · press i to install"
-                ))
-                .style(th.warn()),
+                Paragraph::new(format!(" {warning} No matching skills deployed here"))
+                    .style(th.warn()),
                 inner,
             );
         }
@@ -1616,6 +1635,19 @@ impl AgentsView {
     }
 
     fn hints_current(&self) -> Hints {
+        if self.quick.popup.is_some() {
+            return &[
+                ("↑↓←→", "group"),
+                ("Enter", "install/uninstall / expand"),
+                ("Esc/q", "back"),
+            ];
+        }
+        if let Some(hints) = self.preview.hints() {
+            return hints;
+        }
+        if let Some(hints) = self.matrix.hints() {
+            return hints;
+        }
         if self.focus() == Focus::Filters {
             return &[
                 ("←→", "filter badge"),
@@ -1625,18 +1657,12 @@ impl AgentsView {
                 ("Esc/q", "search"),
             ];
         }
-        if self.focus() == Focus::Groups || self.quick.popup.is_some() {
+        if self.focus() == Focus::Groups {
             return &[
                 ("↑↓←→", "group"),
                 ("Enter", "install/uninstall / expand"),
                 ("Esc/q", "back"),
             ];
-        }
-        if let Some(hints) = self.matrix.hints() {
-            return hints;
-        }
-        if let Some(hints) = self.preview.hints() {
-            return hints;
         }
         if self.filter_editing && self.search_panel.completion.active() {
             return &[
@@ -1648,8 +1674,8 @@ impl AgentsView {
         if !self.destinations.is_empty() && self.filter_editing {
             return &[
                 ("↑", "groups / scope"),
-                ("Enter/↓", "results"),
-                ("Esc", "results"),
+                ("Enter/↓", "filters/results"),
+                ("Esc", "clear/results"),
             ];
         }
         if !self.destinations.is_empty() && self.focus() == Focus::Entries && self.caps.is_empty() {
@@ -1922,6 +1948,9 @@ impl AgentsView {
 impl View for AgentsView {
     fn overlay_open(&self) -> bool {
         self.preview.is_open() || self.matrix.hints().is_some() || self.quick.popup.is_some()
+    }
+    fn mouse_overlay_open(&self) -> bool {
+        self.overlay_open() || (self.filter_editing && self.search_panel.completion.active())
     }
     fn preview_overlay(&mut self) -> Option<&mut super::preview::Overlay> {
         Some(&mut self.preview)

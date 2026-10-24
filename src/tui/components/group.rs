@@ -437,6 +437,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inactive_badges_keep_complete_outlines_without_rewriting_ordinary_glyphs() {
+        use crate::tui::widgets::{PopupSurface, dim_inactive};
+        use ratatui::{Terminal, backend::TestBackend, layout::Rect, widgets::Paragraph};
+        use skills::config::{Config, Icons, PillCaps};
+
+        let dir = skills::ops::DownloadDir::new("inactive-badges").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(dir.path())
+        .unwrap();
+        let ws = skills::Workspace::open(dir.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let literal = "literal:   ▌ ▐   中文";
+        for (fg, bg) in [(Color::White, Color::Black), (Color::Black, Color::White)] {
+            for (icons, caps, left, right) in [
+                (Icons::Nerd, PillCaps::Round, "(", ")"),
+                (Icons::Nerd, PillCaps::Block, "[", "]"),
+                (Icons::Nerd, PillCaps::None, "", ""),
+                (Icons::Text, PillCaps::Round, "(", ")"),
+            ] {
+                settings.ui.icons = icons;
+                settings.ui.pill_caps = caps;
+                let ctx = Ctx {
+                    ws: &ws,
+                    snap: &snap,
+                    settings: &settings,
+                };
+                let mut spans = Badge::new("dotfiles", Color::Cyan).render(&ctx, 40);
+                spans.push(Span::raw(" "));
+                spans.extend(
+                    Badge::for_kind(Kind::Preset, "generic-default", Color::Magenta)
+                        .render(&ctx, 40),
+                );
+                let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+                let draw = |frame: &mut Frame| {
+                    frame.render_widget(
+                        Paragraph::new(literal).style(Style::default().fg(fg).bg(bg)),
+                        frame.area(),
+                    );
+                    frame.render_widget(
+                        Paragraph::new(Line::from(spans.clone())),
+                        Rect::new(0, 1, 80, 1),
+                    );
+                };
+                terminal.draw(draw).unwrap();
+                let active = terminal.backend().buffer().clone();
+                let mut inactive = active.clone();
+                // Both tab focus and popup backdrops share this transformation.
+                dim_inactive(*inactive.area(), &mut inactive);
+                let text: String = (0..80).map(|x| inactive[(x, 1)].symbol()).collect();
+                assert_eq!(
+                    text.trim_end(),
+                    format!("{left} dotfiles {right} / generic-default /")
+                );
+                for x in 0..80 {
+                    assert_eq!(inactive[(x, 0)].symbol(), active[(x, 0)].symbol());
+                    let cell = &inactive[(x, 1)];
+                    assert_eq!(cell.fg, Color::Reset);
+                    assert_eq!(cell.bg, Color::Reset);
+                    assert_eq!(cell.modifier, Modifier::DIM);
+                }
+                let mut nested = inactive.clone();
+                ratatui::widgets::Widget::render(
+                    PopupSurface,
+                    Rect::new(50, 3, 20, 4),
+                    &mut nested,
+                );
+                for x in 0..80 {
+                    assert_eq!(nested[(x, 1)], inactive[(x, 1)]);
+                }
+                terminal.draw(draw).unwrap();
+                assert_eq!(terminal.backend().buffer(), &active);
+            }
+        }
+    }
+
+    #[test]
     fn filled_labels_keep_readable_contrast() {
         let dir = skills::ops::DownloadDir::new("pill-contrast").unwrap();
         let ws = skills::Workspace::open(dir.path()).unwrap();

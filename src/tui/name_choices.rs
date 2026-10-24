@@ -3,7 +3,7 @@ use super::components::choice_footer::{self, ChoiceEvent, ChoiceFocus};
 use super::{
     app::{Action, Ctx, Hints},
     modal::Modal,
-    widgets::{ListNav, OverlayClear, fit},
+    widgets::{ListNav, PopupClass, PopupSurface, fit, popup_size, popup_too_small},
 };
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -23,6 +23,7 @@ pub struct NameChoices {
     focus: ChoiceFocus,
     previous_rect: Rect,
     next_rect: Rect,
+    rect: Rect,
 }
 impl NameChoices {
     pub fn new(pending: Pending) -> Self {
@@ -37,6 +38,7 @@ impl NameChoices {
             focus: ChoiceFocus::List,
             previous_rect: Rect::default(),
             next_rect: Rect::default(),
+            rect: Rect::default(),
         };
         out.list.first(out.len());
         out
@@ -83,6 +85,10 @@ impl NameChoices {
         ]
     }
     pub fn hints(&self) -> Hints {
+        if let Some(hints) = self.focus.button_hints() {
+            return hints;
+        }
+
         &[
             ("↑↓", "option"),
             ("Enter/Space", "choose"),
@@ -91,6 +97,19 @@ impl NameChoices {
             ("Esc", "cancel"),
         ]
     }
+    pub fn footer_help(&self) -> crate::tui::footer::Help<'_> {
+        self.focus.help(
+            self.hints(),
+            "Choose one or none for each name; changes are staged until confirmed",
+            if self.choices.iter().all(Option::is_some) {
+                "Review the selected name choices before applying"
+            } else {
+                "Choose every conflicting name before applying"
+            },
+            "Discard the staged choices and close",
+        )
+    }
+
     pub fn key(&mut self, key: KeyEvent) -> Vec<Action> {
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
             return vec![Action::CloseModal];
@@ -122,11 +141,17 @@ impl NameChoices {
         vec![]
     }
     pub fn mouse(&mut self, event: MouseEvent) -> Vec<Action> {
+        match super::widgets::popup_mouse(event, self.rect) {
+            super::widgets::PopupMouse::OutsidePress => return vec![Action::CloseModal],
+            super::widgets::PopupMouse::Inside => {}
+            _ => return vec![],
+        }
         if matches!(
             event.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
         ) && self.list.rows.contains((event.column, event.row).into())
         {
+            self.focus = ChoiceFocus::List;
             self.list.move_by(
                 if event.kind == MouseEventKind::ScrollUp {
                     -1
@@ -141,10 +166,12 @@ impl NameChoices {
                 .previous_rect
                 .contains((event.column, event.row).into())
             {
+                self.focus = ChoiceFocus::List;
                 self.move_group(-1);
                 return vec![];
             }
             if self.next_rect.contains((event.column, event.row).into()) {
+                self.focus = ChoiceFocus::List;
                 self.move_group(1);
                 return vec![];
             }
@@ -171,15 +198,11 @@ impl NameChoices {
         vec![]
     }
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
-        let width = area.width.saturating_sub(2).min(110);
-        let height = area.height.saturating_sub(2).min(24);
-        let rect = Rect::new(
-            area.x + (area.width - width) / 2,
-            area.y + (area.height - height) / 2,
-            width,
-            height,
-        );
-        f.render_widget(OverlayClear, rect);
+        let height = (self.len().min(17) as u16).saturating_add(7);
+        let size = popup_size(area, PopupClass::Choice, height, (12, 3));
+        let rect = size.outer;
+        self.rect = rect;
+        f.render_widget(PopupSurface, rect);
         let group = &self.pending.groups[self.group];
         let block = ctx.settings.theme.block(
             format!(
@@ -196,10 +219,11 @@ impl NameChoices {
         self.cancel_rect = Rect::default();
         self.previous_rect = Rect::default();
         self.next_rect = Rect::default();
-        if inner.height < 8 {
-            f.render_widget(Paragraph::new("Enlarge terminal · Esc cancel"), inner);
+        if !size.usable {
+            popup_too_small(f, size, &ctx.settings.theme);
             return;
         }
+        let description_height = if inner.height < 8 { 1 } else { 3 };
         f.render_widget(
             Paragraph::new(format!(
                 "Name: {}\nTarget: {}",
@@ -207,9 +231,14 @@ impl NameChoices {
                 group.directory.display()
             ))
             .wrap(Wrap { trim: false }),
-            Rect::new(inner.x, inner.y, inner.width, 3),
+            Rect::new(inner.x, inner.y, inner.width, description_height),
         );
-        self.list.rows = Rect::new(inner.x, inner.y + 3, inner.width, inner.height - 6);
+        self.list.rows = Rect::new(
+            inner.x,
+            inner.y + description_height,
+            inner.width,
+            inner.height.saturating_sub(description_height + 1),
+        );
         let rows = group
             .candidates
             .iter()
@@ -252,34 +281,39 @@ impl NameChoices {
             self.list.rows,
             &mut self.list.state,
         );
-        f.render_widget(
-            Paragraph::new("Choose one or none for each name. Nothing changes until confirmed.")
-                .style(ctx.settings.theme.dim()),
-            Rect::new(inner.x, inner.bottom() - 2, inner.width, 1),
-        );
         let enabled = self.choices.iter().all(Option::is_some);
+        let navigation_width = if inner.width >= 56 && self.pending.groups.len() > 1 {
+            let rects = crate::tui::widgets::draw_button_row(
+                f,
+                Rect::new(inner.x, inner.bottom() - 1, 24, 1),
+                &[
+                    crate::tui::widgets::ButtonSpec::new("Previous"),
+                    crate::tui::widgets::ButtonSpec::new("Next"),
+                ],
+                None,
+                &ctx.settings.theme,
+            );
+            self.previous_rect = rects[0];
+            self.next_rect = rects[1];
+            26
+        } else {
+            0
+        };
         let rects = choice_footer::draw(
             f,
-            Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            Rect::new(
+                inner.x + navigation_width,
+                inner.bottom() - 1,
+                inner.width.saturating_sub(navigation_width),
+                1,
+            ),
             self.focus,
             enabled,
-            "←→ previous / next conflict",
+            "",
             &ctx.settings.theme,
         );
         self.apply_rect = rects[0];
         self.cancel_rect = rects[1];
-        if inner.width >= 56 && self.pending.groups.len() > 1 {
-            self.previous_rect = Rect::new(inner.x, inner.bottom() - 1, 12, 1);
-            self.next_rect = Rect::new(inner.x + 13, inner.bottom() - 1, 10, 1);
-            f.render_widget(
-                Paragraph::new("[ Previous ]").style(ctx.settings.theme.dim()),
-                self.previous_rect,
-            );
-            f.render_widget(
-                Paragraph::new("[ Next ]").style(ctx.settings.theme.dim()),
-                self.next_rect,
-            );
-        }
     }
 }
 
@@ -287,6 +321,88 @@ impl NameChoices {
 mod tests {
     use super::*;
     use skills::ops::name_choices::{Candidate, Group};
+    #[test]
+    fn responsive_name_choices_keep_selection_and_actions() {
+        let tmp = skills::ops::DownloadDir::new("name-choice-size").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = skills::Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut picker = NameChoices::new(Pending {
+            changes: vec![],
+            groups: vec![Group {
+                name: "duplicate".into(),
+                directory: "/synthetic/agent".into(),
+                candidates: vec![Candidate {
+                    key: Some("example".into()),
+                    path: "/synthetic/example".into(),
+                    archive_hash: None,
+                }],
+            }],
+        });
+        picker.rect = Rect::new(10, 5, 60, 18);
+        picker.list.rows = Rect::new(11, 8, 58, 2);
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 8,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(picker.mouse(event).is_empty());
+        assert_eq!(picker.choices, vec![Some(0)]);
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            assert!(matches!(
+                picker
+                    .mouse(MouseEvent {
+                        kind: MouseEventKind::Down(button),
+                        column: 0,
+                        row: 0,
+                        ..event
+                    })
+                    .as_slice(),
+                [Action::CloseModal]
+            ));
+        }
+        for (width, height) in [(160, 40), (112, 32), (60, 20), (40, 12), (4, 3), (0, 0)] {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+                width.max(1),
+                height.max(1),
+            ))
+            .unwrap();
+            let area = Rect::new(0, 0, width, height.saturating_sub(2));
+            terminal
+                .draw(|frame| picker.draw(frame, area, &ctx))
+                .unwrap();
+            for hit in [picker.list.rows, picker.apply_rect, picker.cancel_rect] {
+                assert!(hit.is_empty() || hit.intersection(area) == hit);
+            }
+            if width == 40 {
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                for label in ["Keep example", "Apply", "Cancel"] {
+                    assert!(text.contains(label), "{text}");
+                }
+                assert!(picker.list.rows.height > 0);
+            }
+            assert_eq!(picker.choices, [Some(0)]);
+        }
+    }
+
     #[test]
     fn every_group_requires_an_explicit_choice_before_confirmation() {
         let group = Group {

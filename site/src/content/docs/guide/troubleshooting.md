@@ -85,4 +85,4 @@ After a conflict, the local backup commit is normally retained and the merge is 
 
 ## Missing glyphs or unexpected keys
 
-Set `[ui] icons = "text"` and `pill_caps` to `"block"` or `"none"`. Outside text inputs, `:` opens the command palette; inside a field, it types a colon. Close overlays and leave text input before using page shortcuts. The footer and `Ctrl+G` show controls for the current context.
+Set `[ui] icons = "text"` to use ordinary menu symbols and tag/preset caps without a Nerd Font. To retain Nerd Font icons while changing only tag caps, set `pill_caps` to `"block"` or `"none"`. Outside text inputs, `:` opens the command palette; inside a field, it types a colon. Close overlays and leave text input before using page shortcuts. The footer and `Ctrl+G` show controls for the current context.

@@ -1,10 +1,14 @@
 //! Configure and run root-wide Git synchronization.
+//! Mode descriptions keep previews and focused help aligned with sync execution.
+//! Compact previews cache the exact cell-wrapped display rows at the current
+//! draw width; keyboard and mouse navigation count that same model. Wide
+//! previews retain a status list and a separately visible plan.
 use super::{
     app::{Action, Ctx, Hints},
     components::choice_footer::{self, ChoiceEvent, ChoiceFocus},
     event::Task,
     sync_coordinator::{SyncActivity, SyncPresentation},
-    widgets::{Input, ListNav, OverlayClear, centered, fit, width},
+    widgets::{Input, ListNav, PopupClass, PopupSurface, fit, popup_size, popup_too_small, width},
 };
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -19,6 +23,50 @@ use skills::ops::sync::{Mode, Report, Settings};
 pub struct Request {
     pub mode: Mode,
     pub dry_run: bool,
+}
+
+struct ModeDescription {
+    heading: &'static str,
+    primary: &'static str,
+    operations: &'static str,
+    note: &'static str,
+}
+
+impl ModeDescription {
+    fn for_mode(mode: Mode) -> Self {
+        match mode {
+            Mode::Sync => Self {
+                heading: "Sync",
+                primary: "✓ Run sync",
+                operations: "commit local changes if needed → fetch and merge remote updates → push",
+                note: "With no local commit, fetch and attach the remote branch first if available. Merge conflicts preserve the local backup commit.",
+            },
+            Mode::Push => Self {
+                heading: "Push",
+                primary: "✓ Run push",
+                operations: "commit local changes if needed → push local history",
+                note: "Push requires a local commit; remote divergence may reject the push.",
+            },
+            Mode::Pull => Self {
+                heading: "Pull",
+                primary: "✓ Run pull",
+                operations: "commit local changes if needed → fetch and merge remote updates",
+                note: "With no local commit, fetch and attach the remote branch first if available. Merge conflicts preserve the local backup commit.",
+            },
+        }
+    }
+
+    fn preview_help(&self) -> String {
+        format!("Preview: {}.", self.operations)
+    }
+
+    fn apply_help(&self) -> String {
+        format!("Run: {}. {}", self.operations, self.note)
+    }
+
+    fn plan(&self) -> String {
+        format!("Plan: {}. {}", self.operations, self.note)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -51,6 +99,7 @@ pub struct SyncPicker {
     rect: Rect,
     field_rects: [Rect; 2],
     buttons: [Rect; 2],
+    compact_preview_rows: Option<Vec<String>>,
 }
 impl SyncPicker {
     pub fn new(ctx: &Ctx) -> anyhow::Result<Self> {
@@ -99,6 +148,7 @@ impl SyncPicker {
             rect: Rect::default(),
             field_rects: [Rect::default(); 2],
             buttons: [Rect::default(); 2],
+            compact_preview_rows: None,
         };
         picker.list.first(picker.actions().len());
         Ok(picker)
@@ -173,7 +223,10 @@ impl SyncPicker {
     fn row_count(&self) -> usize {
         match &self.step {
             Step::Overview => self.actions().len(),
-            Step::Preview { report, .. } => report.status.lines().count().max(1),
+            Step::Preview { report, .. } => self
+                .compact_preview_rows
+                .as_ref()
+                .map_or_else(|| report.status.lines().count().max(1), Vec::len),
             Step::Changes => self
                 .status
                 .as_ref()
@@ -185,15 +238,20 @@ impl SyncPicker {
     }
 
     pub fn hints(&self) -> Hints {
+        if let Some(hints) = self.focus.button_hints() {
+            return hints;
+        }
+
         match self.step {
             Step::Configure { .. } => &[
                 ("Tab", "next field"),
                 ("Enter", "continue"),
                 ("Esc", "back"),
             ],
-            Step::Preview { .. } | Step::Changes | Step::Disable => {
-                &[("Tab", "buttons"), ("Enter", "choose"), ("Esc", "back")]
+            Step::Preview { .. } | Step::Changes => {
+                &[("↑↓", "scroll"), ("Enter/Tab", "buttons"), ("Esc", "back")]
             }
+            Step::Disable => &[("Enter/Tab", "buttons"), ("Esc", "back")],
             Step::Overview if !self.configured() => {
                 &[("↑↓", "choose"), ("Enter", "set up"), ("Esc", "close")]
             }
@@ -204,6 +262,72 @@ impl SyncPicker {
                 ("Esc", "close"),
             ],
         }
+    }
+
+    pub fn footer_help(&self) -> crate::tui::footer::Help<'_> {
+        let detail: std::borrow::Cow<'_, str> = match &self.step {
+            Step::Overview => self
+                .list
+                .selected()
+                .and_then(|i| self.actions().get(i).copied())
+                .map_or("".into(), |action| match action {
+                    OverviewAction::Changes => "Review uncommitted Library changes".into(),
+                    OverviewAction::Check => {
+                        "Fetch remote state without changing Library files".into()
+                    }
+                    OverviewAction::Configure => {
+                        "Configure the Git remote and branch for Library backup".into()
+                    }
+                    OverviewAction::Sync(mode) => {
+                        ModeDescription::for_mode(mode).preview_help().into()
+                    }
+                    OverviewAction::Enable => {
+                        "Enable automatic Library backup and synchronization".into()
+                    }
+                    OverviewAction::Disable => {
+                        "Stop automatic synchronization; keep Git history and files".into()
+                    }
+                }),
+            Step::Configure { field, .. } => if *field == 0 {
+                "Git remote URL or local repository path"
+            } else {
+                "Remote branch used for this Library's backup"
+            }
+            .into(),
+            Step::Preview { request, .. } => ModeDescription::for_mode(request.mode)
+                .preview_help()
+                .into(),
+            Step::Changes => "These changes are committed before the next sync".into(),
+            Step::Disable => {
+                "Git history and files remain available after automatic sync is disabled".into()
+            }
+        };
+        let apply: std::borrow::Cow<'_, str> = match &self.step {
+            Step::Configure { fields, .. }
+                if fields.iter().any(|field| field.value().trim().is_empty()) =>
+            {
+                "Enter both a remote URL and branch before enabling backup".into()
+            }
+            Step::Configure { .. } => {
+                "Save the configuration in local Git settings and enable backup".into()
+            }
+            Step::Preview { request, .. } => {
+                ModeDescription::for_mode(request.mode).apply_help().into()
+            }
+            Step::Changes => "Return to the backup overview".into(),
+            Step::Disable => "Turn off automatic sync while retaining Git history".into(),
+            Step::Overview => detail.clone(),
+        };
+        self.focus.help(
+            self.hints(),
+            detail,
+            apply,
+            if matches!(self.step, Step::Overview) {
+                "Close backup settings"
+            } else {
+                "Return to the backup overview without applying changes"
+            },
+        )
     }
 
     pub fn paste(&mut self, text: &str) -> Vec<Action> {
@@ -348,7 +472,31 @@ impl SyncPicker {
             }
             return vec![];
         }
-        if let Some(actions) = self.handle_choice(key.code) {
+        if matches!(self.step, Step::Changes) {
+            match (self.focus, key.code) {
+                (ChoiceFocus::List, KeyCode::Tab | KeyCode::BackTab | KeyCode::Enter) => {
+                    self.focus = ChoiceFocus::Cancel;
+                    return vec![];
+                }
+                (ChoiceFocus::List, KeyCode::Down)
+                    if self.list.selected() == Some(self.row_count().saturating_sub(1)) =>
+                {
+                    self.focus = ChoiceFocus::Cancel;
+                    return vec![];
+                }
+                (_, KeyCode::Tab | KeyCode::BackTab | KeyCode::Up)
+                    if self.focus != ChoiceFocus::List =>
+                {
+                    self.focus = ChoiceFocus::List;
+                    return vec![];
+                }
+                (_, KeyCode::Enter | KeyCode::Char(' ')) if self.focus != ChoiceFocus::List => {
+                    return self.back();
+                }
+                _ if self.focus != ChoiceFocus::List => return vec![],
+                _ => {}
+            }
+        } else if let Some(actions) = self.handle_choice(key.code) {
             return actions;
         }
         match key.code {
@@ -395,17 +543,32 @@ impl SyncPicker {
     }
 
     pub fn mouse(&mut self, event: MouseEvent, _: &Ctx) -> Vec<Action> {
+        match super::widgets::popup_mouse(event, self.rect) {
+            super::widgets::PopupMouse::OutsidePress => return vec![Action::CloseModal],
+            super::widgets::PopupMouse::Inside => {}
+            _ => return vec![],
+        }
         let at = ratatui::layout::Position::new(event.column, event.row);
         match event.kind {
-            MouseEventKind::ScrollDown => self.list.move_by(3, self.row_count()),
-            MouseEventKind::ScrollUp => self.list.move_by(-3, self.row_count()),
-            MouseEventKind::Down(MouseButton::Left) if !self.rect.contains(at) => {
-                return self.back();
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                if self.list.rows.contains(at) && !matches!(self.step, Step::Configure { .. }) =>
+            {
+                self.focus = ChoiceFocus::List;
+                self.list.move_by(
+                    if event.kind == MouseEventKind::ScrollDown {
+                        3
+                    } else {
+                        -3
+                    },
+                    self.row_count(),
+                );
             }
             MouseEventKind::Down(MouseButton::Left) if self.buttons[0].contains(at) => {
+                self.focus = ChoiceFocus::Apply;
                 return self.primary();
             }
             MouseEventKind::Down(MouseButton::Left) if self.buttons[1].contains(at) => {
+                self.focus = ChoiceFocus::Cancel;
                 return self.back();
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -431,13 +594,22 @@ impl SyncPicker {
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         let height = match self.step {
             Step::Configure { .. } => 17,
-            Step::Preview { .. } | Step::Changes => 21,
-            Step::Overview => 27,
+            Step::Preview { ref report, .. } => {
+                (report.status.lines().count().clamp(1, 11) as u16) + 10
+            }
+            Step::Changes => {
+                self.status
+                    .as_ref()
+                    .map_or(1, |s| s.changes.len().clamp(1, 14)) as u16
+                    + 7
+            }
+            Step::Overview => self.actions().len() as u16 + 15,
             Step::Disable => 13,
         };
-        let area = centered(area, 118, height);
+        let size = popup_size(area, PopupClass::Preview, height, (12, 5));
+        let area = size.outer;
         self.rect = area;
-        f.render_widget(OverlayClear, area);
+        f.render_widget(PopupSurface, area);
         let title = match self.step {
             Step::Overview => " Root backup ",
             Step::Configure { .. } => " Root backup · configure ",
@@ -451,46 +623,85 @@ impl SyncPicker {
         f.render_widget(block, area);
         self.buttons = [Rect::default(); 2];
         self.field_rects = [Rect::default(); 2];
+        self.list.rows = Rect::default();
+        self.compact_preview_rows = None;
+        if let Step::Configure { fields, .. } = &mut self.step {
+            for field in fields {
+                field.clear_area();
+            }
+        }
+        if !size.usable {
+            popup_too_small(f, size, th);
+            return;
+        }
         let minimum_height = match self.step {
             Step::Configure { .. } => 13,
-            Step::Overview | Step::Preview { .. } | Step::Changes => 8,
+            Step::Overview => 14,
+            Step::Preview { .. } => 9,
+            Step::Changes => 6,
             Step::Disable => 7,
         };
         if inner.width < 26 || inner.height < minimum_height {
-            f.render_widget(Paragraph::new("Enlarge terminal · Esc back"), inner);
+            self.draw_compact(f, inner, ctx);
             return;
         }
         match &mut self.step {
             Step::Overview => {
                 let configured = self.configured();
+                let icon = |nerd, text| super::icons::decoration(ctx.settings.ui.icons, nerd, text);
                 let activity = if self.checking {
                     SyncActivity::Checking
                 } else {
                     self.presentation.activity
                 };
                 let (hero_icon, hero, detail, hero_style) = match activity {
-                    SyncActivity::NotConfigured => {
-                        ("", "Set up backup", "Connect a Git remote", th.warn())
-                    }
-                    SyncActivity::Ready => ("", "Backed up", "Everything is current", th.ok()),
-                    SyncActivity::Waiting => {
-                        ("", "Sync pending", "Changes are waiting", th.warn())
-                    }
-                    SyncActivity::Checking => {
-                        ("", "Checking…", "Reading remote state", th.accent())
-                    }
-                    SyncActivity::Syncing => ("", "Syncing…", "Saving and merging", th.accent()),
-                    SyncActivity::Retrying => {
-                        ("", "Retrying", "Waiting for the next check", th.warn())
-                    }
-                    SyncActivity::Attention => {
-                        ("", "Needs attention", "Open Git to resolve", th.err())
-                    }
+                    SyncActivity::NotConfigured => (
+                        icon("", "!"),
+                        "Set up backup",
+                        "Connect a Git remote",
+                        th.warn(),
+                    ),
+                    SyncActivity::Ready => (
+                        icon("", "✓"),
+                        "Backed up",
+                        "Everything is current",
+                        th.ok(),
+                    ),
+                    SyncActivity::Waiting => (
+                        icon("", "↻"),
+                        "Sync pending",
+                        "Changes are waiting",
+                        th.warn(),
+                    ),
+                    SyncActivity::Checking => (
+                        icon("", "?"),
+                        "Checking…",
+                        "Reading remote state",
+                        th.accent(),
+                    ),
+                    SyncActivity::Syncing => (
+                        icon("", "↻"),
+                        "Syncing…",
+                        "Saving and merging",
+                        th.accent(),
+                    ),
+                    SyncActivity::Retrying => (
+                        icon("", "↻"),
+                        "Retrying",
+                        "Waiting for the next check",
+                        th.warn(),
+                    ),
+                    SyncActivity::Attention => (
+                        icon("", "!"),
+                        "Needs attention",
+                        "Open Git to resolve",
+                        th.err(),
+                    ),
                 };
                 let badge = if !configured {
                     " NOT CONFIGURED "
                 } else if self.presentation.automatic {
-                    "  AUTO ON "
+                    icon("  AUTO ON ", " ↻ AUTO ON ")
                 } else {
                     " AUTO OFF "
                 };
@@ -525,25 +736,25 @@ impl SyncPicker {
                 let status = self.status.as_ref();
                 let changes = status.map_or("○ unknown".into(), |status| {
                     if status.changes.is_empty() {
-                        " clean".into()
+                        format!("{} clean", icon("", "✓"))
                     } else {
-                        format!(" {} changes", status.changes.len())
+                        format!("{} {} changes", icon("", "!"), status.changes.len())
                     }
                 });
-                let push = status.map_or(" unknown".into(), |status| {
+                let push = status.map_or(format!("{} unknown", icon("", "↑")), |status| {
                     if status.ahead == 0 {
-                        " 0 to push".into()
+                        format!("{} 0 to push", icon("", "↑"))
                     } else {
-                        format!(" {} to push", status.ahead)
+                        format!("{} {} to push", icon("", "↑"), status.ahead)
                     }
                 });
-                let pull = status.map_or(" unknown".into(), |status| {
+                let pull = status.map_or(format!("{} unknown", icon("", "↓")), |status| {
                     if self.checking {
-                        " checking…".into()
+                        format!("{} checking…", icon("", "?"))
                     } else if !status.remote_checked {
-                        "󰄱 not checked".into()
+                        format!("{} not checked", icon("󰄱", "○"))
                     } else {
-                        format!(" {} to pull", status.behind)
+                        format!("{} {} to pull", icon("", "↓"), status.behind)
                     }
                 });
                 let branch = self.settings.branch.as_deref().unwrap_or("—");
@@ -559,7 +770,7 @@ impl SyncPicker {
                         super::components::layout::frame(f, remote_card, false, false, th);
                     f.render_widget(
                         Paragraph::new(Line::from(vec![
-                            Span::styled("  LOCAL", th.bold()),
+                            Span::styled(icon("  LOCAL", "LOCAL"), th.bold()),
                             Span::styled("  Library", th.description()),
                         ])),
                         Rect::new(local_inner.x, local_inner.y, local_inner.width, 1),
@@ -570,8 +781,11 @@ impl SyncPicker {
                     );
                     f.render_widget(
                         Paragraph::new(Line::from(vec![
-                            Span::styled("  REMOTE", th.bold()),
-                            Span::styled(format!("   {branch}"), th.description()),
+                            Span::styled(icon("  REMOTE", "REMOTE"), th.bold()),
+                            Span::styled(
+                                format!("  {} {branch}", icon("", "branch")),
+                                th.description(),
+                            ),
                         ])),
                         Rect::new(remote_inner.x, remote_inner.y, remote_inner.width, 1),
                     );
@@ -583,25 +797,25 @@ impl SyncPicker {
                         Rect::new(remote_inner.x, remote_inner.y + 1, remote_inner.width, 2),
                     );
                     f.render_widget(
-                        Paragraph::new("").style(th.accent()),
+                        Paragraph::new(icon("", "↻")).style(th.accent()),
                         Rect::new(local.right() + 2, summary_y + 2, 2, 1),
                     );
                 } else {
                     f.render_widget(
                         Paragraph::new(Line::from(vec![
-                            Span::styled(" LOCAL", th.bold()),
+                            Span::styled(icon(" LOCAL", "LOCAL"), th.bold()),
                             Span::raw(format!("  {changes} · {push}")),
                         ])),
                         Rect::new(inner.x + 1, summary_y, inner.width - 2, 1),
                     );
                     f.render_widget(
-                        Paragraph::new("  ").style(th.accent()),
+                        Paragraph::new(icon("  ", "  ↻")).style(th.accent()),
                         Rect::new(inner.x + 1, summary_y + 1, inner.width - 2, 1),
                     );
                     f.render_widget(
                         Paragraph::new(Line::from(vec![
-                            Span::styled(" REMOTE", th.bold()),
-                            Span::raw(format!("   {branch} · {pull}")),
+                            Span::styled(icon(" REMOTE", "REMOTE"), th.bold()),
+                            Span::raw(format!("  {} {branch} · {pull}", icon("", "branch"))),
                         ])),
                         Rect::new(inner.x + 1, summary_y + 2, inner.width - 2, 1),
                     );
@@ -612,7 +826,7 @@ impl SyncPicker {
                     inner.x + 1,
                     inner.y + 9,
                     inner.width - 2,
-                    inner.height.saturating_sub(13),
+                    inner.height.saturating_sub(11),
                 );
                 self.list.item_height = 1;
                 self.list.clamp(actions.len());
@@ -641,7 +855,11 @@ impl SyncPicker {
                             OverviewAction::Disable => ("", "Turn off auto sync", "keeps history"),
                         };
                         ListItem::new(Line::from(vec![
-                            Span::raw(format!(" {icon}  {label}")),
+                            Span::raw(if ctx.settings.ui.icons == skills::config::Icons::Text {
+                                format!(" {label}")
+                            } else {
+                                format!(" {icon}  {label}")
+                            }),
                             Span::styled(format!("  {tail}"), th.description()),
                         ]))
                     })
@@ -655,17 +873,12 @@ impl SyncPicker {
                     self.list.rows,
                     &mut self.list.state,
                 );
-                f.render_widget(
-                    Paragraph::new(" Commit · merge · push    Conflicts never force-reset")
-                        .style(th.description()),
-                    Rect::new(inner.x + 1, inner.bottom() - 3, inner.width - 2, 1),
-                );
                 self.buttons = choice_footer::draw_with_labels(
                     f,
                     Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
                     self.focus,
                     true,
-                    "↑↓ choose",
+                    "",
                     ("Open", "Close"),
                     th,
                 );
@@ -709,17 +922,18 @@ impl SyncPicker {
                     Rect::new(inner.x, inner.bottom() - 2, inner.width, 2),
                     self.focus,
                     ready,
-                    "Configuration is stored in local Git settings",
+                    "",
                     ("Enable", "Back"),
                     th,
                 );
             }
             Step::Preview { request, report } => {
+                let description = ModeDescription::for_mode(request.mode);
                 let status = report.status.lines().collect::<Vec<_>>();
                 f.render_widget(
                     Paragraph::new(format!(
-                        "{:?} · {} local change{}",
-                        request.mode,
+                        "{} · {} local change{}",
+                        description.heading,
                         status.len(),
                         if status.len() == 1 { "" } else { "s" }
                     ))
@@ -761,7 +975,7 @@ impl SyncPicker {
                     &mut self.list.state,
                 );
                 f.render_widget(
-                    Paragraph::new("Plan: commit local changes → fetch and merge remote updates → push. The remote is checked again before writing.")
+                    Paragraph::new(description.plan())
                         .wrap(Wrap { trim: true })
                         .style(th.description()),
                     Rect::new(inner.x + 1, inner.bottom() - 5, inner.width - 2, 3),
@@ -771,8 +985,8 @@ impl SyncPicker {
                     Rect::new(inner.x, inner.bottom() - 2, inner.width, 2),
                     self.focus,
                     true,
-                    "Conflicts preserve the local backup commit",
-                    ("✓ Run sync", "Back"),
+                    "",
+                    (description.primary, "Back"),
                     th,
                 );
             }
@@ -817,16 +1031,20 @@ impl SyncPicker {
                         .collect()
                 };
                 f.render_stateful_widget(
-                    List::new(rows).highlight_style(th.selected()),
+                    List::new(rows).highlight_style(if self.focus == ChoiceFocus::List {
+                        th.selected()
+                    } else {
+                        th.selected_unfocused()
+                    }),
                     self.list.rows,
                     &mut self.list.state,
                 );
                 self.buttons = choice_footer::draw_with_labels(
                     f,
                     Rect::new(inner.x, inner.bottom() - 2, inner.width, 2),
-                    ChoiceFocus::Cancel,
+                    self.focus,
                     false,
-                    "These changes are committed before the next sync",
+                    "",
                     ("", "Back"),
                     th,
                 );
@@ -855,17 +1073,588 @@ impl SyncPicker {
                     Rect::new(inner.x, inner.bottom() - 2, inner.width, 2),
                     self.focus,
                     true,
-                    "Git history is retained",
+                    "",
                     ("Turn off", "Back"),
                     th,
                 );
             }
         }
     }
+
+    /// Reserve actions first, then retain fields or a selected row in short windows.
+    fn draw_compact(&mut self, f: &mut Frame, inner: Rect, ctx: &Ctx) {
+        let th = &ctx.settings.theme;
+        let overview = self.actions();
+        let body = Rect::new(inner.x, inner.y, inner.width, inner.height - 1);
+        let (primary, secondary, enabled) = match &mut self.step {
+            Step::Configure { fields, field } => {
+                for (i, label) in ["Remote URL", "Branch"].iter().enumerate() {
+                    let y = inner.y + i as u16 * 2;
+                    f.render_widget(
+                        Paragraph::new(*label).style(th.dim()),
+                        Rect::new(inner.x, y, inner.width, 1),
+                    );
+                    self.field_rects[i] = Rect::new(inner.x, y + 1, inner.width, 1);
+                    fields[i].render(
+                        f,
+                        self.field_rects[i],
+                        self.focus == ChoiceFocus::List && *field == i,
+                        if i == 0 {
+                            "https://… or /path/to/repo.git"
+                        } else {
+                            "main"
+                        },
+                        th,
+                    );
+                }
+                (
+                    "Enable",
+                    "Back",
+                    fields.iter().all(|field| !field.value().trim().is_empty()),
+                )
+            }
+            Step::Disable => {
+                f.render_widget(Paragraph::new("Automatic synchronization will stop. Git history and files remain unchanged.").wrap(Wrap { trim: true }), body);
+                ("Turn off", "Back", true)
+            }
+            _ => {
+                let (rows, primary, secondary, enabled) = match &self.step {
+                    Step::Overview => (
+                        overview
+                            .iter()
+                            .map(|action| {
+                                match action {
+                                    OverviewAction::Changes => "View changes",
+                                    OverviewAction::Check => "Check remote",
+                                    OverviewAction::Configure => "Configure",
+                                    OverviewAction::Sync(Mode::Sync) => "Sync now",
+                                    OverviewAction::Sync(Mode::Push) => "Push only",
+                                    OverviewAction::Sync(Mode::Pull) => "Pull only",
+                                    OverviewAction::Enable => "Turn on auto sync",
+                                    OverviewAction::Disable => "Turn off auto sync",
+                                }
+                                .to_string()
+                            })
+                            .collect::<Vec<_>>(),
+                        "Open",
+                        "Close",
+                        true,
+                    ),
+                    Step::Preview { request, report } => {
+                        let description = ModeDescription::for_mode(request.mode);
+                        let mut rows = report
+                            .status
+                            .lines()
+                            .map(str::to_string)
+                            .collect::<Vec<_>>();
+                        if rows.is_empty() {
+                            rows.push("Working tree is clean".into());
+                        }
+                        rows.extend(wrap_plan(&description.plan(), body.width as usize));
+                        self.compact_preview_rows = Some(rows.clone());
+                        (rows, description.primary, "Back", true)
+                    }
+                    Step::Changes => {
+                        let mut rows = self
+                            .status
+                            .as_ref()
+                            .map(|s| s.changes.clone())
+                            .unwrap_or_default();
+                        if rows.is_empty() {
+                            rows.push("Working tree is clean".into());
+                        }
+                        (rows, "", "Back", false)
+                    }
+                    _ => unreachable!(),
+                };
+                self.list.rows = body;
+                self.list.item_height = 1;
+                self.list.clamp(rows.len());
+                f.render_stateful_widget(
+                    List::new(
+                        rows.into_iter()
+                            .map(|row| ListItem::new(fit(&row, body.width as usize))),
+                    )
+                    .highlight_style(if self.focus == ChoiceFocus::List {
+                        th.selected()
+                    } else {
+                        th.selected_unfocused()
+                    }),
+                    body,
+                    &mut self.list.state,
+                );
+                (primary, secondary, enabled)
+            }
+        };
+        self.buttons = choice_footer::draw_with_labels(
+            f,
+            Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            self.focus,
+            enabled,
+            "",
+            (primary, secondary),
+            th,
+        );
+    }
+}
+
+/// Wrap without truncating text or splitting graphemes, using terminal cells.
+fn wrap_plan(text: &str, columns: usize) -> Vec<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0;
+    for glyph in text.graphemes(true) {
+        let cells = width(glyph);
+        if used + cells > columns && !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        row.push_str(glyph);
+        used += cells;
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_dirty_preview_reaches_entire_plan_by_keys_wheel_and_click() {
+        use std::collections::BTreeMap;
+        let temp = skills::ops::DownloadDir::new("backup-plan-navigation").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(temp.path())
+        .unwrap();
+        let ws = skills::Workspace::open(temp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = context(&ws, &snap, &settings);
+        let normalize = |text: &str| {
+            text.chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+        };
+        for mode in [Mode::Sync, Mode::Push, Mode::Pull] {
+            for wheel in [false, true] {
+                let mut picker = SyncPicker::preview(
+                    &ctx,
+                    Request {
+                        mode,
+                        dry_run: true,
+                    },
+                    Report {
+                        status: (0..8).map(|i| format!(" M dirty-路径-{i}\n")).collect(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 12)).unwrap();
+                let mut seen = BTreeMap::new();
+                for _ in 0..100 {
+                    terminal
+                        .draw(|f| picker.draw(f, Rect::new(0, 0, 40, 10), &ctx))
+                        .unwrap();
+                    for y in 0..picker.list.rows.height {
+                        let text: String = (picker.list.rows.x..picker.list.rows.right())
+                            .map(|x| {
+                                terminal.backend().buffer()[(x, picker.list.rows.y + y)].symbol()
+                            })
+                            .collect();
+                        seen.insert(picker.list.state.offset() + y as usize, text);
+                    }
+                    if picker.list.selected() == Some(picker.row_count() - 1) {
+                        break;
+                    }
+                    let actions = if wheel {
+                        picker.mouse(
+                            MouseEvent {
+                                kind: MouseEventKind::ScrollDown,
+                                column: picker.list.rows.x,
+                                row: picker.list.rows.y,
+                                modifiers: crossterm::event::KeyModifiers::NONE,
+                            },
+                            &ctx,
+                        )
+                    } else {
+                        picker.key(key(KeyCode::Down), &ctx)
+                    };
+                    assert!(actions.is_empty(), "navigation cannot execute a backup");
+                }
+                assert!(
+                    picker.row_count() > 8,
+                    "plan must be navigable display rows"
+                );
+                let displayed = seen.into_values().collect::<String>();
+                let plan = ModeDescription::for_mode(mode).plan();
+                assert!(
+                    normalize(&displayed).contains(&normalize(&plan)),
+                    "{mode:?}, wheel={wheel}: {displayed}"
+                );
+                let last = picker.row_count() - 1;
+                assert_eq!(picker.list.selected(), Some(last));
+                let row = picker.list.rows.y + (last - picker.list.state.offset()) as u16;
+                assert!(
+                    picker
+                        .mouse(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column: picker.list.rows.x,
+                                row,
+                                modifiers: crossterm::event::KeyModifiers::NONE,
+                            },
+                            &ctx
+                        )
+                        .is_empty()
+                );
+                assert_eq!(picker.list.selected(), Some(last));
+                assert!(picker.key(key(KeyCode::Down), &ctx).is_empty());
+                assert_eq!(picker.focus, ChoiceFocus::Apply);
+                assert!(matches!(picker.key(key(KeyCode::Enter), &ctx).as_slice(),
+                    [Action::Spawn(Task::Sync(Request { mode: actual, dry_run: false }))]
+                    if std::mem::discriminant(actual) == std::mem::discriminant(&mode)));
+                picker.focus = ChoiceFocus::List;
+                let mut wide =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+                wide.draw(|f| picker.draw(f, Rect::new(0, 0, 120, 28), &ctx))
+                    .unwrap();
+                assert_eq!(picker.row_count(), 8);
+                assert_eq!(picker.list.selected(), Some(7));
+                let screen: String = wide
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(screen.contains("Plan:"));
+                picker.key(key(KeyCode::Home), &ctx);
+                assert_eq!(picker.list.selected(), Some(0));
+                picker.key(key(KeyCode::End), &ctx);
+                assert_eq!(picker.list.selected(), Some(7));
+            }
+        }
+        assert!(!ws.root.join(".git").exists());
+    }
+
+    #[test]
+    fn icon_mode_covers_whole_backup_overviews() {
+        use skills::config::Icons;
+        let root = skills::ops::DownloadDir::new("backup-icon-mode").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        for mode in [Icons::Text, Icons::Nerd] {
+            settings.ui.icons = mode;
+            let ctx = context(&ws, &snap, &settings);
+            for activity in [
+                SyncActivity::NotConfigured,
+                SyncActivity::Ready,
+                SyncActivity::Waiting,
+                SyncActivity::Checking,
+                SyncActivity::Syncing,
+                SyncActivity::Retrying,
+                SyncActivity::Attention,
+            ] {
+                for (configured, automatic, variant) in [
+                    (false, false, 0),
+                    (true, false, 0),
+                    (true, true, 1),
+                    (true, true, 2),
+                    (true, true, 3),
+                ] {
+                    let mut picker = SyncPicker::new(&ctx).unwrap();
+                    picker.settings.url =
+                        configured.then(|| "https://example.test/backup.git".into());
+                    picker.settings.branch = configured.then(|| "main".into());
+                    picker.presentation = SyncPresentation {
+                        activity,
+                        automatic,
+                        detail: None,
+                    };
+                    picker.error =
+                        (activity == SyncActivity::Attention).then(|| "Remote unavailable".into());
+                    picker.checking = activity == SyncActivity::Checking;
+                    if variant > 0 {
+                        picker.status = Some(skills::ops::sync::Status {
+                            changes: if variant == 1 {
+                                vec![]
+                            } else {
+                                vec![" M example".into()]
+                            },
+                            ahead: variant - 1,
+                            behind: variant,
+                            remote_checked: variant != 3,
+                            ..Default::default()
+                        });
+                    }
+                    for columns in [60, 100, 180] {
+                        let screen = render(&mut picker, &ctx, columns, 40);
+                        assert!(screen.contains("Root backup"));
+                        assert!(screen.contains("Configure") || screen.contains("Set up backup"));
+                        assert_eq!(
+                            crate::tui::icons::tests::has_pua(&screen),
+                            mode == Icons::Nerd,
+                            "mode={mode:?}, width={columns}, variant={variant}: {screen}"
+                        );
+                        if activity == SyncActivity::Attention {
+                            assert!(screen.contains("Remote unavailable"));
+                        }
+                        if configured {
+                            assert!(screen.contains("AUTO ON") || screen.contains("AUTO OFF"));
+                            assert!(screen.contains("Push only") && screen.contains("Pull only"));
+                            assert!(screen.contains(if automatic {
+                                "Turn off auto sync"
+                            } else {
+                                "Turn on auto sync"
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn responsive_sync_keeps_fields_lists_and_actions_in_bounds() {
+        let tmp = skills::ops::DownloadDir::new("sync-responsive").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = skills::Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = context(&ws, &snap, &settings);
+        for step in 0..5 {
+            let mut picker = SyncPicker::new(&ctx).unwrap();
+            match step {
+                1 => picker.configure(),
+                2 => {
+                    picker.step = Step::Preview {
+                        request: Request {
+                            mode: Mode::Sync,
+                            dry_run: true,
+                        },
+                        report: Report {
+                            status: " M example\n".into(),
+                            ..Default::default()
+                        },
+                    }
+                }
+                3 => picker.step = Step::Changes,
+                4 => picker.step = Step::Disable,
+                _ => {}
+            }
+            for (width, height) in [(160, 40), (112, 32), (60, 20), (40, 12), (4, 3), (1, 1)] {
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                        .unwrap();
+                let area = Rect::new(0, 0, width, height.saturating_sub(2));
+                terminal.draw(|f| picker.draw(f, area, &ctx)).unwrap();
+                for hit in picker
+                    .buttons
+                    .into_iter()
+                    .chain(picker.field_rects)
+                    .chain([picker.list.rows])
+                {
+                    assert!(hit.is_empty() || hit.intersection(area) == hit);
+                }
+                if width == 40 {
+                    assert!(!picker.buttons[1].is_empty());
+                    if step == 1 {
+                        assert!(picker.field_rects.iter().all(|hit| !hit.is_empty()));
+                    } else if step != 4 {
+                        assert!(picker.list.rows.height > 0);
+                    }
+                }
+                if width < 4 {
+                    assert_eq!(picker.list.rows, Rect::default());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn each_mode_describes_its_operations_and_dispatches_the_reviewed_request() {
+        let root = skills::ops::DownloadDir::new("sync-mode-preview").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = context(&ws, &snap, &settings);
+        for (mode, heading, button, merges, pushes) in [
+            (Mode::Sync, "Sync", "✓ Run sync", true, true),
+            (Mode::Push, "Push", "✓ Run push", false, true),
+            (Mode::Pull, "Pull", "✓ Run pull", true, false),
+        ] {
+            let assert_operations = |text: &str| {
+                assert!(text.contains("commit local changes if needed"), "{text}");
+                assert_eq!(text.contains("fetch"), merges, "{text}");
+                assert_eq!(text.contains("merge"), merges, "{text}");
+                assert_eq!(text.contains("push"), pushes, "{text}");
+            };
+            let assert_request = |actions: Vec<Action>, dry_run| {
+                assert!(matches!(
+                    actions.as_slice(),
+                    [Action::Spawn(Task::Sync(Request { mode: actual, dry_run: actual_dry_run }))]
+                        if std::mem::discriminant(actual) == std::mem::discriminant(&mode)
+                            && *actual_dry_run == dry_run
+                ));
+            };
+            let mut overview = SyncPicker::new(&ctx).unwrap();
+            overview.settings.url = Some("unused-local-remote".into());
+            overview.settings.branch = Some("main".into());
+            let index = overview
+                .actions()
+                .iter()
+                .position(|action| {
+                    matches!(
+                        action,
+                        OverviewAction::Sync(actual)
+                            if std::mem::discriminant(actual) == std::mem::discriminant(&mode)
+                    )
+                })
+                .unwrap();
+            overview.list.select(Some(index));
+            assert_operations(&overview.footer_help().detail);
+            overview.focus = ChoiceFocus::Apply;
+            assert_operations(&overview.footer_help().detail);
+            assert_request(overview.key(key(KeyCode::Enter), &ctx), true);
+
+            for status in ["", " M example/SKILL.md\n?? new-skill/\n"] {
+                let mut picker = SyncPicker::preview(
+                    &ctx,
+                    Request {
+                        mode,
+                        dry_run: true,
+                    },
+                    Report {
+                        status: status.into(),
+                        preview: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let screen = render(&mut picker, &ctx, 120, 28);
+                let changes = if status.is_empty() {
+                    "0 local changes"
+                } else {
+                    "2 local changes"
+                };
+                assert!(
+                    screen.contains(&format!("{heading} · {changes}")),
+                    "{screen}"
+                );
+                assert!(screen.contains(button), "{screen}");
+                assert_operations(&screen);
+                if merges {
+                    assert!(screen.contains("attach"), "{screen}");
+                    assert!(screen.contains("remote branch first"), "{screen}");
+                    assert!(screen.contains("local backup commit"), "{screen}");
+                }
+                assert_operations(&picker.footer_help().detail);
+                assert!(picker.key(key(KeyCode::Enter), &ctx).is_empty());
+                assert_eq!(picker.focus, ChoiceFocus::Apply);
+                assert_operations(&picker.footer_help().detail);
+                assert_request(picker.key(key(KeyCode::Enter), &ctx), false);
+                picker.focus = ChoiceFocus::List;
+                assert_request(picker.key(key(KeyCode::Char('y')), &ctx), false);
+
+                picker.focus = ChoiceFocus::Cancel;
+                assert!(
+                    picker
+                        .footer_help()
+                        .detail
+                        .contains("without applying changes")
+                );
+                assert!(picker.key(key(KeyCode::Enter), &ctx).is_empty());
+                assert!(matches!(picker.step, Step::Overview));
+            }
+
+            let mut picker = SyncPicker::preview(
+                &ctx,
+                Request {
+                    mode,
+                    dry_run: true,
+                },
+                Report::default(),
+            )
+            .unwrap();
+            render(&mut picker, &ctx, 120, 28);
+            assert_request(
+                picker.mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: picker.buttons[0].x,
+                        row: picker.buttons[0].y,
+                        modifiers: crossterm::event::KeyModifiers::NONE,
+                    },
+                    &ctx,
+                ),
+                false,
+            );
+        }
+        assert!(
+            !ws.root.join(".git").exists(),
+            "preview UI must not run Git"
+        );
+    }
+
+    #[test]
+    fn local_changes_has_one_real_back_button_and_matching_footer_help() {
+        let root = skills::ops::DownloadDir::new("sync-focus").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = context(&ws, &snap, &settings);
+        let mut picker = SyncPicker::new(&ctx).unwrap();
+        picker.step = Step::Changes;
+        picker.list.first(picker.row_count());
+        render(&mut picker, &ctx, 80, 24);
+        assert_eq!(picker.buttons[0].width, 0, "no empty Apply button");
+        assert!(picker.footer_help().detail.contains("committed before"));
+        picker.key(key(KeyCode::Tab), &ctx);
+        assert_eq!(picker.focus, ChoiceFocus::Cancel);
+        assert!(
+            picker
+                .footer_help()
+                .detail
+                .contains("Return to the backup overview")
+        );
+        picker.key(key(KeyCode::Up), &ctx);
+        assert_eq!(picker.focus, ChoiceFocus::List);
+        picker.key(key(KeyCode::Enter), &ctx);
+        assert_eq!(picker.focus, ChoiceFocus::Cancel);
+        picker.key(key(KeyCode::Enter), &ctx);
+        assert!(matches!(picker.step, Step::Overview));
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
@@ -1083,7 +1872,7 @@ mod tests {
         assert!(!ws.root.join(".git").exists());
 
         picker.configure();
-        assert!(render(&mut picker, &ctx, 60, 14).contains("Enlarge terminal"));
+        assert!(render(&mut picker, &ctx, 60, 14).contains("Remote URL"));
 
         picker.step = Step::Disable;
         picker.focus = ChoiceFocus::Apply;
@@ -1122,5 +1911,32 @@ mod tests {
                 dry_run: true
             }))]
         ));
+        assert!(picker.mouse(click(), &ctx).is_empty());
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            picker.configure();
+            render(&mut picker, &ctx, 100, 28);
+            let outside = MouseEvent {
+                column: 0,
+                row: 0,
+                kind: MouseEventKind::ScrollDown,
+                ..click()
+            };
+            assert!(picker.mouse(outside, &ctx).is_empty());
+            assert!(matches!(picker.step, Step::Configure { .. }));
+            assert!(matches!(
+                picker
+                    .mouse(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(button),
+                            ..outside
+                        },
+                        &ctx
+                    )
+                    .as_slice(),
+                [Action::CloseModal]
+            ));
+            assert!(picker.key(key(KeyCode::Esc), &ctx).is_empty());
+            assert!(matches!(picker.step, Step::Overview));
+        }
     }
 }

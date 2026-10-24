@@ -7,7 +7,7 @@ use crate::tui::app::Ctx;
 use crate::tui::components::skill::{status_glyph, status_text};
 use crate::tui::text::{highlight_line, highlight_spans};
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{OverlayClear as Clear, fit};
+use crate::tui::widgets::{PopupSurface, fit};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -120,16 +120,29 @@ impl Overlay {
                 ("e", "less"),
                 ("Esc/q", "close"),
             ])
+        } else if self
+            .browser
+            .as_ref()
+            .is_some_and(|browser| browser.focus == super::file_browser::Focus::Tree)
+        {
+            Some(&[
+                ("↑↓/j/k", "files"),
+                ("→/Tab", "content"),
+                ("Enter/l", "open/expand"),
+                ("←/h", "collapse/parent"),
+                ("e", "details"),
+                (".", "hidden"),
+                ("PgUp/PgDn", "page"),
+                ("Home/End", "first/last"),
+                ("Esc/q", "close"),
+            ])
         } else {
             Some(&[
-                ("←/→", "files/content"),
-                ("j/k ↑/↓", "move/scroll"),
-                ("Enter/l", "open/expand"),
-                ("h/←", "collapse/parent"),
-                ("Tab", "files/content"),
+                ("↑↓/j/k", "scroll content"),
+                ("←/Tab", "files"),
+                ("PgUp/PgDn", "page"),
+                ("Home/End", "top/bottom"),
                 ("e", "details"),
-                ("./gg/G", "hidden/top/bottom"),
-                ("Ctrl-d/u", "page"),
                 ("Esc/q", "close"),
             ])
         }
@@ -203,11 +216,15 @@ impl Overlay {
         if !self.is_open() {
             return false;
         }
-        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
-            && !self.rect.contains((m.column, m.row).into())
-        {
-            self.close();
-        } else if self.metadata_rect.contains((m.column, m.row).into()) {
+        match crate::tui::widgets::popup_mouse(m, self.rect) {
+            crate::tui::widgets::PopupMouse::OutsidePress => {
+                self.close();
+                return true;
+            }
+            crate::tui::widgets::PopupMouse::Inside => {}
+            _ => return true,
+        }
+        if self.metadata_rect.contains((m.column, m.row).into()) {
             let amount = ctx.settings.interaction.wheel_rows.max(1) as usize;
             match m.kind {
                 MouseEventKind::ScrollDown => {
@@ -227,11 +244,10 @@ impl Overlay {
                 }
                 _ => {}
             }
-        } else if let Some(browser) = &mut self.browser {
-            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-                self.metadata_focus = false;
-            }
-            browser.handle_mouse(m, ctx.settings.interaction.wheel_rows);
+        } else if let Some(browser) = &mut self.browser
+            && browser.handle_mouse(m, ctx.settings.interaction.wheel_rows)
+        {
+            self.metadata_focus = false;
         }
         true
     }
@@ -300,15 +316,15 @@ impl Overlay {
             })
             .unwrap_or(&key);
         let title = format!(
-            " {} · e details · Esc closes ",
+            " {} ",
             fit(
                 &skills::util::display_safe(display_name),
-                rect.width.saturating_sub(30) as usize
+                rect.width.saturating_sub(4) as usize
             )
         );
         let block = th.block(title, true);
         let inner = block.inner(rect);
-        f.render_widget(Clear, rect);
+        f.render_widget(PopupSurface, rect);
         f.render_widget(block, rect);
 
         let metadata_width = inner.width.saturating_sub(2) as usize;
@@ -371,12 +387,7 @@ impl Overlay {
             (areas[0], areas[1])
         };
         if metadata_height > 0 {
-            let detail = if self.expanded_fields {
-                " details · e less "
-            } else {
-                " details · e more "
-            };
-            let metadata_block = th.block(detail, self.metadata_focus);
+            let metadata_block = th.block(" details ", self.metadata_focus);
             let content = metadata_block.inner(metadata_area);
             self.metadata_rect = content;
             self.metadata_height = content.height as usize;
@@ -394,7 +405,7 @@ impl Overlay {
         }
 
         if let Some(browser) = &mut self.browser {
-            browser.draw(f, browser_area, ctx);
+            browser.draw(f, browser_area, ctx, !self.metadata_focus);
         } else {
             f.render_widget(
                 Paragraph::new("Files are unavailable for this entry")
@@ -643,6 +654,89 @@ mod tests {
         while let Some(request) = requests.pop() {
             requests.extend(overlay.apply_file_browser(super::super::file_browser::load(&request)));
         }
+    }
+
+    #[test]
+    fn metadata_tree_and_content_focus_keep_highlights_and_hints_together() {
+        let root = skills::ops::DownloadDir::new("preview-focus-hints").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        std::fs::create_dir(root.path().join("sample")).unwrap();
+        std::fs::write(
+            root.path().join("sample/SKILL.md"),
+            "---\nname: sample\ndescription: Sample\n---\nBody",
+        )
+        .unwrap();
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut overlay = Overlay::default();
+        overlay.open("sample".into());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| overlay.draw(frame, frame.area(), &ctx))
+            .unwrap();
+        overlay.handle_key(KeyCode::Left.into());
+        assert!(overlay.hints().unwrap().contains(&("↑↓/j/k", "files")));
+        overlay.handle_key(KeyCode::Right.into());
+        assert!(
+            overlay
+                .hints()
+                .unwrap()
+                .contains(&("↑↓/j/k", "scroll content"))
+        );
+        assert!(
+            !overlay
+                .hints()
+                .unwrap()
+                .iter()
+                .any(|(key, _)| key.contains("Enter"))
+        );
+        overlay.handle_key(KeyCode::Char('e').into());
+        terminal
+            .draw(|frame| overlay.draw(frame, frame.area(), &ctx))
+            .unwrap();
+        assert!(
+            overlay
+                .hints()
+                .unwrap()
+                .contains(&("j/k ↑/↓", "scroll fields"))
+        );
+        let buffer = terminal.backend().buffer();
+        let browser_top = overlay.metadata_rect.bottom() + 1;
+        assert_eq!(
+            buffer[(overlay.rect.x + 1, browser_top)].fg,
+            settings.theme.border,
+            "the file tree cannot look focused while metadata owns the keys"
+        );
+        overlay.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: overlay.rect.right() - 3,
+                row: overlay.rect.bottom() - 3,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &ctx,
+        );
+        assert!(!overlay.metadata_focus);
+        assert!(
+            overlay
+                .hints()
+                .unwrap()
+                .contains(&("↑↓/j/k", "scroll content"))
+        );
+        overlay.handle_key(KeyCode::Left.into());
+        assert!(overlay.hints().unwrap().contains(&("↑↓/j/k", "files")));
     }
 
     #[test]

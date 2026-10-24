@@ -1,10 +1,15 @@
 //! Overlays: help, messages, confirmations, text prompts, agent picker,
 //! and the update conflict resolver.
+//! Filtered repository choices retain their unfiltered viewport on each draw.
+//! Outside presses cancel through the owner; complex dialogs route children first.
 
 use super::app::{Action, Ctx, Hints, MetaFn, Step, WriteFn};
 use super::views::{View, search::SearchView};
-use super::widgets::{Input, ListNav, button, fit, width};
-use crate::tui::widgets::OverlayClear as Clear;
+use super::widgets::{
+    ButtonIntent, ButtonSpec, Input, ListNav, PopupClass, centered, draw_button_row, fit,
+    popup_size, popup_too_small,
+};
+use crate::tui::widgets::PopupSurface;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -56,6 +61,7 @@ pub enum Modal {
     Repository(Box<super::repository_picker::RepositoryPicker>),
     Help {
         scroll: u16,
+        rect: Rect,
     },
     Message {
         kind: MessageKind,
@@ -63,6 +69,7 @@ pub enum Modal {
         lines: Vec<String>,
         scroll: u16,
         return_to: Option<Box<Modal>>,
+        rect: Rect,
     },
     InstallComplete {
         keys: Vec<String>,
@@ -76,6 +83,8 @@ pub enum Modal {
         title: String,
         lines: Vec<String>,
         actions: Vec<deploy::Action>,
+        intent: ButtonIntent,
+        apply_label: &'static str,
         /// Emitted only once the changes actually went through, so a cancelled
         /// or failed confirmation leaves the history where it was.
         then: Option<Step>,
@@ -84,7 +93,7 @@ pub enum Modal {
         btn_rects: Vec<Rect>,
         rect: Rect,
     },
-    /// Destructive write with Apply / Cancel.
+    /// Write confirmation with an explicit action label and semantic intent.
     ConfirmWrite {
         title: String,
         lines: Vec<String>,
@@ -95,6 +104,7 @@ pub enum Modal {
         then: Option<Step>,
         after: Option<Box<Action>>,
         apply_label: String,
+        intent: ButtonIntent,
         btn: usize,
         btn_rects: Vec<Rect>,
         rect: Rect,
@@ -165,7 +175,10 @@ impl Modal {
     }
 
     pub fn help() -> Self {
-        Modal::Help { scroll: 0 }
+        Modal::Help {
+            scroll: 0,
+            rect: Rect::default(),
+        }
     }
     pub fn message(title: impl Into<String>, lines: Vec<String>) -> Self {
         Modal::Message {
@@ -174,6 +187,7 @@ impl Modal {
             lines,
             scroll: 0,
             return_to: None,
+            rect: Rect::default(),
         }
     }
     pub fn repair_results(lines: Vec<String>) -> Self {
@@ -183,6 +197,7 @@ impl Modal {
             lines,
             scroll: 0,
             return_to: None,
+            rect: Rect::default(),
         }
     }
     pub fn migration_recovery(report: &skills::migration::MigrationReport) -> Self {
@@ -192,6 +207,7 @@ impl Modal {
             lines: report.recovery_lines(),
             scroll: 0,
             return_to: None,
+            rect: Rect::default(),
         }
     }
     pub fn install_complete(keys: Vec<String>, message: String) -> Self {
@@ -220,13 +236,37 @@ impl Modal {
                 },
             );
         }
+        let removes = actions.iter().any(|a| {
+            matches!(
+                a,
+                deploy::Action::Unlink { .. }
+                    | deploy::Action::Clean { .. }
+                    | deploy::Action::Relink { .. }
+            )
+        });
+        let apply_label = if actions
+            .iter()
+            .any(|a| matches!(a, deploy::Action::Relink { .. }))
+        {
+            "Relink"
+        } else if removes {
+            "Remove"
+        } else {
+            "Apply"
+        };
         Modal::Confirm {
             title,
             lines,
             actions,
+            intent: if removes {
+                ButtonIntent::Danger
+            } else {
+                ButtonIntent::Normal
+            },
+            apply_label,
             then,
             scroll: 0,
-            btn: 0,
+            btn: usize::from(removes),
             btn_rects: Vec::new(),
             rect: Rect::default(),
         }
@@ -249,7 +289,8 @@ impl Modal {
             scope: MutationScope::Library,
             then: None,
             after: None,
-            apply_label: "Yes".into(),
+            apply_label: "Apply".into(),
+            intent: ButtonIntent::Normal,
             btn: 1,
             btn_rects: Vec::new(),
             rect: Rect::default(),
@@ -263,9 +304,25 @@ impl Modal {
         self
     }
 
-    fn apply_label(mut self, label: &str) -> Self {
+    pub(crate) fn apply_label(mut self, label: &str) -> Self {
         if let Self::ConfirmWrite { apply_label, .. } = &mut self {
             *apply_label = label.to_string();
+        }
+        self
+    }
+
+    /// Destructive actions always start on Cancel, regardless of builder order.
+    pub(crate) fn destructive(mut self, label: &str) -> Self {
+        if let Self::ConfirmWrite {
+            apply_label,
+            intent,
+            btn,
+            ..
+        } = &mut self
+        {
+            *apply_label = label.into();
+            *intent = ButtonIntent::Danger;
+            *btn = 1;
         }
         self
     }
@@ -288,7 +345,7 @@ impl Modal {
             title: " new preset ".into(),
             input: Input::default(),
             kind: InputKind::PresetName,
-            hint: "name · Enter create · Esc cancel".into(),
+            hint: "name".into(),
             rect: Rect::default(),
         }
     }
@@ -300,7 +357,7 @@ impl Modal {
             title: format!(" description of {name} "),
             input: Input::with_value(current.unwrap_or_default()),
             kind: InputKind::PresetDescription { name: name.into() },
-            hint: "one sentence · Enter save · empty clears · Esc cancel".into(),
+            hint: "one sentence · empty clears".into(),
             rect: Rect::default(),
         }
     }
@@ -313,7 +370,7 @@ impl Modal {
             title: format!(" rename preset {name} "),
             input: Input::with_value(name),
             kind: InputKind::RenamePreset { old: name.into() },
-            hint: "new name · Enter rename · Esc cancel".into(),
+            hint: "new name".into(),
             rect: Rect::default(),
         }
     }
@@ -323,7 +380,7 @@ impl Modal {
             title: " install a skill ".into(),
             input: Input::default(),
             kind: InputKind::Install,
-            hint: "owner/repo[/path] · Git or archive URL · local path\nUse owner/repo#branch or a GitHub /tree/ URL · Enter discover · Esc cancel"
+            hint: "owner/repo[/path] · Git or archive URL · local path\nUse owner/repo#branch or a GitHub /tree/ URL"
                 .into(),
             rect: Rect::default(),
         }
@@ -334,7 +391,7 @@ impl Modal {
             title: " create tag ".into(),
             input: Input::default(),
             kind: InputKind::TagName,
-            hint: "name · Enter create · Esc cancel".into(),
+            hint: "name".into(),
             rect: Rect::default(),
         }
     }
@@ -344,7 +401,7 @@ impl Modal {
             title: format!(" description of {name} "),
             input: Input::with_value(current.unwrap_or_default()),
             kind: InputKind::TagDescription { name: name.into() },
-            hint: "one sentence · Enter save · empty clears · Esc cancel".into(),
+            hint: "one sentence · empty clears".into(),
             rect: Rect::default(),
         }
     }
@@ -354,7 +411,7 @@ impl Modal {
             title: format!(" rename tag {old} "),
             input: Input::with_value(old),
             kind: InputKind::RenameTag { old: old.into() },
-            hint: "new name · Enter rename everywhere · Esc cancel".into(),
+            hint: "new name · updates all references".into(),
             rect: Rect::default(),
         }
     }
@@ -366,7 +423,7 @@ impl Modal {
             kind: InputKind::RenameRepository {
                 alias: alias.into(),
             },
-            hint: "display name · Enter save · Esc cancel".into(),
+            hint: "display name".into(),
             rect: Rect::default(),
         }
     }
@@ -380,7 +437,7 @@ impl Modal {
             kind: InputKind::Rename {
                 skill: skill.into(),
             },
-            hint: "new name · Enter shows what moves · Esc cancel".into(),
+            hint: "new name · changes are reviewed before applying".into(),
             rect: Rect::default(),
         }
     }
@@ -421,6 +478,7 @@ impl Modal {
                 ))
             }),
         )
+        .apply_label("Rename")
     }
 
     /// Point a skill at a different source. The field starts empty rather than
@@ -459,6 +517,7 @@ impl Modal {
                 install::adopt(ws, &path, None).map(|k| format!("adopted {k} from {a}"))
             }),
         )
+        .apply_label("Adopt")
     }
     pub fn delete_tag(tag: &str) -> Self {
         let t = tag.to_string();
@@ -471,6 +530,7 @@ impl Modal {
                 })
             }),
         )
+        .destructive("Delete")
     }
     pub fn delete_preset(name: &str) -> Self {
         let n = name.to_string();
@@ -481,6 +541,7 @@ impl Modal {
             )],
             Box::new(move |ws| history::preset_delete(ws, &n)),
         )
+        .destructive("Delete")
     }
     pub fn remove_source(alias: &str, name: &str, summary: &edit::RepositoryRemoveSummary) -> Self {
         let alias = alias.to_string();
@@ -530,7 +591,7 @@ impl Modal {
                 ))
             }),
         )
-        .apply_label("Remove source and skills")
+        .destructive("Remove source and skills")
         .in_background(keys)
     }
 
@@ -547,6 +608,7 @@ impl Modal {
                 edit::remove(ws, &snap, &k, false).map(|_| format!("removed {k}"))
             }),
         )
+        .destructive("Remove")
         .in_background(vec![skill.to_string()])
     }
     /// Delete a directory that is not a usable skill. The common cause is a
@@ -573,6 +635,7 @@ impl Modal {
                 edit::remove(ws, &snap, &k, false).map(|_| format!("discarded {k}"))
             }),
         )
+        .destructive("Delete")
         .in_background(vec![skill.to_string()])
     }
 
@@ -631,25 +694,46 @@ impl Modal {
 
     /// Confirm a history step that is a write rather than a set of links.
     pub fn undo_write(describe: String, back: skills::history::WriteBack, dir: Step) -> Self {
+        fn removes_skills(back: &history::WriteBack) -> bool {
+            match back {
+                history::WriteBack::RemoveInstalled { .. } => true,
+                history::WriteBack::TargetDeployment {
+                    expected, desired, ..
+                } => expected.difference(desired).next().is_some(),
+                history::WriteBack::Group(writes) => writes.iter().any(removes_skills),
+                _ => false,
+            }
+        }
+        let destructive = removes_skills(&back);
         let verb = if dir == Step::Undo { "undo" } else { "redo" };
-        Self::confirm_write(
+        let modal = Self::confirm_write(
             format!(" {verb} "),
             vec![format!("{}?", capitalize(&describe))],
             Box::new(move |ws| back.apply(ws)),
         )
-        .with_step(dir)
+        .apply_label(if dir == Step::Undo { "Undo" } else { "Redo" })
+        .with_step(dir);
+        if destructive {
+            modal.destructive("Remove")
+        } else {
+            modal
+        }
     }
 
     /// Carry the history move onto a write confirmation. The Apply button
     /// takes the focus here: a destructive confirmation starts on Cancel so a
     /// second Enter cannot delete anything, but an undo was asked for with
     /// Ctrl-Z a moment ago, and Enter should do what was asked rather than
-    /// quietly cancel it. `Modal::Confirm`, used for link steps, already
-    /// starts on Apply.
+    /// quietly cancel it. Explicit destructive intent still keeps Cancel focused.
     fn with_step(mut self, dir: Step) -> Self {
-        if let Modal::ConfirmWrite { then, btn, .. } = &mut self {
+        if let Modal::ConfirmWrite {
+            then, btn, intent, ..
+        } = &mut self
+        {
             *then = Some(dir);
-            *btn = 0;
+            if *intent != ButtonIntent::Danger {
+                *btn = 0;
+            }
         }
         self
     }
@@ -726,6 +810,29 @@ impl Modal {
         }
     }
 
+    pub fn help_keys(&self) -> Vec<(&'static str, &'static str)> {
+        if let Self::PresetSkills(view) = self {
+            return view.hints().to_vec();
+        }
+        let mut keys = self.hints().to_vec();
+        if matches!(
+            self,
+            Self::Input { .. }
+                | Self::Picker {
+                    input_focus: true,
+                    ..
+                }
+        ) || keys.iter().any(|(key, _)| {
+            *key == "type" || *key == "Tab" && keys.iter().any(|(_, desc)| *desc == "complete")
+        }) {
+            keys.extend_from_slice(super::footer::INPUT_KEYS);
+        }
+        if matches!(self, Self::Help { .. } | Self::Message { .. }) {
+            keys.extend([("j/k", "scroll"), ("Home", "first line"), ("q", "close")]);
+        }
+        keys
+    }
+
     pub fn hints(&self) -> Hints {
         match self {
             Modal::DeploymentChoices(picker) => picker.hints(),
@@ -784,12 +891,62 @@ impl Modal {
                 ("/", "filter"),
                 ("Esc", "close"),
             ],
-            Modal::Resolve { .. } => &[
-                ("Space", "switch whole-skill choice"),
-                ("l/u", "keep whole skill/use upstream"),
-                ("Enter", "apply choice"),
+            Modal::Resolve { btn: 1, .. } => &[
+                ("Enter", "cancel"),
+                ("←→", "buttons"),
+                ("y", "apply choice"),
                 ("Esc", "cancel"),
             ],
+            Modal::Resolve { .. } => &[
+                ("Enter", "apply choice"),
+                ("←→", "buttons"),
+                ("Space", "switch whole-skill choice"),
+                ("l/u", "keep whole skill/use upstream"),
+                ("Esc", "cancel"),
+            ],
+        }
+    }
+
+    /// Descriptions and keys use the same modal/child focus as input dispatch.
+    pub fn footer_help(&self) -> super::footer::Help<'_> {
+        use super::footer::Help;
+        match self {
+            Self::DeploymentChoices(p) => p.footer_help(),
+            Self::PresetSkills(p) => p.footer_help(),
+            Self::HealthRepair(p) => p.footer_help(),
+            Self::Sync(p) => p.footer_help(),
+            Self::Batch(p) => p.footer_help(),
+            Self::Repository(p) => p.footer_help(),
+            Self::DeployTargets(p) => p.footer_help(),
+            Self::Input { hint, .. } => Help::new(self.hints()).detail(hint.as_str()),
+            Self::Message {
+                return_to: Some(_), ..
+            } => Help::new(self.hints())
+                .detail("Return to the selection to fix the error and apply again"),
+            Self::Confirm { btn: 0, .. } | Self::ConfirmWrite { btn: 0, .. } => {
+                Help::new(self.hints()).detail("Apply the changes shown in this confirmation")
+            }
+            Self::Confirm { .. } | Self::ConfirmWrite { .. } => {
+                Help::new(self.hints()).detail("Close without applying the proposed changes")
+            }
+            Self::InstallComplete { btn: 0, .. } => {
+                Help::new(self.hints()).detail("Finish without changing deployments")
+            }
+            Self::InstallComplete { .. } => {
+                Help::new(self.hints()).detail("Choose agents for the newly installed skills")
+            }
+            Self::Resolve { btn: 1, .. } => {
+                Help::new(self.hints()).detail("Cancel this update and keep current files")
+            }
+            Self::Resolve {
+                default_take: Take::Local,
+                ..
+            } => Help::new(self.hints())
+                .detail("Keep the entire local skill; skip this upstream update"),
+            Self::Resolve { .. } => {
+                Help::new(self.hints()).detail("Replace the entire skill with upstream content")
+            }
+            _ => Help::new(self.hints()),
         }
     }
 
@@ -865,7 +1022,7 @@ impl Modal {
                 }
                 _ => vec![],
             },
-            Modal::Help { scroll } | Modal::Message { scroll, .. } => match k.code {
+            Modal::Help { scroll, .. } | Modal::Message { scroll, .. } => match k.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     *scroll = scroll.saturating_add(1);
                     vec![]
@@ -1127,6 +1284,33 @@ impl Modal {
     }
 
     pub fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        // Complex owners route their children before checking parent bounds.
+        let outer = match self {
+            Modal::Help { rect, .. }
+            | Modal::Message { rect, .. }
+            | Modal::InstallComplete { rect, .. }
+            | Modal::Confirm { rect, .. }
+            | Modal::ConfirmWrite { rect, .. }
+            | Modal::Input { rect, .. }
+            | Modal::Picker { rect, .. }
+            | Modal::Resolve { rect, .. } => Some(*rect),
+            _ => None,
+        };
+        if let Some(outer) = outer {
+            match super::widgets::popup_mouse(m, outer) {
+                super::widgets::PopupMouse::OutsidePress => {
+                    if let Modal::Resolve { prepared, .. } = self {
+                        if let Some(p) = prepared.take() {
+                            p.cleanup();
+                        }
+                        return vec![Action::CloseModal, Action::Toast("update cancelled".into())];
+                    }
+                    return vec![Action::CloseModal];
+                }
+                super::widgets::PopupMouse::Inside => {}
+                _ => return vec![],
+            }
+        }
         let at = (m.column, m.row).into();
         let wheel = match m.kind {
             MouseEventKind::ScrollUp => Some(-3),
@@ -1161,11 +1345,9 @@ impl Modal {
                 }
                 vec![]
             }
-            Modal::Help { scroll } | Modal::Message { scroll, .. } => {
+            Modal::Help { scroll, .. } | Modal::Message { scroll, .. } => {
                 if let Some(d) = wheel {
                     *scroll = (*scroll as i32 + d).max(0) as u16;
-                } else if click {
-                    return vec![Action::CloseModal];
                 }
                 vec![]
             }
@@ -1258,7 +1440,8 @@ impl Modal {
                         input.click(m.column);
                         return vec![];
                     }
-                    if let Some((row, double)) = list.click(m.row, shown.len())
+                    if list.rows.contains(at)
+                        && let Some((row, double)) = list.click(m.row, shown.len())
                         && let Some(i) = shown.get(row).copied()
                     {
                         *input_focus = false;
@@ -1301,7 +1484,9 @@ impl Modal {
                         let _ = default_take;
                         return vec![Action::CloseModal, Action::Toast("update cancelled".into())];
                     }
-                    let _ = list.click(m.row, n);
+                    if list.rows.contains(at) {
+                        let _ = list.click(m.row, n);
+                    }
                 }
                 vec![]
             }
@@ -1320,18 +1505,19 @@ impl Modal {
                     area.width.saturating_sub(4),
                     area.height.saturating_sub(2),
                 );
-                f.render_widget(Clear, r);
+                f.render_widget(PopupSurface, r);
                 let block = th.block(view.picker_title(), true);
                 let inner = block.inner(r);
                 f.render_widget(block, r);
                 view.draw(f, inner, ctx);
+                view.set_picker_rect(r);
             }
             Modal::HealthRepair(p) => p.draw(f, area, ctx),
             Modal::Sync(p) => p.draw(f, area, ctx),
             Modal::Batch(p) => p.draw(f, area, ctx),
             Modal::Repository(p) => p.draw(f, area, ctx),
             Modal::DeployTargets(p) => p.draw(f, area, ctx),
-            Modal::Help { scroll } => {
+            Modal::Help { scroll, rect } => {
                 let lines: Vec<Line> = HELP
                     .lines()
                     .filter(|l| {
@@ -1344,9 +1530,10 @@ impl Modal {
                 let content_width = 78.min(area.width.saturating_sub(2)).saturating_sub(2);
                 let total = paragraph.line_count(content_width).min(u16::MAX as usize) as u16;
                 let r = centered(area, 78, total.saturating_add(2));
+                *rect = r;
                 let visible = r.height.saturating_sub(2);
                 *scroll = (*scroll).min(total.saturating_sub(visible));
-                f.render_widget(Clear, r);
+                f.render_widget(PopupSurface, r);
                 f.render_widget(
                     paragraph.scroll((*scroll, 0)).block(th.block(
                         format!(
@@ -1365,14 +1552,15 @@ impl Modal {
                 title,
                 lines,
                 scroll,
-                return_to,
+                rect,
+                ..
             } => {
                 let repair_result = *kind == MessageKind::RepairResults;
                 let expanded = matches!(
                     kind,
                     MessageKind::RepairResults | MessageKind::MigrationRecovery
                 );
-                let mut ls: Vec<Line> = lines
+                let ls: Vec<Line> = lines
                     .iter()
                     .map(|line| {
                         if repair_result {
@@ -1382,49 +1570,31 @@ impl Modal {
                         }
                     })
                     .collect();
-                ls.push(Line::from(""));
-                ls.push(Line::from(Span::styled(
-                    if return_to.is_some() {
-                        "Esc returns to your selection; fix the error and apply again."
-                    } else if expanded {
-                        "↑↓ scroll · PgUp/PgDn page · Enter/Esc close"
-                    } else {
-                        "↑↓ scroll · PgUp/PgDn page · Esc close"
-                    },
-                    th.dim(),
-                )));
-                let wanted_width = if expanded {
-                    area.width.saturating_sub(8).min(112)
+                let class = if expanded {
+                    PopupClass::Preview
                 } else {
-                    84
+                    PopupClass::Choice
                 };
-                let content_width = wanted_width
-                    .min(area.width.saturating_sub(2))
-                    .saturating_sub(2);
+                let content_width = popup_size(area, class, 3, (1, 1)).inner.width;
                 let paragraph = Paragraph::new(ls).wrap(Wrap { trim: false });
                 let content_height = paragraph
                     .line_count(content_width.max(1))
                     .min(u16::MAX as usize) as u16;
-                let wanted_height = if expanded {
-                    content_height.saturating_add(2).max(16)
-                } else {
-                    content_height.saturating_add(2)
-                };
-                let height = wanted_height.min(if expanded {
-                    area.height.saturating_sub(4)
-                } else {
-                    area.height.saturating_sub(2)
-                });
-                let r = centered(area, wanted_width, height);
+                let size = popup_size(area, class, content_height.saturating_add(2), (1, 1));
+                let r = size.outer;
+                *rect = r;
                 let visible = r.height.saturating_sub(2);
                 *scroll = (*scroll).min(content_height.saturating_sub(visible));
-                f.render_widget(Clear, r);
+                f.render_widget(PopupSurface, r);
                 f.render_widget(
                     paragraph
                         .scroll((*scroll, 0))
                         .block(th.block(format!(" {} ", title.trim()), true)),
                     r,
                 );
+                if !size.usable {
+                    popup_too_small(f, size, th);
+                }
             }
             Modal::InstallComplete {
                 message,
@@ -1434,17 +1604,24 @@ impl Modal {
                 ..
             } => {
                 let body = Paragraph::new(message.as_str()).wrap(Wrap { trim: false });
-                let width = centered(area, 70, 5).width.saturating_sub(2);
+                btn_rects.clear();
+                let width = popup_size(area, PopupClass::Input, 5, (12, 3)).inner.width;
                 let height = body
                     .line_count(width)
                     .saturating_add(4)
                     .min(u16::MAX as usize) as u16;
-                let r = centered(area, 70, height);
+                let size = popup_size(area, PopupClass::Input, height, (12, 3));
+                let r = size.outer;
                 *rect = r;
-                f.render_widget(Clear, r);
+                f.render_widget(PopupSurface, r);
                 let block = th.block(" install complete ", true);
                 let inner = block.inner(r);
                 f.render_widget(block, r);
+                if !size.usable {
+                    *btn_rects = vec![Rect::default(); 2];
+                    popup_too_small(f, size, th);
+                    return;
+                }
                 f.render_widget(
                     body,
                     Rect {
@@ -1457,22 +1634,32 @@ impl Modal {
             Modal::Confirm {
                 title,
                 lines,
+                intent,
+                apply_label,
                 scroll,
                 btn,
                 btn_rects,
                 rect,
                 ..
             } => {
-                let r = centered(
+                btn_rects.clear();
+                let size = popup_size(
                     area,
-                    96,
-                    (lines.len() as u16 + 5).min(area.height.saturating_sub(2)),
+                    PopupClass::Preview,
+                    (lines.len().min(u16::MAX as usize) as u16).saturating_add(5),
+                    (12, 3),
                 );
+                let r = size.outer;
                 *rect = r;
-                f.render_widget(Clear, r);
+                f.render_widget(PopupSurface, r);
                 let block = th.block(format!(" {} ", title.trim()), true);
                 let inner = block.inner(r);
                 f.render_widget(block, r);
+                if !size.usable {
+                    *btn_rects = vec![Rect::default(); 2];
+                    popup_too_small(f, size, th);
+                    return;
+                }
                 let body = Rect {
                     height: inner.height.saturating_sub(2),
                     ..inner
@@ -1480,31 +1667,52 @@ impl Modal {
                 let ls: Vec<Line> = lines.iter().map(|l| action_line(l, th)).collect();
                 f.render_widget(Paragraph::new(ls).scroll((*scroll, 0)), body);
                 let n_changes = lines.iter().filter(|l| !l.starts_with("skip")).count();
-                *btn_rects =
-                    draw_buttons(f, inner, &[("Apply", n_changes), ("Cancel", 0)], *btn, th);
+                let label = format!("{apply_label} ({n_changes})");
+                *btn_rects = draw_button_row(
+                    f,
+                    inner,
+                    &[
+                        ButtonSpec {
+                            label: &label,
+                            enabled: true,
+                            intent: *intent,
+                        },
+                        ButtonSpec::new("Cancel"),
+                    ],
+                    Some(*btn),
+                    th,
+                );
             }
             Modal::ConfirmWrite {
                 title,
                 lines,
                 apply_label,
+                intent,
                 btn,
                 btn_rects,
                 rect,
                 ..
             } => {
-                let width = centered(area, 70, 5).width.saturating_sub(2);
+                btn_rects.clear();
+                let width = popup_size(area, PopupClass::Input, 5, (12, 3)).inner.width;
                 let ls: Vec<Line> = lines.iter().map(|l| Line::from(l.as_str())).collect();
                 let body = Paragraph::new(ls).wrap(Wrap { trim: false });
                 let height = body
                     .line_count(width)
                     .saturating_add(4)
                     .min(u16::MAX as usize) as u16;
-                let r = centered(area, 70, height);
+                let size = popup_size(area, PopupClass::Input, height, (12, 3));
+                let r = size.outer;
                 *rect = r;
-                f.render_widget(Clear, r);
+                f.render_widget(PopupSurface, r);
                 let block = th.block(format!(" {} ", title.trim()), true);
                 let inner = block.inner(r);
                 f.render_widget(block, r);
+                if !size.usable {
+                    *btn_rects = vec![Rect::default(); 2];
+                    popup_too_small(f, size, th);
+                    return;
+                }
                 f.render_widget(
                     body,
                     Rect {
@@ -1512,32 +1720,36 @@ impl Modal {
                         ..inner
                     },
                 );
-                *btn_rects = draw_buttons(
+                *btn_rects = draw_button_row(
                     f,
                     inner,
-                    &[(apply_label.as_str(), 0), ("Cancel", 0)],
-                    *btn,
+                    &[
+                        ButtonSpec {
+                            label: apply_label,
+                            enabled: true,
+                            intent: *intent,
+                        },
+                        ButtonSpec::new("Cancel"),
+                    ],
+                    Some(*btn),
                     th,
                 );
             }
             Modal::Input {
-                title,
-                input,
-                hint,
-                rect,
-                ..
+                title, input, rect, ..
             } => {
-                let width = centered(area, 72, 4).width.saturating_sub(4);
-                let hint_text = Paragraph::new(hint.as_str())
-                    .style(th.dim())
-                    .wrap(Wrap { trim: false });
-                let hint_height = hint_text.line_count(width).min(6) as u16;
-                let r = centered(area, 72, 3 + hint_height);
+                input.clear_area();
+                let size = popup_size(area, PopupClass::Input, 3, (3, 1));
+                let r = size.outer;
                 *rect = r;
-                f.render_widget(Clear, r);
+                f.render_widget(PopupSurface, r);
                 let block = th.block(title.as_str(), true);
                 let inner = block.inner(r);
                 f.render_widget(block, r);
+                if !size.usable {
+                    popup_too_small(f, size, th);
+                    return;
+                }
                 let field = Rect {
                     x: inner.x + 1,
                     width: inner.width.saturating_sub(2),
@@ -1545,15 +1757,6 @@ impl Modal {
                     ..inner
                 };
                 input.render(f, field, true, "", th);
-                f.render_widget(
-                    hint_text,
-                    Rect {
-                        x: inner.x + 1,
-                        y: inner.y + 1,
-                        width: inner.width.saturating_sub(2),
-                        height: inner.height.saturating_sub(1),
-                    },
-                );
             }
             Modal::Picker {
                 title,
@@ -1565,16 +1768,25 @@ impl Modal {
                 list,
                 rect,
             } => {
-                let r = centered(
+                input.clear_area();
+                *input_rect = Rect::default();
+                list.rows = Rect::default();
+                let size = popup_size(
                     area,
-                    76,
-                    (shown.len() as u16 + 5).clamp(8, area.height.saturating_sub(4)),
+                    PopupClass::Choice,
+                    (items.len().min(u16::MAX as usize) as u16).saturating_add(5),
+                    (4, 3),
                 );
+                let r = size.outer;
                 *rect = r;
-                f.render_widget(Clear, r);
+                f.render_widget(PopupSurface, r);
                 let block = th.block(title.as_str(), true);
                 let inner = block.inner(r);
                 f.render_widget(block, r);
+                if !size.usable {
+                    popup_too_small(f, size, th);
+                    return;
+                }
                 let field = Rect {
                     x: inner.x + 1,
                     width: inner.width.saturating_sub(2),
@@ -1593,14 +1805,15 @@ impl Modal {
                     .iter()
                     .map(|i| {
                         let it = &items[*i];
+                        let available = (list_area.width as usize).saturating_sub(6);
+                        let label_width = available.min(26);
+                        let label = fit(&it.label, label_width);
+                        let sub_width = available.saturating_sub(super::widgets::width(&label));
                         ListItem::new(Line::from(vec![
                             Span::raw("  "),
-                            Span::styled(fit(&it.label, 26), Style::default()),
+                            Span::styled(label, Style::default()),
                             Span::raw("  "),
-                            Span::styled(
-                                fit(&it.sub, list_area.width.saturating_sub(32) as usize),
-                                th.dim(),
-                            ),
+                            Span::styled(fit(&it.sub, sub_width), th.dim()),
                         ]))
                     })
                     .collect();
@@ -1629,7 +1842,11 @@ impl Modal {
                 rect,
             } => {
                 let Some(p) = prepared.as_ref() else { return };
-                let modal_width = 100.min(area.width.saturating_sub(2)).max(1);
+                btn_rects.clear();
+                list.rows = Rect::default();
+                let modal_width = popup_size(area, PopupClass::Preview, 6, (12, 4))
+                    .outer
+                    .width;
                 let content_width = modal_width.saturating_sub(2).max(1);
                 let new_skills = new_upstream_skills_text(&p.new_skills);
                 let new_skill_height = new_skills
@@ -1641,16 +1858,23 @@ impl Modal {
                     })
                     .unwrap_or(0);
                 let head_height = 3 + new_skill_height;
-                let r = centered(
+                let size = popup_size(
                     area,
-                    100,
-                    (files.len() as u16 + head_height + 6).min(area.height.saturating_sub(2)),
+                    PopupClass::Preview,
+                    (files.len().min(u16::MAX as usize) as u16).saturating_add(head_height + 6),
+                    (12, 4),
                 );
+                let r = size.outer;
                 *rect = r;
-                f.render_widget(Clear, r);
+                f.render_widget(PopupSurface, r);
                 let block = th.block(format!(" update {} ", p.skill), true);
                 let inner = block.inner(r);
                 f.render_widget(block, r);
+                if !size.usable {
+                    popup_too_small(f, size, th);
+                    return;
+                }
+                let head_height = head_height.min(inner.height.saturating_sub(3));
 
                 let choice = whole_skill_choice(*default_take);
                 let mut head = vec![
@@ -1849,7 +2073,7 @@ fn merge_confirm(kind: &str, old: &str, new: &str, write: MetaFn) -> Modal {
         ],
         write,
     )
-    .apply_label("Merge")
+    .destructive("Merge")
 }
 
 fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
@@ -2041,17 +2265,6 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
     }
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let w = width.min(area.width.saturating_sub(2)).max(1);
-    let h = height.min(area.height.saturating_sub(2)).max(1);
-    Rect::new(
-        area.x + (area.width - w) / 2,
-        area.y + (area.height - h) / 2,
-        w,
-        h,
-    )
-}
-
 /// Render a right-aligned button row on the last inner line; returns the button rects.
 fn draw_buttons(
     f: &mut Frame,
@@ -2060,7 +2273,6 @@ fn draw_buttons(
     active: usize,
     th: &super::theme::Theme,
 ) -> Vec<Rect> {
-    let y = inner.bottom().saturating_sub(1);
     let labels: Vec<String> = buttons
         .iter()
         .map(|(l, n)| {
@@ -2071,24 +2283,8 @@ fn draw_buttons(
             }
         })
         .collect();
-    let total: usize =
-        labels.iter().map(|l| width(l) + 4).sum::<usize>() + labels.len().saturating_sub(1) * 2;
-    let mut x = inner.right().saturating_sub(total as u16 + 1);
-    let mut rects = Vec::new();
-    let mut spans = Vec::new();
-    for (i, l) in labels.iter().enumerate() {
-        let w = width(l) as u16 + 4;
-        rects.push(Rect::new(x, y, w, 1));
-        spans.push(button(l, i == active, th));
-        spans.push(Span::raw("  "));
-        x += w + 2;
-    }
-    let start = inner.right().saturating_sub(total as u16 + 1);
-    f.render_widget(
-        Paragraph::new(Line::from(spans)),
-        Rect::new(start, y, total as u16 + 1, 1),
-    );
-    rects
+    let specs: Vec<_> = labels.iter().map(|l| ButtonSpec::new(l)).collect();
+    draw_button_row(f, inner, &specs, Some(active), th)
 }
 
 fn action_line<'a>(l: &'a str, th: &super::theme::Theme) -> Line<'a> {
@@ -2216,6 +2412,8 @@ const HELP: &str = "Startup
   Startup scanning is read-only. Broken deployment links remain unchanged until you explicitly
   analyze, review, and apply a repair in Health.
 Global
+  F1                current-focus help from any control; click the footer message for the same help
+                    Esc / Enter closes; arrows, Page Up/Down, Home/End and wheel scroll
   :                 search commands outside text inputs: install, repair, backup, settings
   a                 open Actions for the selected item
   ?                 help (outside text inputs)
@@ -2304,6 +2502,496 @@ mod picker_tests {
     use crate::tui::theme::Theme;
     use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::Config, preset::Preset};
+
+    #[test]
+    fn source_picker_filter_geometry_stays_stable_and_resize_scrolls_selection() {
+        let tmp = skills::ops::DownloadDir::new("source-filter-geometry").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut modal = Modal::picker(
+            "Sources".into(),
+            (0..30)
+                .map(|i| PickItem {
+                    id: format!("source-{i:02}"),
+                    label: format!("source-{i:02}"),
+                    sub: "repository".into(),
+                })
+                .collect(),
+        );
+        let mut previous = None;
+        for (width, height) in [(100, 40), (60, 18), (100, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut geometry = None;
+            for (query, count) in [("", 30), ("source-29", 1), ("no-such-source", 0), ("", 30)] {
+                let Modal::Picker {
+                    input, input_focus, ..
+                } = &mut modal
+                else {
+                    unreachable!()
+                };
+                input.clear();
+                *input_focus = true;
+                modal.paste(query, &ctx);
+                let Modal::Picker {
+                    input,
+                    items,
+                    shown,
+                    list,
+                    ..
+                } = &mut modal
+                else {
+                    unreachable!()
+                };
+                refilter(input.value(), items, shown);
+                list.last(shown.len());
+                assert_eq!(shown.len(), count);
+                terminal
+                    .draw(|f| modal.draw(f, Rect::new(0, 0, width, height - 2), &ctx))
+                    .unwrap();
+                let Modal::Picker {
+                    rect,
+                    input_rect,
+                    list,
+                    ..
+                } = &modal
+                else {
+                    unreachable!()
+                };
+                let current = (*rect, *input_rect, list.rows);
+                if let Some(expected) = geometry {
+                    assert_eq!(current, expected);
+                } else {
+                    geometry = Some(current);
+                }
+                if let Some(selected) = list.selected() {
+                    let offset = list.state.offset();
+                    assert!(selected >= offset && selected < offset + list.rows.height as usize);
+                    let y = list.rows.y + (selected - offset) as u16;
+                    assert_eq!(terminal.backend().buffer()[(list.rows.x, y)].symbol(), "▸");
+                }
+            }
+            if let Some(before) = previous {
+                assert_ne!(geometry.unwrap().0, before);
+            }
+            previous = Some(geometry.unwrap().0);
+        }
+    }
+
+    #[test]
+    fn responsive_popups_keep_content_and_clear_geometry_on_shrink() {
+        let tmp = skills::ops::DownloadDir::new("responsive-popups").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut menus = vec![
+            Modal::install(),
+            Modal::Picker {
+                title: "Choose".into(),
+                input: Input::default(),
+                input_focus: true,
+                input_rect: Rect::default(),
+                items: vec![PickItem {
+                    id: "one".into(),
+                    label: "Selected option".into(),
+                    sub: "detail".into(),
+                }],
+                shown: vec![0],
+                list: ListNav::default(),
+                rect: Rect::default(),
+            },
+            Modal::install_complete(vec![], "Installed.".into()),
+            Modal::confirm_write(
+                "Confirm".into(),
+                vec!["Preview".into()],
+                Box::new(|_| Ok("done".into())),
+            ),
+            Modal::confirm("Deploy".into(), vec![]),
+            Modal::message("Message", vec!["Visible message".into()]),
+            Modal::batch_tags(vec![], &ctx),
+            Modal::batch_deploy(vec![], &ctx),
+            Modal::batch_presets(vec![], &ctx),
+            Modal::DeployTargets(Box::new(super::super::deploy_picker::DeployPicker::new(
+                vec![],
+                &ctx,
+            ))),
+            Modal::Sync(Box::new(
+                super::super::sync_picker::SyncPicker::new(&ctx).unwrap(),
+            )),
+        ];
+        for menu in &mut menus {
+            for (width, height) in [
+                (160, 40),
+                (112, 32),
+                (60, 20),
+                (40, 12),
+                (4, 3),
+                (1, 1),
+                (0, 0),
+            ] {
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width.max(1), height.max(1))).unwrap();
+                let area = Rect::new(0, 0, width, height.saturating_sub(2));
+                terminal.draw(|frame| menu.draw(frame, area, &ctx)).unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                if width == 40 {
+                    assert!(text.chars().any(char::is_alphanumeric), "blank dialog");
+                    assert!(!text.contains("Resize"));
+                }
+                match menu {
+                    Modal::Input { rect, .. }
+                    | Modal::Picker { rect, .. }
+                    | Modal::Confirm { rect, .. }
+                    | Modal::ConfirmWrite { rect, .. }
+                    | Modal::InstallComplete { rect, .. } => {
+                        assert_eq!(rect.intersection(area), *rect)
+                    }
+                    _ => {}
+                }
+                if let Modal::Picker {
+                    input_rect, list, ..
+                } = menu
+                {
+                    for hit in [*input_rect, list.rows] {
+                        assert!(hit.is_empty() || hit.intersection(area) == hit);
+                    }
+                    if width < 4 {
+                        assert_eq!(list.rows, Rect::default());
+                    }
+                }
+                if let Modal::ConfirmWrite { btn_rects, .. } = menu {
+                    assert!(
+                        btn_rects
+                            .iter()
+                            .all(|hit| hit.is_empty() || hit.intersection(area) == *hit)
+                    );
+                }
+            }
+            let closed = (0..3).any(|_| {
+                matches!(
+                    menu.handle_key(KeyCode::Esc.into(), &ctx).first(),
+                    Some(Action::CloseModal)
+                )
+            });
+            assert!(closed, "Escape must reach the existing close/back path");
+        }
+    }
+
+    #[test]
+    fn confirmation_button_clicks_match_drawn_cells_and_keep_modal_keys() {
+        let temp = skills::ops::DownloadDir::new("confirmation-buttons").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(temp.path())
+        .unwrap();
+        let ws = Workspace::open(temp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let make = || {
+            Modal::confirm_write(
+                "No title inference".into(),
+                vec!["Preview retained".into()],
+                Box::new(|_| Ok("saved".into())),
+            )
+            .destructive("删除")
+        };
+        for w in [8, 12, 24, 80] {
+            let mut terminal = Terminal::new(TestBackend::new(w, 15)).unwrap();
+            let mut modal = make();
+            terminal.draw(|f| modal.draw(f, f.area(), &ctx)).unwrap();
+            let Modal::ConfirmWrite {
+                btn_rects, rect, ..
+            } = &modal
+            else {
+                unreachable!()
+            };
+            let rects = btn_rects.clone();
+            assert!(
+                rects
+                    .iter()
+                    .all(|r| r.is_empty() || r.intersection(*rect) == *r)
+            );
+            for (i, r) in rects.iter().enumerate() {
+                for x in r.x..r.right() {
+                    let mut clicked = make();
+                    terminal.draw(|f| clicked.draw(f, f.area(), &ctx)).unwrap();
+                    let actions = clicked.handle_mouse(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column: x,
+                            row: r.y,
+                            modifiers: KeyModifiers::NONE,
+                        },
+                        &ctx,
+                    );
+                    if i == 0 {
+                        assert!(matches!(
+                            actions.as_slice(),
+                            [Action::CloseModal, Action::WriteMeta(_)]
+                        ));
+                    } else {
+                        assert!(matches!(actions.as_slice(), [Action::CloseModal]));
+                    }
+                }
+            }
+            for x in rects[0].right()..rects[1].x {
+                assert!(
+                    modal
+                        .handle_mouse(
+                            MouseEvent {
+                                kind: MouseEventKind::Down(MouseButton::Left),
+                                column: x,
+                                row: rects[0].y,
+                                modifiers: KeyModifiers::NONE,
+                            },
+                            &ctx
+                        )
+                        .is_empty(),
+                    "spacing must not activate a button"
+                );
+            }
+        }
+        for code in [KeyCode::Enter, KeyCode::Char('n'), KeyCode::Esc] {
+            assert!(matches!(
+                make()
+                    .handle_key(KeyEvent::new(code, KeyModifiers::NONE), &ctx)
+                    .as_slice(),
+                [Action::CloseModal]
+            ));
+        }
+        assert!(matches!(
+            make()
+                .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &ctx)
+                .as_slice(),
+            [Action::CloseModal, Action::WriteMeta(_)]
+        ));
+        let mut modal = make();
+        for code in [
+            KeyCode::Right,
+            KeyCode::Left,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+        ] {
+            assert!(
+                modal
+                    .handle_key(KeyEvent::new(code, KeyModifiers::NONE), &ctx)
+                    .is_empty()
+            );
+        }
+        assert!(matches!(modal, Modal::ConfirmWrite { btn: 1, .. }));
+        modal.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &ctx);
+        assert!(matches!(
+            modal
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &ctx)
+                .as_slice(),
+            [Action::CloseModal, Action::WriteMeta(_)]
+        ));
+    }
+
+    #[test]
+    fn scoped_deployment_history_removal_defaults_to_cancel() {
+        let deployment =
+            |expected: &[&str], desired: &[&str]| history::WriteBack::TargetDeployment {
+                agent: skills::config::AgentConfig {
+                    key: "synthetic".into(),
+                    name: "Synthetic".into(),
+                    skills_dir: "unused".into(),
+                },
+                project: None,
+                expected: expected.iter().map(|key| (*key).to_string()).collect(),
+                desired: desired.iter().map(|key| (*key).to_string()).collect(),
+            };
+        let cases = [
+            (
+                "removing",
+                deployment(&["kept", "removed"], &["kept"]),
+                true,
+            ),
+            ("add-only", deployment(&["kept"], &["kept", "added"]), false),
+            ("unchanged", deployment(&["kept"], &["kept"]), false),
+            ("empty", deployment(&[], &[]), false),
+            (
+                "replacement with equal counts",
+                deployment(&["repos/source/old"], &["repos/source/new"]),
+                true,
+            ),
+            (
+                "nested removing group",
+                history::WriteBack::Group(vec![
+                    deployment(&["kept"], &["kept", "added"]),
+                    history::WriteBack::Group(vec![deployment(&["removed"], &[])]),
+                ]),
+                true,
+            ),
+            (
+                "nested benign group",
+                history::WriteBack::Group(vec![
+                    deployment(&["kept"], &["kept"]),
+                    history::WriteBack::Group(vec![deployment(&[], &["added"])]),
+                ]),
+                false,
+            ),
+            (
+                "nested installed removal",
+                history::WriteBack::Group(vec![history::WriteBack::Group(vec![
+                    history::WriteBack::RemoveInstalled {
+                        skill: "removed".into(),
+                    },
+                ])]),
+                true,
+            ),
+        ];
+        for dir in [Step::Undo, Step::Redo] {
+            for (name, back, destructive) in &cases {
+                let modal = Modal::undo_write("restore deployment state".into(), back.clone(), dir);
+                let Modal::ConfirmWrite {
+                    btn,
+                    intent,
+                    apply_label,
+                    then,
+                    ..
+                } = modal
+                else {
+                    panic!("expected a write confirmation");
+                };
+                assert_eq!(btn, usize::from(*destructive), "{name}: {dir:?}");
+                assert_eq!(
+                    intent,
+                    if *destructive {
+                        ButtonIntent::Danger
+                    } else {
+                        ButtonIntent::Normal
+                    },
+                    "{name}: {dir:?}"
+                );
+                assert_eq!(
+                    apply_label,
+                    if *destructive {
+                        "Remove"
+                    } else if dir == Step::Undo {
+                        "Undo"
+                    } else {
+                        "Redo"
+                    },
+                    "{name}: {dir:?}"
+                );
+                assert_eq!(then, Some(dir), "{name}: {dir:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn destructive_labels_and_defaults_are_explicit_and_builder_order_safe() {
+        for (modal, label) in [
+            (Modal::delete_tag("tag"), "Delete"),
+            (Modal::delete_preset("preset"), "Delete"),
+            (Modal::remove("skill"), "Remove"),
+            (
+                Modal::discard_invalid("skill", "missing SKILL.md"),
+                "Delete",
+            ),
+            (
+                merge_confirm(
+                    "Tag",
+                    "old",
+                    "new",
+                    Box::new(|_| Ok(("merged".into(), None))),
+                ),
+                "Merge",
+            ),
+            (
+                Modal::confirm_meta(
+                    "benign title".into(),
+                    vec![],
+                    Box::new(|_| Ok(("saved".into(), None))),
+                )
+                .destructive("Remove")
+                .with_step(Step::Undo),
+                "Remove",
+            ),
+            (
+                Modal::undo_write(
+                    "undo install".into(),
+                    history::WriteBack::RemoveInstalled {
+                        skill: "skill".into(),
+                    },
+                    Step::Undo,
+                ),
+                "Remove",
+            ),
+        ] {
+            assert!(
+                matches!(modal, Modal::ConfirmWrite { btn: 1, intent: ButtonIntent::Danger, ref apply_label, .. } if apply_label == label)
+            );
+        }
+        assert!(
+            matches!(Modal::confirm_write("delete in title only".into(), vec![], Box::new(|_| Ok("saved".into()))), Modal::ConfirmWrite { intent: ButtonIntent::Normal, ref apply_label, .. } if apply_label == "Apply")
+        );
+        let link = deploy::Action::Link {
+            agent: "fake".into(),
+            skill: "fake".into(),
+            path: PathBuf::from("unused"),
+            target: PathBuf::from("unused"),
+        };
+        assert!(matches!(
+            Modal::confirm("delete in title only".into(), vec![link]),
+            Modal::Confirm {
+                btn: 0,
+                intent: ButtonIntent::Normal,
+                ..
+            }
+        ));
+        let relink = deploy::Action::Relink {
+            agent: "fake".into(),
+            skill: "fake".into(),
+            path: PathBuf::from("unused"),
+            target: PathBuf::from("unused"),
+        };
+        assert!(matches!(
+            Modal::confirm("benign title".into(), vec![relink]),
+            Modal::Confirm {
+                btn: 1,
+                intent: ButtonIntent::Danger,
+                apply_label: "Relink",
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn tag_rename_submit_reports_invalid_name() {
@@ -2514,7 +3202,7 @@ mod picker_tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect();
-            assert!(text.contains("Enter/Esc close"));
+            assert!(!text.contains("Enter/Esc close"));
             assert!(!text.contains("page · Esc close"));
         }
         let mut narrow = Modal::repair_results(vec![
@@ -2535,7 +3223,7 @@ mod picker_tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("Repair results"));
-        assert!(text.contains("Enter/Esc close"));
+        assert!(!text.contains("Enter/Esc close"));
         for code in [
             KeyCode::Down,
             KeyCode::PageDown,
@@ -2576,6 +3264,7 @@ mod picker_tests {
                 lines: vec![],
                 scroll: 0,
                 return_to: Some(Box::new(Modal::help())),
+                rect: Rect::default(),
             },
         ] {
             assert!(!other.hints().contains(&("Enter/Esc", "close")));
@@ -2638,11 +3327,11 @@ mod picker_tests {
                     .map(|cell| cell.symbol())
                     .collect::<String>()
                     .contains("Metadata migrated");
-                let modal_width = width.saturating_sub(8).min(112);
-                let x = (width - modal_width) / 2;
                 let buffer = terminal.backend().buffer();
-                for row in 3..13 {
-                    for column in x + 1..x + modal_width - 1 {
+                let inside =
+                    popup_size(Rect::new(0, 0, width, 16), PopupClass::Preview, 16, (1, 1)).inner;
+                for row in inside.top()..inside.bottom() {
+                    for column in inside.left()..inside.right() {
                         rendered.push_str(buffer[(column, row)].symbol());
                     }
                 }
@@ -2722,7 +3411,7 @@ mod picker_tests {
     }
 
     #[test]
-    fn install_hint_wraps_without_losing_cancel_instruction() {
+    fn input_guidance_is_returned_to_the_footer_without_local_duplication() {
         let root = std::env::temp_dir().join(format!("skills-install-hint-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         Config {
@@ -2749,11 +3438,11 @@ mod picker_tests {
             terminal.draw(|f| modal.draw(f, f.area(), &ctx)).unwrap();
             let buffer = terminal.backend().buffer();
             let text: String = buffer.content.iter().map(|c| c.symbol()).collect();
-            assert!(text.contains("discover · Esc"), "{width}: {text}");
-            assert!(text.contains("cancel"), "{width}: {text}");
-            assert!(text.contains("owner/repo[/path]"));
-            assert!(text.contains("#branch") || text.contains("/tree/"));
-            assert!(!text.contains("Esc c…"));
+            assert!(!text.contains("discover · Esc"), "{width}: {text}");
+            assert!(!text.contains("cancel"), "{width}: {text}");
+            assert!(!text.contains("owner/repo[/path]"));
+            assert!(modal.footer_help().detail.contains("owner/repo[/path]"));
+            assert!(modal.footer_help().detail.contains("#branch"));
         }
         std::fs::remove_dir_all(root).unwrap();
     }

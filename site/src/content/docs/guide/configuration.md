@@ -72,7 +72,7 @@ icons = "text"
 | --- | --- |
 | `layout` | `grid`, `list`, or `compact`; `split` is a compatibility alias. |
 | `pill_caps` | Round Powerline caps by default; use `block` or `none` if glyphs fail. |
-| `icons` | Nerd Font icons by default; use `text` when glyphs are unavailable. |
+| `icons` | Nerd Font icons by default; `text` uses ordinary symbols throughout menus and status labels, with parentheses for tags and slashes for presets regardless of `pill_caps`. |
 | `tags_enabled` | Shows or hides tag classification without deleting tag or preset data. |
 
 A session-only layout change does not update startup configuration.

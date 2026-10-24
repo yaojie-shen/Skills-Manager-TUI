@@ -1,7 +1,8 @@
 //! Explicit, staged edits for a fixed selection of skills.
+//! Tag filtering retains the unfiltered bounded viewport and button positions.
 use super::app::{Action, Ctx, Hints};
 use super::components::choice_footer::{self, ChoiceEvent, ChoiceFocus};
-use super::widgets::{Input, ListNav, OverlayClear, fit};
+use super::widgets::{Input, ListNav, PopupClass, PopupSurface, fit, popup_size, popup_too_small};
 use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -192,24 +193,55 @@ impl Batch {
                 ]
             };
         }
+        if self.focus >= 2 {
+            return ChoiceFocus::Apply.button_hints().unwrap();
+        }
         if self.focus == 0 {
             &[
                 ("type", "filter"),
                 ("↓", "list"),
                 ("Enter", "results"),
                 ("Tab/Shift+Tab", "list / buttons"),
-                ("Esc", "cancel"),
+                ("Esc", "clear/results"),
             ]
         } else {
             &[
                 ("↑↓", "move"),
-                ("Space", "toggle"),
-                ("←→", "controls"),
+                ("Enter/Space", "toggle"),
                 ("Tab/Shift+Tab", "list / buttons"),
                 ("Esc", "cancel"),
             ]
         }
     }
+    pub fn footer_help(&self) -> crate::tui::footer::Help<'_> {
+        if self.busy {
+            return crate::tui::footer::Help::new(self.hints());
+        }
+        if self.kind == Kind::Tags {
+            return crate::tui::footer::Help::new(self.hints())
+                .detail("Tag changes take effect immediately; type to add or create a tag");
+        }
+        let focus = match self.focus {
+            2 => ChoiceFocus::Apply,
+            3 => ChoiceFocus::Cancel,
+            _ => ChoiceFocus::List,
+        };
+        focus.help(
+            self.hints(),
+            if self.kind == Kind::Presets {
+                "Add selected skills to each chosen preset's fixed member list"
+            } else {
+                "Stage deployment changes for the selected skills"
+            },
+            if self.pending_count() == 0 {
+                "No pending changes; choose an entry first"
+            } else {
+                "Apply the staged changes"
+            },
+            "Discard pending changes and close",
+        )
+    }
+
     fn filter(&mut self) {
         let query = self.input.value().trim().to_lowercase();
         let selected = self
@@ -566,6 +598,11 @@ impl Batch {
         }
     }
     pub fn mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action> {
+        match super::widgets::popup_mouse(m, self.rect) {
+            super::widgets::PopupMouse::OutsidePress => return vec![Action::CloseModal],
+            super::widgets::PopupMouse::Inside => {}
+            _ => return vec![],
+        }
         self.remove_armed = false;
         let at = ratatui::layout::Position::new(m.column, m.row);
         if self.kind == Kind::Tags {
@@ -577,7 +614,10 @@ impl Batch {
                     if let Some((rect, name)) =
                         self.tag_chips.iter().find(|(rect, _)| rect.contains(at))
                     {
-                        let (_, right) = ctx.settings.ui.pill_caps.glyphs();
+                        let (_, right) = super::icons::tag_caps(
+                            ctx.settings.ui.icons,
+                            ctx.settings.ui.pill_caps,
+                        );
                         let close_x = rect
                             .right()
                             .saturating_sub(super::widgets::width(right) as u16 + 2);
@@ -640,6 +680,11 @@ impl Batch {
         vec![]
     }
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
+        self.input_rect = Rect::default();
+        self.input.clear_area();
+        self.list.rows = Rect::default();
+        self.buttons = [Rect::default(); 2];
+        self.tag_chips.clear();
         if self.kind == Kind::Tags {
             let selected = self
                 .list
@@ -695,14 +740,15 @@ impl Batch {
                     self.selected_tags.push(row.id.clone());
                 }
             }
-            let w = area.width.saturating_sub(2).min(50);
+            let w = popup_size(area, PopupClass::Choice, 6, (6, 3)).outer.width;
             // Selected tags form removable tokens before the search field.
             let mut chips = Vec::new();
             let mut x = 0u16;
             let mut y = 0u16;
             let available = w.saturating_sub(4);
             for name in &self.selected_tags {
-                let (left, right) = ctx.settings.ui.pill_caps.glyphs();
+                let (left, right) =
+                    super::icons::tag_caps(ctx.settings.ui.icons, ctx.settings.ui.pill_caps);
                 let caps = super::widgets::width(left) + super::widgets::width(right);
                 let label = fit(name, (available as usize).saturating_sub(caps + 5));
                 let body = format!(" {label} × ");
@@ -719,17 +765,14 @@ impl Batch {
             let overflow = total_chip_rows > chip_rows && chip_rows > 0;
             let first_chip_row =
                 total_chip_rows.saturating_sub(chip_rows.saturating_sub(u16::from(overflow)));
-            let h = area
-                .height
-                .saturating_sub(2)
-                .min(self.shown.len().clamp(1, 7) as u16 + 6 + chip_rows);
-            self.rect = Rect::new(
-                area.x + (area.width - w) / 2,
-                area.y + (area.height - h) / 2,
-                w,
-                h,
+            let size = popup_size(
+                area,
+                PopupClass::Choice,
+                self.rows.len().clamp(1, 7) as u16 + 6 + chip_rows,
+                (6, 3),
             );
-            f.render_widget(OverlayClear, self.rect);
+            self.rect = size.outer;
+            f.render_widget(PopupSurface, self.rect);
             let block = ctx
                 .settings
                 .theme
@@ -754,7 +797,8 @@ impl Batch {
             let inner = block.inner(self.rect);
             f.render_widget(block, self.rect);
             self.tag_chips.clear();
-            if inner.height < 4 || inner.width < 6 {
+            if !size.usable {
+                popup_too_small(f, size, &ctx.settings.theme);
                 return;
             }
             if overflow {
@@ -763,8 +807,7 @@ impl Batch {
                     .filter(|(rect, _, _)| rect.y < first_chip_row)
                     .count();
                 f.render_widget(
-                    Paragraph::new(format!("+{hidden} more · search to remove"))
-                        .style(ctx.settings.theme.dim()),
+                    Paragraph::new(format!("+{hidden} more")).style(ctx.settings.theme.dim()),
                     Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), 1),
                 );
             }
@@ -814,7 +857,7 @@ impl Batch {
                 inner.x + 1,
                 input_y + 2,
                 inner.width.saturating_sub(2),
-                inner.height.saturating_sub(4 + chip_rows),
+                inner.height.saturating_sub(2 + chip_rows),
             );
             self.list.clamp(self.shown.len());
             let items: Vec<ListItem> = self
@@ -824,7 +867,10 @@ impl Batch {
                 .map(|(index, i)| {
                     ListItem::new(if let Some(row) = self.rows.get(*i) {
                         let fill = crate::tui::components::group::tag_fill(&row.id, ctx);
-                        let (left, right) = ctx.settings.ui.pill_caps.glyphs();
+                        let (left, right) = super::icons::tag_caps(
+                            ctx.settings.ui.icons,
+                            ctx.settings.ui.pill_caps,
+                        );
                         let caps_width = super::widgets::width(left) + super::widgets::width(right);
                         let membership = if row.count == self.keys.len() {
                             "✓".to_string()
@@ -880,45 +926,22 @@ impl Batch {
                 .collect();
             if items.is_empty() {
                 f.render_widget(
-                    Paragraph::new("Type to add or create a tag").style(ctx.settings.theme.dim()),
+                    Paragraph::new("No matching tags").style(ctx.settings.theme.dim()),
                     self.list.rows,
                 );
             } else {
                 f.render_stateful_widget(List::new(items), self.list.rows, &mut self.list.state);
             }
-            f.render_widget(
-                Paragraph::new(if self.remove_armed {
-                    "Backspace removes last tag · type to cancel"
-                } else if self
-                    .list
-                    .selected()
-                    .and_then(|i| self.shown.get(i))
-                    .and_then(|i| self.rows.get(*i))
-                    .is_some_and(|r| r.count == self.keys.len())
-                {
-                    "Enter remove · Esc done"
-                } else {
-                    "Enter add · × remove · Esc done"
-                })
-                .style(ctx.settings.theme.dim()),
-                Rect::new(
-                    inner.x + 2,
-                    inner.bottom() - 1,
-                    inner.width.saturating_sub(4),
-                    1,
-                ),
-            );
             return;
         }
-        let w = area.width.saturating_sub(2).min(76);
-        let h = area.height.saturating_sub(2).min(20);
-        self.rect = Rect::new(
-            area.x + (area.width - w) / 2,
-            area.y + (area.height - h) / 2,
-            w,
-            h,
+        let size = popup_size(
+            area,
+            PopupClass::Choice,
+            self.rows.len().clamp(1, 13) as u16 + 7,
+            (12, 4),
         );
-        f.render_widget(OverlayClear, self.rect);
+        self.rect = size.outer;
+        f.render_widget(PopupSurface, self.rect);
         let title = match self.kind {
             Kind::Tags => "Tags",
             Kind::Deploy => "Deploy",
@@ -930,8 +953,8 @@ impl Batch {
             .block(format!(" {title} · {} skills ", self.keys.len()), true);
         let inner = block.inner(self.rect);
         f.render_widget(block, self.rect);
-        if inner.height < 5 {
-            f.render_widget(Paragraph::new("Enlarge terminal · Esc cancel"), inner);
+        if !size.usable {
+            popup_too_small(f, size, &ctx.settings.theme);
             return;
         }
         self.input_rect = Rect::new(inner.x, inner.y, inner.width, 1);
@@ -942,7 +965,13 @@ impl Batch {
             "Filter…",
             &ctx.settings.theme,
         );
-        self.list.rows = Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 5);
+        let list_y = inner.y + if inner.height < 6 { 1 } else { 2 };
+        self.list.rows = Rect::new(
+            inner.x,
+            list_y,
+            inner.width,
+            inner.bottom().saturating_sub(list_y + 2),
+        );
         self.list.clamp(self.shown.len());
         let items: Vec<ListItem> = self
             .shown
@@ -998,7 +1027,7 @@ impl Batch {
                         Err(e) => e.to_string(),
                     }
                 } else {
-                    "Add selected skills to each chosen Preset's fixed member list.".into()
+                    String::new()
                 }
             })
         };
@@ -1062,6 +1091,146 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn text_tag_caps_match_packing_rows_and_close_hitboxes() {
+        use skills::config::{Icons, PillCaps};
+        let root = skills::ops::DownloadDir::new("text-tag-caps").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            tags: [
+                "alpha",
+                "中文标签",
+                "a-long-tag-name-that-needs-truncation",
+                "omega",
+            ]
+            .into_iter()
+            .map(|name| skills::config::TagConfig {
+                name: name.into(),
+                skills: vec!["synthetic".into()],
+                color: None,
+                description: None,
+            })
+            .collect(),
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        let ws = Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let mut settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        settings.ui.icons = Icons::Text;
+        for (columns, rows) in [(40, 24), (60, 30), (100, 30)] {
+            let mut expected = None;
+            for caps in [PillCaps::Round, PillCaps::Block, PillCaps::None] {
+                settings.ui.pill_caps = caps;
+                let ctx = Ctx {
+                    ws: &ws,
+                    snap: &snap,
+                    settings: &settings,
+                };
+                let mut batch = Batch::tags(vec!["synthetic".into()], &ctx);
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(columns, rows))
+                        .unwrap();
+                terminal.draw(|f| batch.draw(f, f.area(), &ctx)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let screen: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert!(!crate::tui::icons::tests::has_pua(&screen));
+                assert!(!batch.tag_chips.is_empty());
+                let current = (
+                    screen,
+                    batch.tag_chips.clone(),
+                    batch.input_rect,
+                    batch.list.rows,
+                );
+                if let Some(expected) = &expected {
+                    assert_eq!(&current, expected, "caps={caps:?}, columns={columns}");
+                } else {
+                    expected = Some(current);
+                }
+                for (rect, _) in &batch.tag_chips {
+                    assert!(rect.right() < batch.rect.right());
+                    assert_eq!(buffer[(rect.x, rect.y)].symbol(), "(");
+                    assert_eq!(buffer[(rect.right() - 1, rect.y)].symbol(), ")");
+                    assert_eq!(buffer[(rect.right() - 3, rect.y)].symbol(), "×");
+                }
+                for pair in batch.tag_chips.windows(2) {
+                    assert!(pair[0].0.y != pair[1].0.y || pair[0].0.right() < pair[1].0.x);
+                }
+                let (rect, name) = batch.tag_chips[0].clone();
+                let click = |column| MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row: rect.y,
+                    modifiers: KeyModifiers::NONE,
+                };
+                assert!(batch.mouse(click(rect.x), &ctx).is_empty());
+                assert!(batch.selected_tags.contains(&name));
+                assert!(matches!(
+                    batch.mouse(click(rect.right() - 3), &ctx).as_slice(),
+                    [Action::WriteMeta(_)]
+                ));
+                assert!(!batch.selected_tags.contains(&name));
+            }
+        }
+    }
+
+    #[test]
+    fn tag_filter_geometry_keeps_input_and_buttons_stable_on_resize() {
+        let tmp = skills::ops::DownloadDir::new("tag-filter-geometry").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            tags: (0..20)
+                .map(|i| skills::config::TagConfig {
+                    name: format!("tag-{i:02}"),
+                    skills: vec![],
+                    color: None,
+                    description: None,
+                })
+                .collect(),
+            ..Default::default()
+        }
+        .save(tmp.path())
+        .unwrap();
+        let ws = Workspace::open(tmp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let mut batch = Batch::tags(vec!["synthetic".into()], &ctx);
+        let mut previous = None;
+        for (width, height) in [(100, 30), (60, 12), (100, 30)] {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let mut geometry = None;
+            // A missing tag offers one inline Create row rather than zero results.
+            for (query, count) in [("", 20), ("tag-19", 1), ("new-tag", 1), ("", 20)] {
+                batch.input = Input::with_value(query);
+                batch.filter();
+                batch.list.last(batch.shown.len());
+                term.draw(|f| batch.draw(f, Rect::new(0, 0, width, height - 2), &ctx))
+                    .unwrap();
+                assert_eq!(batch.shown.len(), count);
+                let current = (batch.rect, batch.input_rect, batch.list.rows, batch.buttons);
+                if let Some(expected) = geometry {
+                    assert_eq!(current, expected);
+                } else {
+                    geometry = Some(current);
+                }
+                let selected = batch.list.selected().unwrap();
+                let offset = batch.list.state.offset();
+                assert!(selected >= offset && selected < offset + batch.list.rows.height as usize);
+            }
+            if let Some(before) = previous {
+                assert_ne!(geometry.unwrap().0, before);
+            }
+            previous = Some(geometry.unwrap().0);
+        }
+    }
+
     #[test]
     fn rapid_tag_toggles_use_optimistic_picker_state() {
         let fixture = Fixture::new();

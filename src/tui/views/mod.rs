@@ -1,5 +1,10 @@
+//! `footer_help()` returns shortcuts and focused-control descriptions together;
+//! only the app renders them. Do not draw control help inside a page or overlay.
 //! One module per tab. Views keep their own cursor and layout rects; the
 //! data always comes from `Ctx`.
+//! Open overlays own input and hints before any background focus state. Split
+//! views must forward keys and pointer events to child overlays before hit-testing
+//! their own panes, including clicks outside the overlay.
 
 pub mod agents;
 pub mod file_browser;
@@ -30,6 +35,10 @@ pub(super) enum SplitFocus {
 pub trait View {
     fn overlay_open(&self) -> bool {
         false
+    }
+    /// Completion popovers capture pointer events without changing keyboard routing.
+    fn mouse_overlay_open(&self) -> bool {
+        self.overlay_open()
     }
     fn preview_overlay(&mut self) -> Option<&mut preview::Overlay> {
         None
@@ -83,6 +92,9 @@ pub trait View {
     fn handle_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Vec<Action>;
     fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx);
     fn hints(&self) -> Hints;
+    fn footer_help(&self) -> super::footer::Help<'_> {
+        super::footer::Help::new(self.hints())
+    }
 }
 
 /// Mouse wheel delta for list navigation.

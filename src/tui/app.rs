@@ -1,5 +1,6 @@
 //! Application state: owns the snapshot, dispatches messages to the active
-//! view or modal, and applies the `Action`s they return.
+//! view or modal, and applies the `Action`s they return. The read-only contextual
+//! help layer owns input above every surface without replacing its state.
 
 use super::event::{Msg, Task, TaskOutput, WriteWork, spawn_sync_status, spawn_task, spawn_write};
 use super::keymap;
@@ -12,7 +13,7 @@ use super::views::{
     View, agents::AgentsView, health::HealthView, presets::PresetsView, repos::ReposView,
     search::SearchView, tags::TagsView,
 };
-use super::widgets::{SPINNER, fit, width};
+use super::widgets::{SPINNER, dim_inactive, fit, width};
 use crate::tui::components::command_palette::{
     Command as AppCommand, CommandPalette, Event as PaletteEvent,
 };
@@ -22,7 +23,7 @@ use anyhow::Result;
 use crossterm::event::KeyModifiers;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -258,6 +259,8 @@ pub struct App {
     pub modal: Option<Modal>,
     context_menu: Option<ContextMenu>,
     command_palette: Option<CommandPalette>,
+    context_help: Option<super::footer::ContextHelp>,
+    footer_message_rect: Rect,
     pending_task_ui: VecDeque<Action>,
     pending_writes: VecDeque<WriteWork>,
     single_write_running: bool,
@@ -309,7 +312,7 @@ impl QuitPrompt {
     }
 
     fn draw(&mut self, f: &mut Frame, outer: Rect, th: &Theme, tasks: Vec<String>) {
-        use super::widgets::{OverlayClear, button, fit};
+        use super::widgets::{ButtonIntent, ButtonSpec, PopupSurface, draw_button_row, fit};
         let w = outer.width.saturating_sub(2).min(86);
         let h = if self.sync_in_progress {
             outer.height.saturating_sub(2).clamp(1, 6)
@@ -326,7 +329,7 @@ impl QuitPrompt {
             w,
             h,
         );
-        f.render_widget(OverlayClear, self.area);
+        f.render_widget(PopupSurface, self.area);
         let block = th.block(" quit ", true);
         let inner = block.inner(self.area);
         f.render_widget(block, self.area);
@@ -359,35 +362,26 @@ impl QuitPrompt {
             lines
         };
         f.render_widget(Paragraph::new(lines), inner);
-        let y = inner.bottom().saturating_sub(1);
-        self.cancel_button = Rect::new(
-            inner.right().saturating_sub(12).max(inner.x),
-            y,
-            inner.width.min(12),
-            u16::from(inner.height > 0),
-        );
-        self.force_exit_button = Rect::new(
-            self.cancel_button.x.saturating_sub(12).max(inner.x),
-            y,
-            self.cancel_button.x.saturating_sub(inner.x).min(12),
-            u16::from(inner.height > 0),
-        );
-        f.render_widget(
-            Paragraph::new(Line::from(button(
-                if self.sync_in_progress {
-                    "Force exit"
-                } else {
-                    "Quit"
+        let rects = draw_button_row(
+            f,
+            inner,
+            &[
+                ButtonSpec {
+                    label: if self.sync_in_progress {
+                        "Force exit"
+                    } else {
+                        "Quit"
+                    },
+                    enabled: true,
+                    intent: ButtonIntent::Danger,
                 },
-                self.force_exit_selected,
-                th,
-            ))),
-            self.force_exit_button,
+                ButtonSpec::new("Cancel"),
+            ],
+            Some(usize::from(!self.force_exit_selected)),
+            th,
         );
-        f.render_widget(
-            Paragraph::new(Line::from(button("Cancel", !self.force_exit_selected, th))),
-            self.cancel_button,
-        );
+        self.force_exit_button = rects[0];
+        self.cancel_button = rects[1];
     }
 }
 
@@ -446,6 +440,8 @@ impl App {
             modal: None,
             context_menu: None,
             command_palette: None,
+            context_help: None,
+            footer_message_rect: Rect::default(),
             pending_task_ui: VecDeque::new(),
             pending_writes: VecDeque::new(),
             single_write_running: false,
@@ -498,8 +494,10 @@ impl App {
     }
 
     fn on_snapshot(&mut self) {
-        self.context_menu = None;
-        self.command_palette = None;
+        if self.context_help.is_none() {
+            self.context_menu = None;
+            self.command_palette = None;
+        }
         self.settings
             .reload(&self.ws.config, &self.session_settings);
         self.sync.set_quiet_window(self.settings.sync.quiet_window);
@@ -562,7 +560,6 @@ impl App {
                     None,
                     vec![],
                     Some("note failed".into()),
-                    false,
                 );
             }
             Err(e) => {
@@ -606,8 +603,11 @@ impl App {
                 Vec::new()
             }
             Msg::Resize => {
-                self.context_menu = None;
-                self.command_palette = None;
+                self.footer_message_rect = Rect::default();
+                if self.context_help.is_none() {
+                    self.context_menu = None;
+                    self.command_palette = None;
+                }
                 Vec::new()
             }
             Msg::SyncPublishing => {
@@ -773,7 +773,8 @@ impl App {
     }
 
     fn task_ui_blocked(&self) -> bool {
-        self.quit_prompt.is_some()
+        self.context_help.is_some()
+            || self.quit_prompt.is_some()
             || self.modal.is_some()
             || self.context_menu.is_some()
             || self.command_palette.is_some()
@@ -967,15 +968,10 @@ impl App {
             TaskOutput::Write(outcome) => {
                 let actions = match outcome.result {
                     Ok((message, intent)) => {
-                        let undo_hint = if outcome.undo_hint && intent.is_some() {
-                            " · Ctrl+Z undo"
-                        } else {
-                            ""
-                        };
                         if let Some(intent) = intent {
                             self.history.record(intent);
                         }
-                        self.toast(format!("{message}{undo_hint}"), Level::Ok);
+                        self.toast(message, Level::Ok);
                         self.mutation_finished(outcome.scope);
                         for action in outcome.then {
                             self.apply_scoped(action, outcome.scope);
@@ -1030,11 +1026,6 @@ impl App {
                         Box::new(super::name_choices::NameChoices::new(pending)),
                     )))];
                 }
-                let undo_hint = if outcome.intent.is_some() {
-                    " · Ctrl+Z undo"
-                } else {
-                    ""
-                };
                 if let Some(intent) = outcome.intent {
                     self.history.record(intent);
                 }
@@ -1043,7 +1034,7 @@ impl App {
                 self.presets.batch_finished(&outcome.failed);
                 self.repos.batch_finished(&outcome.failed);
                 if outcome.errors.is_empty() {
-                    self.toast(format!("{}{undo_hint}", outcome.message), Level::Ok);
+                    self.toast(outcome.message, Level::Ok);
                 } else {
                     self.toast(
                         format!("{}; errors: {}", outcome.message, outcome.errors.len()),
@@ -1064,6 +1055,7 @@ impl App {
                         lines: outcome.errors,
                         scroll: 0,
                         return_to,
+                        rect: Rect::default(),
                     }))]
                 }
             }
@@ -1362,7 +1354,7 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) -> Vec<Action> {
-        if self.context_menu.is_some() {
+        if self.context_help.is_some() || self.context_menu.is_some() {
             return vec![];
         }
         if let Some(palette) = self.command_palette.as_mut() {
@@ -1371,7 +1363,10 @@ impl App {
                 .err()
                 .map_or_else(Vec::new, |error| vec![Action::Error(error)]);
         }
-        if self.focus == AppFocus::Tabs && self.modal.is_none() {
+        if self.focus == AppFocus::Tabs
+            && self.modal.is_none()
+            && !self.active_view().overlay_open()
+        {
             return vec![];
         }
 
@@ -1400,6 +1395,16 @@ impl App {
     }
 
     fn on_key(&mut self, k: KeyEvent) -> Vec<Action> {
+        if k.code == KeyCode::F(1) && k.modifiers.is_empty() {
+            self.toggle_context_help();
+            return vec![];
+        }
+        if let Some(help) = self.context_help.as_mut() {
+            if help.key(k) {
+                self.context_help = None;
+            }
+            return vec![];
+        }
         if let Some(prompt) = self.quit_prompt.as_mut() {
             match k.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.quit_prompt = None,
@@ -1438,7 +1443,7 @@ impl App {
         if let Some(m) = self.modal.as_mut() {
             return m.handle_key(k, &ctx);
         }
-        if self.focus == AppFocus::Page && self.active_view().overlay_open() {
+        if self.active_view().overlay_open() {
             return match self.tab {
                 Tab::Search => self.search.handle_key(k, &ctx),
                 Tab::Tags => self.tags.handle_key(k, &ctx),
@@ -1447,6 +1452,11 @@ impl App {
                 Tab::Health => self.health.handle_key(k, &ctx),
                 Tab::Repos => self.repos.handle_key(k, &ctx),
             };
+        }
+        // Library View is available from the tab strip too. Keep App focus at
+        // its origin: the page overlay owns input/footer until it closes.
+        if self.tab == Tab::Search && k.code == KeyCode::F(2) && k.modifiers.is_empty() {
+            return self.search.handle_key(k, &ctx);
         }
         match k.code {
             KeyCode::Char('r') if keymap::control(k, 'r') => {
@@ -1731,12 +1741,13 @@ impl App {
     }
 
     fn global_hints_visible(&self) -> bool {
-        self.modal.is_none()
+        self.context_help.is_none()
+            && self.modal.is_none()
             && self.quit_prompt.is_none()
             && self.context_menu.is_none()
             && self.command_palette.is_none()
             && !self.text_input_focused()
-            && (self.focus == AppFocus::Tabs || !self.active_view().overlay_open())
+            && !self.active_view().overlay_open()
     }
 
     fn context_event(&mut self, event: MenuEvent) -> Vec<Action> {
@@ -1769,7 +1780,25 @@ impl App {
     }
 
     fn on_mouse(&mut self, m: MouseEvent) -> Vec<Action> {
+        if let Some(help) = self.context_help.as_mut() {
+            if help.mouse(m, self.settings.interaction.wheel_rows) {
+                self.context_help = None;
+            }
+            return vec![];
+        }
+        if m.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.footer_message_rect.contains((m.column, m.row).into())
+        {
+            self.toggle_context_help();
+            return vec![];
+        }
         if let Some(prompt) = self.quit_prompt.as_ref() {
+            if super::widgets::popup_mouse(m, prompt.area)
+                == super::widgets::PopupMouse::OutsidePress
+            {
+                self.quit_prompt = None;
+                return vec![];
+            }
             if m.kind == MouseEventKind::Down(MouseButton::Left) {
                 let point = (m.column, m.row).into();
                 if prompt.force_exit_button.contains(point) {
@@ -1780,29 +1809,6 @@ impl App {
                 }
             }
             return vec![];
-        }
-        // A Library view menu owns pointer events just as it owns keyboard
-        // events. Outside clicks dismiss it without activating a tab or sync.
-        if self.tab == Tab::Search
-            && self.search.view_menu_open()
-            && self.modal.is_none()
-            && self.context_menu.is_none()
-            && self.command_palette.is_none()
-        {
-            let ctx = Ctx {
-                ws: &self.ws,
-                snap: &self.snap,
-                settings: &self.settings,
-            };
-            return self.search.handle_mouse(m, &ctx);
-        }
-        if m.kind == MouseEventKind::Down(MouseButton::Left)
-            && self.modal.is_none()
-            && self.context_menu.is_none()
-            && self.command_palette.is_none()
-            && self.sync_button.contains((m.column, m.row).into())
-        {
-            return self.open_sync(true);
         }
         if let Some(menu) = self.context_menu.as_mut() {
             let event = menu.mouse(m);
@@ -1825,8 +1831,25 @@ impl App {
         if let Some(modal) = self.modal.as_mut() {
             return modal.handle_mouse(m, &ctx);
         }
-        if self.tab == Tab::Agents && self.agents.group_popup_open() {
-            return self.agents.handle_mouse(m, &ctx);
+        // Every page-owned overlay receives pointer events before background
+        // tabs, sync controls or split panes can change keyboard focus.
+        if self.active_view().mouse_overlay_open() {
+            return match self.tab {
+                Tab::Search => self.search.handle_mouse(m, &ctx),
+                Tab::Tags => self.tags.handle_mouse(m, &ctx),
+                Tab::Presets => self.presets.handle_mouse(m, &ctx),
+                Tab::Agents => self.agents.handle_mouse(m, &ctx),
+                Tab::Health => self.health.handle_mouse(m, &ctx),
+                Tab::Repos => self.repos.handle_mouse(m, &ctx),
+            };
+        }
+        if m.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.modal.is_none()
+            && self.context_menu.is_none()
+            && self.command_palette.is_none()
+            && self.sync_button.contains((m.column, m.row).into())
+        {
+            return self.open_sync(true);
         }
         if m.kind == MouseEventKind::Down(MouseButton::Right) {
             let request = match self.tab {
@@ -1998,10 +2021,9 @@ impl App {
                         prompt,
                         actions,
                         None,
-                        true,
                     ),
                     Action::WriteMeta(write) => {
-                        self.spawn_write(scope, write, prompt, actions, None, true)
+                        self.spawn_write(scope, write, prompt, actions, None)
                     }
                     other => {
                         self.apply_scoped(other, scope);
@@ -2081,7 +2103,6 @@ impl App {
                         None,
                         vec![],
                         Some(format!("{title} failed")),
-                        false,
                     );
                 } else {
                     match deploy::apply(&actions) {
@@ -2119,7 +2140,6 @@ impl App {
                 None,
                 vec![],
                 None,
-                true,
             ),
             Action::BackgroundWrite { title, write, keys } => {
                 self.spawn_batch(super::event::BatchWork::Metadata(scope, write, keys), title);
@@ -2137,7 +2157,7 @@ impl App {
             } => {
                 self.spawn_batch(super::event::BatchWork::Links(actions, keys), title);
             }
-            Action::WriteMeta(write) => self.spawn_write(scope, write, None, vec![], None, true),
+            Action::WriteMeta(write) => self.spawn_write(scope, write, None, vec![], None),
         }
     }
 
@@ -2269,7 +2289,6 @@ impl App {
         prompt: Option<Modal>,
         then: Vec<Action>,
         error_prefix: Option<String>,
-        undo_hint: bool,
     ) {
         let work = WriteWork {
             scope,
@@ -2277,7 +2296,6 @@ impl App {
             prompt: prompt.map(Box::new),
             then,
             error_prefix,
-            undo_hint,
         };
         if self.single_write_running {
             self.pending_writes.push_back(work);
@@ -2482,14 +2500,25 @@ impl App {
             self.command_palette = None;
         }
         let area = f.area();
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(3),
-                Constraint::Length(1),
-            ])
-            .split(area);
+        // The final row belongs to the footer even when the whole terminal
+        // has only one row; the header yields before the active controls do.
+        let footer_height = u16::from(area.height > 0);
+        let header_height = u16::from(area.height > 1);
+        let rows = [
+            Rect::new(area.x, area.y, area.width, header_height),
+            Rect::new(
+                area.x,
+                area.y + header_height,
+                area.width,
+                area.height.saturating_sub(header_height + footer_height),
+            ),
+            Rect::new(
+                area.x,
+                area.bottom().saturating_sub(footer_height),
+                area.width,
+                footer_height,
+            ),
+        ];
         self.draw_header(f, rows[0]);
         self.body = rows[1];
         let ctx = Ctx {
@@ -2505,48 +2534,45 @@ impl App {
             Tab::Health => self.health.draw(f, rows[1], &ctx),
             Tab::Repos => self.repos.draw(f, rows[1], &ctx),
         }
-        if self.focus == AppFocus::Tabs {
-            let th = &self.settings.theme;
-            for y in rows[1].y..rows[1].bottom() {
-                for x in rows[1].x..rows[1].right() {
-                    let cell = &mut f.buffer_mut()[(x, y)];
-                    if cell.fg == th.border_focus {
-                        cell.fg = th.border;
-                    }
-                    if cell.bg == th.selection_bg {
-                        cell.bg = ratatui::style::Color::Reset;
-                    }
-                    cell.modifier.remove(Modifier::BOLD);
-                    cell.modifier.insert(Modifier::DIM);
-                }
-            }
+        if self.focus == AppFocus::Tabs && !self.active_view().overlay_open() {
+            dim_inactive(rows[1], f.buffer_mut());
             if let Some((rect, _)) = self.tab_rects.iter().find(|(_, t)| *t == self.tab) {
                 f.set_cursor_position((rect.x, rect.y));
             }
         }
+        // All popups stop above the fixed app-owned footer row.
+        let overlay_area = Rect {
+            height: rows[2].y.saturating_sub(area.y),
+            ..area
+        };
+        if !overlay_area.is_empty() {
+            if let Some(m) = self.modal.as_mut() {
+                m.draw(f, overlay_area, &ctx);
+            }
+            if let Some(menu) = self.context_menu.as_mut() {
+                menu.draw(f, overlay_area, &self.settings.theme);
+            }
+            if let Some(palette) = self.command_palette.as_mut() {
+                palette.draw(f, overlay_area, &ctx);
+            }
+            // Above everything: a notification should be readable over a dialog.
+            self.toasts.draw(f, overlay_area, &self.settings.theme);
+            if let Some(prompt) = self.quit_prompt.as_mut() {
+                let mut tasks = self.toasts.running_details();
+                let scans = self.tasks_running.saturating_sub(tasks.len());
+                if scans > 0 {
+                    tasks.push(format!("Scan skills: {scans} running"));
+                }
+                if !self.pending_writes.is_empty() {
+                    tasks.push(format!("Queued changes: {}", self.pending_writes.len()));
+                }
+                prompt.draw(f, overlay_area, &self.settings.theme, tasks);
+            }
+            if let Some(help) = self.context_help.as_mut() {
+                help.draw(f, overlay_area, &self.settings.theme);
+            }
+        }
         self.draw_footer(f, rows[2]);
-        if let Some(m) = self.modal.as_mut() {
-            m.draw(f, area, &ctx);
-        }
-        if let Some(menu) = self.context_menu.as_mut() {
-            menu.draw(f, area, &self.settings.theme);
-        }
-        if let Some(palette) = self.command_palette.as_mut() {
-            palette.draw(f, area, &ctx);
-        }
-        // Above everything: a notification should be readable over a dialog.
-        self.toasts.draw(f, area, &self.settings.theme);
-        if let Some(prompt) = self.quit_prompt.as_mut() {
-            let mut tasks = self.toasts.running_details();
-            let scans = self.tasks_running.saturating_sub(tasks.len());
-            if scans > 0 {
-                tasks.push(format!("Scan skills: {scans} running"));
-            }
-            if !self.pending_writes.is_empty() {
-                tasks.push(format!("Queued changes: {}", self.pending_writes.len()));
-            }
-            prompt.draw(f, area, &self.settings.theme, tasks);
-        }
     }
 
     fn draw_header(&mut self, f: &mut Frame, area: Rect) {
@@ -2576,13 +2602,7 @@ impl App {
                 self.tab,
             ));
             f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(title, th.selected()),
-                    Span::styled(
-                        "  Tab → next · Shift+Tab ←",
-                        Style::default().fg(th.placeholder),
-                    ),
-                ])),
+                Paragraph::new(Span::styled(title, th.selected())),
                 left_area,
             );
             f.render_widget(Paragraph::new(button).style(button_style), self.sync_button);
@@ -2595,12 +2615,8 @@ impl App {
             vec![Span::styled(" skills ", th.bold().fg(th.accent))]
         };
         let mut x = area.x + if compact { 0 } else { width(" skills ") as u16 };
-        for (i, t) in Tab::visible(self.settings.tags_enabled).iter().enumerate() {
-            let label = if compact {
-                format!(" {} ", t.title())
-            } else {
-                format!(" {} {} ", i + 1, t.title())
-            };
+        for t in Tab::visible(self.settings.tags_enabled).iter() {
+            let label = format!(" {} ", t.title());
             let style = if *t == self.tab {
                 th.selected()
             } else {
@@ -2612,8 +2628,6 @@ impl App {
             spans.push(Span::raw(" "));
             x += w + 1;
         }
-        spans.push(Span::styled(" Tab ↔ ", Style::default().fg(th.placeholder)));
-        x += width(" Tab ↔ ") as u16;
         let used = (x - area.x) as usize;
         let right = if self.tasks_running > 0 && !self.sync.syncing() {
             format!("{} working  ", SPINNER[self.spinner])
@@ -2692,19 +2706,18 @@ impl App {
         )
     }
 
-    fn draw_footer(&self, f: &mut Frame, area: Rect) {
-        if self.context_menu.is_some() {
-            f.render_widget(Paragraph::new(" ".repeat(area.width as usize)), area);
-            return;
-        }
-
-        let th = &self.settings.theme;
+    fn footer_status(&self) -> String {
         let ctx = Ctx {
             ws: &self.ws,
             snap: &self.snap,
             settings: &self.settings,
         };
-        let mut status = if self.modal.is_some() || self.quit_prompt.is_some() {
+        let popup = self.modal.is_some()
+            || self.quit_prompt.is_some()
+            || self.context_menu.is_some()
+            || self.command_palette.is_some()
+            || self.active_view().overlay_open();
+        let mut status = if popup {
             String::new()
         } else {
             match self.tab {
@@ -2714,7 +2727,7 @@ impl App {
                 _ => String::new(),
             }
         };
-        if self.modal.is_none() && self.quit_prompt.is_none() && self.tab == Tab::Search {
+        if !popup && self.tab == Tab::Search {
             let content = if self.verification_task.is_some() {
                 Some("Checking content…".to_string())
             } else {
@@ -2736,120 +2749,259 @@ impl App {
                 };
             }
         }
-        let status = fit(&status, area.width as usize / 3);
-        let status_width = width(&status);
-        let budget = area.width as usize - status_width;
-        let hints = self.footer_hints();
-        // Results moved out to the notification stack, so the footer is only keys.
-        let mut spans: Vec<Span> = Vec::new();
-        let mut hint_w = 0usize;
-        let escape = hints.iter().find(|(key, _)| key.contains("Esc"));
-        let show_globals = self.global_hints_visible();
-        let global_hints = [
+        status.trim().to_owned()
+    }
+
+    fn footer_message(&self) -> String {
+        let help = self.footer_help();
+        if help.detail.is_empty() {
+            let status = self.footer_status();
+            if status.is_empty() {
+                "Context help".to_owned()
+            } else {
+                status
+            }
+        } else {
+            help.detail.into_owned()
+        }
+    }
+
+    fn compact_global_hints(&self) -> Vec<(&'static str, &'static str)> {
+        if !self.global_hints_visible() {
+            return vec![];
+        }
+        [
             self.actions_available().then_some(("a", "actions")),
             Some((":", "commands")),
             Some(("?", "help")),
-        ];
-        let global_width = if show_globals {
-            global_hints
-                .iter()
-                .flatten()
-                .map(|(key, desc)| width(key) + width(desc) + 3)
-                .sum()
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+
+    pub fn context_help_open(&self) -> bool {
+        self.context_help.is_some()
+    }
+
+    fn toggle_context_help(&mut self) {
+        if self.context_help.take().is_some() {
+            return;
+        }
+        let help = self.footer_help();
+        let mut lines = vec![format!("{} · current focus", self.tab.title())];
+        if !help.detail.is_empty() {
+            lines.extend(help.detail.lines().map(str::to_owned));
+        }
+        let status = self.footer_status();
+        if !status.is_empty() && status != help.detail {
+            lines.extend(status.lines().map(str::to_owned));
+        }
+        lines.extend([String::new(), "Shortcuts".to_owned()]);
+        let mut keys = if self.batch_running && self.batch_modal_owned || self.quit_prompt.is_some()
+        {
+            help.keys.to_vec()
+        } else if let Some(modal) = &self.modal {
+            modal.help_keys()
+        } else if self.command_palette.is_some() {
+            let mut keys = help.keys.to_vec();
+            keys.extend_from_slice(super::footer::INPUT_KEYS);
+            keys.push(("PgUp/PgDn", "page commands"));
+            keys
+        } else if self.context_menu.is_some()
+            || self.focus == AppFocus::Tabs && !self.active_view().overlay_open()
+        {
+            help.keys.to_vec()
+        } else {
+            let mut keys = help.keys.to_vec();
+            if self.text_input_focused() && !self.active_view().overlay_open() {
+                keys.extend_from_slice(super::footer::INPUT_KEYS);
+            }
+            keys
+        };
+        keys.retain(|(key, _)| self.settings.tags_enabled || *key != "t");
+        keys.extend(self.compact_global_hints());
+        // These app-level bindings are available even while a page text field
+        // owns input, but page overlays and modal owners intercept them.
+        if self.quit_prompt.is_none() {
+            keys.push(("Ctrl-C", "quit"));
+        }
+        if self.modal.is_none()
+            && self.quit_prompt.is_none()
+            && self.context_menu.is_none()
+            && self.command_palette.is_none()
+            && !self.active_view().overlay_open()
+        {
+            keys.extend([
+                ("Ctrl-R", "verify content in Health; rescan on other tabs"),
+                ("Ctrl-G", "general keyboard help"),
+                ("Ctrl-O", "toggle tag visibility"),
+                ("Ctrl-Z", "undo"),
+                ("Ctrl-Y", "redo"),
+                ("Tab/Shift+Tab", "next / previous tab"),
+            ]);
+            if !self.text_input_focused() {
+                keys.push(("1–6", "select a visible tab"));
+                if self.focus == AppFocus::Page {
+                    keys.push(("R", "repositories"));
+                }
+            }
+            if self.tab == Tab::Search {
+                keys.push(("F2", "Library view options"));
+            }
+        }
+        keys.push(("F1", "toggle this contextual help"));
+        let mut seen = BTreeSet::new();
+        lines.extend(
+            keys.into_iter()
+                .filter(|hint| seen.insert(*hint))
+                .map(|(key, desc)| format!("{key}  {desc}")),
+        );
+        if let Some(menu) = &self.context_menu {
+            lines.push(String::new());
+            lines.push(menu.request.title.clone());
+            lines.push(menu.request.detail.clone());
+            for item in &menu.request.items {
+                lines.push(format!(
+                    "{}  {}{}",
+                    item.shortcut,
+                    item.label,
+                    item.disabled
+                        .as_ref()
+                        .map(|reason| format!(" · unavailable: {reason}"))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+        self.context_help = Some(super::footer::ContextHelp::new(lines));
+    }
+
+    fn draw_footer(&mut self, f: &mut Frame, area: Rect) {
+        self.footer_message_rect = Rect::default();
+        if area.is_empty() {
+            return;
+        }
+        let th = &self.settings.theme;
+        let help = self.footer_help();
+        let budget = area.width as usize;
+        // Keep Escape at the very smallest widths. At six columns it can share
+        // the row with the universal F1; larger rows gain its descriptive label.
+        let f1 = if budget >= 90 {
+            Some(("F1", "help"))
+        } else if budget >= 6 {
+            Some(("F1", ""))
+        } else {
+            None
+        };
+        let f1_width = f1.map_or(0, |hint| super::footer::hint_width(hint) + 1);
+        let message_budget = if budget >= 90 {
+            (budget / 4).min(48)
+        } else if budget >= 60 {
+            18
+        } else if budget >= 30 {
+            6
         } else {
             0
         };
-        let reserve = escape.map_or(0, |(key, desc)| width(key) + width(desc) + 3) + global_width;
-        for (key, desc) in hints {
-            if (!self.settings.tags_enabled && *key == "t")
-                || key.contains("Esc")
-                || (show_globals && global_hints.contains(&Some((*key, *desc))))
-            {
-                continue;
-            }
-            let piece_w = width(key) + width(desc) + 3;
-            if hint_w + piece_w + reserve > budget {
-                break;
-            }
-            spans.push(Span::styled(*key, th.key_hint()));
+        let globals = self.compact_global_hints();
+        let hints = super::footer::fit_hints(
+            help.keys,
+            &globals,
+            self.settings.tags_enabled,
+            budget.saturating_sub(message_budget + f1_width),
+        );
+        let hint_width = hints
+            .iter()
+            .copied()
+            .map(super::footer::hint_width)
+            .sum::<usize>();
+        let keys_width = hint_width + f1_width;
+        let message_width = budget.saturating_sub(keys_width);
+        let message = self.footer_message().replace('\n', " · ");
+        let mut spans = Vec::new();
+        if message_width >= 4 {
+            let text = fit(&message, message_width.saturating_sub(1));
+            let padding = message_width.saturating_sub(width(&text));
             spans.push(Span::styled(
-                format!(" {desc}  "),
+                format!("{text}{}", " ".repeat(padding)),
                 Style::default().fg(th.placeholder),
             ));
-            hint_w += piece_w;
+            self.footer_message_rect = Rect::new(area.x, area.y, message_width as u16, 1);
+        } else {
+            spans.push(Span::raw(" ".repeat(message_width)));
         }
-        if let Some((key, desc)) = escape {
-            let piece_w = width(key) + width(desc) + 3;
-            if hint_w + piece_w <= budget {
-                spans.push(Span::styled(*key, th.key_hint()));
+        for (key, desc) in hints {
+            spans.push(Span::styled(key, th.key_hint()));
+            if !desc.is_empty() {
                 spans.push(Span::styled(
                     format!(" {desc}  "),
                     Style::default().fg(th.placeholder),
                 ));
-                hint_w += piece_w;
             }
         }
-        if show_globals {
-            for (key, desc) in global_hints.into_iter().flatten() {
-                let piece_w = width(key) + width(desc) + 3;
-                if hint_w + piece_w > budget {
-                    break;
-                }
-                spans.push(Span::styled(key, th.key_hint()));
+        if let Some((key, desc)) = f1 {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(key, th.key_hint()));
+            if !desc.is_empty() {
                 spans.push(Span::styled(
                     format!(" {desc}  "),
                     Style::default().fg(th.placeholder),
                 ));
-                hint_w += piece_w;
             }
         }
-        let pad = budget.saturating_sub(hint_w);
-        let mut line = vec![
-            Span::styled(status, th.skill_count()),
-            Span::raw(" ".repeat(pad)),
-        ];
-        line.extend(spans);
-        f.render_widget(Paragraph::new(Line::from(line)), area);
+        f.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::reset()),
+            area,
+        );
     }
 
-    /// Return the shortcuts owned by the surface that currently receives
-    /// keyboard input. Keeping this decision in one place prevents the global
-    /// footer from retaining a page hint while a modal or quit prompt owns
-    /// focus.
-    fn footer_hints(&self) -> Hints {
-        if self.quit_prompt.is_some() {
-            return &[("←→", "buttons"), ("Enter", "confirm"), ("Esc/q", "cancel")];
+    /// Choose one input owner for both shortcut keys and contextual help.
+    /// Overlay precedence is shared, so a background control cannot leak help.
+    fn footer_help(&self) -> super::footer::Help<'_> {
+        use super::footer::Help;
+        if self.context_help.is_some() {
+            return Help::new(super::footer::CONTEXT_KEYS)
+                .detail("Read current-focus help; close to return to the previous control");
+        }
+        if let Some(prompt) = &self.quit_prompt {
+            return Help::new(&[("←→", "buttons"), ("Enter", "confirm"), ("Esc/q", "cancel")])
+                .detail(if prompt.force_exit_selected {
+                    "Exit now and abandon running work"
+                } else {
+                    "Keep the application and background work running"
+                });
         }
         if self.batch_running && self.batch_modal_owned {
-            return &[("…", "saving changes")];
+            return Help::new(&[("…", "saving changes")]);
         }
         if let Some(m) = &self.modal {
-            return m.hints();
+            return m.footer_help();
         }
         if let Some(palette) = &self.command_palette {
-            return palette.hints();
+            return palette.footer_help();
         }
-        if self.focus == AppFocus::Tabs {
-            return &[
+        if let Some(menu) = &self.context_menu {
+            return menu.footer_help();
+        }
+        if self.focus == AppFocus::Tabs && !self.active_view().overlay_open() {
+            return Help::new(&[
                 ("←→/Tab", "tabs"),
                 ("Enter/↓", "enter"),
                 (":", "commands"),
                 ("Esc/q", "quit"),
-            ];
+            ]);
         }
-        match self.tab {
-            Tab::Search => self.search.hints(),
-            Tab::Tags => self.tags.hints(),
-            Tab::Presets => self.presets.hints(),
-            Tab::Agents => self.agents.hints(),
-            Tab::Health => self.health.hints(),
-            Tab::Repos => self.repos.hints(),
-        }
+        self.active_view().footer_help()
+    }
+
+    #[cfg(test)]
+    fn footer_hints(&self) -> Hints {
+        self.footer_help().keys
     }
 }
 
 /// Key hint pairs shown in the footer.
-pub type Hints = &'static [(&'static str, &'static str)];
+pub use super::footer::Hints;
 
 /// Fit the root into its header allocation while keeping the directory tail.
 pub(crate) fn middle_ellipsis(text: &str, max: usize) -> String {
@@ -3315,7 +3467,10 @@ mod matrix_key_tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(text.contains("Ctrl+Z undo"));
+        assert!(
+            !text.contains("Ctrl+Z undo"),
+            "completion toasts must not duplicate footer shortcuts"
+        );
     }
 
     #[test]
@@ -3359,12 +3514,12 @@ mod matrix_key_tests {
             help.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE), &ctx)
                 .is_empty()
         );
-        assert!(matches!(help, Modal::Help { scroll: 10 }));
+        assert!(matches!(help, Modal::Help { scroll: 10, .. }));
         assert!(
             help.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), &ctx)
                 .is_empty()
         );
-        assert!(matches!(help, Modal::Help { scroll: 0 }));
+        assert!(matches!(help, Modal::Help { scroll: 0, .. }));
     }
 
     #[test]
@@ -3666,7 +3821,6 @@ mod matrix_key_tests {
                 prompt: Some(Box::new(Modal::new_preset())),
                 then: vec![],
                 error_prefix: None,
-                undo_hint: false,
             })),
         ));
 
@@ -3705,7 +3859,6 @@ mod matrix_key_tests {
                 prompt: None,
                 then: vec![],
                 error_prefix: None,
-                undo_hint: false,
             })),
         ));
 
@@ -3796,6 +3949,61 @@ mod matrix_key_tests {
             "worker completion must not close a newer dialog"
         );
         assert!(!app.batch_running);
+    }
+
+    #[test]
+    fn quit_button_clicks_follow_clipped_drawn_rectangles() {
+        let temp = skills::ops::DownloadDir::new("quit-button-clicks").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(temp.path())
+        .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(Workspace::open(temp.path()).unwrap(), tx).unwrap();
+        for sync_in_progress in [false, true] {
+            for width in [8, 12, 40, 100] {
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).unwrap();
+                app.quit = false;
+                app.quit_prompt = Some(QuitPrompt {
+                    sync_in_progress,
+                    ..Default::default()
+                });
+                terminal.draw(|f| app.draw(f)).unwrap();
+                let prompt = app.quit_prompt.as_ref().unwrap();
+                let rects = [prompt.force_exit_button, prompt.cancel_button];
+                for rect in rects {
+                    assert!(rect.is_empty() || rect.intersection(prompt.area) == rect);
+                }
+                for (i, rect) in rects.into_iter().enumerate() {
+                    for column in rect.x..rect.right() {
+                        app.quit = false;
+                        app.quit_prompt = Some(QuitPrompt {
+                            sync_in_progress,
+                            ..Default::default()
+                        });
+                        terminal.draw(|f| app.draw(f)).unwrap();
+                        let cell = &terminal.backend().buffer()[(column, rect.y)];
+                        assert_eq!(cell.modifier.contains(Modifier::BOLD), i == 1);
+                        if i == 1 {
+                            assert_eq!(cell.bg, app.settings.theme.selection_bg);
+                        } else {
+                            assert_eq!(cell.fg, app.settings.theme.err);
+                        }
+                        app.handle(Msg::Mouse(MouseEvent {
+                            kind: MouseEventKind::Down(MouseButton::Left),
+                            column,
+                            row: rect.y,
+                            modifiers: KeyModifiers::NONE,
+                        }));
+                        assert_eq!(app.quit, i == 0);
+                        assert!(app.quit_prompt.is_none());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -4389,7 +4597,7 @@ mod panel_navigation_tests {
     use super::*;
 
     #[test]
-    fn header_keeps_current_page_and_navigation_visible_at_small_widths() {
+    fn header_keeps_current_page_visible_without_local_shortcuts_at_small_widths() {
         let root = std::env::temp_dir().join(format!("skills-header-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         Config {
@@ -4414,7 +4622,7 @@ mod panel_navigation_tests {
                     .map(|c| c.symbol())
                     .collect();
                 assert!(text.contains(tab.title()), "{width}: {text}");
-                assert!(text.contains("Tab"), "{width}: {text}");
+                assert!(!text.contains("Tab"), "{width}: {text}");
                 assert!(app.tab_rects.iter().all(|(rect, _)| rect.right() <= width));
             }
         }
@@ -4547,9 +4755,9 @@ mod escape_hierarchy_tests {
                 [Action::Rescan, Action::Toast(_)]
             ));
             for number in 1..=12 {
-                // F2 now opens the Library view menu; its containment and
-                // focus restoration are exercised in library_view_tests.
-                if number == 2 {
+                // F1 owns the independent contextual notification; F2 opens
+                // Library View. Both have dedicated containment tests.
+                if matches!(number, 1 | 2) {
                     continue;
                 }
                 assert!(
@@ -5067,6 +5275,7 @@ mod escape_hierarchy_tests {
             lines: vec!["retry the staged selection".into()],
             scroll: 0,
             return_to: app.modal.take().map(Box::new),
+            rect: Rect::default(),
         });
         app.handle(Msg::Resize);
         settle_modal_browser(&mut app, &rx, "preset preview files");
@@ -5316,6 +5525,432 @@ mod context_menu_tests {
             .collect()
     }
 
+    fn assert_help_at_bottom(app: &mut App, expected: &str) {
+        let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let detail: String = (0..200).map(|x| buffer[(x, 39)].symbol()).collect();
+        assert!(detail.starts_with(&fit(
+            expected,
+            app.footer_message_rect.width.saturating_sub(1) as usize
+        )));
+        for y in 0..39 {
+            let row: String = (0..200).map(|x| buffer[(x, y)].symbol()).collect();
+            assert!(
+                !row.contains(expected),
+                "control help leaked into row {y}: {row}"
+            );
+        }
+        assert!(
+            buffer[(0, 39)].modifier.is_empty(),
+            "active help must not inherit popup dimming"
+        );
+    }
+
+    #[test]
+    fn focused_control_help_moves_with_keyboard_and_is_owned_by_the_top_surface() {
+        let (_root, mut app) = interactive_app();
+        app.modal = Some(Modal::confirm_write(
+            "Review".into(),
+            vec!["Proposed edit".into()],
+            Box::new(|_| Ok("done".into())),
+        ));
+        assert_help_at_bottom(&mut app, "Close without applying the proposed changes");
+        let body = app.body;
+        key(&mut app, KeyCode::Left);
+        assert_help_at_bottom(&mut app, "Apply the changes shown in this confirmation");
+        assert_eq!(app.body, body, "changing help must not move the page");
+        app.quit_prompt = Some(QuitPrompt::default());
+        assert_help_at_bottom(&mut app, "Keep the application and background work running");
+        key(&mut app, KeyCode::Right);
+        assert_help_at_bottom(&mut app, "Exit now and abandon running work");
+        key(&mut app, KeyCode::Esc);
+        assert_help_at_bottom(&mut app, "Apply the changes shown in this confirmation");
+        app.modal = None;
+        app.command_palette = Some(Default::default());
+        assert_help_at_bottom(&mut app, "Refresh skills and deployment state");
+        key(&mut app, KeyCode::Down);
+        assert_help_at_bottom(
+            &mut app,
+            "Compare repository skills with recorded baselines",
+        );
+        key(&mut app, KeyCode::Esc);
+        assert!(
+            app.footer_help().detail.is_empty(),
+            "closed controls must not leave stale help"
+        );
+    }
+
+    #[test]
+    fn context_help_hides_the_text_owner_caret_and_restores_it_on_close() {
+        let (_root, mut app) = interactive_app();
+        for palette in [false, true] {
+            if palette {
+                app.modal = None;
+                app.command_palette = Some(Default::default());
+            } else {
+                app.modal = Some(Modal::install());
+            }
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            crate::tui::draw_frame(&mut terminal, &mut app).unwrap();
+            assert!(terminal.backend().cursor_visible());
+            key(&mut app, KeyCode::F(1));
+            crate::tui::draw_frame(&mut terminal, &mut app).unwrap();
+            assert!(!terminal.backend().cursor_visible());
+            key(&mut app, KeyCode::Esc);
+            crate::tui::draw_frame(&mut terminal, &mut app).unwrap();
+            assert!(terminal.backend().cursor_visible());
+        }
+    }
+
+    #[test]
+    fn context_help_retains_every_unfitted_owner_shortcut_in_full() {
+        let (_root, mut app) = interactive_app();
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        app.modal = Some(Modal::preset_members("Office", &ctx));
+        let full_keys = app.footer_hints();
+        let footer = footer_line(&mut app, 40, 12);
+        assert!(!footer.contains("Ctrl+A select all results"));
+        key(&mut app, KeyCode::F(1));
+        let lines = &app.context_help.as_ref().unwrap().lines;
+        for (key, desc) in full_keys {
+            assert!(
+                lines.contains(&format!("{key}  {desc}")),
+                "missing {key}: {lines:?}"
+            );
+        }
+        assert!(lines.contains(&"Ctrl+A  select all results".to_string()));
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.modal, Some(Modal::PresetSkills(_))));
+    }
+
+    #[test]
+    fn context_help_preserves_modal_text_and_full_unicode_detail_without_input_leaks() {
+        let (_root, mut app) = interactive_app();
+        let detail = format!(
+            "中文说明 e\u{301} 👩‍💻\n{}",
+            "完整内容 and full context · ".repeat(30)
+        );
+        let mut input = super::super::widgets::Input::default();
+        input.set("staged text");
+        app.modal = Some(Modal::Input {
+            title: "Input".into(),
+            input,
+            kind: crate::tui::modal::InputKind::Install,
+            hint: detail.clone(),
+            rect: Rect::default(),
+        });
+        let footer = footer_line(&mut app, 40, 12);
+        assert!(footer.contains('…') && footer.contains("F1"), "{footer}");
+        assert_eq!(app.body.height, 10, "one header and one footer row");
+        let message = app.footer_message_rect;
+        left_click(&mut app, message.x, message.y);
+        let click_snapshot = app.context_help.as_ref().unwrap().lines.clone();
+        assert!(click_snapshot.join("\n").contains(&detail));
+        assert!(click_snapshot.iter().any(|line| line.contains("Ctrl-W")));
+        key(&mut app, KeyCode::F(1));
+        assert!(app.context_help.is_none());
+        key(&mut app, KeyCode::F(1));
+        assert_eq!(app.context_help.as_ref().unwrap().lines, click_snapshot);
+        draw_app(&mut app, 40, 12);
+        key(&mut app, KeyCode::PageDown);
+        assert!(app.context_help.as_ref().unwrap().scroll > 0);
+        app.handle(Msg::Paste("leaked paste".into()));
+        app.handle(Msg::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        key(&mut app, KeyCode::Char('y'));
+        assert!(!app.quit && app.quit_prompt.is_none());
+        assert!(app.context_help.is_some());
+        key(&mut app, KeyCode::Enter);
+        assert!(app.context_help.is_none());
+        let Some(Modal::Input { input, hint, .. }) = &app.modal else {
+            panic!("input owner lost")
+        };
+        assert_eq!(input.value(), "staged text");
+        assert_eq!(hint, &detail);
+    }
+
+    #[test]
+    fn context_help_uses_live_focus_and_restores_nested_completion_and_view_menu() {
+        let (_root, mut app) = interactive_app();
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Char('/'));
+        for c in "status:loc".chars() {
+            key(&mut app, KeyCode::Char(c));
+        }
+        let hints = app.footer_hints();
+        assert!(hints.contains(&("Enter", "complete")));
+        let query = app.search.query().to_owned();
+        key(&mut app, KeyCode::F(1)); // No draw since changing focus.
+        assert!(
+            app.context_help
+                .as_ref()
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| line.contains("Enter  complete"))
+        );
+        key(&mut app, KeyCode::Down);
+        app.handle(Msg::Paste("ignored".into()));
+        draw_app(&mut app, 80, 15);
+        left_click(&mut app, 0, 0); // Outside closes only the help.
+        assert!(app.context_help.is_none());
+        assert_eq!(app.search.query(), query);
+        assert_eq!(app.footer_hints(), hints);
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::F(2));
+        assert!(app.search.view_menu_open());
+        let layout = app.settings.layout_for(LayoutScope::Library);
+        key(&mut app, KeyCode::F(1));
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::F(1));
+        assert!(app.search.view_menu_open());
+        assert_eq!(app.settings.layout_for(LayoutScope::Library), layout);
+    }
+
+    #[test]
+    fn context_help_preserves_palette_menu_quit_and_busy_owners_and_queued_work() {
+        let (_root, mut app) = interactive_app();
+        app.command_palette = Some(Default::default());
+        key(&mut app, KeyCode::F(1));
+        app.pending_task_ui
+            .push_back(Action::OpenModal(Box::new(Modal::help())));
+        app.handle(Msg::Resize);
+        draw_app(&mut app, 60, 12);
+        assert!(app.command_palette.is_some() && app.modal.is_none());
+        key(&mut app, KeyCode::Esc);
+        assert!(app.command_palette.is_some() && app.modal.is_none());
+        assert_eq!(app.pending_task_ui.len(), 1);
+        key(&mut app, KeyCode::Esc);
+        assert!(app.command_palette.is_none() && app.modal.is_some());
+        app.modal = None;
+        app.enter_page();
+        key(&mut app, KeyCode::Char('a'));
+        assert!(app.context_menu.is_some());
+        let target = app.context_menu.as_ref().unwrap().request.target.clone();
+        key(&mut app, KeyCode::F(1));
+        app.handle(Msg::Resize);
+        app.on_snapshot();
+        draw_app(&mut app, 80, 20);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.context_menu.as_ref().unwrap().request.target, target);
+        app.context_menu = None;
+        app.quit_prompt = Some(QuitPrompt::default());
+        key(&mut app, KeyCode::F(1));
+        key(&mut app, KeyCode::Right);
+        key(&mut app, KeyCode::Enter);
+        assert!(!app.quit_prompt.as_ref().unwrap().force_exit_selected);
+        app.quit_prompt = None;
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        app.modal = Some(Modal::batch_deploy_agent(
+            vec!["sample".into()],
+            "sample-agent",
+            &ctx,
+        ));
+        app.batch_running = true;
+        app.batch_modal_owned = true;
+        key(&mut app, KeyCode::F(1));
+        assert!(
+            app.context_help
+                .as_ref()
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| line.contains("saving changes"))
+        );
+        key(&mut app, KeyCode::Enter);
+        assert!(app.batch_running && app.batch_modal_owned);
+        assert!(matches!(app.modal, Some(Modal::Batch(_))));
+    }
+
+    #[test]
+    fn single_footer_keeps_safe_hitboxes_and_escape_f1_through_tiny_resizes() {
+        let (_root, mut app) = interactive_app();
+        app.modal = Some(Modal::help());
+        for width in 0..=40 {
+            for height in 0..=4 {
+                let _ = draw_app(&mut app, width, height);
+                if height > 0 && width >= 3 {
+                    let footer = footer_line(&mut app, width, height);
+                    assert!(footer.contains("Esc"), "{width}×{height}: {footer}");
+                    if width >= 6 {
+                        assert!(footer.contains("F1"), "{width}×{height}: {footer}");
+                    }
+                }
+                key(&mut app, KeyCode::F(1));
+                let _ = draw_app(&mut app, width, height);
+                key(&mut app, KeyCode::Esc);
+                assert!(matches!(app.modal, Some(Modal::Help { .. })));
+            }
+        }
+        draw_app(&mut app, 80, 15);
+        let old = app.footer_message_rect;
+        assert!(!old.is_empty());
+        app.handle(Msg::Resize);
+        assert!(app.footer_message_rect.is_empty());
+        left_click(&mut app, old.x, old.y);
+        assert!(
+            app.context_help.is_none(),
+            "resize invalidates old message hitbox"
+        );
+    }
+
+    #[test]
+    fn input_guidance_uses_the_footer_even_in_small_windows() {
+        let (_root, mut app) = interactive_app();
+        app.modal = Some(Modal::Input {
+            title: " Input ".into(),
+            input: Default::default(),
+            kind: crate::tui::modal::InputKind::Install,
+            hint: "中文输入 · local path".into(),
+            rect: Rect::default(),
+        });
+        for (w, h) in [(40, 12), (80, 24), (200, 40), (3, 4), (1, 2)] {
+            let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let buffer = terminal.backend().buffer();
+            if w >= 40 {
+                let help: String = (0..app.footer_message_rect.width)
+                    .map(|x| buffer[(x, h - 1)].symbol())
+                    .collect();
+                assert!(
+                    help.replace(' ', "").starts_with(
+                        &fit(
+                            "中文输入 · local path",
+                            app.footer_message_rect.width.saturating_sub(1) as usize
+                        )
+                        .replace(' ', "")
+                    ),
+                    "{w}×{h}: {help:?}"
+                );
+                let keys: String = (0..w).map(|x| buffer[(x, h - 1)].symbol()).collect();
+                assert!(keys.contains("Esc cancel"));
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_footer_keeps_library_primary_back_and_later_focus_controls() {
+        let (_root, mut app) = interactive_app();
+        key(&mut app, KeyCode::Enter);
+        assert!(app.footer_hints().contains(&("Enter", "preview")));
+        for width in [40, 60, 120] {
+            let footer = footer_line(&mut app, width, 24);
+            assert!(footer.contains("Enter preview"), "{width}: {footer:?}");
+            assert!(footer.contains("Esc"), "{width}: {footer:?}");
+            assert!(footer.contains("back"), "{width}: {footer:?}");
+            if width <= 60 {
+                if width == 60 {
+                    assert!(
+                        footer.contains("Ctrl+←/→ fold") || footer.contains("/ search"),
+                        "{width}: {footer:?}"
+                    );
+                }
+                assert!(!footer.contains(": commands"), "{width}: {footer:?}");
+            }
+            if width == 120 {
+                assert!(footer.contains("Ctrl+←/→ fold / unfold all"));
+                assert!(footer.contains("m multi-select"));
+                assert!(footer.contains("F1 help"));
+            }
+        }
+        key(&mut app, KeyCode::Char('m'));
+        for width in [40, 60, 120] {
+            let footer = footer_line(&mut app, width, 24);
+            assert!(footer.contains("Space select"), "{width}: {footer:?}");
+            assert!(footer.contains("Esc"), "{width}: {footer:?}");
+            if width <= 60 {
+                assert!(!footer.contains(": commands"), "{width}: {footer:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_footer_keeps_command_and_staged_picker_actions() {
+        let (_root, mut app) = interactive_app();
+        app.command_palette = Some(Default::default());
+        for width in [40, 60, 120] {
+            let footer = footer_line(&mut app, width, 24);
+            assert!(footer.contains("Enter run"), "{width}: {footer:?}");
+            if width > 40 {
+                assert!(footer.contains("↑↓ choose"), "{width}: {footer:?}");
+            }
+            assert!(footer.contains("F1"), "{width}: {footer:?}");
+            assert!(footer.contains("Esc close"), "{width}: {footer:?}");
+            if width == 120 {
+                assert!(footer.contains("type filter commands"));
+            }
+        }
+        app.command_palette = None;
+        let options = skills::ops::repair::Options::default();
+        let report = skills::ops::repair::build_plan(&app.ws, &options).unwrap();
+        app.modal = Some(Modal::HealthRepair(Box::new(
+            crate::tui::views::health::RepairDialog::preview(options, report),
+        )));
+        for width in [40, 60, 120] {
+            let footer = footer_line(&mut app, width, 24);
+            assert!(footer.contains("Space stage"), "{width}: {footer:?}");
+            assert!(footer.contains("Esc cancel"), "{width}: {footer:?}");
+            if width == 120 {
+                assert!(footer.contains("Enter resolve"));
+                assert!(footer.contains("Space stage / skip"));
+                assert!(footer.contains("Tab buttons") || footer.contains("Tab/Shift+Tab buttons"));
+            }
+        }
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        app.modal = Some(Modal::preset_members("Office", &ctx));
+        for width in [40, 60, 120] {
+            let footer = footer_line(&mut app, width, 24);
+            assert!(footer.contains("Space"), "{width}: {footer:?}");
+            assert!(footer.contains("toggle"), "{width}: {footer:?}");
+            assert!(footer.contains("Esc cancel"), "{width}: {footer:?}");
+            if width == 120 {
+                assert!(footer.contains("Space toggle"));
+                assert!(footer.contains("Ctrl+A select all results"));
+                assert!(footer.contains("Tab buttons") || footer.contains("Tab apply / cancel"));
+            }
+        }
+        key(&mut app, KeyCode::Tab);
+        for width in [40, 60, 120] {
+            let footer = footer_line(&mut app, width, 24);
+            assert!(footer.contains("Space"), "{width}: {footer:?}");
+            assert!(footer.contains("activate"), "{width}: {footer:?}");
+            assert!(footer.contains("Esc"), "{width}: {footer:?}");
+            if width > 40 {
+                assert!(footer.contains("←→ buttons"), "{width}: {footer:?}");
+            }
+            assert!(footer.contains("F1"));
+        }
+        app.modal = Some(Modal::help());
+        for width in [0, 1, 2, 3, 4, 8] {
+            let footer = footer_line(&mut app, width, 8);
+            if width < 3 {
+                assert!(footer.trim().is_empty(), "{width}: {footer:?}");
+            } else if width >= 6 {
+                assert!(
+                    footer.contains("Esc") && footer.contains("F1"),
+                    "{width}: {footer:?}"
+                );
+            } else {
+                assert_eq!(footer.trim(), "Esc", "{width}: {footer:?}");
+            }
+        }
+    }
+
     fn rendered_footer_hints(app: &mut App, width: u16, height: u16) -> Vec<(String, String)> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
@@ -5388,11 +6023,26 @@ mod context_menu_tests {
                     .map(|(key, desc)| (key.into(), desc.into())),
             );
         }
+        expected.push(("F1".into(), "help".into()));
         expected
     }
 
     fn assert_footer_exact(app: &mut App, label: &str, hints: Hints) {
         let footer = footer_line(app, 400, 40);
+        let detail = app.footer_help().detail.replace('\n', " · ");
+        let mut terminal = Terminal::new(TestBackend::new(400, 40)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        if !detail.is_empty() {
+            let message = app.footer_message_rect;
+            let rendered: String = (message.x..message.right())
+                .map(|x| terminal.backend().buffer()[(x, 39)].symbol())
+                .collect();
+            assert_eq!(
+                rendered.trim_end(),
+                fit(&detail, message.width.saturating_sub(1) as usize),
+                "{label}: focused control explanation"
+            );
+        }
         assert_eq!(
             app.footer_hints(),
             hints,
@@ -5493,6 +6143,232 @@ mod context_menu_tests {
     }
 
     #[test]
+    fn page_overlays_keep_keyboard_hints_when_mouse_crosses_background_panels() {
+        let (_root, mut app) = interactive_app();
+        for tab in Tab::ALL {
+            app.apply(Action::SwitchTab(tab));
+            app.enter_page();
+            draw_app(&mut app, 140, 40);
+            key(&mut app, KeyCode::Char('/'));
+            let overlay = app
+                .active_view_mut()
+                .preview_overlay()
+                .expect("page preview");
+            overlay.open("sample".into());
+            draw_app(&mut app, 140, 40);
+            assert!(app.active_view().overlay_open(), "{tab:?}");
+            app.handle(Msg::Paste("PASTE-MUST-NOT-REACH-BACKGROUND".into()));
+            key(&mut app, KeyCode::Left);
+            assert!(app.footer_hints().contains(&("↑↓/j/k", "files")), "{tab:?}");
+            for kind in [MouseEventKind::Moved, MouseEventKind::ScrollDown] {
+                app.handle(Msg::Mouse(MouseEvent {
+                    kind,
+                    column: 2,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                }));
+                assert_eq!(app.tab, tab);
+                assert!(app.active_view().overlay_open());
+                assert!(app.context_menu.is_none());
+            }
+            key(&mut app, KeyCode::Right);
+            assert!(app.footer_hints().contains(&("↑↓/j/k", "scroll content")));
+            key(&mut app, KeyCode::Left);
+            assert!(app.footer_hints().contains(&("↑↓/j/k", "files")));
+            // The first click on a background tab dismisses the preview only.
+            let other = app
+                .tab_rects
+                .iter()
+                .find(|(_, candidate)| *candidate != tab)
+                .unwrap()
+                .0;
+            left_click(&mut app, other.x, other.y);
+            assert_eq!(app.tab, tab);
+            assert!(!app.active_view().overlay_open());
+            assert!(app.modal.is_none());
+            assert!(!draw_app(&mut app, 140, 40).contains("PASTE-MUST-NOT"));
+        }
+    }
+
+    #[test]
+    fn outside_mouse_press_closes_top_overlay_without_background_activation() {
+        let (_root, mut app) = interactive_app();
+        app.enter_page();
+        let event = |kind| MouseEvent {
+            kind,
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            app.modal = Some(Modal::message("Content", vec!["keep open".into()]));
+            draw_app(&mut app, 140, 40);
+            let Some(Modal::Message { rect, .. }) = app.modal.as_ref() else {
+                unreachable!()
+            };
+            let inside = MouseEvent {
+                column: rect.x + 1,
+                row: rect.y + 1,
+                ..event(MouseEventKind::Down(button))
+            };
+            app.handle(Msg::Mouse(inside));
+            assert!(app.modal.is_some());
+            app.handle(Msg::Mouse(event(MouseEventKind::ScrollDown)));
+            assert!(matches!(app.modal, Some(Modal::Message { scroll: 0, .. })));
+            app.handle(Msg::Mouse(event(MouseEventKind::Down(button))));
+            assert!(app.modal.is_none());
+            assert_eq!(app.tab, Tab::Search);
+            assert!(app.context_menu.is_none());
+
+            app.modal = Some(Modal::Message {
+                kind: MessageKind::Normal,
+                title: "Child".into(),
+                lines: vec!["content".into()],
+                scroll: 0,
+                rect: Rect::default(),
+                return_to: Some(Box::new(Modal::help())),
+            });
+            draw_app(&mut app, 140, 40);
+            app.handle(Msg::Mouse(event(MouseEventKind::Down(button))));
+            assert!(matches!(app.modal, Some(Modal::Help { .. })));
+            app.modal = None;
+
+            app.search.preview_overlay().unwrap().open("sample".into());
+            draw_app(&mut app, 140, 40);
+            app.handle(Msg::Mouse(event(MouseEventKind::ScrollDown)));
+            assert!(app.active_view().overlay_open());
+            app.handle(Msg::Mouse(event(MouseEventKind::Down(button))));
+            assert!(!app.active_view().overlay_open());
+            assert_eq!(app.tab, Tab::Search);
+            assert!(app.context_menu.is_none());
+
+            let ctx = Ctx {
+                ws: &app.ws,
+                snap: &app.snap,
+                settings: &app.settings,
+            };
+            app.modal = Some(Modal::batch_presets(vec!["sample".into()], &ctx));
+            app.batch_running = true;
+            draw_app(&mut app, 140, 40);
+            app.handle(Msg::Mouse(event(MouseEventKind::Down(button))));
+            assert!(matches!(app.modal, Some(Modal::Batch(_))));
+            app.batch_running = false;
+            app.modal = None;
+        }
+    }
+
+    #[test]
+    fn mouse_commands_dispatch_once_and_completion_consumes_background_press() {
+        let (_root, mut app) = interactive_app();
+        app.enter_page();
+        key(&mut app, KeyCode::Char('/'));
+        app.handle(Msg::Paste("tag:".into()));
+        draw_app(&mut app, 140, 40);
+        assert!(app.active_view().mouse_overlay_open());
+        for kind in [MouseEventKind::ScrollDown, MouseEventKind::Moved] {
+            app.handle(Msg::Mouse(MouseEvent {
+                kind,
+                column: 2,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert!(app.active_view().mouse_overlay_open());
+            assert_eq!(app.tab, Tab::Search);
+        }
+        app.handle(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(!app.active_view().mouse_overlay_open());
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.tab, Tab::Search);
+
+        let mut palette = CommandPalette::default();
+        palette.paste("tags").unwrap();
+        app.command_palette = Some(palette);
+        draw_app(&mut app, 140, 40);
+        let rect = app.command_palette.as_ref().unwrap().mouse_row_for_test();
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let actions = app.on_mouse(click);
+        assert!(app.command_palette.is_none());
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::OpenModal(modal)] if matches!(modal.as_ref(), Modal::ConfirmWrite { title, .. } if title == "Settings · Tags")
+        ));
+        assert!(!app.on_mouse(click).iter().any(|action| {
+            matches!(action, Action::OpenModal(modal) if matches!(modal.as_ref(), Modal::ConfirmWrite { title, .. } if title == "Settings · Tags"))
+        }));
+    }
+
+    #[test]
+    fn picker_buttons_and_project_input_advertise_only_their_own_actions() {
+        let (_root, mut app) = interactive_app();
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        app.modal = Some(Modal::DeployTargets(Box::new(
+            crate::tui::deploy_picker::DeployPicker::new(vec!["sample".into()], &ctx),
+        )));
+        key(&mut app, KeyCode::Char('p'));
+        assert!(app.footer_hints().contains(&("type", "project path")));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_some(), "Esc stops editing without closing");
+        key(&mut app, KeyCode::Tab);
+        assert!(app.footer_hints().contains(&("←→", "buttons")));
+        assert!(!app.footer_hints().contains(&("p", "project path")));
+        key(&mut app, KeyCode::Right);
+        assert!(matches!(&app.modal, Some(Modal::DeployTargets(_))));
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            app.modal.is_none(),
+            "the focused Cancel button receives Enter"
+        );
+    }
+
+    #[test]
+    fn filter_escape_and_resolve_cancel_match_the_advertised_actions() {
+        let (_root, mut app) = interactive_app();
+        app.enter_page();
+        let ctx = Ctx {
+            ws: &app.ws,
+            snap: &app.snap,
+            settings: &app.settings,
+        };
+        app.modal = Some(Modal::preset_members("Office", &ctx));
+        key(&mut app, KeyCode::Char('/'));
+        app.handle(Msg::Paste("sample".into()));
+        assert!(app.footer_hints().contains(&("Esc", "clear/results")));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.footer_hints().contains(&("Esc", "clear/results")));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.footer_hints().contains(&("Enter/Space", "toggle")));
+        assert!(app.modal.is_some());
+
+        app.modal = Some(Modal::Resolve {
+            prepared: None,
+            files: vec![],
+            list: Default::default(),
+            default_take: skills::ops::update::Take::Local,
+            btn: 0,
+            btn_rects: vec![],
+            rect: Rect::default(),
+        });
+        key(&mut app, KeyCode::Right);
+        assert!(app.footer_hints().contains(&("Enter", "cancel")));
+        key(&mut app, KeyCode::Enter);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
     fn footer_shortcuts_follow_focus_across_all_pages_on_isolated_fixture() {
         let (root, mut app) = interactive_app();
         add_footer_fixture_variants(&root, &mut app);
@@ -5533,9 +6409,8 @@ mod context_menu_tests {
             &mut app,
             "search input after closing completion",
             &[
-                ("↑↓", "select"),
-                ("↓", "list"),
-                ("Enter", "list"),
+                ("Enter/↓", "results"),
+                ("↑", "tabs"),
                 ("Esc", "clear/results"),
                 ("F2", "view"),
             ],
@@ -5886,6 +6761,7 @@ mod context_menu_tests {
             lines: vec!["line".into()],
             scroll: 0,
             return_to: Some(Box::new(Modal::help())),
+            rect: Rect::default(),
         });
         assert_footer_exact(
             &mut app,
@@ -6011,10 +6887,10 @@ mod context_menu_tests {
             "preset skill picker apply button",
             &[
                 ("←→", "buttons"),
-                ("Tab/Shift+Tab", "next / previous"),
-                ("↑", "list"),
                 ("Enter/Space", "activate"),
-                ("Esc/q", "cancel"),
+                ("↑", "content"),
+                ("Tab/Shift+Tab", "next / previous"),
+                ("Esc", "back/cancel"),
             ],
         );
         key(&mut app, KeyCode::Tab);
@@ -6023,10 +6899,10 @@ mod context_menu_tests {
             "preset skill picker cancel button",
             &[
                 ("←→", "buttons"),
-                ("Tab/Shift+Tab", "next / previous"),
-                ("↑", "list"),
                 ("Enter/Space", "activate"),
-                ("Esc/q", "cancel"),
+                ("↑", "content"),
+                ("Tab/Shift+Tab", "next / previous"),
+                ("Esc", "back/cancel"),
             ],
         );
         key(&mut app, KeyCode::Up);
@@ -6129,18 +7005,18 @@ mod context_menu_tests {
     }
 
     #[test]
-    fn context_menu_owns_popup_footer_and_hides_global_page_shortcuts() {
+    fn context_menu_owns_app_footer_including_disabled_reasons() {
         let (_root, mut app) = interactive_app();
         app.apply(Action::SwitchTab(Tab::Search));
         app.enter_page();
         open_first_menu(&mut app, 140, 35);
-        let global_footer = footer_line(&mut app, 140, 35);
-        assert_eq!(
-            global_footer.trim(),
-            "",
-            "context menu must clear the global page footer"
+        assert_footer_exact(
+            &mut app,
+            "context menu",
+            &[("↑↓", "choose"), ("Enter", "run"), ("Esc", "close")],
         );
-        assert!(!global_footer.contains("Ctrl-G") && !global_footer.contains("preview"));
+        let menu_footer = footer_line(&mut app, 140, 35);
+        assert!(!menu_footer.contains("Ctrl-G") && !menu_footer.contains("preview"));
 
         draw_app(&mut app, 140, 35);
         let request = app.context_menu.as_ref().unwrap().request.clone();
@@ -6159,12 +7035,10 @@ mod context_menu_tests {
             row: disabled_rect.y,
             modifiers: KeyModifiers::NONE,
         }));
-        let disabled_footer = draw_app(&mut app, 140, 35);
-        assert!(
-            disabled_footer.contains(disabled.disabled.as_deref().unwrap()),
-            "disabled item must explain why it cannot run"
-        );
-        assert!(!disabled_footer.contains("↑↓ select"));
+        assert_help_at_bottom(&mut app, disabled.disabled.as_deref().unwrap());
+        let footer = footer_line(&mut app, 140, 35);
+        assert!(footer.contains("↑↓ choose") && footer.contains("Esc close"));
+        assert!(!footer.contains("Enter run"));
 
         let Some(enabled) = request.items.iter().find(|item| item.disabled.is_none()) else {
             panic!("fixture should expose an enabled context-menu action");
@@ -6181,9 +7055,82 @@ mod context_menu_tests {
             row: enabled_rect.y,
             modifiers: KeyModifiers::NONE,
         }));
-        let enabled_footer = draw_app(&mut app, 140, 35);
-        assert!(enabled_footer.contains("Click or shown keys run"));
-        assert!(!enabled_footer.contains("Ctrl-G help"));
+        let enabled_screen = draw_app(&mut app, 140, 35);
+        assert!(!enabled_screen.contains("Click or shown keys run"));
+        let footer = footer_line(&mut app, 140, 35);
+        assert!(footer.contains("↑↓ choose") && footer.contains("Esc close"));
+        assert!(!footer.contains("Ctrl-G help"));
+    }
+
+    #[test]
+    fn popup_footer_remains_visible_on_short_and_fullscreen_modals() {
+        let (_root, mut app) = interactive_app();
+        for (label, modal) in [
+            ("short help", Modal::help()),
+            (
+                "expanded message",
+                Modal::message("status", (0..80).map(|i| format!("line {i}")).collect()),
+            ),
+        ] {
+            app.modal = Some(modal);
+            for width in [24, 36, 60, 120] {
+                for height in [8, 35] {
+                    let footer = footer_line(&mut app, width, height);
+                    assert!(
+                        footer.contains("Esc close"),
+                        "{label} at {width}×{height} must leave an escape control visible: {footer:?}"
+                    );
+                    assert!(
+                        !footer.contains("line "),
+                        "modal overwrote footer at {width}×{height}: {footer:?}"
+                    );
+                    if width == 120 {
+                        assert!(
+                            footer.contains("↑↓ scroll") && footer.contains("PgUp/PgDn page"),
+                            "{label} at {width}×{height} should show all modal controls: {footer:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        app.modal = Some(Modal::help());
+        assert_eq!(
+            footer_line(&mut app, 3, 8),
+            "Esc",
+            "the smallest useful footer must retain the real escape key"
+        );
+    }
+
+    #[test]
+    fn repository_picker_renders_above_footer_at_short_heights() {
+        let (_root, mut app) = interactive_app();
+        for width in [24, 120] {
+            for height in [8, 12] {
+                let ctx = Ctx {
+                    ws: &app.ws,
+                    snap: &app.snap,
+                    settings: &app.settings,
+                };
+                app.modal = Some(Modal::repositories(&ctx));
+
+                let footer = footer_line(&mut app, width, height);
+                assert!(
+                    footer.contains("Esc"),
+                    "repository picker at {width}×{height} must keep escape visible: {footer:?}"
+                );
+                assert!(
+                    !footer.contains("Demo skills"),
+                    "repository picker overwrote the footer at {width}×{height}: {footer:?}"
+                );
+                if width == 120 {
+                    assert!(
+                        footer.contains("type filter") && footer.contains("Esc close"),
+                        "repository picker at {width}×{height} must expose its filter footer: {footer:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -6233,7 +7180,7 @@ mod context_menu_tests {
         key(&mut app, KeyCode::Down);
         key(&mut app, KeyCode::Down);
         let width: u16 = 60;
-        let height: u16 = 24;
+        let height: u16 = 24; // One footer row leaves the original content height.
         let body = Rect::new(0, 1, width, height.saturating_sub(2));
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
@@ -6334,17 +7281,37 @@ mod context_menu_tests {
 
         app.apply(Action::SwitchTab(Tab::Health));
         app.enter_page();
+        let mut remove = false;
+        let mut relink = false;
+        let mut no_direct_repair = false;
         for _ in 0..64 {
             assert_footer_matches_focus(&mut app, "health repair-state row");
             let hints = app.footer_hints();
             assert!(
-                hints
-                    .iter()
-                    .any(|(key, desc)| *key == "a" && *desc == "actions")
+                hints.iter().all(|(key, _)| *key != "a"),
+                "Health must not advertise a as a direct accept/adopt shortcut"
             );
-            assert!(hints.iter().all(|(key, _)| !matches!(*key, "x" | "r")));
+            assert!(
+                app.actions_available(),
+                "accept/adopt discovery should remain available through App Actions"
+            );
+            assert!(
+                footer_line(&mut app, 400, 40).contains("a actions"),
+                "the rendered App footer should expose Actions discovery"
+            );
+            remove |= hints.iter().any(|(key, _)| *key == "x");
+            relink |= hints.iter().any(|(key, _)| *key == "r");
+            no_direct_repair |= hints
+                .iter()
+                .all(|(key, _)| !matches!(*key, "x" | "r" | "U"));
             key(&mut app, KeyCode::Down);
         }
+        assert!(remove, "removable Health rows should expose x");
+        assert!(relink, "relinkable Health rows should expose r");
+        assert!(
+            no_direct_repair,
+            "rows without a direct repair must not advertise one"
+        );
     }
 
     #[test]
@@ -6448,7 +7415,8 @@ mod context_menu_tests {
         open_first_menu(&mut app, 80, 12);
         draw_app(&mut app, 80, 12);
         let area = app.context_menu.as_ref().unwrap().menu_area();
-        assert!(area.right() <= 80 && area.bottom() <= 12);
+        assert!(area.right() <= 80 && area.bottom() <= 11);
+        assert!(footer_line(&mut app, 80, 12).contains("Esc close"));
         for _ in 0..20 {
             app.handle(Msg::Mouse(MouseEvent {
                 kind: MouseEventKind::ScrollDown,
@@ -6459,7 +7427,8 @@ mod context_menu_tests {
         }
         draw_app(&mut app, 80, 12);
         let area = app.context_menu.as_ref().unwrap().menu_area();
-        assert!(area.right() <= 80 && area.bottom() <= 12);
+        assert!(area.right() <= 80 && area.bottom() <= 11);
+        assert!(footer_line(&mut app, 80, 12).contains("Esc close"));
     }
 
     #[test]
@@ -6649,7 +7618,7 @@ mod root_sync_tests {
     fn queued_manual_sync_preview_blocks_ready_automatic_sync() {
         let mut app = ready_app();
         app.settings.sync.tui_idle_window = std::time::Duration::ZERO;
-        app.modal = Some(Modal::Help { scroll: 0 });
+        app.modal = Some(Modal::help());
 
         successful_dry_run(&mut app);
 
