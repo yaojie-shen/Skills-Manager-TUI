@@ -38,7 +38,13 @@ impl ratatui::widgets::Widget for OverlayClear {
                 x = end;
             }
         }
-        ratatui::widgets::Clear.render(area, buf);
+        // This is the one permitted native Clear use: edge repair must happen first.
+        #[expect(
+            clippy::disallowed_types,
+            reason = "OverlayClear repairs wide-glyph edges before delegating to native Clear"
+        )]
+        use ratatui::widgets::Clear;
+        Clear.render(area, buf);
     }
 }
 

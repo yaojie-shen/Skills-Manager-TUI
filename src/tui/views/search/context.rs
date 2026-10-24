@@ -147,9 +147,20 @@ impl SearchView {
         {
             return None;
         }
-        let i = self.grid.hit(x, y)?;
+        let i = if self.is_library() {
+            let entry = self.grouped.hit(x, y)?;
+            let hit = match self.grouped.entries.get(entry)? {
+                super::GroupedEntry::Skill { hit, .. } => *hit,
+                super::GroupedEntry::Header { .. } => return None,
+            };
+            self.grouped.select(Some(entry));
+            hit
+        } else {
+            let hit = self.grid.hit(x, y)?;
+            self.grid.select(Some(hit));
+            hit
+        };
         self.hits.get(i)?;
-        self.grid.select(Some(i));
         self.focus = Focus::List;
         self.preview_scroll = 0;
         self.search_panel.completion.close();
@@ -225,7 +236,21 @@ impl SearchView {
                 if ctx.snap.get(key).is_none() {
                     return stale();
                 }
-                self.grid.select(Some(i));
+                if self.is_library() {
+                    let preferred = match self.grouped.selected_entry() {
+                        Some(super::GroupedEntry::Skill { group, .. }) => group.clone(),
+                        Some(super::GroupedEntry::Header { group }) => {
+                            Some(self.organized.groups[*group].id.clone())
+                        }
+                        None => None,
+                    };
+                    let Some(entry) = self.grouped.find_skill(i, preferred.as_ref()) else {
+                        return stale();
+                    };
+                    self.grouped.select(Some(entry));
+                } else {
+                    self.grid.select(Some(i));
+                }
                 if !self
                     .skill_items(ctx)
                     .iter()
@@ -282,7 +307,9 @@ mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 36)).unwrap();
         terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
-        let cell = view.grid.cell(1).unwrap();
+        let hit = view.hits.iter().position(|hit| hit.key == "beta").unwrap();
+        let entry = view.grouped.find_skill(hit, None).unwrap();
+        let cell = view.grouped.cell(entry).unwrap();
         let request = view.menu_at(cell.x + 1, cell.y, &ctx).unwrap();
         assert_eq!(request.target, Target::Skill("beta".into()));
         assert_eq!(view.selected(&ctx).unwrap().key, "beta");
@@ -297,7 +324,8 @@ mod tests {
         view.checked = BTreeSet::from(["alpha".into(), "beta".into()]);
         view.set_query("beta", &ctx);
         terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
-        let cell = view.grid.cell(0).unwrap();
+        let entry = view.grouped.find_skill(0, None).unwrap();
+        let cell = view.grouped.cell(entry).unwrap();
         let request = view.menu_at(cell.x + 1, cell.y, &ctx).unwrap();
         assert!(request.title.contains('2'));
         assert!(request.detail.contains("1 hidden"));
@@ -335,7 +363,8 @@ mod tests {
         ));
         view.set_query("gamma", &ctx);
         terminal.draw(|f| view.draw(f, f.area(), &ctx)).unwrap();
-        let cell = view.grid.cell(0).unwrap();
+        let entry = view.grouped.find_skill(0, None).unwrap();
+        let cell = view.grouped.cell(entry).unwrap();
         let request = view.menu_at(cell.x + 1, cell.y, &ctx).unwrap();
         assert_eq!(request.target, Target::Skill("gamma".into()));
         assert!(view.checked.contains("beta"));
@@ -351,7 +380,8 @@ mod tests {
             terminal
                 .draw(|f| view.draw(f, f.area(), &layout_ctx))
                 .unwrap();
-            let cell = view.grid.cell(0).unwrap();
+            let entry = view.grouped.find_skill(0, None).unwrap();
+            let cell = view.grouped.cell(entry).unwrap();
             assert_eq!(
                 view.menu_at(cell.x + 1, cell.y, &layout_ctx)
                     .unwrap()

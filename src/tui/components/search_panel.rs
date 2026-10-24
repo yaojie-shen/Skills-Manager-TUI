@@ -34,6 +34,8 @@ pub struct PanelStyle<'a> {
 #[derive(Default, Clone, Copy)]
 pub struct PanelAreas {
     pub input: Rect,
+    /// Interior of the results frame's top border, when a frame is drawn.
+    pub results_header: Rect,
     pub header: Rect,
     pub results: Rect,
     pub footer: Rect,
@@ -164,6 +166,7 @@ impl SearchPanel {
         th: &Theme,
     ) -> PanelAreas {
         let mut footer = Rect::default();
+        let mut results_header = Rect::default();
         let (input, content) = match style.layout {
             PanelLayout::Separate => {
                 // In a very short panel preserve a result row instead of spending all rows on borders.
@@ -188,6 +191,8 @@ impl SearchPanel {
                     top
                 };
                 let content = if bottom.height >= 3 {
+                    results_header =
+                        Rect::new(bottom.x + 1, bottom.y, bottom.width.saturating_sub(2), 1);
                     let block = th.block(style.results_title, style.results_active);
                     footer = Rect::new(
                         bottom.x + 1,
@@ -275,6 +280,7 @@ impl SearchPanel {
         let hh = style.header_height.min(content.height.saturating_sub(1));
         self.areas = PanelAreas {
             input,
+            results_header,
             footer,
             header: Rect {
                 height: hh,

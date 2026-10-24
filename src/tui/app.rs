@@ -50,6 +50,10 @@ pub enum Tab {
 #[path = "verification_tests.rs"]
 mod verification_tests;
 
+#[cfg(test)]
+#[path = "library_view_tests.rs"]
+mod library_view_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppFocus {
     Tabs,
@@ -1777,6 +1781,21 @@ impl App {
             }
             return vec![];
         }
+        // A Library view menu owns pointer events just as it owns keyboard
+        // events. Outside clicks dismiss it without activating a tab or sync.
+        if self.tab == Tab::Search
+            && self.search.view_menu_open()
+            && self.modal.is_none()
+            && self.context_menu.is_none()
+            && self.command_palette.is_none()
+        {
+            let ctx = Ctx {
+                ws: &self.ws,
+                snap: &self.snap,
+                settings: &self.settings,
+            };
+            return self.search.handle_mouse(m, &ctx);
+        }
         if m.kind == MouseEventKind::Down(MouseButton::Left)
             && self.modal.is_none()
             && self.context_menu.is_none()
@@ -2713,7 +2732,7 @@ impl App {
                 status = if status.is_empty() {
                     format!(" {content} ")
                 } else {
-                    format!(" {content} · {}", status.trim())
+                    format!(" {} · {content} ", status.trim())
                 };
             }
         }
@@ -4528,6 +4547,11 @@ mod escape_hierarchy_tests {
                 [Action::Rescan, Action::Toast(_)]
             ));
             for number in 1..=12 {
+                // F2 now opens the Library view menu; its containment and
+                // focus restoration are exercised in library_view_tests.
+                if number == 2 {
+                    continue;
+                }
                 assert!(
                     app.on_key(KeyEvent::new(KeyCode::F(number), KeyModifiers::NONE))
                         .is_empty()
@@ -4785,6 +4809,11 @@ mod escape_hierarchy_tests {
         assert!(app.search.input_focused());
         key(&mut app, KeyCode::Down);
         assert!(!app.search.input_focused());
+        key(&mut app, KeyCode::Up);
+        assert!(
+            !app.search.input_focused(),
+            "the group header precedes its first skill"
+        );
         key(&mut app, KeyCode::Up);
         assert!(app.search.input_focused());
         key(&mut app, KeyCode::Up);
@@ -5508,6 +5537,7 @@ mod context_menu_tests {
                 ("↓", "list"),
                 ("Enter", "list"),
                 ("Esc", "clear/results"),
+                ("F2", "view"),
             ],
         );
         key(&mut app, KeyCode::Esc);
@@ -5515,6 +5545,7 @@ mod context_menu_tests {
         key(&mut app, KeyCode::Down);
         assert_footer_matches_focus(&mut app, "search list after input");
         key(&mut app, KeyCode::Home);
+        key(&mut app, KeyCode::Down); // first skill below the first group header
         key(&mut app, KeyCode::Enter);
         let preview_footer = footer_line(&mut app, 400, 40);
         assert!(
