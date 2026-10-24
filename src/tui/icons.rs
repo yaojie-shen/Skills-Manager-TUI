@@ -1,5 +1,13 @@
-//! Optional Nerd Font source decorations; text mode needs no patched font.
+//! Optional Nerd Font decorations; text mode needs no patched font.
+//! Resolve decorations before measuring, fitting or assigning mouse hitboxes.
 use skills::{config::Icons, meta::Source};
+
+pub fn decoration<'a>(mode: Icons, nerd: &'a str, text: &'a str) -> &'a str {
+    match mode {
+        Icons::Nerd => nerd,
+        Icons::Text => text,
+    }
+}
 
 fn github(url: &str) -> bool {
     let host = if let Some((_, rest)) = url.split_once("://") {
@@ -107,8 +115,13 @@ pub fn source(mode: Icons, source: &Source) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn has_pua(text: &str) -> bool {
+        text.chars()
+            .any(|c| matches!(c as u32, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd))
+    }
 
     #[test]
     fn github_icons_require_the_actual_host() {

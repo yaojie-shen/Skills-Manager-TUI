@@ -1221,7 +1221,7 @@ fn collapse_expand_all_preserves_filter_counts_checks_and_selection_anchor() {
     let compact_header = render(&mut view, &ctx, 60, 20);
     assert!(compact_header.contains("▸ All"));
     assert!(compact_header.contains("▾ All"));
-    assert!(compact_header.contains("View F2"));
+    assert!(compact_header.contains(" View "));
     assert!(!compact_header.contains("Collapse all"));
     assert!(!compact_header.contains("Expand all"));
 
@@ -1299,6 +1299,98 @@ fn collapse_expand_all_preserves_filter_counts_checks_and_selection_anchor() {
             "outer width {width} expand control must remain clickable"
         );
     }
+}
+
+fn completion_captures_header_control(control: ViewControl) {
+    let (_root, ws) = workspace("organization-completion-header-control");
+    let snap = ws.scan().unwrap();
+    let settings = RuntimeSettings::new(&ws.config);
+    let ctx = Ctx {
+        ws: &ws,
+        snap: &snap,
+        settings: &settings,
+    };
+    let mut view = SearchView::default();
+    view.refresh(&ctx);
+    view.organization.grouping = GroupMode::Tag;
+    view.set_query("tag:", &ctx);
+    if control == ViewControl::ExpandAll {
+        view.set_all_groups_collapsed(true, &ctx);
+    }
+    view.focus_input();
+    view.update_completion(&ctx);
+    assert!(view.search_panel.completion.active());
+    assert!(view.control_enabled(control));
+
+    let buffer = draw_buffer(&mut view, &ctx, 120, 30);
+    let rect = view
+        .view_buttons
+        .iter()
+        .find(|(_, candidate)| *candidate == control)
+        .unwrap()
+        .0;
+    let label = match control {
+        ViewControl::View => "View",
+        ViewControl::CollapseAll => "Collapse all",
+        ViewControl::ExpandAll => "Expand all",
+    };
+    assert!(buffer_row(&buffer, rect, rect.y).contains(label));
+    assert!(rect.bottom() <= view.list_rect.y);
+    let collapsed = view.collapsed.clone();
+    let query = view.query().to_owned();
+    let selected = view.grouped.selected_entry().cloned();
+
+    assert!(
+        view.handle_mouse(click(rect.x + 1, rect.y), &ctx)
+            .is_empty()
+    );
+    assert!(!view.search_panel.completion.active());
+    assert!(
+        !view.view_menu.is_open(),
+        "first press must only close completion"
+    );
+    assert_eq!(
+        view.collapsed, collapsed,
+        "first press must not fold groups"
+    );
+    assert_eq!(view.query(), query);
+    assert_eq!(view.focus, Focus::Input);
+    assert_eq!(view.grouped.selected_entry().cloned(), selected);
+    assert_eq!(view.organization.grouping, GroupMode::Tag);
+
+    draw_buffer(&mut view, &ctx, 120, 30);
+    assert!(
+        view.handle_mouse(click(rect.x + 1, rect.y), &ctx)
+            .is_empty()
+    );
+    match control {
+        ViewControl::View => {
+            assert!(view.view_menu.is_open());
+            assert_eq!(view.collapsed, collapsed);
+        }
+        ViewControl::CollapseAll | ViewControl::ExpandAll => {
+            assert!(!view.view_menu.is_open());
+            assert_ne!(view.collapsed, collapsed);
+            assert!(view.organized.groups.iter().all(|group| {
+                view.collapsed.contains(&group.id) == (control == ViewControl::CollapseAll)
+            }));
+        }
+    }
+}
+
+#[test]
+fn completion_captures_drawn_view_header_control_before_activation() {
+    completion_captures_header_control(ViewControl::View);
+}
+
+#[test]
+fn completion_captures_drawn_collapse_header_control_before_activation() {
+    completion_captures_header_control(ViewControl::CollapseAll);
+}
+
+#[test]
+fn completion_captures_drawn_expand_header_control_before_activation() {
+    completion_captures_header_control(ViewControl::ExpandAll);
 }
 
 #[test]

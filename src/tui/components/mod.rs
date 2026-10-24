@@ -1,3 +1,4 @@
+//! Shortcut hints belong only to the app footer; components render no key legends.
 //! Shared semantic presentation and rendering; pages only supply data and layout.
 
 //! Shared semantic presentation. Pages pass content, selection and search state;

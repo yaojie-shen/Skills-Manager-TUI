@@ -1,5 +1,8 @@
+//! Command selection; focused command descriptions belong to the app footer.
 use crate::tui::app::{Ctx, Hints};
-use crate::tui::widgets::{Input, ListNav, OverlayClear, centered, fit};
+use crate::tui::widgets::{
+    Input, ListNav, PopupClass, PopupSurface, fit, popup_size, popup_too_small,
+};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
@@ -131,12 +134,25 @@ impl Default for CommandPalette {
 
 impl CommandPalette {
     pub fn hints(&self) -> Hints {
+        if self.shown.is_empty() {
+            return &[("type", "filter commands"), ("Esc", "close")];
+        }
         &[
             ("type", "filter commands"),
             ("↑↓", "choose"),
             ("Enter", "run"),
             ("Esc", "close"),
         ]
+    }
+
+    pub fn footer_help(&self) -> crate::tui::footer::Help<'_> {
+        let detail = self
+            .list
+            .selected()
+            .and_then(|index| self.shown.get(index))
+            .map(|index| ENTRIES[*index].detail)
+            .unwrap_or("");
+        crate::tui::footer::Help::new(self.hints()).detail(detail)
     }
 
     fn refilter(&mut self) {
@@ -200,22 +216,23 @@ impl CommandPalette {
     }
 
     pub fn mouse(&mut self, event: MouseEvent) -> Event {
+        match crate::tui::widgets::popup_mouse(event, self.rect) {
+            crate::tui::widgets::PopupMouse::OutsidePress => return Event::Close,
+            crate::tui::widgets::PopupMouse::Inside => {}
+            _ => return Event::Stay,
+        }
         let point = (event.column, event.row).into();
         match event.kind {
-            MouseEventKind::Down(MouseButton::Left) if !self.rect.contains(point) => Event::Close,
             MouseEventKind::Down(MouseButton::Left) if self.input_rect.contains(point) => {
                 self.input.click(event.column);
                 Event::Stay
             }
             MouseEventKind::Down(MouseButton::Left) if self.list.rows.contains(point) => {
-                let Some((_, double)) = self.list.click(event.row, self.shown.len()) else {
+                let Some(row) = self.list.row_at(event.row, self.shown.len()) else {
                     return Event::Stay;
                 };
-                if double {
-                    self.selected().map_or(Event::Stay, Event::Execute)
-                } else {
-                    Event::Stay
-                }
+                self.list.select(Some(row));
+                self.selected().map_or(Event::Stay, Event::Execute)
             }
             MouseEventKind::ScrollDown => {
                 self.list.move_by(3, self.shown.len());
@@ -229,20 +246,24 @@ impl CommandPalette {
         }
     }
 
+    #[cfg(test)]
+    pub fn mouse_row_for_test(&self) -> Rect {
+        self.list.rows
+    }
+
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         self.input_rect = Rect::default();
         self.list.rows = Rect::default();
         let height = (ENTRIES.len() as u16 + 6).clamp(8, 18);
-        self.rect = centered(area, 72, height);
-        f.render_widget(OverlayClear, self.rect);
-        let block = ctx
-            .settings
-            .theme
-            .block(" Commands · type to filter ", true);
+        self.input.clear_area();
+        let size = popup_size(area, PopupClass::Choice, height, (4, 3));
+        self.rect = size.outer;
+        f.render_widget(PopupSurface, self.rect);
+        let block = ctx.settings.theme.block(" Commands ", true);
         let inner = block.inner(self.rect);
         f.render_widget(block, self.rect);
-        if inner.width < 20 || inner.height < 4 {
-            f.render_widget(Paragraph::new("Enlarge terminal · Esc close"), inner);
+        if !size.usable {
+            popup_too_small(f, size, &ctx.settings.theme);
             return;
         }
         self.input_rect = Rect::new(inner.x + 1, inner.y, inner.width.saturating_sub(2), 1);
@@ -257,7 +278,7 @@ impl CommandPalette {
             inner.x + 1,
             inner.y + 2,
             inner.width.saturating_sub(2),
-            inner.height.saturating_sub(4),
+            inner.height.saturating_sub(2),
         );
         self.list.item_height = 1;
         self.list.clamp(self.shown.len());
@@ -276,36 +297,12 @@ impl CommandPalette {
             self.list.rows,
             &mut self.list.state,
         );
-        let detail = self
-            .list
-            .selected()
-            .and_then(|index| self.shown.get(index))
-            .map(|index| ENTRIES[*index].detail)
-            .unwrap_or("");
-        f.render_widget(
-            Paragraph::new(fit(detail, inner.width.saturating_sub(2) as usize))
-                .style(ctx.settings.theme.description()),
-            Rect::new(
-                inner.x + 1,
-                inner.bottom() - 2,
-                inner.width.saturating_sub(2),
-                1,
-            ),
-        );
-        f.render_widget(
-            Paragraph::new(if self.shown.is_empty() {
-                "No matching commands"
-            } else {
-                "Enter runs · Esc closes"
-            })
-            .style(ctx.settings.theme.dim()),
-            Rect::new(
-                inner.x + 1,
-                inner.bottom() - 1,
-                inner.width.saturating_sub(2),
-                1,
-            ),
-        );
+        if self.shown.is_empty() {
+            f.render_widget(
+                Paragraph::new("No matching commands").style(ctx.settings.theme.dim()),
+                self.list.rows,
+            );
+        }
     }
 }
 
@@ -313,6 +310,33 @@ impl CommandPalette {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn mouse_command_executes_on_first_press_and_outside_wheel_is_inert() {
+        let mut palette = CommandPalette {
+            rect: Rect::new(10, 5, 40, 15),
+            ..Default::default()
+        };
+        palette.list.rows = Rect::new(11, 8, 38, 10);
+        let mut event = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 12,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(palette.mouse(event), Event::Stay);
+        event.kind = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(palette.mouse(event), Event::Execute(Command::Rescan));
+        event.column = 0;
+        event.kind = MouseEventKind::ScrollDown;
+        let selected = palette.list.selected();
+        assert_eq!(palette.mouse(event), Event::Stay);
+        assert_eq!(palette.list.selected(), selected);
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            event.kind = MouseEventKind::Down(button);
+            assert_eq!(palette.mouse(event), Event::Close);
+        }
+    }
 
     #[test]
     fn empty_results_paste_and_small_terminal_geometry() {

@@ -1,6 +1,8 @@
 //! Context menu presentation and input. Commands are dispatched by the owning view.
+//! Shortcuts and selected action/disabled explanations belong to the app footer.
+use crate::tui::app::Hints;
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{OverlayClear as Clear, fit, width};
+use crate::tui::widgets::{PopupSurface, fit, width};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{Frame, layout::Rect, style::Style, text::Line, widgets::Paragraph};
 
@@ -101,7 +103,6 @@ pub struct ContextMenu {
     offset: usize,
     area: Rect,
     hits: Vec<(Rect, usize)>,
-    keyboard: bool,
 }
 impl ContextMenu {
     pub fn new(request: Request, x: u16, y: u16) -> Self {
@@ -112,15 +113,29 @@ impl ContextMenu {
             offset: 0,
             area: Rect::default(),
             hits: vec![],
-            keyboard: false,
         }
     }
     pub fn keyboard(request: Request) -> Self {
-        Self {
-            keyboard: true,
-            ..Self::new(request, u16::MAX, u16::MAX)
+        Self::new(request, u16::MAX, u16::MAX)
+    }
+    pub fn hints(&self) -> Hints {
+        if self
+            .request
+            .items
+            .get(self.selected)
+            .is_none_or(|item| item.disabled.is_some())
+        {
+            &[("↑↓", "choose"), ("Esc", "close")]
+        } else {
+            &[("↑↓", "choose"), ("Enter", "run"), ("Esc", "close")]
         }
     }
+    pub fn footer_help(&self) -> crate::tui::footer::Help<'_> {
+        let item = self.request.items.get(self.selected);
+        crate::tui::footer::Help::new(self.hints())
+            .detail(item.map_or("", |item| item.disabled.as_deref().unwrap_or(&item.label)))
+    }
+
     fn activate(&self) -> MenuEvent {
         self.request
             .items
@@ -153,6 +168,11 @@ impl ContextMenu {
         MenuEvent::Stay
     }
     pub fn mouse(&mut self, event: MouseEvent) -> MenuEvent {
+        match crate::tui::widgets::popup_mouse(event, self.area) {
+            crate::tui::widgets::PopupMouse::OutsidePress => return MenuEvent::Close,
+            crate::tui::widgets::PopupMouse::Inside => {}
+            _ => return MenuEvent::Stay,
+        }
         let point = (event.column, event.row).into();
         match event.kind {
             MouseEventKind::Down(_) if !self.area.contains(point) => return MenuEvent::Close,
@@ -171,53 +191,19 @@ impl ContextMenu {
         MenuEvent::Stay
     }
     pub fn draw(&mut self, f: &mut Frame, bounds: Rect, th: &Theme) {
-        const MOUSE_FOOTER: &str = "Click or shown keys run · click outside closes";
-        const KEYBOARD_FOOTER: &str = "↑↓ choose · Enter run · shown keys work here · Esc close";
         self.hits.clear();
-        let has_disabled = self
-            .request
-            .items
-            .iter()
-            .any(|item| item.disabled.is_some());
-        let has_footer = self.keyboard || has_disabled;
-        let footer_width = if has_footer {
-            self.request
-                .items
-                .iter()
-                .filter_map(|item| item.disabled.as_deref())
-                .map(width)
-                .chain([width(if self.keyboard {
-                    KEYBOARD_FOOTER
-                } else {
-                    MOUSE_FOOTER
-                })])
-                .max()
-                .unwrap_or(0)
-                + 2
-        } else {
-            width(if self.keyboard {
-                KEYBOARD_FOOTER
-            } else {
-                MOUSE_FOOTER
-            }) + 2
-        };
         let wanted = self
             .request
             .items
             .iter()
-            .map(|i| {
-                (width(&i.label) + shortcut_label(i.shortcut).map_or(0, |key| width(&key) + 2) + 4)
-                    .max(i.disabled.as_deref().map_or(0, |reason| width(reason) + 4))
-            })
+            .map(|i| width(&i.label) + 4)
             .chain([
                 width(&self.request.title) + 4,
                 width(&self.request.detail) + 4,
-                footer_width,
             ])
             .max()
             .unwrap_or(36)
-            .max(36)
-            .clamp(24, 72) as u16;
+            .clamp(36, 72) as u16;
         let w = wanted.min(bounds.width);
         let mut lines = Vec::new();
         for (index, item) in self.request.items.iter().enumerate() {
@@ -227,8 +213,7 @@ impl ContextMenu {
             lines.push(Some(index));
         }
         let has_detail = !self.request.detail.is_empty();
-        let h = (lines.len() as u16 + 2 + u16::from(has_detail) + 2 * u16::from(has_footer))
-            .min(bounds.height);
+        let h = (lines.len() as u16 + 2 + u16::from(has_detail)).min(bounds.height);
 
         self.area = if self.anchor == (u16::MAX, u16::MAX) {
             crate::tui::widgets::centered(bounds, w, h)
@@ -246,7 +231,7 @@ impl ContextMenu {
                 h,
             )
         };
-        f.render_widget(Clear, self.area);
+        f.render_widget(PopupSurface, self.area);
         let block = th.block(fit(&self.request.title, w.saturating_sub(4) as usize), true);
         let inner = block.inner(self.area);
         f.render_widget(block, self.area);
@@ -254,12 +239,7 @@ impl ContextMenu {
             return;
         }
         let show_detail = has_detail && inner.height >= 3;
-        let footer = has_footer && inner.height >= 2;
-        let footer_gap = footer && inner.height > u16::from(show_detail) + 2;
-        let rows = inner
-            .height
-            .saturating_sub(u16::from(show_detail) + u16::from(footer) + u16::from(footer_gap))
-            as usize;
+        let rows = inner.height.saturating_sub(u16::from(show_detail)) as usize;
         if show_detail {
             f.render_widget(
                 Paragraph::new(fit(&self.request.detail, inner.width as usize)).style(th.dim()),
@@ -299,17 +279,9 @@ impl ContextMenu {
             };
             let item = &self.request.items[index];
             let marker = if index == self.selected { "›" } else { " " };
-            let shortcut = shortcut_label(item.shortcut);
-            let shortcut_width = shortcut.as_deref().map_or(0, width);
-            let budget = (inner.width as usize).saturating_sub(shortcut_width + 4);
+            let budget = (inner.width as usize).saturating_sub(2);
             let label = fit(&item.label, budget);
-            let gap = (inner.width as usize)
-                .saturating_sub(width(marker) + 1 + width(&label) + shortcut_width);
-            let text = format!(
-                "{marker} {label}{}{}",
-                " ".repeat(gap),
-                shortcut.unwrap_or_default()
-            );
+            let text = format!("{marker} {label}");
             let mut style = Style::default();
             if item.danger {
                 style = style.fg(th.err);
@@ -329,27 +301,21 @@ impl ContextMenu {
             );
             self.hits.push((rect, index));
         }
-        if footer {
-            let reason = self
-                .request
-                .items
-                .get(self.selected)
-                .and_then(|i| i.disabled.as_deref())
-                .unwrap_or(if self.keyboard {
-                    KEYBOARD_FOOTER
-                } else {
-                    MOUSE_FOOTER
-                });
-            let message = if self.offset > 0 || self.offset + rows < lines.len() {
-                format!("↕ {reason}")
-            } else {
-                reason.into()
-            };
-            f.render_widget(
-                Paragraph::new(fit(&message, inner.width as usize))
-                    .style(Style::default().fg(th.placeholder)),
-                Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
-            );
+        // Keep overflow discoverable without a second, local help row.
+        for (visible, y, marker) in [
+            (self.offset > 0, self.area.y, "↑"),
+            (
+                self.offset + rows < lines.len(),
+                self.area.bottom() - 1,
+                "↓",
+            ),
+        ] {
+            if visible {
+                f.render_widget(
+                    Paragraph::new(marker).style(th.dim()),
+                    Rect::new(inner.right() - 1, y, 1, 1),
+                );
+            }
         }
     }
 
@@ -363,14 +329,6 @@ impl ContextMenu {
     #[cfg(test)]
     pub(crate) fn menu_area(&self) -> Rect {
         self.area
-    }
-}
-
-fn shortcut_label(key: KeyCode) -> Option<String> {
-    match key {
-        KeyCode::Char(character) => Some(character.to_string()),
-        KeyCode::Enter => Some("Enter".into()),
-        _ => None,
     }
 }
 
@@ -422,8 +380,10 @@ mod tests {
             draw(&mut m, w, h);
             assert!(m.area.right() <= w && m.area.bottom() <= h);
         }
+        m.selected = 0;
+        assert!(draw(&mut m, 30, 5).contains('↓'));
         m.selected = 3;
-        draw(&mut m, 30, 5);
+        assert!(draw(&mut m, 30, 5).contains('↑'));
         assert!(m.offset > 0);
         assert!(m.hits.iter().any(|(_, i)| *i == 3));
     }
@@ -447,14 +407,18 @@ mod tests {
             MenuEvent::Stay
         ));
         let rendered = draw(&mut m, 80, 24);
-        assert!(rendered.contains("Click or shown keys run"));
+        assert!(!rendered.contains("Click or shown keys run"));
         assert!(!rendered.contains("↑↓ choose"));
         assert!(!rendered.contains("shortcut run"));
+        assert!(!rendered.contains(" u "));
+        assert!(!rendered.contains(" U "));
         assert!(matches!(
             m.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
             MenuEvent::Stay
         ));
-        assert!(draw(&mut m, 80, 24).contains("Unavailable now"));
+        assert!(!draw(&mut m, 80, 24).contains("Unavailable now"));
+        assert_eq!(m.footer_help().detail, "Unavailable now");
+        assert!(!m.hints().iter().any(|(key, _)| *key == "Enter"));
         for _ in 0..10 {
             m.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
@@ -500,11 +464,13 @@ mod tests {
             MenuEvent::Stay
         ));
         assert_eq!(m.selected, 3);
-        assert!(draw(&mut m, 80, 24).contains("Unavailable now"));
+        assert!(!draw(&mut m, 80, 24).contains("Unavailable now"));
+        assert_eq!(m.footer_help().detail, "Unavailable now");
+        assert!(!m.hints().iter().any(|(key, _)| *key == "Enter"));
     }
 
     #[test]
-    fn context_menu_without_disabled_items_has_no_footer_row() {
+    fn context_menu_without_disabled_items_has_no_local_footer() {
         let mut m = menu();
         m.request.items.pop();
         let rendered = draw(&mut m, 80, 24);
@@ -513,14 +479,17 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_menu_is_centered_and_shows_keys() {
+    fn keyboard_menu_is_centered_and_exposes_keys_only_as_hints() {
         let mut m = ContextMenu::keyboard(menu().request);
         let rendered = draw(&mut m, 80, 24);
         assert_eq!(m.area.x, (80 - m.area.width) / 2);
-        assert!(rendered.contains("↑↓ choose · Enter run · shown keys work here · Esc close"));
+        assert_eq!(
+            m.hints(),
+            &[("↑↓", "choose"), ("Enter", "run"), ("Esc", "close")]
+        );
+        assert!(!rendered.contains("↑↓ choose"));
         assert!(rendered.contains("View"));
-        assert!(rendered.contains("Enter"));
         assert!(rendered.contains("Check"));
-        assert!(rendered.contains("u"));
+        assert!(!rendered.contains("shown keys"));
     }
 }

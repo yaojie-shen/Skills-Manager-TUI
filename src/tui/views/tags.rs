@@ -49,6 +49,12 @@ pub struct TagsView {
 impl TagsView {
     /// Route pasted text to the same control that currently owns keyboard input.
     pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
+        if let Some(prompt) = self.prompt.as_mut() {
+            return prompt.paste(text);
+        }
+        if self.overlay_open() {
+            return vec![];
+        }
         if self.filter.editing {
             let actions = self.filter.paste(text);
             self.refilter(ctx);
@@ -59,10 +65,7 @@ impl TagsView {
         {
             return view.paste(text, ctx);
         }
-        let Some(prompt) = self.prompt.as_mut() else {
-            return vec![];
-        };
-        prompt.paste(text)
+        vec![]
     }
 
     pub fn input_focused(&self) -> bool {
@@ -370,9 +373,14 @@ impl TagsView {
 
 impl View for TagsView {
     fn overlay_open(&self) -> bool {
+        self.prompt.is_some() || self.skill_search.as_ref().is_some_and(View::overlay_open)
+    }
+    fn mouse_overlay_open(&self) -> bool {
         self.prompt.is_some()
-            || (self.focus == SplitFocus::Members
-                && self.skill_search.as_ref().is_some_and(View::overlay_open))
+            || self
+                .skill_search
+                .as_ref()
+                .is_some_and(View::mouse_overlay_open)
     }
     fn preview_overlay(&mut self) -> Option<&mut super::preview::Overlay> {
         self.skill_search.as_mut().and_then(View::preview_overlay)
@@ -589,6 +597,13 @@ impl View for TagsView {
         if self.prompt.is_some() {
             return self.prompt_key(k);
         }
+        if let Some(view) = self
+            .skill_search
+            .as_mut()
+            .filter(|view| view.overlay_open())
+        {
+            return view.handle_key(k, ctx);
+        }
         if self.focus != SplitFocus::Members
             && self.filter.editing
             && k.code == KeyCode::Right
@@ -720,6 +735,13 @@ impl View for TagsView {
         if self.prompt.is_some() {
             return self.prompt_mouse(m);
         }
+        if let Some(view) = self
+            .skill_search
+            .as_mut()
+            .filter(|view| view.mouse_overlay_open())
+        {
+            return view.handle_mouse(m, ctx);
+        }
         self.ensure_skill_search(ctx);
         let at = (m.column, m.row).into();
         let pressing = m.kind == MouseEventKind::Down(MouseButton::Left);
@@ -796,6 +818,16 @@ impl View for TagsView {
     }
 
     fn hints(&self) -> Hints {
+        if let Some(prompt) = &self.prompt {
+            return prompt.hints();
+        }
+        if let Some(view) = self
+            .skill_search
+            .as_ref()
+            .filter(|view| view.overlay_open())
+        {
+            return view.hints();
+        }
         if self.filter.editing {
             return &[("Enter/↓", "tags"), ("Esc", "clear filter")];
         }
@@ -804,14 +836,8 @@ impl View for TagsView {
         {
             return view.hints();
         }
-        match self.prompt.as_ref().map(Prompt::kind) {
-            Some(Ask::Merge) => &[("↑/↓", "target"), ("Enter", "merge"), ("Esc", "cancel")],
-            Some(Ask::Color) => &[
-                ("type", "a name or #rrggbb"),
-                ("Enter", "apply"),
-                ("Esc", "cancel"),
-            ],
-            None if self.focus == SplitFocus::Members => &[
+        match self.focus {
+            SplitFocus::Members => &[
                 ("/", "filter skills"),
                 ("Enter", "preview"),
                 ("a", "actions"),
@@ -820,7 +846,7 @@ impl View for TagsView {
                 ("m", "multi-select"),
                 ("←/Esc", "tags"),
             ],
-            None => &[
+            _ => &[
                 ("↑↓/j/k", "select"),
                 ("a", "actions"),
                 ("c", "create"),

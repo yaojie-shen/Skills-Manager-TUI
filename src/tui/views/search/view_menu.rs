@@ -18,7 +18,7 @@ use ratatui::widgets::Paragraph;
 use skills::config::{Icons, UiLayout};
 
 use crate::tui::theme::Theme;
-use crate::tui::widgets::{OverlayClear, fit, width};
+use crate::tui::widgets::{PopupSurface, fit, width};
 
 use super::organization::{GroupMode, GroupOrder, SortMode};
 
@@ -290,6 +290,14 @@ impl ViewMenu {
     }
 
     pub(super) fn mouse(&mut self, event: MouseEvent, rows: &[MenuRow]) -> Event {
+        match crate::tui::widgets::popup_mouse(event, self.rect) {
+            crate::tui::widgets::PopupMouse::OutsidePress => {
+                self.close();
+                return Event::Close;
+            }
+            crate::tui::widgets::PopupMouse::Inside => {}
+            _ => return Event::Stay,
+        }
         let point = (event.column, event.row).into();
         let previous = self.selected;
         if matches!(event.kind, MouseEventKind::ScrollUp) {
@@ -373,7 +381,7 @@ impl ViewMenu {
         );
         let block = theme.block(" View ", true);
         let inner = block.inner(self.rect);
-        frame.render_widget(OverlayClear, self.rect);
+        frame.render_widget(PopupSurface, self.rect);
         frame.render_widget(block, self.rect);
 
         self.tab_rects.clear();

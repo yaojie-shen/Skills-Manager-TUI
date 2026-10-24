@@ -500,7 +500,6 @@ pub struct WriteOutcome {
     pub prompt: Option<Box<super::modal::Modal>>,
     pub then: Vec<super::app::Action>,
     pub error_prefix: Option<String>,
-    pub undo_hint: bool,
 }
 
 pub struct SpawnWriteError {
@@ -514,7 +513,6 @@ pub struct WriteWork {
     pub prompt: Option<Box<super::modal::Modal>>,
     pub then: Vec<super::app::Action>,
     pub error_prefix: Option<String>,
-    pub undo_hint: bool,
 }
 
 pub fn spawn_write(
@@ -529,7 +527,6 @@ pub fn spawn_write(
         prompt,
         then,
         error_prefix,
-        undo_hint,
     } = work;
     let prompt = Arc::new(std::sync::Mutex::new(prompt));
     let worker_prompt = Arc::clone(&prompt);
@@ -548,7 +545,6 @@ pub fn spawn_write(
                     prompt,
                     then,
                     error_prefix,
-                    undo_hint,
                 })),
             ));
         }) {

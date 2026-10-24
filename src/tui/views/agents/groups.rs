@@ -137,6 +137,7 @@ pub(super) struct QuickGroups {
     selected: usize,
     pub(super) popup: Option<Vec<GroupKey>>,
     popup_hits: Vec<(Rect, usize)>,
+    popup_rect: Rect,
     popup_cursor: usize,
 }
 
@@ -543,6 +544,14 @@ impl AgentsView {
     pub(super) fn group_mouse(&mut self, m: MouseEvent, ctx: &Ctx) -> Option<Vec<Action>> {
         let at = (m.column, m.row).into();
         if self.quick.popup.is_some() {
+            match crate::tui::widgets::popup_mouse(m, self.quick.popup_rect) {
+                crate::tui::widgets::PopupMouse::OutsidePress => {
+                    self.quick.popup = None;
+                    return Some(vec![]);
+                }
+                crate::tui::widgets::PopupMouse::Inside => {}
+                _ => return Some(vec![]),
+            }
             if let Some(delta) = wheel(&m, ctx) {
                 let n = self.quick.popup.as_ref().unwrap().len();
                 self.quick.popup_cursor = (self.quick.popup_cursor as i32 + delta)
@@ -616,11 +625,9 @@ impl AgentsView {
             w,
             h,
         );
-        f.render_widget(crate::tui::widgets::OverlayClear, rect);
-        let block = ctx
-            .settings
-            .theme
-            .block(" Group deployment · Enter toggle · Esc back ", true);
+        f.render_widget(crate::tui::widgets::PopupSurface, rect);
+        self.quick.popup_rect = rect;
+        let block = ctx.settings.theme.block(" Group deployment ", true);
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         let count = inner.height as usize;
@@ -780,6 +787,35 @@ mod interaction_tests {
         assert!(view.handle_mouse_current(mouse, &ctx).is_empty());
         assert_eq!(view.quick.popup.as_ref(), Some(&hidden));
         assert!(!target.join("one").exists());
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            view.quick.popup = Some(hidden.clone());
+            term.draw(|f| view.draw_group_popup(f, f.area(), &ctx))
+                .unwrap();
+            let outside = MouseEvent {
+                column: 0,
+                row: 0,
+                kind: MouseEventKind::ScrollDown,
+                ..mouse
+            };
+            let cursor = view.quick.popup_cursor;
+            assert!(view.group_mouse(outside, &ctx).unwrap().is_empty());
+            assert_eq!(view.quick.popup_cursor, cursor);
+            assert!(view.quick.popup.is_some());
+            assert!(
+                view.group_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(button),
+                        ..outside
+                    },
+                    &ctx
+                )
+                .unwrap()
+                .is_empty()
+            );
+            assert!(view.quick.popup.is_none());
+            assert!(!target.join("one").exists());
+        }
+        view.quick.popup = Some(hidden.clone());
         for (w, h) in [(60, 24), (8, 4), (1, 1)] {
             let mut small = Terminal::new(TestBackend::new(w, h)).unwrap();
             small

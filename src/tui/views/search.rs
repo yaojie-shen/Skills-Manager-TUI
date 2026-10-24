@@ -125,6 +125,7 @@ pub struct SearchView {
         bool,
     )>,
     area: Rect,
+    picker_rect: Rect,
     scope: Option<(BTreeSet<String>, String)>,
     checked: BTreeSet<String>,
     batch_buttons: Vec<(Rect, char)>,
@@ -168,6 +169,7 @@ impl Default for SearchView {
             tag: None,
             target: None,
             area: Rect::default(),
+            picker_rect: Rect::default(),
             scope: None,
             checked: BTreeSet::new(),
             batch_buttons: Vec::new(),
@@ -276,7 +278,6 @@ impl SearchView {
             self.preview_rect = right;
             self.draw_preview(f, right, ctx);
         }
-        self.overlay.draw(f, content, ctx);
         self.batch_buttons.clear();
         if self.is_picker() {
             if self.hits.is_empty()
@@ -309,6 +310,8 @@ impl SearchView {
         {
             self.search_panel.draw_completion(f, areas.results, ctx);
         }
+        // Draw overlays after picker buttons so their background stays inactive.
+        self.overlay.draw(f, content, ctx);
         // The View menu is modal and must remain above completion and footers,
         // including when a background refresh arrives while it is open.
         if self.view_menu.is_open() {
@@ -331,6 +334,7 @@ impl SearchView {
         !self.is_picker() && self.scope.is_none() && self.panel.is_none()
     }
 
+    #[cfg(test)]
     pub(crate) fn view_menu_open(&self) -> bool {
         self.view_menu.is_open()
     }
@@ -505,6 +509,10 @@ impl SearchView {
         if self.panel.is_none() && self.scope.is_none() && !self.is_picker() {
             self.search_panel.completion.healthy_only();
         }
+    }
+
+    pub fn set_picker_rect(&mut self, rect: Rect) {
+        self.picker_rect = rect;
     }
 
     pub fn picker_title(&self) -> String {
@@ -1265,7 +1273,7 @@ impl SearchView {
                 controls.push((ViewControl::ExpandAll, "▾"));
             }
         }
-        controls.push((ViewControl::View, " View F2 "));
+        controls.push((ViewControl::View, " View "));
         let controls_width: u16 = controls
             .iter()
             .map(|(_, label)| width(label) as u16)
@@ -1755,6 +1763,9 @@ impl View for SearchView {
     fn overlay_open(&self) -> bool {
         self.overlay.is_open() || self.view_menu.is_open()
     }
+    fn mouse_overlay_open(&self) -> bool {
+        self.overlay_open() || (self.focus == Focus::Input && self.search_panel.completion.active())
+    }
     fn preview_overlay(&mut self) -> Option<&mut super::preview::Overlay> {
         Some(&mut self.overlay)
     }
@@ -2241,6 +2252,22 @@ impl View for SearchView {
         if self.overlay.handle_mouse(m, ctx) {
             return vec![];
         }
+        // Completion captures mouse input before background header controls.
+        // The View menu and preview retain their higher overlay priority.
+        if self.focus == Focus::Input {
+            let (consumed, accepted) = self.search_panel.mouse_completion(m);
+            if consumed {
+                if accepted {
+                    self.run_search(ctx, false);
+                    if self.search_panel.input.value()[..self.search_panel.input.cursor_byte()]
+                        .ends_with(':')
+                    {
+                        self.update_completion(ctx);
+                    }
+                }
+                return vec![];
+            }
+        }
         if self.is_library()
             && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
             && let Some((_, control)) = self
@@ -2258,24 +2285,16 @@ impl View for SearchView {
             }
             return vec![];
         }
-        if self.is_picker()
-            && matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
-            && !self.area.contains((m.column, m.row).into())
-        {
-            return vec![Action::CloseModal];
-        }
-        if self.focus == Focus::Input {
-            let (consumed, accepted) = self.search_panel.mouse_completion(m);
-            if consumed {
-                if accepted {
-                    self.run_search(ctx, false);
-                    if self.search_panel.input.value()[..self.search_panel.input.cursor_byte()]
-                        .ends_with(':')
-                    {
-                        self.update_completion(ctx);
-                    }
-                }
-                return vec![];
+        if self.is_picker() {
+            let rect = if self.picker_rect.is_empty() {
+                self.area
+            } else {
+                self.picker_rect
+            };
+            match crate::tui::widgets::popup_mouse(m, rect) {
+                crate::tui::widgets::PopupMouse::OutsidePress => return vec![Action::CloseModal],
+                crate::tui::widgets::PopupMouse::Inside => {}
+                _ => return vec![],
             }
         }
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
@@ -2433,6 +2452,47 @@ impl View for SearchView {
         self.draw_with_content_header(f, area, ctx, 0, |_, _| {});
     }
 
+    fn footer_help(&self) -> crate::tui::footer::Help<'_> {
+        let help = crate::tui::footer::Help::new(self.hints());
+        if self.view_menu.is_open() || self.overlay.is_open() || !self.is_picker() {
+            return help;
+        }
+        if self.focus == Focus::List {
+            let pending = if self.target.is_some() {
+                self.hits.iter().any(|hit| self.checked.contains(&hit.key))
+            } else {
+                self.checked != self.picker_original
+            };
+            let (list, apply) = if self.target.is_some() {
+                (
+                    "Select skills for this deployment",
+                    "Apply the selected deployment changes",
+                )
+            } else if self.tag.is_some() {
+                (
+                    "Select the skills to include in this tag",
+                    "Save the staged tag membership",
+                )
+            } else {
+                (
+                    "Select the skills to include in this preset",
+                    "Save the staged preset membership",
+                )
+            };
+            return self.choice_focus.help(
+                self.hints(),
+                list,
+                if pending {
+                    apply
+                } else {
+                    "No pending changes; change the selection first"
+                },
+                "Discard pending changes and close",
+            );
+        }
+        help
+    }
+
     fn hints(&self) -> Hints {
         if self.view_menu.is_open() {
             return &[
@@ -2442,20 +2502,13 @@ impl View for SearchView {
                 ("Esc/F2", "close"),
             ];
         }
+        if let Some(hints) = self.overlay.hints() {
+            return hints;
+        }
         if self.is_picker()
             && self.focus == Focus::List
-            && self.choice_focus != ChoiceFocus::List
-            && !self.overlay.is_open()
+            && let Some(hints) = self.choice_focus.button_hints()
         {
-            return &[
-                ("←→", "buttons"),
-                ("Tab/Shift+Tab", "next / previous"),
-                ("↑", "list"),
-                ("Enter/Space", "activate"),
-                ("Esc/q", "cancel"),
-            ];
-        }
-        if let Some(hints) = self.overlay.hints() {
             return hints;
         }
         if self.focus == Focus::Input {
@@ -2470,14 +2523,14 @@ impl View for SearchView {
                 return &[
                     ("Enter/↓", "results"),
                     ("Tab/Shift+Tab", "list / buttons"),
-                    ("Esc", "cancel"),
+                    ("Esc", "clear/results"),
                 ];
             }
             if self.multi {
-                return &[("Enter/↓", "results"), ("Esc", "cancel selection")];
+                return &[("Enter/↓", "results"), ("Esc", "clear/results")];
             }
             if self.panel.is_some() {
-                return &[("Enter/↓", "results"), ("Esc", "results")];
+                return &[("Enter/↓", "results"), ("Esc", "clear/results")];
             }
         }
         if self.is_picker() && self.focus == Focus::Preview {
@@ -2496,6 +2549,34 @@ impl View for SearchView {
                 ("o", "preview"),
                 ("Tab", "apply / cancel"),
                 ("Esc", "cancel"),
+            ];
+        }
+        if self.is_library()
+            && self.focus == Focus::List
+            && matches!(
+                self.grouped.selected_entry(),
+                Some(GroupedEntry::Header { .. })
+            )
+        {
+            if self.multi {
+                return &[
+                    ("Enter/Space", "collapse / expand"),
+                    ("Ctrl+A", "select all results"),
+                    ("a", "actions"),
+                    ("←/→", "collapse / expand"),
+                    ("Ctrl+←/→", "fold / unfold all"),
+                    ("/", "filter"),
+                    ("Esc", "cancel selection"),
+                ];
+            }
+            return &[
+                ("Enter/Space", "collapse / expand"),
+                ("←/→", "collapse / expand"),
+                ("↑↓", "navigate"),
+                ("Ctrl+←/→", "fold / unfold all"),
+                ("F2", "view"),
+                ("/", "search"),
+                ("Esc", "clear/back"),
             ];
         }
         if self.multi && self.focus == Focus::List {
@@ -2519,22 +2600,6 @@ impl View for SearchView {
                 ("Esc", "cancel selection"),
             ];
         }
-        if self.is_library()
-            && self.focus == Focus::List
-            && matches!(
-                self.grouped.selected_entry(),
-                Some(GroupedEntry::Header { .. })
-            )
-        {
-            return &[
-                ("Enter/Space", "collapse / expand"),
-                ("←/→", "collapse / expand"),
-                ("↑↓", "navigate"),
-                ("Ctrl+←/→", "fold / unfold all"),
-                ("F2", "view"),
-                ("/", "search"),
-            ];
-        }
         match self.focus {
             Focus::Input if self.search_panel.completion.active() => &[
                 ("↑↓", "suggestions"),
@@ -2542,16 +2607,14 @@ impl View for SearchView {
                 ("Esc", "close suggestions"),
             ],
             Focus::Input if self.is_library() => &[
-                ("↑↓", "select"),
-                ("↓", "list"),
-                ("Enter", "list"),
+                ("Enter/↓", "results"),
+                ("↑", "tabs"),
                 ("Esc", "clear/results"),
                 ("F2", "view"),
             ],
             Focus::Input => &[
-                ("↑↓", "select"),
-                ("↓", "list"),
-                ("Enter", "list"),
+                ("Enter/↓", "results"),
+                ("↑", "tabs"),
                 ("Esc", "clear/results"),
             ],
             Focus::List if self.is_library() => &[
@@ -3352,9 +3415,10 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(
-            screen.contains("details · e less"),
+            screen.contains(" details "),
             "expanded metadata must render over split layouts"
         );
+        assert!(!screen.contains("details · e"));
         assert!(screen.contains("SKILL.md"));
         assert!(screen.contains("description: shared tools"));
         std::fs::remove_dir_all(root).unwrap();

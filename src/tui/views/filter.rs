@@ -99,16 +99,9 @@ impl Filter {
                 area,
                 PanelStyle {
                     layout: PanelLayout::Separate,
-                    input_title: Line::from(format!(
-                        " {label}{} ",
-                        if self.panel.input.is_empty() {
-                            ""
-                        } else {
-                            " · Esc clear"
-                        }
-                    )),
+                    input_title: Line::from(format!(" {label} ")),
                     results_title: Line::from(format!(" {results} ")),
-                    hint: ("filter…", " · Enter results"),
+                    hint: ("filter…", ""),
                     input_active: self.panel.editing,
                     results_active: active && !self.panel.editing,
                     header_height: 0,

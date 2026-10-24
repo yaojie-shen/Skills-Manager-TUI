@@ -13,6 +13,7 @@ mod batch;
 mod components;
 mod deploy_picker;
 mod event;
+mod footer;
 mod icons;
 mod keymap;
 #[cfg(test)]
@@ -55,7 +56,7 @@ pub fn run(ws: skills::Workspace, launch_dir: Option<&std::path::Path>) -> Resul
 
     let result = (|| -> Result<()> {
         loop {
-            terminal.draw(|f| app.draw(f))?;
+            draw_frame(&mut terminal, &mut app)?;
             if let Some(req) = app.take_external() {
                 gate.hold();
                 leave(&mut terminal)?;
@@ -86,6 +87,20 @@ pub fn run(ws: skills::Workspace, launch_dir: Option<&std::path::Path>) -> Resul
 
     leave(&mut terminal)?;
     result
+}
+
+/// Frame cannot unset a cursor requested by an underlying text owner. Apply
+/// read-only help's cursor policy after Ratatui finishes drawing; a normal
+/// frame restores the text owner's caret as soon as the help closes.
+fn draw_frame<B: Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut app::App,
+) -> Result<(), B::Error> {
+    terminal.draw(|frame| app.draw(frame))?;
+    if app.context_help_open() {
+        terminal.hide_cursor()?;
+    }
+    Ok(())
 }
 
 fn enter() -> Result<Term> {

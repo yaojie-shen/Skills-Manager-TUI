@@ -226,13 +226,25 @@ impl<'a> SkillPresentation<'a> {
         } else if matches!(self.tone, Tone::Error) {
             (format!(" {}  ", self.marker), self.tone.style(th))
         } else if let Some(SkillDecoration::Attention(_)) = state.decoration {
-            ("   ".into(), th.warn())
+            (
+                format!(
+                    " {}  ",
+                    crate::tui::icons::decoration(ctx.settings.ui.icons, "", "!")
+                ),
+                th.warn(),
+            )
         } else if matches!(self.tone, Tone::Warning) {
             (format!(" {}  ", self.marker), self.tone.style(th))
         } else if state.update_available
             || matches!(state.decoration, Some(SkillDecoration::Update))
         {
-            ("   ".into(), th.accent())
+            (
+                format!(
+                    " {}  ",
+                    crate::tui::icons::decoration(ctx.settings.ui.icons, "", "↑")
+                ),
+                th.accent(),
+            )
         } else {
             (format!(" {}  ", self.marker), self.tone.style(th))
         };
@@ -553,6 +565,85 @@ mod tests {
     use super::*;
     use crate::tui::settings::RuntimeSettings;
     use ratatui::style::Color;
+
+    #[test]
+    fn icon_mode_covers_attention_and_updates_in_all_densities() {
+        use skills::config::Icons;
+        let root = skills::ops::DownloadDir::new("skill-icon-mode").unwrap();
+        skills::config::Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(root.path())
+        .unwrap();
+        let ws = skills::Workspace::open(root.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let mut settings = RuntimeSettings::new(&ws.config);
+        let skill = SkillPresentation::entry("example", None, Some(&EntryState::Deployed));
+        for mode in [Icons::Text, Icons::Nerd] {
+            settings.ui.icons = mode;
+            let ctx = Ctx {
+                ws: &ws,
+                snap: &snap,
+                settings: &settings,
+            };
+            for (decoration, update_available, glyph) in [
+                (
+                    Some(SkillDecoration::Attention("Needs review".into())),
+                    false,
+                    ("!", ""),
+                ),
+                (Some(SkillDecoration::Update), false, ("↑", "")),
+                (None, true, ("↑", "")),
+            ] {
+                let state = SkillRenderState {
+                    decoration: decoration.as_ref(),
+                    update_available,
+                    ..Default::default()
+                };
+                for lines in [
+                    skill.card(&ctx, 80, &state),
+                    skill.list(&ctx, 80, true, &state),
+                    skill.compact(&ctx, 80, true, &state),
+                ] {
+                    let mut terminal =
+                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+                    terminal
+                        .draw(|f| {
+                            f.render_widget(
+                                ratatui::widgets::Paragraph::new(lines.clone()),
+                                f.area(),
+                            )
+                        })
+                        .unwrap();
+                    let screen: String = terminal
+                        .backend()
+                        .buffer()
+                        .content
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect();
+                    assert!(screen.contains("example"));
+                    assert!(screen.contains(if mode == Icons::Text {
+                        glyph.0
+                    } else {
+                        glyph.1
+                    }));
+                    assert_eq!(
+                        crate::tui::icons::tests::has_pua(&screen),
+                        mode == Icons::Nerd
+                    );
+                    assert!(lines.iter().all(|line| line.width() <= 80));
+                }
+                // Selection retains precedence over transient attention/update decorations.
+                let checked = SkillRenderState {
+                    checked: Some(true),
+                    ..state
+                };
+                assert_eq!(skill.marker(&checked, &ctx).content, "[✓] ");
+            }
+        }
+    }
 
     #[test]
     fn memberships_pack_right_in_every_density_and_hide_only_the_enclosing_group() {

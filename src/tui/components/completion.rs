@@ -1,9 +1,11 @@
 //! Local query-filter completion from the current inventory and source metadata.
+//! Active suggestions own input. Draw them after all parent content using the
+//! popup surface; higher overlays and the App footer may draw afterwards.
 use std::{collections::BTreeSet, ops::Range};
 
 use crate::tui::{
     app::Ctx,
-    widgets::{Input, OverlayClear, fit},
+    widgets::{Input, PopupSurface, fit},
 };
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{Frame, layout::Rect, text::Line, widgets::Paragraph};
@@ -20,6 +22,13 @@ pub(crate) struct Completion {
 impl Completion {
     pub fn active(&self) -> bool {
         !self.choices.is_empty()
+    }
+    #[cfg(test)]
+    pub fn rect(&self) -> Rect {
+        self.rect
+    }
+    pub fn clear_area(&mut self) {
+        self.rect = Rect::default();
     }
     pub fn close(&mut self) {
         self.choices.clear();
@@ -183,8 +192,16 @@ impl Completion {
 
     /// Returns whether the popup consumed the event and whether it accepted a value.
     pub fn mouse(&mut self, m: MouseEvent, input: &mut Input) -> (bool, bool) {
-        if !self.active() || !self.rect.contains((m.column, m.row).into()) {
+        if !self.active() {
             return (false, false);
+        }
+        match crate::tui::widgets::popup_mouse(m, self.rect) {
+            crate::tui::widgets::PopupMouse::OutsidePress => {
+                self.close();
+                return (true, false);
+            }
+            crate::tui::widgets::PopupMouse::Inside => {}
+            _ => return (true, false),
         }
         match m.kind {
             MouseEventKind::ScrollDown => self.move_by(1),
@@ -225,8 +242,8 @@ impl Completion {
             height: rows as u16 + 2,
             ..area
         };
-        f.render_widget(OverlayClear, self.rect);
-        let block = ctx.settings.theme.block(" filters · Enter accepts ", true);
+        f.render_widget(PopupSurface, self.rect);
+        let block = ctx.settings.theme.block(" filters ", true);
         let inner = block.inner(self.rect);
         f.render_widget(block, self.rect);
         let lines: Vec<Line> = self
@@ -423,6 +440,29 @@ mod tests {
         assert!(!popup.active());
     }
     #[test]
+    fn outside_mouse_buttons_close_completion_without_accepting() {
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            let mut input = Input::with_value("tag:");
+            let mut popup = Completion {
+                token: 0..4,
+                choices: vec!["tag:alpha".into()],
+                rect: Rect::new(3, 3, 20, 4),
+                ..Default::default()
+            };
+            let outside = MouseEvent {
+                kind: MouseEventKind::Down(button),
+                column: 0,
+                row: 0,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            };
+            assert_eq!(popup.mouse(outside, &mut input), (true, false));
+            assert!(!popup.active());
+            assert_eq!(input.value(), "tag:");
+            assert_eq!(popup.mouse(outside, &mut input), (false, false));
+        }
+    }
+
+    #[test]
     fn mouse_scrolls_and_accepts_only_within_the_popup() {
         let mut input = Input::with_value("tag:");
         let mut popup = Completion {
@@ -443,11 +483,8 @@ mod tests {
         );
         assert_eq!(popup.selected, 1);
         assert_eq!(
-            popup.mouse(
-                event(MouseEventKind::Down(MouseButton::Left), 0),
-                &mut input
-            ),
-            (false, false)
+            popup.mouse(event(MouseEventKind::ScrollDown, 0), &mut input),
+            (true, false)
         );
         assert_eq!(
             popup.mouse(

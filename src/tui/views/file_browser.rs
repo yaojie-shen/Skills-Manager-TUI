@@ -466,7 +466,7 @@ impl Browser {
         }
     }
 
-    pub fn handle_mouse(&mut self, event: MouseEvent, wheel_rows: i32) {
+    pub fn handle_mouse(&mut self, event: MouseEvent, wheel_rows: i32) -> bool {
         let point = (event.column, event.row).into();
         let over_tree = self.tree_rect.contains(point);
         let over_preview = self.preview_rect.contains(point);
@@ -503,8 +503,9 @@ impl Browser {
                     self.load_selected();
                 }
             }
-            _ => {}
+            _ => return false,
         }
+        true
     }
 
     fn load_selected(&mut self) {
@@ -520,7 +521,7 @@ impl Browser {
         }
     }
 
-    pub fn draw(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, ctx: &Ctx, active: bool) {
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -530,11 +531,17 @@ impl Browser {
             if self.focus == Focus::Tree {
                 self.tree_rect = area;
                 self.tree_height = area.height.saturating_sub(2).max(1) as usize;
-                self.draw_tree(frame, area, &ctx.settings.theme, ctx.settings.ui.icons);
+                self.draw_tree(
+                    frame,
+                    area,
+                    &ctx.settings.theme,
+                    ctx.settings.ui.icons,
+                    active,
+                );
             } else {
                 self.preview_rect = area;
                 self.preview_height = area.height.saturating_sub(2).max(1) as usize;
-                self.draw_preview(frame, area, &ctx.settings.theme);
+                self.draw_preview(frame, area, &ctx.settings.theme, active);
             }
             return;
         }
@@ -549,13 +556,19 @@ impl Browser {
         self.preview_rect = panes[1];
         self.tree_height = panes[0].height.saturating_sub(2).max(1) as usize;
         self.preview_height = panes[1].height.saturating_sub(2).max(1) as usize;
-        self.draw_tree(frame, panes[0], &ctx.settings.theme, ctx.settings.ui.icons);
-        self.draw_preview(frame, panes[1], &ctx.settings.theme);
+        self.draw_tree(
+            frame,
+            panes[0],
+            &ctx.settings.theme,
+            ctx.settings.ui.icons,
+            active,
+        );
+        self.draw_preview(frame, panes[1], &ctx.settings.theme, active);
     }
 
-    fn draw_tree(&mut self, frame: &mut Frame, area: Rect, th: &Theme, icons: Icons) {
+    fn draw_tree(&mut self, frame: &mut Frame, area: Rect, th: &Theme, icons: Icons, active: bool) {
         let title = format!(" Files{} ", if self.show_hidden { " · hidden" } else { "" });
-        let block = th.block(title, self.focus == Focus::Tree);
+        let block = th.block(title, active && self.focus == Focus::Tree);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let height = inner.height as usize;
@@ -608,7 +621,7 @@ impl Browser {
                     ));
                 }
                 if index == self.selected {
-                    line = line.style(if self.focus == Focus::Tree {
+                    line = line.style(if active && self.focus == Focus::Tree {
                         th.selected()
                     } else {
                         th.selected_unfocused()
@@ -623,19 +636,19 @@ impl Browser {
         frame.render_widget(Paragraph::new(lines), inner);
     }
 
-    fn draw_preview(&mut self, frame: &mut Frame, area: Rect, th: &Theme) {
+    fn draw_preview(&mut self, frame: &mut Frame, area: Rect, th: &Theme, active: bool) {
         let selected = self.entries.get(self.selected);
         let title = display_safe(selected.map_or("Preview", |entry| entry.name.as_str()));
         let block = th.block(
             format!(" {} ", fit(&title, area.width.saturating_sub(4) as usize)),
-            self.focus == Focus::Preview,
+            active && self.focus == Focus::Preview,
         );
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let lines = match selected {
             None => vec![Line::from(Span::styled("loading…", th.dim()))],
             Some(entry) if entry.kind == EntryKind::Directory => {
-                vec![Line::raw("Directory — press l or Enter to expand")]
+                vec![Line::raw("Directory")]
             }
             Some(entry) => content_lines(
                 self.contents.get(&entry.path).unwrap_or(&Content::Loading),
@@ -1078,8 +1091,8 @@ mod tests {
             .draw(|frame| {
                 let [tree, preview] =
                     Layout::horizontal([Constraint::Fill(1); 2]).areas(frame.area());
-                browser.draw_tree(frame, tree, &Theme::default(), Icons::default());
-                browser.draw_preview(frame, preview, &Theme::default());
+                browser.draw_tree(frame, tree, &Theme::default(), Icons::default(), true);
+                browser.draw_preview(frame, preview, &Theme::default(), true);
             })
             .unwrap();
         let rendered: String = terminal
@@ -1107,7 +1120,7 @@ mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
         terminal
-            .draw(|frame| browser.draw_preview(frame, frame.area(), &Theme::default()))
+            .draw(|frame| browser.draw_preview(frame, frame.area(), &Theme::default(), true))
             .unwrap();
 
         assert_eq!(browser.preview_scroll, 10);

@@ -57,8 +57,8 @@ fn outcome(app: &App, snapshot: Result<Snapshot>) -> ScanOutcome {
     }
 }
 
-fn footer(app: &App, width: u16) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(width, 2)).unwrap();
+fn footer(app: &mut App, width: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
     terminal
         .draw(|frame| app.draw_footer(frame, Rect::new(0, 0, width, 1)))
         .unwrap();
@@ -71,7 +71,7 @@ fn footer(app: &App, width: u16) -> String {
 
 #[test]
 fn startup_is_browsable_and_truthfully_unchecked_at_narrow_and_wide_sizes() {
-    let (_temp, app, _rx) = fixture();
+    let (_temp, mut app, _rx) = fixture();
     let record = app.snap.get(KEY).unwrap();
     assert_eq!(record.status, SkillStatus::Unchecked);
     assert!(record.current_hash.is_none());
@@ -79,7 +79,7 @@ fn startup_is_browsable_and_truthfully_unchecked_at_narrow_and_wide_sizes() {
     assert!(!record.status.is_healthy());
     assert!(app.verification_task.is_none());
     for width in [60, 120] {
-        assert!(footer(&app, width).contains("1 unchecked"));
+        assert!(footer(&mut app, width).contains("1 unchecked"));
     }
 }
 
@@ -278,7 +278,7 @@ fn queued_explicit_recheck_runs_once_after_invalidated_verification_and_inventor
             .verification_task
             .expect("one queued explicit check must run");
         assert_eq!(id, 102);
-        assert!(footer(&app, 60).contains("Checking content"));
+        assert!(footer(&mut app, 60).contains("Checking content"));
         let message = wait_for_msg_matching(
             &rx,
             "queued recheck",
@@ -304,7 +304,7 @@ fn completed_attempt_with_unreadable_records_does_not_retry_automatically() {
     assert!(!app.needs_content_verification());
     app.verify_content(false);
     assert!(app.verification_task.is_none());
-    assert!(footer(&app, 120).contains("unchecked"));
+    assert!(footer(&mut app, 120).contains("unchecked"));
 }
 
 #[test]

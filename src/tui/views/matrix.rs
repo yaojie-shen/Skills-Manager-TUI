@@ -5,7 +5,7 @@
 //! as the Agents page; coverage comes from the supplied inventory.
 
 use crate::tui::app::{Action, Ctx};
-use crate::tui::widgets::OverlayClear as Clear;
+use crate::tui::widgets::PopupSurface;
 use crate::tui::widgets::{pad, width};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -152,6 +152,14 @@ impl Matrix {
         if !self.open {
             return None;
         }
+        match crate::tui::widgets::popup_mouse(m, self.rect) {
+            crate::tui::widgets::PopupMouse::OutsidePress => {
+                self.close();
+                return Some(vec![]);
+            }
+            crate::tui::widgets::PopupMouse::Inside => {}
+            _ => return Some(vec![]),
+        }
         if let MouseEventKind::Down(MouseButton::Left) = m.kind {
             let at = (m.column, m.row).into();
             if !self.rect.contains(at) {
@@ -190,10 +198,8 @@ impl Matrix {
             .max()
             .unwrap_or(4)
             .clamp(8, 20);
-        // The key help is the widest thing in a small table, so it sets the floor.
-        let help = " Space toggle · A whole row · Esc";
-        let inner_w = (name_w + 2 + agents.len() * (col_w + 2)).max(width(help)) as u16;
-        let inner_h = (self.presets.len() as u16 + 4).max(5);
+        let inner_w = (name_w + 2 + agents.len() * (col_w + 2)).max(24) as u16;
+        let inner_h = (self.presets.len() as u16 + 3).max(4);
         let w = (inner_w + 4).min(area.width);
         let h = (inner_h + 2).min(area.height);
         let rect = Rect {
@@ -203,7 +209,7 @@ impl Matrix {
             height: h,
         };
         self.rect = rect;
-        f.render_widget(Clear, rect);
+        f.render_widget(PopupSurface, rect);
         let block = th.block(" presets × agents ", true);
         let inner = block.inner(rect);
         f.render_widget(block, rect);
@@ -211,7 +217,7 @@ impl Matrix {
         let name_w = name_w.min((inner.width as usize).saturating_sub(12));
         let col_w = col_w.min((inner.width as usize).saturating_sub(name_w + 4));
         let visible_cols = (inner.width as usize).saturating_sub(name_w + 2) / (col_w + 2);
-        let visible_rows = inner.height.saturating_sub(4) as usize;
+        let visible_rows = inner.height.saturating_sub(3) as usize;
         let rows = viewport(
             self.presets.len(),
             self.row,
@@ -269,7 +275,7 @@ impl Matrix {
             lines.push(Line::from(Span::styled(" no presets yet", th.dim())));
         }
         let position = format!(
-            " ↑↓ rows {}–{}/{} · ←→ cols {}–{}/{}",
+            " rows {}–{}/{} · cols {}–{}/{}",
             if rows.is_empty() { 0 } else { rows.start + 1 },
             rows.end,
             self.presets.len(),
@@ -278,7 +284,6 @@ impl Matrix {
             agents.len()
         );
         lines.push(Line::from(Span::styled(position, th.dim())));
-        lines.push(Line::from(Span::styled(help, th.dim())));
         f.render_widget(Paragraph::new(lines), inner);
     }
 }
@@ -358,7 +363,7 @@ mod tests {
                 for (_, _, cell) in &matrix.cells {
                     assert!(inner.contains((cell.x, cell.y).into()));
                     assert!(cell.right() <= inner.right());
-                    assert!(cell.bottom() <= inner.bottom() - 2);
+                    assert!(cell.bottom() < inner.bottom());
                 }
                 let (_, _, selected) = matrix
                     .cells

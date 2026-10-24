@@ -1,10 +1,11 @@
 //! Always-expanded repository tree with ancestry-aware multi-selection.
+//! Filters retain the full tree's bounded viewport; resizing refits it live.
 use super::components::search_panel::{PanelLayout, PanelStyle, SearchEvent, SearchPanel};
 use super::views::preview::Overlay;
 use super::{
     app::{Action, Ctx, Hints},
     event::Task,
-    widgets::{Input, ListNav, OverlayClear, fit},
+    widgets::{Input, ListNav, PopupClass, PopupSurface, fit, popup_size, popup_too_small},
 };
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -376,7 +377,6 @@ impl RepositoryPicker {
             return &[
                 ("↑↓", "suggestions"),
                 ("Enter", "complete"),
-                ("Enter", "list"),
                 ("Esc", "close suggestions"),
             ];
         }
@@ -391,6 +391,12 @@ impl RepositoryPicker {
                 ("/", "filter"),
                 ("Esc", "cancel"),
             ],
+            1 => &[
+                ("type", "filter"),
+                ("Enter/↓", "list"),
+                ("Tab/Shift+Tab", "fields"),
+                ("Esc", "clear/results"),
+            ],
             _ => &[
                 ("type", "edit"),
                 ("Enter/↓", "list"),
@@ -399,6 +405,20 @@ impl RepositoryPicker {
             ],
         }
     }
+    pub fn footer_help(&self) -> crate::tui::footer::Help<'_> {
+        let help = crate::tui::footer::Help::new(self.hints());
+        if self.preview.is_open() || (self.focus == 1 && self.search_panel.completion.active()) {
+            return help;
+        }
+        help.detail(match self.focus {
+            0 => "Folder used to store this source in the Library",
+            3 => "Local storage name for the selected skill",
+            4 => "Display name for this source; required for archive imports",
+            2 => "Install the selected skills that match the current filter",
+            _ => "Filter candidate skills before selecting them",
+        })
+    }
+
     pub fn paste(&mut self, text: &str, ctx: &Ctx) -> Vec<Action> {
         self.configure(ctx);
         if self.preview.is_open() {
@@ -569,6 +589,14 @@ impl RepositoryPicker {
             }
         }
         let at = (m.column, m.row).into();
+        match super::widgets::popup_mouse(m, self.rect) {
+            super::widgets::PopupMouse::OutsidePress => {
+                self.selection.fetched.cleanup();
+                return vec![Action::CloseModal];
+            }
+            super::widgets::PopupMouse::Inside => {}
+            _ => return vec![],
+        }
         match m.kind {
             MouseEventKind::ScrollDown if self.list.rows.contains(at) => self
                 .list
@@ -577,9 +605,6 @@ impl RepositoryPicker {
                 .list
                 .move_by(-ctx.settings.interaction.wheel_rows, self.shown.len()),
             MouseEventKind::Down(MouseButton::Left) => {
-                if !self.rect.contains(at) {
-                    return self.key(KeyEvent::new(KeyCode::Esc, m.modifiers), ctx);
-                }
                 let focused_field = match self.focus {
                     0 => Some(0),
                     1 => Some(1),
@@ -623,16 +648,15 @@ impl RepositoryPicker {
     pub fn draw(&mut self, f: &mut Frame, area: Rect, ctx: &Ctx) {
         self.configure(ctx);
         let th = &ctx.settings.theme;
-        let w = area.width.saturating_sub(4).min(110);
-        let h = area.height.saturating_sub(4).min(32);
-        let r = Rect::new(
-            area.x + (area.width - w) / 2,
-            area.y + (area.height - h) / 2,
-            w,
-            h,
+        let size = popup_size(
+            area,
+            PopupClass::Preview,
+            self.tree().len().clamp(1, 20) as u16 + 11,
+            (12, 6),
         );
+        let r = size.outer;
         self.rect = r;
-        f.render_widget(OverlayClear, r);
+        f.render_widget(PopupSurface, r);
         let block = th.block(
             format!(
                 " install · {} selected to install · {} outside filter (excluded) ",
@@ -653,7 +677,30 @@ impl RepositoryPicker {
         f.render_widget(block, r);
         self.fields = [Rect::default(); 4];
         self.list.rows = Rect::default();
-        if inner.height < 6 {
+        self.source_name.clear_area();
+        self.alias.clear_area();
+        self.local_name.clear_area();
+        self.search_panel.rect = Rect::default();
+        self.search_panel.input.clear_area();
+        self.search_panel.completion.clear_area();
+        if !size.usable {
+            popup_too_small(f, size, th);
+            let candidate_ctx = Ctx {
+                ws: ctx.ws,
+                snap: &self.candidates,
+                settings: ctx.settings,
+            };
+            self.preview.draw(f, area, &candidate_ctx);
+            return;
+        }
+        if inner.height < 10 || inner.width < 32 {
+            self.draw_compact(f, inner, ctx);
+            let candidate_ctx = Ctx {
+                ws: ctx.ws,
+                snap: &self.candidates,
+                settings: ctx.settings,
+            };
+            self.preview.draw(f, area, &candidate_ctx);
             return;
         }
         let archive = self.selection.fetched.repository.kind == SourceKind::Archive;
@@ -808,6 +855,82 @@ impl RepositoryPicker {
         };
         self.preview.draw(f, area, &candidate_ctx);
     }
+
+    fn draw_compact(&mut self, f: &mut Frame, inner: Rect, ctx: &Ctx) {
+        let th = &ctx.settings.theme;
+        // Stack labels above their fields; the active metadata field gets the
+        // first pair of rows while Tab keeps all existing fields reachable.
+        let (index, label) = match self.focus {
+            0 => (0, "Storage folder"),
+            3 => (2, "Local skill name"),
+            _ if self.selection.fetched.repository.kind == SourceKind::Archive => {
+                (3, "Package name *")
+            }
+            _ => (3, "Source name"),
+        };
+        f.render_widget(
+            Paragraph::new(label).style(th.dim()),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        self.fields[index] = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+        match index {
+            0 => self
+                .alias
+                .render(f, self.fields[0], self.focus == 0, "", th),
+            2 => self
+                .local_name
+                .render(f, self.fields[2], self.focus == 3, "", th),
+            _ => {
+                self.source_name
+                    .render(f, self.fields[3], self.focus == 4, "owner/repository", th)
+            }
+        }
+        let areas = self.search_panel.draw(
+            f,
+            Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 2),
+            PanelStyle {
+                layout: PanelLayout::Separate,
+                input_title: Line::default(),
+                results_title: Line::default(),
+                hint: ("Filter skills…", ""),
+                input_active: self.focus == 1,
+                results_active: self.focus == 2,
+                header_height: 0,
+            },
+            th,
+        );
+        self.fields[1] = areas.input;
+        self.list.rows = areas.results;
+        self.list.clamp(self.shown.len());
+        let rows = self.shown.iter().map(|path| {
+            let selected = self.selection.paths.contains(path) && self.matches_filter(path);
+            let name = self
+                .candidates
+                .get(path)
+                .and_then(|r| r.name.as_deref())
+                .unwrap_or(if path.is_empty() { "." } else { path });
+            ListItem::new(fit(
+                &format!("[{}] {name}", if selected { "x" } else { " " }),
+                self.list.rows.width.saturating_sub(2) as usize,
+            ))
+        });
+        f.render_stateful_widget(
+            List::new(rows)
+                .highlight_symbol("› ")
+                .highlight_style(th.selected()),
+            self.list.rows,
+            &mut self.list.state,
+        );
+        if self.shown.is_empty() {
+            f.render_widget(
+                Paragraph::new("No matching skills").style(th.dim()),
+                self.list.rows,
+            );
+        }
+        if self.focus == 1 {
+            self.search_panel.completion.draw(f, self.list.rows, ctx);
+        }
+    }
 }
 
 /// Candidate records stay in memory; browsing never creates metadata or copies skills.
@@ -863,6 +986,197 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use ratatui::{Terminal, backend::TestBackend};
     use skills::{Workspace, config::Config, repository::Repository};
+
+    #[test]
+    fn completion_dims_nested_chooser_after_all_parent_fields() {
+        let temp = skills::ops::DownloadDir::new("chooser-completion-surface").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(temp.path())
+        .unwrap();
+        let ws = Workspace::open(temp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        for (width, height) in [(40, 16), (60, 24), (120, 30)] {
+            let mut picker = RepositoryPicker::new(
+                FetchedRepository {
+                    repository: Repository {
+                        name: None,
+                        kind: SourceKind::Git,
+                        alias: "sample".into(),
+                        url: "https://example.test/sample.git".into(),
+                        branch: "main".into(),
+                    },
+                    revision: "test".into(),
+                    workdir: temp.path().join("download"),
+                    choices: vec!["reader".into()],
+                    invalid: BTreeMap::new(),
+                },
+                &ctx,
+            );
+            picker.focus = 1;
+            picker.search_panel.input = Input::with_value("repo:");
+            picker.configure(&ctx);
+            picker.search_panel.completion.close();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| picker.draw(f, f.area(), &ctx)).unwrap();
+            let before = terminal.backend().buffer().clone();
+            picker.update_completion(&ctx);
+            assert!(picker.search_panel.completion.active());
+            terminal.draw(|f| picker.draw(f, f.area(), &ctx)).unwrap();
+            let child = picker.search_panel.completion.rect();
+            assert!(!child.is_empty());
+            for y in picker.rect.y..picker.rect.bottom() {
+                for x in picker.rect.x..picker.rect.right() {
+                    if !child.contains((x, y).into()) {
+                        let c = &terminal.backend().buffer()[(x, y)];
+                        assert_eq!(c.fg, ratatui::style::Color::Reset, "{width} ({x},{y})");
+                        assert_eq!(c.bg, ratatui::style::Color::Reset);
+                        assert!(c.modifier.contains(ratatui::style::Modifier::DIM));
+                    }
+                }
+            }
+            let c = &terminal.backend().buffer()[child.as_position()];
+            assert_eq!(c.fg, settings.theme.border_focus);
+            assert!(!c.modifier.contains(ratatui::style::Modifier::DIM));
+            picker.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &ctx);
+            terminal.draw(|f| picker.draw(f, f.area(), &ctx)).unwrap();
+            assert_eq!(terminal.backend().buffer(), &before);
+        }
+    }
+
+    #[test]
+    fn outside_mouse_cancel_cleans_download_even_from_search_focus() {
+        let temp = skills::ops::DownloadDir::new("repository-outside-mouse").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(temp.path())
+        .unwrap();
+        let ws = Workspace::open(temp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            let workdir = temp.path().join("download");
+            std::fs::create_dir_all(&workdir).unwrap();
+            let mut picker = RepositoryPicker::new(
+                FetchedRepository {
+                    repository: Repository {
+                        name: None,
+                        kind: SourceKind::Git,
+                        alias: "sample".into(),
+                        url: "https://example.invalid/sample".into(),
+                        branch: "main".into(),
+                    },
+                    revision: "revision".into(),
+                    workdir: workdir.clone(),
+                    choices: vec![],
+                    invalid: BTreeMap::new(),
+                },
+                &ctx,
+            );
+            picker.rect = Rect::new(10, 5, 60, 18);
+            picker.focus = 1;
+            let event = MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert!(picker.mouse(event, &ctx).is_empty());
+            assert!(workdir.exists());
+            assert!(matches!(
+                picker
+                    .mouse(
+                        MouseEvent {
+                            kind: MouseEventKind::Down(button),
+                            ..event
+                        },
+                        &ctx
+                    )
+                    .as_slice(),
+                [Action::CloseModal]
+            ));
+            assert!(!workdir.exists());
+        }
+    }
+
+    #[test]
+    fn install_filter_geometry_stays_stable_and_resize_scrolls_selection() {
+        let temp = skills::ops::DownloadDir::new("install-filter-geometry").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(temp.path())
+        .unwrap();
+        let ws = Workspace::open(temp.path()).unwrap();
+        let snap = ws.scan().unwrap();
+        let settings = crate::tui::settings::RuntimeSettings::new(&ws.config);
+        let ctx = Ctx {
+            ws: &ws,
+            snap: &snap,
+            settings: &settings,
+        };
+        let fetched = FetchedRepository {
+            repository: Repository {
+                name: None,
+                kind: SourceKind::Git,
+                alias: "sample".into(),
+                url: "https://example.com/sample.git".into(),
+                branch: "main".into(),
+            },
+            revision: "test".into(),
+            workdir: temp.path().join("download"),
+            choices: (0..30).map(|i| format!("tool-{i:02}")).collect(),
+            invalid: BTreeMap::new(),
+        };
+        let mut picker = RepositoryPicker::new(fetched, &ctx);
+        picker.configure(&ctx);
+        let mut previous = None;
+        for (width, height) in [(120, 40), (60, 18), (120, 40)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut geometry = None;
+            for (query, count) in [("", 30), ("./tool-29", 1), ("absent/", 0), ("", 30)] {
+                picker.search_panel.input = Input::with_value(query);
+                picker.refilter();
+                picker.list.last(picker.shown.len());
+                assert_eq!(picker.shown.len(), count);
+                terminal
+                    .draw(|f| picker.draw(f, Rect::new(0, 0, width, height - 2), &ctx))
+                    .unwrap();
+                let current = (picker.rect, picker.fields, picker.list.rows);
+                if let Some(expected) = geometry {
+                    assert_eq!(current, expected);
+                } else {
+                    geometry = Some(current);
+                }
+                if let Some(selected) = picker.list.selected() {
+                    let offset = picker.list.state.offset();
+                    assert!(
+                        selected >= offset && selected < offset + picker.list.rows.height as usize
+                    );
+                }
+            }
+            if let Some(before) = previous {
+                assert_ne!(geometry.unwrap().0, before);
+            }
+            previous = Some(geometry.unwrap().0);
+        }
+    }
 
     #[test]
     fn archive_picker_preserves_source_kind_and_excludes_only_matching_installs() {
@@ -1104,9 +1418,21 @@ mod tests {
             Some("project-reader")
         );
 
-        for (width, height) in [(120, 35), (80, 24), (44, 20), (24, 12)] {
+        for (width, height) in [
+            (160, 40),
+            (112, 32),
+            (60, 20),
+            (40, 12),
+            (120, 35),
+            (80, 24),
+            (44, 20),
+            (24, 12),
+            (4, 3),
+            (1, 1),
+        ] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|f| restored.draw(f, f.area(), &ctx)).unwrap();
+            let area = Rect::new(0, 0, width, height.saturating_sub(2));
+            terminal.draw(|f| restored.draw(f, area, &ctx)).unwrap();
             let text: String = terminal
                 .backend()
                 .buffer()
@@ -1114,7 +1440,7 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect();
-            if width >= 80 {
+            if restored.rect.width.saturating_sub(2) >= 56 {
                 assert!(text.contains("Package name (required)"));
                 assert!(text.contains("Merlin Tools"));
                 assert!(text.contains("Storage folder"));
@@ -1122,6 +1448,17 @@ mod tests {
             } else if width >= 44 {
                 assert!(text.contains("Package name *"));
                 assert!(text.contains("Merlin Tools"));
+            }
+            for hit in restored.fields.into_iter().chain([restored.list.rows]) {
+                assert!(hit.is_empty() || hit.intersection(area) == hit);
+            }
+            if width == 40 {
+                assert!(restored.list.rows.height > 0);
+                assert!(text.contains("reader"));
+            }
+            if width < 4 {
+                assert_eq!(restored.fields, [Rect::default(); 4]);
+                assert_eq!(restored.list.rows, Rect::default());
             }
             assert!(
                 restored
