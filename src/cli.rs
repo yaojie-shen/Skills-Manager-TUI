@@ -54,7 +54,12 @@ pub enum Command {
     /// Fuzzy search and filter skills
     List(ListArgs),
     /// Show one skill in detail
-    Show { skill: String },
+    Show {
+        skill: String,
+        /// Verify this skill's content and include its current hash
+        #[arg(long)]
+        verify: bool,
+    },
     /// Full reconciliation report of skills and agents
     #[command(visible_alias = "rescan")]
     Status,
@@ -163,6 +168,9 @@ pub struct ListArgs {
     pub status: Vec<String>,
     #[arg(long)]
     pub untagged: bool,
+    /// Verify repository content before filtering (for example status:modified)
+    #[arg(long)]
+    pub verify: bool,
 }
 
 #[derive(Args, Debug)]
@@ -610,7 +618,7 @@ fn run_command(cli: Cli) -> Result<()> {
     match command {
         Command::Init => unreachable!(),
         Command::List(a) => cmd_list(&ctx, a),
-        Command::Show { skill } => cmd_show(&ctx, &skill),
+        Command::Show { skill, verify } => cmd_show(&ctx, &skill, verify),
         Command::Status => cmd_status(&ctx),
         Command::Repair {
             apply, deployments, ..
@@ -679,7 +687,7 @@ fn run_command(cli: Cli) -> Result<()> {
             if !yes {
                 bail!("refusing to remove {skill} without --yes");
             }
-            let snap = ctx.ws.scan()?;
+            let snap = ctx.ws.scan_for_links()?;
             let log = edit::remove(&ctx.ws, &snap, &skill, keep_meta)?;
             ctx.out(&serde_json::json!({"removed": skill, "log": log}), || {
                 for l in &log {
@@ -688,7 +696,7 @@ fn run_command(cli: Cli) -> Result<()> {
             })
         }
         Command::Rename { old, new } => {
-            let snap = ctx.ws.scan()?;
+            let snap = ctx.ws.scan_for_links()?;
             let log = edit::rename(&ctx.ws, &snap, &old, &new)?;
             ctx.out(
                 &serde_json::json!({"renamed": {"from": old, "to": new}, "log": log}),
@@ -715,7 +723,7 @@ fn run_command(cli: Cli) -> Result<()> {
         }
         Command::Check { skill, all, repo } => {
             if let Some(alias) = repo {
-                let snap = ctx.ws.scan()?;
+                let snap = ctx.ws.inventory()?;
                 let mut session = update::UpdateSession::default();
                 let results: Vec<_> = snap
                     .skills
@@ -853,7 +861,11 @@ struct ListRow<'a> {
 }
 
 fn cmd_list(ctx: &Ctx, a: ListArgs) -> Result<()> {
-    let snap = ctx.ws.scan()?;
+    let snap = if a.verify {
+        ctx.ws.scan()?
+    } else {
+        ctx.ws.inventory()?
+    };
     let mut input = a.query.join(" ");
     for t in &a.tag {
         input.push_str(&format!(" tag:{t}"));
@@ -944,15 +956,19 @@ fn truncate(s: &str, n: usize) -> String {
     out
 }
 
-fn cmd_show(ctx: &Ctx, key: &str) -> Result<()> {
-    let snap = ctx.ws.scan_selected(&[key.to_string()])?;
+fn cmd_show(ctx: &Ctx, key: &str, verify: bool) -> Result<()> {
+    let snap = if verify {
+        ctx.ws.scan_selected(&[key.to_string()])?
+    } else {
+        ctx.ws.inventory()?
+    };
     let r = snap
         .get(key)
         .with_context(|| format!("no such skill: {key}"))?;
     // A detail request may display the hash; compute only this skill when the
     // reconciliation did not need its content for a status comparison.
     let mut detail = r.clone();
-    if detail.name.is_some() && detail.current_hash.is_none() {
+    if verify && detail.name.is_some() && detail.current_hash.is_none() {
         detail.current_hash = skills::hash::hash_directory(&detail.path).ok();
     }
     let r = &detail;
@@ -1133,7 +1149,7 @@ fn cmd_tag(ctx: &Ctx, c: TagCommand) -> Result<()> {
             ctx.out(&m, || println!("{}", m.join("\n")))
         }
         TagCommand::List { skill: None } => {
-            let snap = ctx.ws.scan()?;
+            let snap = ctx.ws.inventory()?;
             let tags = snap.all_tags();
             ctx.out(&tags, || {
                 for (t, n) in &tags {
@@ -1172,7 +1188,7 @@ fn cmd_note(ctx: &Ctx, c: NoteCommand) -> Result<()> {
     match c {
         NoteCommand::Get { skill } => {
             ctx.ws
-                .scan()?
+                .inventory()?
                 .get(&skill)
                 .with_context(|| format!("no such skill: {skill}"))?;
             let m = ctx.ws.meta.load(&skill)?.unwrap_or_default();
@@ -1330,7 +1346,7 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
             let actions = if a.deploy_to.is_empty() {
                 vec![]
             } else {
-                let snap = ctx.ws.scan()?;
+                let snap = ctx.ws.scan_for_links()?;
                 let plan = deploy::plan_deploy(&ctx.ws, &snap, &keys, &a.deploy_to)?;
                 let actions = deploy::resolve_names(&snap, &plan, ctx.same_name.as_deref())?;
                 deploy::apply(&actions)?;
@@ -1358,7 +1374,7 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
     let key = install::install(&ctx.ws, &r, a.name.as_deref())?;
     let mut actions = Vec::new();
     if !a.deploy_to.is_empty() {
-        let snap = ctx.ws.scan()?;
+        let snap = ctx.ws.scan_for_links()?;
         actions = deploy::plan_deploy(&ctx.ws, &snap, std::slice::from_ref(&key), &a.deploy_to)?;
         actions = deploy::resolve_names(&snap, &actions, ctx.same_name.as_deref())?;
         deploy::apply(&actions)?;
@@ -1376,7 +1392,7 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
 
 fn cmd_check(ctx: &Ctx, skill: Option<String>, all: bool) -> Result<()> {
     let keys: Vec<String> = if all {
-        let snap = ctx.ws.scan()?;
+        let snap = ctx.ws.inventory()?;
         snap.skills
             .iter()
             .filter(|s| {
@@ -1430,7 +1446,7 @@ fn cmd_check(ctx: &Ctx, skill: Option<String>, all: bool) -> Result<()> {
 
 fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
     eprintln!("Scanning installed skills …");
-    let snap = ctx.ws.scan()?;
+    let snap = ctx.ws.inventory()?;
     let keys: Vec<String> = if let Some(alias) = &a.repo {
         snap.skills
             .iter()
@@ -1448,7 +1464,10 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
             .filter(|s| {
                 matches!(
                     s.status,
-                    SkillStatus::Repository | SkillStatus::MissingBaseline | SkillStatus::Modified
+                    SkillStatus::Repository
+                        | SkillStatus::MissingBaseline
+                        | SkillStatus::Modified
+                        | SkillStatus::Unchecked
                 )
             })
             .map(|s| s.key.clone())
@@ -1575,7 +1594,7 @@ fn cmd_deploy(ctx: &Ctx, a: DeployArgs, on: bool) -> Result<()> {
         bail!("pass at least one skill");
     }
     let agents = resolve_agents(ctx, &a.agents, a.all_agents)?;
-    let snap = ctx.ws.scan()?;
+    let snap = ctx.ws.scan_for_links()?;
     let actions = if on {
         deploy::plan_deploy(&ctx.ws, &snap, &a.skills, &agents)?
     } else {
@@ -1672,7 +1691,7 @@ fn cmd_agents(ctx: &Ctx, c: Option<AgentsCommand>) -> Result<()> {
             })
         }
         AgentsCommand::Status { agent } => {
-            let snap = ctx.ws.scan()?;
+            let snap = ctx.ws.inventory()?;
             let reports: Vec<_> = snap
                 .agents
                 .iter()
@@ -1693,7 +1712,7 @@ fn cmd_agents(ctx: &Ctx, c: Option<AgentsCommand>) -> Result<()> {
             dry_run,
             yes,
         } => {
-            let snap = ctx.ws.scan()?;
+            let snap = ctx.ws.scan_for_links()?;
             let actions = deploy::plan_clean(&ctx.ws, &snap, &agent, &skills)?;
             gate(&actions, dry_run, yes, "cleaning removes links")?;
             run_actions(ctx, &snap, &actions, dry_run)
@@ -1730,7 +1749,7 @@ fn cmd_agents(ctx: &Ctx, c: Option<AgentsCommand>) -> Result<()> {
             dry_run,
             yes,
         } => {
-            let snap = ctx.ws.scan()?;
+            let snap = ctx.ws.scan_for_links()?;
             let actions = deploy::plan_relink(&ctx.ws, &snap, &agent, &skills)?;
             gate(
                 &actions,
@@ -1911,7 +1930,7 @@ fn preset_links(
         .load(name)?
         .with_context(|| format!("no such preset: {name}"))?;
     let targets = resolve_agents(ctx, agents, all_agents)?;
-    let snap = ctx.ws.scan()?;
+    let snap = ctx.ws.scan_for_links()?;
     let actions = if on {
         deploy::plan_preset_activate(&ctx.ws, &snap, &p, &targets)?
     } else {

@@ -55,7 +55,7 @@ fn batch_skips_unchanged_repositories_and_downloads_changed_repository_once() {
     }
     let mut session = UpdateSession::default();
     let mut messages = Vec::new();
-    let snap = ws.scan().unwrap();
+    let snap = ws.inventory().unwrap();
     for key in ["one", "two"] {
         let checked = session
             .check(&ws, key, &mut |m| messages.push(m.to_string()))
@@ -82,6 +82,20 @@ fn batch_skips_unchanged_repositories_and_downloads_changed_repository_once() {
             .count(),
         0
     );
+    // Preparation must not trust even a verified snapshot after a local edit.
+    let verified = ws.scan().unwrap();
+    let changed = ws.skill_path("one").join("late.txt");
+    std::fs::write(&changed, "edited after verification").unwrap();
+    let prepared = UpdateSession::default()
+        .prepare(&verified, "one", &mut |_| {})
+        .unwrap();
+    assert!(prepared.needs_resolution());
+    assert_eq!(
+        prepared.files["late.txt"],
+        skills::ops::update::FileChange::LocalChanged
+    );
+    prepared.cleanup();
+    std::fs::remove_file(changed).unwrap();
     for key in ["one", "two"] {
         std::fs::write(source.join(key).join("new.txt"), "upstream").unwrap();
     }
@@ -90,7 +104,7 @@ fn batch_skips_unchanged_repositories_and_downloads_changed_repository_once() {
     for key in ["one", "two"] {
         std::fs::write(ws.skill_path(key).join("mine.txt"), "local").unwrap();
     }
-    let snap = ws.scan().unwrap();
+    let snap = ws.inventory().unwrap();
     let mut session = UpdateSession::default();
     messages.clear();
     for key in ["one", "two"] {

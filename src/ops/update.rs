@@ -194,7 +194,10 @@ impl UpdateSession {
             .with_context(|| format!("{key} is not a remote-sourced skill"))?;
         let revision = source.revision().map(str::to_owned);
         match rec.status {
-            SkillStatus::Repository | SkillStatus::MissingBaseline | SkillStatus::Modified => {}
+            SkillStatus::Repository
+            | SkillStatus::MissingBaseline
+            | SkillStatus::Modified
+            | SkillStatus::Unchecked => {}
             ref s => bail!("cannot update a skill in state {}", s.label()),
         }
         let local = crate::skill::SkillDoc::load(&rec.path)?;
@@ -207,6 +210,14 @@ impl UpdateSession {
             "local skill name changed; keeping local copy and deployments"
         );
         let expected_hash = hash_directory(&rec.path)?;
+        // Preparation owns content verification for this skill. Both front ends
+        // can supply an inventory snapshot without hashing unrelated skills, and
+        // a previously verified snapshot cannot hide edits made since that scan.
+        let status = match &meta.baseline {
+            Some(baseline) if baseline.hash == expected_hash => SkillStatus::Repository,
+            Some(_) => SkillStatus::Modified,
+            None => SkillStatus::MissingBaseline,
+        };
 
         let download = DownloadDir::new("update")?;
         let work = download.path().to_path_buf();
@@ -216,7 +227,7 @@ impl UpdateSession {
             self.latest(&source, progress)?;
         }
         if matches!(source, Source::Git { .. })
-            && rec.status != SkillStatus::Modified
+            && status != SkillStatus::Modified
             && let Some(head) = self.heads.get(&identity)
             && revision.as_ref() == Some(head)
         {
@@ -224,7 +235,7 @@ impl UpdateSession {
                 skill: key.into(),
                 from_revision: revision,
                 to_revision: head.clone(),
-                status: rec.status.label().into(),
+                status: status.label().into(),
                 new_skills: Vec::new(),
                 files: BTreeMap::new(),
                 upstream_dir: work.join("upstream"),
@@ -308,7 +319,7 @@ impl UpdateSession {
             skill: key.to_string(),
             from_revision: revision.clone(),
             to_revision,
-            status: rec.status.label().to_string(),
+            status: status.label().to_string(),
             new_skills,
             files: BTreeMap::new(),
             upstream_dir,
@@ -319,7 +330,7 @@ impl UpdateSession {
             expected_hash,
         };
 
-        if rec.status == SkillStatus::Modified {
+        if status == SkillStatus::Modified {
             // Providers with version history can recover a three-way baseline;
             // otherwise differences remain unclassified.
             if let Some(rev) = &revision

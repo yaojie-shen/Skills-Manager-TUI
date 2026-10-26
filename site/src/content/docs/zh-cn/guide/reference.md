@@ -43,6 +43,8 @@ skills --json status
 
 `--dry-run` 只适用于明确支持它的命令。删除和清理通常要求 `--yes`；[健康检查](../health/)和[根目录同步](../sync/)说明了安全边界。
 
+`list` 和 `show` 使用与 TUI Library 相同的轻量清单。仓库技能初始显示为 `unchecked`，浏览时不校验全部文件。使用 `list --verify`（例如 `list --verify status:modified`）按已校验状态过滤，或用 `show KEY --verify` 校验单个技能并计算当前 hash。`status` 和 Health 仍执行完整校验。部署、标签、备注和上游版本检查不校验无关的 baseline；更新准备由公共库校验将要更新的技能。
+
 ## 搜索
 
 ```sh

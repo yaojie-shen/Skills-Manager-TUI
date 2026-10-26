@@ -43,6 +43,8 @@ Uppercase terms are placeholders. Prefix each command in the table with `skills`
 
 `--dry-run` works only where documented. Removal and cleanup commands commonly require `--yes`; [health](../health/) and [root sync](../sync/) define their safety boundaries.
 
+`list` and `show` use the same lightweight inventory as the TUI Library. Repository content starts as `unchecked`; browsing does not verify every file. Use `list --verify` (including `list --verify status:modified`) for verified filtering, or `show KEY --verify` to verify one skill and calculate its current hash. `status` and Health still perform full verification. Deployment, tags, notes and upstream revision checks do not verify unrelated baselines; update preparation verifies the skill being updated in the shared library.
+
 ## Search
 
 ```sh

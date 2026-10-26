@@ -344,7 +344,9 @@ pub fn spawn_task(mut ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                             Some(&alias),
                             &mut progress,
                         )?;
-                        let inventory = ws.scan().and_then(|snapshot| fetched.inventory(&snapshot));
+                        let inventory = ws
+                            .inventory()
+                            .and_then(|snapshot| fetched.inventory(&snapshot));
                         fetched.cleanup();
                         inventory
                     })();
@@ -439,11 +441,9 @@ pub fn spawn_task(mut ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                 }
                 Task::Prepare(key) => {
                     progress("Update: inspecting local files and fetching upstream…");
-                    let r = ws
-                        .scan_selected(std::slice::from_ref(&key))
-                        .and_then(|snap| {
-                            update::UpdateSession::default().prepare(&snap, &key, &mut progress)
-                        });
+                    let r = ws.inventory().and_then(|snap| {
+                        update::UpdateSession::default().prepare(&snap, &key, &mut progress)
+                    });
                     TaskOutput::Prepared(key, r)
                 }
             };
