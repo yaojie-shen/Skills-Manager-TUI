@@ -1,4 +1,8 @@
 //! Symlink deployment: deploy, undeploy, convert dir-linked agents.
+//!
+//! Lookup indexes live only for one planning/validation call. Preflight reads
+//! current documents and destinations once per batch; nothing is cached across
+//! previews or writes. Unlink/clean identities are also rechecked at removal.
 
 use crate::Workspace;
 use crate::hash::hash_directory;
@@ -7,10 +11,10 @@ use crate::reconcile::{AgentDirMode, DeployState, EntryState, Snapshot};
 use crate::util::is_symlink;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "op", rename_all = "kebab-case")]
@@ -149,10 +153,11 @@ pub fn plan_deploy(
 ) -> Result<Vec<Action>> {
     let mut actions = Vec::new();
     let mut mkdir_done = BTreeSet::new();
+    let records: BTreeMap<_, _> = snap.skills.iter().map(|r| (r.key.as_str(), r)).collect();
     for (agent, dir) in agent_dirs(ws, agents)? {
         let report = snap.agent(&agent).context("agent not scanned")?;
         for skill in skills {
-            let rec = match snap.get(skill) {
+            let rec = match records.get(skill.as_str()) {
                 Some(r) if r.status.is_present() && r.deployment_name().is_some() => r,
                 Some(r) => {
                     actions.push(Action::Skip {
@@ -450,6 +455,72 @@ pub fn plan_relink(
 /// resolution; this checks only state that can make an otherwise resolved plan
 /// unsafe to apply.
 pub fn preflight(actions: &[Action]) -> Result<()> {
+    preflight_links(actions).map(|_| ())
+}
+
+struct CheckedLink<'a> {
+    path: &'a Path,
+    target: &'a Path,
+    directory: PathBuf,
+    name: String,
+}
+
+#[derive(Default)]
+struct DestinationEntries {
+    paths: BTreeMap<PathBuf, Option<PathBuf>>,
+    names: BTreeMap<String, Vec<(PathBuf, Option<PathBuf>)>>,
+}
+
+impl DestinationEntries {
+    fn read(parent: &Path, removed: &BTreeSet<&PathBuf>) -> Result<Self> {
+        let mut entries = Self::default();
+        if parent.is_dir() {
+            for entry in fs::read_dir(parent)? {
+                let other = entry?.path();
+                if removed.contains(&other)
+                    || other
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+                {
+                    continue;
+                }
+                let target = fs::canonicalize(&other).ok();
+                if let Ok(document) = crate::skill::SkillDoc::load(&other) {
+                    entries
+                        .names
+                        .entry(document.name)
+                        .or_default()
+                        .push((other.clone(), target.clone()));
+                }
+                entries.paths.insert(other, target);
+            }
+        }
+        Ok(entries)
+    }
+
+    fn check(&self, path: &Path, name: &str, target: &Option<PathBuf>) -> Result<()> {
+        let occupied = self
+            .paths
+            .get_key_value(path)
+            .filter(|(_, other)| *other != target)
+            .map(|(path, _)| path);
+        let same_name = self.names.get(name).and_then(|entries| {
+            entries
+                .iter()
+                .find(|(_, other)| other != target)
+                .map(|(path, _)| path)
+        });
+        if let Some(other) = occupied.or(same_name) {
+            bail!(
+                "deployment conflict at {}; choose one skill before applying",
+                other.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn preflight_links(actions: &[Action]) -> Result<Vec<CheckedLink<'_>>> {
     // A configured agent directory can be replaced after planning. Reject the
     // whole batch before any action can write through that new symlink.
     for action in actions {
@@ -486,61 +557,58 @@ pub fn preflight(actions: &[Action]) -> Result<()> {
     let removed: BTreeSet<_> = actions
         .iter()
         .filter_map(|a| match a {
-            Action::Unlink { path, .. } | Action::Clean { path, .. } => Some(path.clone()),
+            Action::Unlink { path, .. } | Action::Clean { path, .. } => Some(path),
             _ => None,
         })
         .collect();
+    let mut sources = BTreeMap::new();
+    let mut directories = BTreeMap::new();
+    let mut links = Vec::new();
     for action in actions {
         if let Action::Link { path, target, .. } = action {
-            let name = crate::skill::SkillDoc::load(target)?.name;
+            let (name, canonical_target) = match sources.entry(target) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert((
+                    crate::skill::SkillDoc::load(target)?.name,
+                    fs::canonicalize(target).ok(),
+                )),
+            };
             let parent = path.parent().context("invalid deployment path")?;
-            if parent.is_dir() {
-                for entry in std::fs::read_dir(parent)? {
-                    let other = entry?.path();
-                    if removed.contains(&other)
-                        || other
-                            .file_name()
-                            .is_some_and(|n| n.to_string_lossy().starts_with('.'))
-                    {
-                        continue;
-                    }
-                    if std::fs::canonicalize(&other).ok() == std::fs::canonicalize(target).ok() {
-                        continue;
-                    }
-                    anyhow::ensure!(
-                        other != *path
-                            && crate::skill::SkillDoc::load(&other)
-                                .map_or(true, |d| d.name != name),
-                        "deployment conflict at {}; choose one skill before applying",
-                        other.display()
-                    );
-                }
-            }
+            let (directory, entries) = match directories.entry(parent) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert((
+                    fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()),
+                    DestinationEntries::read(parent, &removed)?,
+                )),
+            };
+            entries.check(path, name, canonical_target)?;
+            links.push(CheckedLink {
+                path,
+                target,
+                directory: directory.clone(),
+                name: name.clone(),
+            });
         }
     }
-    Ok(())
+    Ok(links)
 }
 
 /// Execute planned actions in order. Stops at the first failure.
 pub fn apply(actions: &[Action]) -> Result<usize> {
-    preflight(actions)?;
+    let links = preflight_links(actions)?;
 
     // Applying cannot leave an unresolved duplicate-name choice to the caller.
-    let mut planned = Vec::new();
-    for action in actions {
-        if let Action::Link { path, target, .. } = action {
-            let name = crate::skill::SkillDoc::load(target)?.name;
-            let parent = path.parent().context("invalid deployment path")?;
-            let directory = std::fs::canonicalize(parent).unwrap_or(parent.to_path_buf());
-            for (other_dir, other_path, other_name, other_target) in &planned {
-                anyhow::ensure!(
-                    other_dir != &directory
-                        || other_target == target
-                        || (other_path != path && other_name != &name),
-                    "deployment conflict: choose only one skill per folder/name"
-                );
-            }
-            planned.push((directory, path.clone(), name, target.clone()));
+    let mut paths = BTreeMap::new();
+    let mut names = BTreeMap::new();
+    for link in &links {
+        for previous in [
+            paths.insert((&link.directory, link.path), link.target),
+            names.insert((&link.directory, &link.name), link.target),
+        ] {
+            anyhow::ensure!(
+                previous.is_none_or(|target| target == link.target),
+                "deployment conflict: choose only one skill per folder/name"
+            );
         }
     }
 
@@ -1030,8 +1098,81 @@ pub struct NameConflict {
     pub other_skill: Option<String>,
 }
 
+/// Index candidates without changing the order of conflicts presented to users.
+#[derive(Default)]
+struct ConflictIndex {
+    paths: BTreeMap<PathBuf, Vec<usize>>,
+    names: BTreeMap<String, Vec<usize>>,
+}
+
+impl ConflictIndex {
+    fn insert(&mut self, index: usize, path: PathBuf, name: Option<&str>) {
+        self.paths.entry(path).or_default().push(index);
+        if let Some(name) = name {
+            self.names.entry(name.into()).or_default().push(index);
+        }
+    }
+
+    fn candidates(&self, path: &Path, name: &str) -> BTreeSet<usize> {
+        self.paths
+            .get(path)
+            .into_iter()
+            .flatten()
+            .chain(self.names.get(name).into_iter().flatten())
+            .copied()
+            .collect()
+    }
+}
+
 pub fn name_conflicts(snap: &Snapshot, actions: &[Action]) -> Vec<NameConflict> {
     let mut conflicts = Vec::new();
+    let records: BTreeMap<_, _> = snap.skills.iter().map(|r| (r.key.as_str(), r)).collect();
+    let removed: BTreeSet<_> = actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Unlink { path, .. } => Some(path),
+            _ => None,
+        })
+        .collect();
+    let mut planned = BTreeMap::<&str, ConflictIndex>::new();
+    for (index, action) in actions.iter().enumerate() {
+        if let Action::Link {
+            agent, skill, path, ..
+        } = action
+        {
+            planned.entry(agent).or_default().insert(
+                index,
+                path.clone(),
+                records.get(skill.as_str()).and_then(|r| r.name.as_deref()),
+            );
+        }
+    }
+    let mut existing = BTreeMap::new();
+    for report in &snap.agents {
+        if !planned.contains_key(report.key.as_str()) {
+            continue;
+        }
+        let mut index = ConflictIndex::default();
+        let mut entries = Vec::new();
+        for (alias, state) in &report.entries {
+            let path = report.skills_dir.join(alias);
+            if removed.contains(&path) {
+                continue;
+            }
+            index.insert(
+                entries.len(),
+                path.clone(),
+                report.documents.get(alias).map(|d| d.name.as_str()),
+            );
+            entries.push((path, state));
+        }
+        existing.insert(report.key.as_str(), (index, entries));
+    }
+    // Resolve Library identities only when a candidate actually conflicts.
+    // Most batches have none; even occupied destinations resolve each path at
+    // most once rather than canonicalizing the Library for every Link/entry pair.
+    let mut canonical_records = None;
+    let mut resolved_entries = BTreeMap::new();
     for action in actions {
         let Action::Link {
             agent, skill, path, ..
@@ -1039,57 +1180,56 @@ pub fn name_conflicts(snap: &Snapshot, actions: &[Action]) -> Vec<NameConflict> 
         else {
             continue;
         };
-        let Some(record) = snap.get(skill) else {
+        let Some(record) = records.get(skill.as_str()) else {
             continue;
         };
         let Some(name) = record.name.as_ref() else {
             continue;
         };
-        let Some(report) = snap.agent(agent) else {
+        let Some((index, entries)) = existing.get(agent.as_str()) else {
             continue;
         };
-        for (alias, state) in &report.entries {
-            let other_path = report.skills_dir.join(alias);
-            if actions
-                .iter()
-                .any(|a| matches!(a, Action::Unlink {path,..} if *path == other_path))
-            {
-                continue;
-            }
-            let resolved = std::fs::canonicalize(&other_path).ok();
-            let other = snap
-                .skills
-                .iter()
-                .find(|s| resolved.is_some() && std::fs::canonicalize(&s.path).ok() == resolved);
+        for index in index.candidates(path, name) {
+            let (other_path, state) = &entries[index];
+            let resolved = resolved_entries
+                .entry(other_path)
+                .or_insert_with(|| fs::canonicalize(other_path).ok());
+            let other = resolved.as_ref().and_then(|resolved| {
+                canonical_records
+                    .get_or_insert_with(|| {
+                        let mut paths = BTreeMap::new();
+                        for record in &snap.skills {
+                            if let Ok(path) = fs::canonicalize(&record.path) {
+                                paths.entry(path).or_insert(record);
+                            }
+                        }
+                        paths
+                    })
+                    .get(resolved)
+                    .copied()
+            });
             if other.is_some_and(|s| &s.key == skill) {
                 continue;
             }
-
-            let actual_name = report.documents.get(alias).map(|d| &d.name);
-            if actual_name == Some(name) || &other_path == path {
-                conflicts.push(NameConflict {
-                    agent: agent.clone(),
-                    skill: skill.clone(),
-                    name: name.clone(),
-                    other_path,
-                    other_skill: if matches!(state, EntryState::Deployed) {
-                        other.map(|s| s.key.clone())
-                    } else {
-                        None
-                    },
-                });
-            }
+            conflicts.push(NameConflict {
+                agent: agent.clone(),
+                skill: skill.clone(),
+                name: name.clone(),
+                other_path: other_path.clone(),
+                other_skill: if matches!(state, EntryState::Deployed) {
+                    other.map(|s| s.key.clone())
+                } else {
+                    None
+                },
+            });
         }
-        for other in actions {
+        for index in planned[agent.as_str()].candidates(path, name) {
             if let Action::Link {
-                agent: oa,
                 skill: os,
                 path: op,
                 ..
-            } = other
-                && oa == agent
+            } = &actions[index]
                 && os != skill
-                && (op == path || snap.get(os).and_then(|r| r.name.as_ref()) == Some(name))
             {
                 conflicts.push(NameConflict {
                     agent: agent.clone(),
