@@ -1,7 +1,9 @@
 //! Read-only reconciliation of the skills root, its metadata and every agent
 //! directory. Scanning never writes anything.
 //! Repository metadata and skill documents use a short-lived ordered pool of
-//! at most 32 workers, each claiming batches of four reads.
+//! at most 32 workers, each claiming batches of four reads. Workspace inventory
+//! may reuse unchanged parsed documents; direct scans and mutation preflight
+//! remain fresh. The optional read cache never covers baseline/shadow hashes.
 //! Baseline hashes share one bounded pool of at most 32 workers across directory
 //! discovery and file batches; completed hashes are reused only within this scan.
 
@@ -291,13 +293,43 @@ impl Snapshot {
 
 /// Scan the root and every agent. Pure read.
 pub fn scan(root: &Path, config: &Config) -> Result<Snapshot> {
-    scan_inventory(root, config, &mut hash_directory, Verification::All, true)
+    scan_inventory(
+        root,
+        config,
+        &mut hash_directory,
+        Verification::All,
+        true,
+        None,
+    )
 }
 
 /// Read Library and deployment inventory without verifying remote baselines or
 /// inferring content-based renames. Shadow copies are still compared freshly.
 pub fn inventory(root: &Path, config: &Config) -> Result<Snapshot> {
-    scan_inventory(root, config, &mut hash_directory, Verification::None, true)
+    scan_inventory(
+        root,
+        config,
+        &mut hash_directory,
+        Verification::None,
+        true,
+        None,
+    )
+}
+
+/// Inventory backed by the Workspace's process-local document cache.
+pub(crate) fn inventory_cached(
+    root: &Path,
+    config: &Config,
+    cache: &crate::read_cache::ReadCache,
+) -> Result<Snapshot> {
+    scan_inventory(
+        root,
+        config,
+        &mut hash_directory,
+        Verification::None,
+        true,
+        Some(cache),
+    )
 }
 
 /// Verify only the selected remote skills. Other present remote skills remain
@@ -310,6 +342,7 @@ pub fn scan_selected(root: &Path, config: &Config, keys: &[String]) -> Result<Sn
         &mut hash_directory,
         Verification::Selected(&keys),
         true,
+        None,
     )
 }
 
@@ -334,7 +367,7 @@ pub fn rescope(snapshot: &Snapshot, destinations: &[AgentConfig]) -> Result<Snap
             &mut hash_directory,
         )?);
     }
-    load_agent_documents(&mut agents, true);
+    load_agent_documents(&mut agents, true, None);
     for record in records.values_mut() {
         record.deploy.clear();
         for agent in &agents {
@@ -376,7 +409,14 @@ fn cached_hash(
 /// use `scan` for display, health checks and content updates. Shadow comparisons
 /// and actual destination inspection remain fresh, including before mutations.
 pub fn scan_for_links(root: &Path, config: &Config) -> Result<Snapshot> {
-    scan_inventory(root, config, &mut hash_directory, Verification::None, true)
+    scan_inventory(
+        root,
+        config,
+        &mut hash_directory,
+        Verification::None,
+        true,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -385,7 +425,7 @@ fn scan_with_hash(
     config: &Config,
     hash: &mut dyn FnMut(&Path) -> Result<String>,
 ) -> Result<Snapshot> {
-    scan_inventory(root, config, hash, Verification::All, false)
+    scan_inventory(root, config, hash, Verification::All, false, None)
 }
 
 #[derive(Clone, Copy)]
@@ -426,6 +466,7 @@ fn scan_inventory(
     hash: &mut dyn FnMut(&Path) -> Result<String>,
     verification: Verification<'_>,
     parallel: bool,
+    cache: Option<&crate::read_cache::ReadCache>,
 ) -> Result<Snapshot> {
     let mut hashes = HashMap::new();
     // Compare canonical symlink targets with a canonical root, including when
@@ -433,7 +474,7 @@ fn scan_inventory(
     let root = crate::paths::resolve_root(Some(root))?;
     let root = root.as_path();
     let store = MetaStore::new(root);
-    let metadata = store.inventory(parallel)?;
+    let metadata = store.inventory(parallel, cache)?;
     let repositories: BTreeMap<_, _> = metadata
         .repositories
         .into_iter()
@@ -514,7 +555,7 @@ fn scan_inventory(
     // Parse every discovered document once. Per-skill aliases into repository
     // storage are deployments, not second skills.
     let loaded_documents = crate::scan_io::map_ordered(&discovered, parallel, |(_, path)| {
-        SkillDoc::load(path).map_err(|error| error.to_string())
+        SkillDoc::load_cached(path, cache).map_err(|error| error.to_string())
     });
     let mut documents: HashMap<PathBuf, Result<SkillDoc, String>> = discovered
         .iter()
@@ -635,7 +676,9 @@ fn scan_inventory(
         .filter(|_| config.tags_enabled)
         .flat_map(|tag| tag.skills.clone())
         .collect();
-    let presets = crate::preset::PresetIndex::new(crate::preset::PresetStore::new(root).list()?);
+    let presets = crate::preset::PresetIndex::new(
+        crate::preset::PresetStore::new(root).list_with_cache(cache)?,
+    );
     references.extend(presets.by_skill.keys().cloned());
     for key in references {
         if !crate::repository::valid_id(&key) {
@@ -794,7 +837,7 @@ fn scan_inventory(
         }
         agents
     };
-    load_agent_documents(&mut agents, parallel);
+    load_agent_documents(&mut agents, parallel, cache);
     for rec in records.values_mut() {
         if rec.current_hash.is_none() {
             rec.current_hash = hashes.get(&rec.path).cloned().flatten();
@@ -1025,7 +1068,11 @@ fn scan_agent(
 /// Load only documents that classification could not reuse from the Library.
 /// Work is collected across every agent so one bounded pool serves the scan.
 /// Keep this pool small to limit simultaneous document opens and tail latency.
-fn load_agent_documents(agents: &mut [AgentReport], parallel: bool) {
+fn load_agent_documents(
+    agents: &mut [AgentReport],
+    parallel: bool,
+    cache: Option<&crate::read_cache::ReadCache>,
+) {
     let pending: Vec<_> = agents
         .iter()
         .enumerate()
@@ -1038,7 +1085,7 @@ fn load_agent_documents(agents: &mut [AgentReport], parallel: bool) {
         .collect();
     let documents =
         crate::scan_io::map_ordered_with_limit(&pending, parallel, 2, |(_, _, path)| {
-            SkillDoc::load(path).ok()
+            SkillDoc::load_cached(path, cache).ok()
         });
     for ((agent_index, name, _), document) in pending.into_iter().zip(documents) {
         if let Some(document) = document {
@@ -1158,6 +1205,7 @@ mod scan_cost_tests {
             &mut hash_directory,
             Verification::None,
             true,
+            None,
         )
         .unwrap();
         let serial = scan_inventory(
@@ -1166,6 +1214,7 @@ mod scan_cost_tests {
             &mut hash_directory,
             Verification::None,
             false,
+            None,
         )
         .unwrap();
         let signature = |report: &AgentReport| {
@@ -1281,7 +1330,7 @@ mod scan_cost_tests {
             report("cached", vec![("same".into(), fallback)], cached_documents),
         ];
 
-        load_agent_documents(&mut agents, true);
+        load_agent_documents(&mut agents, true, None);
 
         assert_eq!(agents[0].documents["same"].path, first);
         assert_eq!(agents[0].documents["same"].description, "first");
@@ -1441,6 +1490,7 @@ mod scan_cost_tests {
             &mut |_| panic!("link planning must not hash unrelated baselines"),
             Verification::None,
             false,
+            None,
         )
         .unwrap();
         assert!(snap.get("one").unwrap().status.is_present());
@@ -1568,6 +1618,7 @@ mod scan_cost_tests {
             &mut |path| panic!("inventory hashed baseline {}", path.display()),
             Verification::None,
             false,
+            None,
         )
         .unwrap();
         for key in ["repos/demo/clean", "repos/demo/changed"] {
@@ -1637,6 +1688,7 @@ mod scan_cost_tests {
             },
             Verification::Selected(&selected),
             false,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1686,6 +1738,7 @@ mod scan_cost_tests {
             &mut |_| anyhow::bail!("injected read failure"),
             Verification::All,
             false,
+            None,
         )
         .unwrap();
         let record = snapshot.get(key).unwrap();

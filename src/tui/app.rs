@@ -119,6 +119,8 @@ pub enum Action {
     Error(String),
     /// Re-scan in the background.
     Rescan,
+    /// Automatic refresh reuses unchanged inputs; Rescan explicitly bypasses them.
+    RefreshInventory,
     /// Verify repository content against recorded baselines.
     VerifyContent {
         explicit: bool,
@@ -419,8 +421,8 @@ impl App {
             .unwrap_or(std::env::current_dir()?);
         let mut agents = AgentsView::default();
         agents.discover(&local_project)?;
-        let snap = ws.inventory()?;
         let root_stamp = skills::reconcile::watch::stamp(&ws.root, &ws.config).ok();
+        let snap = ws.inventory()?;
         let settings = RuntimeSettings::new(&ws.config);
         let mut app = Self {
             ws,
@@ -1187,7 +1189,7 @@ impl App {
                     if changed {
                         self.sync.external_changed();
                         self.refresh_sync_status(false, ProbeReason::ObservedChange);
-                        return vec![Action::Rescan];
+                        return vec![Action::RefreshInventory];
                     }
                 }
                 Vec::new()
@@ -1981,7 +1983,11 @@ impl App {
             }
             Action::Toast(t) => self.toast(t, Level::Ok),
             Action::Error(t) => self.toast(t, Level::Error),
-            Action::Rescan => self.rescan(),
+            Action::Rescan => {
+                self.ws.reads.clear();
+                self.rescan();
+            }
+            Action::RefreshInventory => self.rescan(),
             Action::VerifyContent { explicit } => self.verify_content(explicit),
             Action::RefreshSyncStatus { remote, reason } => {
                 self.refresh_sync_status(remote, reason)
@@ -2441,6 +2447,9 @@ impl App {
     }
 
     fn verify_content(&mut self, explicit: bool) {
+        if explicit {
+            self.ws.reads.clear();
+        }
         if let Some(verification) = self.verification_task {
             if self.latest_scan_task != Some(verification) {
                 self.verification_queued = true;
@@ -3669,6 +3678,84 @@ mod matrix_key_tests {
         assert!(rendered.contains("note unchanged on printer"));
         assert!(!rendered.contains("note saved"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_poll_updates_library_search_after_edits_replacement_and_recovery() {
+        let temp = skills::ops::DownloadDir::new("cached-poll-search").unwrap();
+        Config {
+            agents: vec![],
+            ..Default::default()
+        }
+        .save(temp.path())
+        .unwrap();
+        let dir = temp.path().join("sample");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("SKILL.md");
+        std::fs::write(&path, "---\nname: sample\n---\nfirstneedle").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new_with_launch_directory(
+            Workspace::open(temp.path()).unwrap(),
+            tx,
+            Some(temp.path()),
+        )
+        .unwrap();
+        let search = |app: &mut App, query: &str| {
+            app.apply(Action::Search {
+                query: query.into(),
+                focus_list: true,
+            });
+            app.search.panel_keys(&Ctx {
+                ws: &app.ws,
+                snap: &app.snap,
+                settings: &app.settings,
+            })
+        };
+        assert_eq!(search(&mut app, "firstneedle"), ["sample"]);
+        let poll = |app: &mut App| {
+            app.last_root_poll = std::time::Instant::now() - std::time::Duration::from_secs(3);
+            app.handle(Msg::Tick);
+            while app.tasks_running > 0 {
+                app.handle(wait_for_msg(&rx, "cached poll"));
+            }
+        };
+        // Two rapid edits before polling must expose the latest content.
+        std::fs::write(&path, "---\nname: sample\n---\nintermediate").unwrap();
+        std::fs::write(&path, "---\nname: sample\n---\nsecondneedle").unwrap();
+        poll(&mut app);
+        assert!(search(&mut app, "firstneedle").is_empty());
+        assert_eq!(search(&mut app, "secondneedle"), ["sample"]);
+        let replacement = dir.join("replacement");
+        std::fs::write(&replacement, "---\nname: sample\n---\nthirdneedle").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        poll(&mut app);
+        assert!(search(&mut app, "secondneedle").is_empty());
+        assert_eq!(search(&mut app, "thirdneedle"), ["sample"]);
+        std::fs::write(&path, "---\nname: [\n---\n").unwrap();
+        poll(&mut app);
+        assert!(matches!(
+            app.snap.get("sample").unwrap().status,
+            skills::reconcile::SkillStatus::Invalid { .. }
+        ));
+        assert!(search(&mut app, "thirdneedle").is_empty());
+        std::fs::write(&path, "---\nname: sample\n---\nfourthneedle").unwrap();
+        // Explicit Ctrl+R goes through Rescan, discarding warmed reads too.
+        app.apply(Action::Rescan);
+        app.benchmark_drain(&rx);
+        assert_eq!(search(&mut app, "fourthneedle"), ["sample"]);
+        // Dictionary-only changes must travel through the same polling and
+        // page refresh path even when no indexed document text changes.
+        let dictionary = skills::paths::meta_dir(&app.ws.root).join(skills::dict::USER_FILE);
+        std::fs::write(&dictionary, "fourthneedle\t映射词\n").unwrap();
+        poll(&mut app);
+        assert_eq!(search(&mut app, "映射词"), ["sample"]);
+        std::fs::remove_file(&dictionary).unwrap();
+        poll(&mut app);
+        assert!(search(&mut app, "映射词").is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+        poll(&mut app);
+        assert!(app.snap.get("sample").is_none());
+        assert!(search(&mut app, "fourthneedle").is_empty());
     }
 
     #[test]

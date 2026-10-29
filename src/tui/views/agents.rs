@@ -2036,7 +2036,7 @@ impl View for AgentsView {
         self.scope_cache.clear();
         self.content_searcher.borrow_mut().configure(
             ctx.settings.search.clone(),
-            skills::dict::Dictionaries::load(&ctx.ws.root, &ctx.settings.search.dictionaries),
+            skills::dict::Dictionaries::for_workspace(ctx.ws, &ctx.settings.search.dictionaries),
         );
         self.content_searcher.borrow_mut().index(&ctx.snap.skills);
         self.refresh_scope(ctx);

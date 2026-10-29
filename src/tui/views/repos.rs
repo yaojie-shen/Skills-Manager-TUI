@@ -565,6 +565,7 @@ impl View for ReposView {
     }
 
     fn refresh(&mut self, ctx: &Ctx) {
+        self.filter.refresh(ctx);
         // Inventory is computed against one concrete Library snapshot. Any new
         // snapshot can change local hashes, installed paths, or source records,
         // so never present the old comparison as current.

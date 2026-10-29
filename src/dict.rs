@@ -133,18 +133,41 @@ impl Dictionaries {
     /// Tables for a skills root: the built-ins with their configured weights,
     /// plus the user table when the file exists. A weight of zero disables a source.
     pub fn load(root: &Path, w: &DictionaryWeights) -> Dictionaries {
+        Self::load_cached(root, w, None)
+    }
+
+    pub fn for_workspace(ws: &crate::Workspace, w: &DictionaryWeights) -> Dictionaries {
+        Self::load_cached(&ws.root, w, Some(&ws.reads))
+    }
+
+    fn load_cached(
+        root: &Path,
+        w: &DictionaryWeights,
+        cache: Option<&crate::read_cache::ReadCache>,
+    ) -> Dictionaries {
         let mut d = Dictionaries::default();
         for (source, weight) in [(Source::Tech, w.tech), (Source::Common, w.common)] {
             if weight > 0.0 {
                 d.entries.push((source, weight, builtin(source).clone()));
             }
         }
-        if w.user > 0.0
-            && let Ok(text) = std::fs::read_to_string(crate::paths::meta_dir(root).join(USER_FILE))
-        {
-            let table = Table::parse(&text);
-            if !table.is_empty() {
-                d.entries.push((Source::User, w.user, Arc::new(table)));
+        if w.user > 0.0 {
+            let path = crate::paths::meta_dir(root).join(USER_FILE);
+            let read = || -> anyhow::Result<Option<Arc<Table>>> {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => Ok(Some(Arc::new(Table::parse(&text)))),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error.into()),
+                }
+            };
+            let table = match cache {
+                Some(cache) => cache.load(&path, read),
+                None => read(),
+            };
+            if let Ok(Some(table)) = table
+                && !table.is_empty()
+            {
+                d.entries.push((Source::User, w.user, table));
             }
         }
         d

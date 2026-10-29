@@ -273,6 +273,7 @@ pub(crate) struct RepositoryMetadataInventory {
 
 /// A repository document parsed once, retaining the one syntax distinction
 /// needed by the on-disk contract before serde decoding normalizes it.
+#[derive(Clone)]
 pub(crate) struct RepositoryDocument {
     pub value: toml::Value,
     skills_is_table: Option<bool>,
@@ -411,10 +412,16 @@ impl MetaStore {
     /// Load repository identities and skill metadata from one fresh snapshot of
     /// every repository TOML file. Document/index errors remain global; errors
     /// decoding an individual skill are retained on that skill.
-    pub(crate) fn inventory(&self, parallel: bool) -> Result<RepositoryMetadataInventory> {
+    pub(crate) fn inventory(
+        &self,
+        parallel: bool,
+        cache: Option<&crate::read_cache::ReadCache>,
+    ) -> Result<RepositoryMetadataInventory> {
         let paths = self.repository_paths()?;
-        let documents =
-            crate::scan_io::map_ordered(&paths, parallel, |path| Self::read_value(path));
+        let documents = crate::scan_io::map_ordered(&paths, parallel, |path| match cache {
+            Some(cache) => cache.load(path, || Self::read_value(path)),
+            None => Self::read_value(path),
+        });
         let documents: Vec<_> = paths
             .into_iter()
             .zip(documents)

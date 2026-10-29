@@ -79,12 +79,19 @@ impl<G: Group> GroupStore<G> {
         Ok(doc.to_string().into_bytes())
     }
     fn entries(&self) -> Result<Vec<Entry<G>>> {
-        let files = crate::file_set::read_store(
+        self.entries_with_cache(None)
+    }
+    fn entries_with_cache(
+        &self,
+        cache: Option<&crate::read_cache::ReadCache>,
+    ) -> Result<Vec<Entry<G>>> {
+        let files = crate::file_set::read_store_cached(
             &meta_dir(&self.root),
             G::DIR,
             G::KIND,
             &crate::util::is_store_document_name,
             &mut |_, _, _| Ok(()),
+            cache,
         )?;
         self.parse_entries(files)
     }
@@ -135,6 +142,12 @@ impl<G: Group> GroupStore<G> {
         let mut values: Vec<_> = entries.iter().map(|e| e.group.clone()).collect();
         values.sort_by(|a, b| a.name().cmp(b.name()));
         values
+    }
+    pub(crate) fn list_with_cache(
+        &self,
+        cache: Option<&crate::read_cache::ReadCache>,
+    ) -> Result<Vec<G>> {
+        Ok(Self::values(&self.entries_with_cache(cache)?))
     }
     pub fn list(&self) -> Result<Vec<G>> {
         Ok(Self::values(&self.entries()?))

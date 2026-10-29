@@ -45,6 +45,8 @@ Uppercase terms are placeholders. Prefix each command in the table with `skills`
 
 `list` and `show` use the same lightweight inventory as the TUI Library. Repository content starts as `unchecked`; browsing does not verify every file. Use `list --verify` (including `list --verify status:modified`) for verified filtering, or `show KEY --verify` to verify one skill and calculate its current hash. `status` and Health still perform full verification. Deployment, tags, notes and upstream revision checks do not verify unrelated baselines; update preparation verifies the skill being updated in the shared library.
 
+While the TUI is running, unchanged skill documents, repository metadata, group files and the user dictionary are reused from a shared in-memory cache. Background polling detects external edits, replacements and deletions; subsequent refreshes reload changed inputs and update affected search documents. The cache is not saved on exit. Ordinary Ctrl+R clears it and rereads the inventory; Health Ctrl+R additionally verifies content. Verification and write-time validation always inspect current files. Polling still lists directories and checks file attributes, and network filesystem visibility follows the mount's caching behavior.
+
 ## Search
 
 ```sh

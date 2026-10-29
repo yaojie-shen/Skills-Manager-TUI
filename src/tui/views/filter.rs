@@ -1,4 +1,6 @@
 //! Plain-text navigation search, backed by the shared panel and text index.
+//! Views refresh the dictionary from shared reads with each new snapshot;
+//! keystrokes reuse it without filesystem I/O or clearing the user's query.
 use crate::tui::{
     app::{Action, Ctx},
     components::search_panel::{PanelLayout, PanelStyle, SearchEvent, SearchPanel},
@@ -30,17 +32,21 @@ impl std::ops::DerefMut for Filter {
     }
 }
 impl Filter {
+    pub fn refresh(&mut self, ctx: &Ctx) {
+        self.dictionary = Some((
+            ctx.ws.root.clone(),
+            ctx.settings.search.clone(),
+            skills::dict::Dictionaries::for_workspace(ctx.ws, &ctx.settings.search.dictionaries),
+        ));
+    }
+
     pub fn rank(&mut self, documents: &[TextDocument], ctx: &Ctx) -> Vec<usize> {
         if self
             .dictionary
             .as_ref()
             .is_none_or(|(root, cfg, _)| root != &ctx.ws.root || cfg != &ctx.settings.search)
         {
-            self.dictionary = Some((
-                ctx.ws.root.clone(),
-                ctx.settings.search.clone(),
-                skills::dict::Dictionaries::load(&ctx.ws.root, &ctx.settings.search.dictionaries),
-            ));
+            self.refresh(ctx);
         }
         self.searcher.search(
             documents,

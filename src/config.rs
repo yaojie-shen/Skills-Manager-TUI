@@ -432,14 +432,28 @@ impl Config {
 
     /// Load current settings and the unified in-memory Tag view.
     pub fn load(root: &Path) -> Result<Self> {
+        Self::load_with_cache(root, None)
+    }
+
+    pub(crate) fn load_with_cache(
+        root: &Path,
+        cache: Option<&crate::read_cache::ReadCache>,
+    ) -> Result<Self> {
         let path = Self::path(root);
-        let mut config = match std::fs::read_to_string(&path) {
-            // Every parse error already names the file.
-            Ok(text) => Self::parse_at(&path, &text)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        let read = || -> Result<Self> {
+            let config = match std::fs::read_to_string(&path) {
+                // Every parse error already names the file.
+                Ok(text) => Self::parse_at(&path, &text)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+                Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            };
+            Ok(config)
         };
-        config.tags = crate::tag::TagStore::new(root).list()?;
+        let mut config = match cache {
+            Some(cache) => cache.load(&path, read)?,
+            None => read()?,
+        };
+        config.tags = crate::tag::TagStore::new(root).list_with_cache(cache)?;
         Ok(config)
     }
 

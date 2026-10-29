@@ -840,6 +840,7 @@ impl View for HealthView {
     }
 
     fn refresh(&mut self, ctx: &Ctx) {
+        self.filter.refresh(ctx);
         self.checks.retain(|key, result| {
             let Some(record) = ctx.snap.get(key) else {
                 return false;

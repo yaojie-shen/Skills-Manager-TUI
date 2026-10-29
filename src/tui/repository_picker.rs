@@ -123,7 +123,7 @@ impl RepositoryPicker {
     pub fn refresh(&mut self, ctx: &Ctx) {
         self.searcher.configure(
             ctx.settings.search.clone(),
-            skills::dict::Dictionaries::load(&ctx.ws.root, &ctx.settings.search.dictionaries),
+            skills::dict::Dictionaries::for_workspace(ctx.ws, &ctx.settings.search.dictionaries),
         );
         self.configured_search = Some(ctx.settings.search.clone());
         self.refilter();

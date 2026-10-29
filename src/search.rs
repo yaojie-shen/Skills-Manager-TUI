@@ -636,6 +636,82 @@ impl Index {
         }
     }
 
+    /// Tokenize only changed/new documents. Preserve postings for unchanged
+    /// keys, remapping document numbers after additions, removals or reordering.
+    /// Corpus lengths and vocabulary are recomputed so ranking matches a fresh
+    /// build, including after deletions. No old term can survive a changed doc.
+    fn update(
+        &mut self,
+        records: &[SkillRecord],
+        previous: &[IndexedText],
+        weights: &FieldWeights,
+    ) {
+        if previous.is_empty() {
+            *self = Self::build(records, weights);
+            return;
+        }
+        let old: HashMap<_, _> = previous
+            .iter()
+            .enumerate()
+            .map(|(i, text)| (text.key.as_str(), i))
+            .collect();
+        let mut remap = vec![None; previous.len()];
+        let mut changed = Vec::new();
+        let mut changed_positions = Vec::new();
+        let mut docs = vec![Doc::default(); records.len()];
+        for (new, record) in records.iter().enumerate() {
+            if let Some(&old) = old.get(record.key.as_str())
+                && previous[old].matches(record)
+            {
+                remap[old] = Some(new);
+                docs[new] = self.docs[old].clone();
+            } else {
+                changed_positions.push(new);
+                changed.push(record.clone());
+            }
+        }
+        let updated = Self::build(&changed, weights);
+        for (i, doc) in updated.docs.into_iter().enumerate() {
+            docs[changed_positions[i]] = doc;
+        }
+        self.postings.retain(|_, postings| {
+            postings.retain_mut(|posting| {
+                if let Some(new) = remap[posting.doc] {
+                    posting.doc = new;
+                    true
+                } else {
+                    false
+                }
+            });
+            !postings.is_empty()
+        });
+        for (term, postings) in updated.postings {
+            self.postings
+                .entry(term)
+                .or_default()
+                .extend(postings.into_iter().map(|mut posting| {
+                    posting.doc = changed_positions[posting.doc];
+                    posting
+                }));
+        }
+        for postings in self.postings.values_mut() {
+            postings.sort_by_key(|p| p.doc);
+        }
+        let mut totals = [0u64; 6];
+        for doc in &docs {
+            for (total, len) in totals.iter_mut().zip(doc.len) {
+                *total += len as u64;
+            }
+        }
+        for (average, total) in self.avg_len.iter_mut().zip(totals) {
+            *average = (total as f32 / records.len().max(1) as f32).max(1.0);
+        }
+        self.docs = docs;
+        self.vocab = self.postings.keys().cloned().collect();
+        self.vocab.sort();
+        self.weights = updated.weights;
+    }
+
     fn idf(&self, term: &str) -> f32 {
         let n = self.docs.len() as f32;
         let df = self.postings.get(term).map(|p| p.len()).unwrap_or(0) as f32;
@@ -1077,22 +1153,27 @@ impl Searcher {
     /// Searcher for a workspace: its `[search]` config plus the built-in and user dictionaries.
     pub fn for_workspace(ws: &crate::Workspace) -> Self {
         let mut s = Self::new();
-        let dicts = Dictionaries::load(&ws.root, &ws.config.search.dictionaries);
+        let dicts = Dictionaries::for_workspace(ws, &ws.config.search.dictionaries);
         s.configure(ws.config.search.clone(), dicts);
         s
     }
 
     pub fn configure(&mut self, cfg: SearchConfig, dict: Dictionaries) {
-        let reindex = cfg.weights != self.cfg.weights;
+        self.index.weights = [
+            cfg.weights.name,
+            cfg.weights.tag,
+            cfg.weights.description,
+            cfg.weights.note,
+            cfg.weights.heading,
+            cfg.weights.body,
+        ];
         self.cfg = cfg;
         self.dict = dict;
-        if reindex {
-            self.len = usize::MAX;
-        }
     }
 
-    /// Refresh after a scan. Rebuild only when indexed text, ordering, or weights
-    /// changed; deployment and health filters do not require tokenizing again.
+    /// Refresh after a scan. Tokenize only changed/new records; remap unchanged
+    /// postings after reordering/deletion. Weights, deployment and health changes
+    /// do not require tokenizing again. Ranking matches a complete fresh build.
     pub fn index(&mut self, records: &[SkillRecord]) {
         if self.len == records.len()
             && self.indexed_text.len() == records.len()
@@ -1104,7 +1185,8 @@ impl Searcher {
         {
             return;
         }
-        self.index = Index::build(records, &self.cfg.weights);
+        self.index
+            .update(records, &self.indexed_text, &self.cfg.weights);
         self.indexed_text = records.iter().map(IndexedText::from_record).collect();
         self.len = records.len();
     }
@@ -1578,6 +1660,45 @@ mod tests {
     }
 
     #[test]
+    fn incremental_index_matches_fresh_build_after_every_kind_of_change() {
+        let mut records = parallel_records(25, 2048);
+        let mut searcher = Searcher::new();
+        let mut config = SearchConfig::default();
+        for step in 0..7 {
+            match step {
+                1 => {
+                    records[4].body = Some("# changed\nreplacement 中文 searchable".into());
+                    records[7].tags = vec!["newtag".into()];
+                }
+                2 => {
+                    records.remove(3);
+                    records.push(rec("added", "replacement", "new body", &["newtag"]));
+                }
+                3 => records.reverse(),
+                4 => {
+                    config.weights.body *= 2.0;
+                    config.weights.tag *= 0.5;
+                }
+                5 => records.clear(),
+                6 => records.push(rec("restored", "replacement", "中文", &[])),
+                _ => {}
+            }
+            searcher.configure(config.clone(), Dictionaries::default());
+            searcher.index(&records);
+            let fresh = Index::build(&records, &config.weights);
+            assert_same_index(&fresh, &searcher.index);
+            for query in ["replacement", "中文", "printer", "newtag", "skill"] {
+                assert_same_raw_hits(
+                    &fresh.query(query, &config, &Dictionaries::default()),
+                    &searcher
+                        .index
+                        .query(query, &config, &Dictionaries::default()),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn parallel_index_is_structurally_and_semantically_identical() {
         let mut records = parallel_records(37, 12 * 1024);
         records[1].description = Some(String::new());
@@ -1738,6 +1859,41 @@ mod tests {
             .find(|posting| posting.doc == 4)
             .unwrap();
         assert_eq!(posting.tf[Field::Body.idx()], u16::MAX);
+    }
+
+    #[test]
+    #[ignore = "release-mode incremental search benchmark; run with --ignored --nocapture"]
+    fn incremental_search_latency() {
+        let mut records = parallel_records(500, 13 * 1024);
+        let mut searcher = Searcher::new();
+        searcher.index(&records);
+        for scenario in ["unchanged", "one-document"] {
+            for round in 0..3 {
+                if scenario == "one-document" {
+                    records[42].body.as_mut().unwrap().push_str(" newword");
+                }
+                for incremental in if round % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
+                    let start = std::time::Instant::now();
+                    let full = if incremental {
+                        searcher.index(&records);
+                        None
+                    } else {
+                        Some(Index::build(&records, &FieldWeights::default()))
+                    };
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    if let Some(full) = full {
+                        std::hint::black_box(full.vocab.len());
+                    }
+                    println!(
+                        "INDEX scenario={scenario} incremental={incremental} round={round} records=500 ms={ms:.3}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

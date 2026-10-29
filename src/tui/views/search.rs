@@ -560,7 +560,7 @@ impl SearchView {
         view.hidden_group = Some((Kind::Preset, preset.into()));
         view.run_search(ctx, false);
         view.multi = true;
-        if let Ok(Some(p)) = ctx.ws.presets.load(preset) {
+        if let Some(p) = ctx.snap.presets.get(preset) {
             view.checked = p.members().into_iter().collect();
             view.picker_original = view.checked.clone();
         }
@@ -1822,7 +1822,7 @@ impl View for SearchView {
         }
         self.searcher.configure(
             ctx.settings.search.clone(),
-            skills::dict::Dictionaries::load(&ctx.ws.root, &ctx.settings.search.dictionaries),
+            skills::dict::Dictionaries::for_workspace(ctx.ws, &ctx.settings.search.dictionaries),
         );
         self.searcher.index(&ctx.snap.skills);
         self.run_search(ctx, true);

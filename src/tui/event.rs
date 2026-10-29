@@ -463,7 +463,7 @@ pub struct ScanOutcome {
 
 fn scan_workspace(ws: &mut Workspace, verify: bool) -> ScanOutcome {
     let mut warnings = Vec::new();
-    match ws.load_config() {
+    match ws.load_config_cached() {
         Ok(config) => {
             ws.config = config;
             // The worker clone carries the previous successful inventory. A

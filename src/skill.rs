@@ -21,6 +21,19 @@ pub struct SkillDoc {
 }
 
 impl SkillDoc {
+    pub(crate) fn load_cached(
+        dir: &Path,
+        cache: Option<&crate::read_cache::ReadCache>,
+    ) -> Result<Self> {
+        let Some(cache) = cache else {
+            return Self::load(dir);
+        };
+        let mut document = cache.load(&dir.join(SKILL_FILE), || Self::load(dir))?;
+        // A parent may become a symlink to the same document inode.
+        document.external = crate::util::is_symlink(dir);
+        Ok(document)
+    }
+
     pub fn load(dir: &Path) -> Result<Self> {
         let key = dir
             .file_name()

@@ -1,13 +1,14 @@
-//! Cheap polling for library topology and document changes. Never hashes skill trees.
+//! Poll Library topology, display documents and symlink targets, without hashing
+//! skill trees. Identity and ctime catch replacements and preserved-mtime edits.
+//! Agent SKILL.md files are watched too; attachments remain explicitly verified.
 
 use crate::config::Config;
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Stamp(BTreeMap<PathBuf, (u64, Option<SystemTime>, Option<PathBuf>)>);
+pub struct Stamp(BTreeMap<PathBuf, crate::read_cache::Stamp>);
 
 /// Inspect the supported library containers, SKILL.md files and metadata. Do not
 /// walk scripts, repository caches or external symlink trees on every UI tick.
@@ -30,7 +31,11 @@ pub fn stamp(root: &Path, config: &Config) -> Result<Stamp> {
         let file_type = record(&dir, &mut out)?;
         if recorded_is_dir(&dir, file_type) {
             for entry in std::fs::read_dir(&dir)? {
-                record(&entry?.path(), &mut out)?;
+                let path = entry?.path();
+                record(&path, &mut out)?;
+                if path.is_dir() {
+                    record(&path.join(crate::skill::SKILL_FILE), &mut out)?;
+                }
             }
         }
     }
@@ -41,14 +46,9 @@ fn record(path: &Path, out: &mut Stamp) -> Result<Option<std::fs::FileType>> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             let file_type = meta.file_type();
-            let target = if file_type.is_symlink() {
-                std::fs::read_link(path).ok()
-            } else {
-                None
-            };
             out.0.insert(
                 path.to_path_buf(),
-                (meta.len(), meta.modified().ok(), target),
+                crate::read_cache::watch_stamp(path, &meta),
             );
             return Ok(Some(file_type));
         }
@@ -228,24 +228,29 @@ mod tests {
             root.join("dangling"),
             agent.clone(),
             agent.join("one"),
+            agent.join("one/SKILL.md"),
             agent_link.clone(),
             agent_link.join("one"),
+            agent_link.join("one/SKILL.md"),
         ]
         .into_iter()
         .collect();
         assert_eq!(watched_paths(&before), expected);
-        assert_eq!(before.0[&root.join("linked")].2.as_ref(), Some(&external));
+        assert_eq!(
+            before.0[&root.join("linked")].link.as_ref(),
+            Some(&external)
+        );
         assert_eq!(
             before.0[&root.join("local/group/linked-document/SKILL.md")]
-                .2
+                .link
                 .as_ref(),
             Some(&external.join("SKILL.md"))
         );
         assert_eq!(
-            before.0[&root.join("dangling")].2.as_ref(),
+            before.0[&root.join("dangling")].link.as_ref(),
             Some(&tmp.path().join("missing"))
         );
-        assert_eq!(before.0[&agent_link].2.as_ref(), Some(&agent));
+        assert_eq!(before.0[&agent_link].link.as_ref(), Some(&agent));
         assert!(!before.0.contains_key(&root.join("flat/scripts")));
         assert!(!before.0.contains_key(&root.join("flat/scripts/payload")));
 
@@ -262,7 +267,7 @@ mod tests {
         assert_ne!(before_retarget, retargeted);
         assert_eq!(watched_paths(&retargeted), expected);
         assert_eq!(
-            retargeted.0[&root.join("linked")].2.as_ref(),
+            retargeted.0[&root.join("linked")].link.as_ref(),
             Some(&replacement)
         );
     }

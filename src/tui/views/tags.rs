@@ -561,6 +561,7 @@ impl View for TagsView {
             .map_or_else(String::new, |v| v.status(ctx))
     }
     fn refresh(&mut self, ctx: &Ctx) {
+        self.filter.refresh(ctx);
         let selected = self.selected_tag().map(str::to_owned);
         let panel = self.skill_search.take();
         let mut counts = ctx.snap.all_tags();

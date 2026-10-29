@@ -524,6 +524,7 @@ impl View for PresetsView {
             .map_or_else(String::new, |(_, v)| v.status(ctx))
     }
     fn refresh(&mut self, ctx: &Ctx) {
+        self.filter.refresh(ctx);
         // The list is sorted by name, so a preset keeps its place only by
         // name: one created or deleted above the cursor would otherwise move
         // the selection onto a neighbour.

@@ -1094,6 +1094,19 @@ enum Attempt {
     Changed,
 }
 
+/// A transient listing/open race, not a document value. Return an error from
+/// the cache loader so the retry signal can never become a reusable entry.
+#[derive(Debug)]
+struct ChangedDuringRead;
+
+impl std::fmt::Display for ChangedDuringRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("store document changed during read")
+    }
+}
+
+impl std::error::Error for ChangedDuringRead {}
+
 /// Admission check run before each document is read: its path, its size, and
 /// the documents already read in this attempt.
 pub(crate) type Admit<'a> = dyn FnMut(&Path, u64, &[(PathBuf, Vec<u8>)]) -> Result<()> + 'a;
@@ -1103,6 +1116,7 @@ fn read_attempt(
     kind: &str,
     is_document: &dyn Fn(&OsStr) -> bool,
     admit: &mut Admit<'_>,
+    cache: Option<&crate::read_cache::ReadCache>,
 ) -> Result<Attempt> {
     if let Pending::Busy(pid, work) = settle(target)? {
         return Ok(Attempt::Busy(pid, work));
@@ -1112,23 +1126,42 @@ fn read_attempt(
     };
     let mut files = Vec::with_capacity(listing.len());
     for (path, expected) in &listing {
-        let mut file = match fs::File::open(path) {
-            Ok(file) => file,
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(meta) if identity(&meta) == *expected => meta,
+            Ok(_) => return Ok(Attempt::Changed),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Attempt::Changed);
             }
-            Err(error) => {
-                return Err(error).with_context(|| format!("reading {}", path.display()));
-            }
+            Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
         };
-        let metadata = file.metadata()?;
-        if identity(&metadata) != *expected {
-            return Ok(Attempt::Changed);
-        }
         admit(path, metadata.len(), &files)?;
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.read_to_end(&mut bytes)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let read = || -> Result<Vec<u8>> {
+            let mut file = match fs::File::open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(ChangedDuringRead.into());
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("reading {}", path.display()));
+                }
+            };
+            if identity(&file.metadata()?) != *expected {
+                return Err(ChangedDuringRead.into());
+            }
+            let mut bytes = Vec::with_capacity(metadata.len() as usize);
+            file.read_to_end(&mut bytes)
+                .with_context(|| format!("reading {}", path.display()))?;
+            Ok(bytes)
+        };
+        let bytes = match cache {
+            Some(cache) => cache.load(path, read),
+            None => read(),
+        };
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(error) if error.is::<ChangedDuringRead>() => return Ok(Attempt::Changed),
+            Err(error) => return Err(error),
+        };
         files.push((path.clone(), bytes));
     }
     if let Pending::Busy(pid, work) = settle(target)? {
@@ -1150,10 +1183,23 @@ pub(crate) fn read_store(
     is_document: &dyn Fn(&OsStr) -> bool,
     admit: &mut Admit<'_>,
 ) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+    read_store_cached(meta, name, kind, is_document, admit, None)
+}
+
+/// Cached contents retain the same transaction settling, admission and listing
+/// validation as fresh store reads. Writes never pass a cache.
+pub(crate) fn read_store_cached(
+    meta: &Path,
+    name: &str,
+    kind: &str,
+    is_document: &dyn Fn(&OsStr) -> bool,
+    admit: &mut Admit<'_>,
+    cache: Option<&crate::read_cache::ReadCache>,
+) -> Result<Vec<(PathBuf, Vec<u8>)>> {
     let target = Target::store(meta, name);
     let deadline = Instant::now() + READ_WAIT;
     loop {
-        let attempt = read_attempt(&target, kind, is_document, admit)?;
+        let attempt = read_attempt(&target, kind, is_document, admit, cache)?;
         let expired = Instant::now() >= deadline;
         match attempt {
             Attempt::Done(files) => return Ok(files),
@@ -2346,6 +2392,55 @@ mod tests {
         );
         drop(running);
         fs::remove_dir_all(work).unwrap();
+    }
+
+    #[test]
+    fn cached_reader_retries_after_replacement_between_listing_and_open() {
+        let temp = DownloadDir::new("file-set-cache-replacement").unwrap();
+        let tags = TagStore::new(temp.path());
+        tags.save(&tag("a", &[])).unwrap();
+        let cache = crate::read_cache::ReadCache::default();
+        let target = Target::store(&crate::paths::meta_dir(temp.path()), "tags");
+        let mut replaced = false;
+        let mut admit = |path: &Path, _: u64, _: &[(PathBuf, Vec<u8>)]| {
+            if !replaced {
+                // Deterministic edit after the listing/metadata check, before
+                // the cache records its signature and opens the document.
+                let replacement = path.with_extension("replacement");
+                fs::write(&replacement, fs::read(path)?)?;
+                fs::rename(replacement, path)?;
+                replaced = true;
+            }
+            Ok(())
+        };
+        assert!(matches!(
+            read_attempt(
+                &target,
+                "tag",
+                &crate::util::is_store_document_name,
+                &mut admit,
+                Some(&cache)
+            )
+            .unwrap(),
+            Attempt::Changed
+        ));
+        assert!(
+            matches!(read_attempt(&target, "tag", &crate::util::is_store_document_name, &mut admit, Some(&cache)).unwrap(), Attempt::Done(files) if files.len() == 1)
+        );
+    }
+
+    #[test]
+    fn cached_store_reads_still_refuse_interrupted_publication() {
+        let temp = DownloadDir::new("file-set-cached-reader").unwrap();
+        let tags = TagStore::new(temp.path());
+        tags.save(&tag("a", &[])).unwrap();
+        let cache = crate::read_cache::ReadCache::default();
+        assert_eq!(tags.list_with_cache(Some(&cache)).unwrap().len(), 1);
+        let work = fake_transaction(temp.path(), "tags", std::process::id(), &[PUBLISHING]);
+        let error = format!("{:#}", tags.list_with_cache(Some(&cache)).unwrap_err());
+        assert!(error.contains("did not finish"), "{error}");
+        fs::remove_dir_all(work).unwrap();
+        assert_eq!(tags.list_with_cache(Some(&cache)).unwrap().len(), 1);
     }
 
     #[test]

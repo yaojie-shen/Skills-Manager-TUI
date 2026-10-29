@@ -1,6 +1,9 @@
 //! Core library for `skills`: scanning a central skills directory, keeping
 //! per-skill metadata as TOML files, and deploying skills to agents via
 //! symlinks. Both the CLI and the TUI are thin layers over this crate.
+//! Workspace clones share inventory document reads; explicit verification and
+//! mutation planning bypass that cache. Display consumers use their coherent
+//! inventory snapshot, refreshed after writes or watched external changes.
 
 pub mod agents;
 pub mod config;
@@ -15,6 +18,7 @@ pub mod migration;
 pub mod ops;
 pub mod paths;
 pub mod preset;
+pub mod read_cache;
 pub mod reconcile;
 pub mod repository;
 mod scan_io;
@@ -31,6 +35,8 @@ use std::path::{Path, PathBuf};
 /// Everything an operation needs: the root, the loaded config, and stores.
 #[derive(Debug, Clone)]
 pub struct Workspace {
+    /// Shared process-local inventory reads; fresh mutation/verification APIs bypass it.
+    pub reads: std::sync::Arc<read_cache::ReadCache>,
     pub root: PathBuf,
     pub project: Option<PathBuf>,
     /// Project associated with the transient directory inventory.
@@ -73,6 +79,7 @@ impl Workspace {
         migration: Option<migration::MigrationReport>,
     ) -> Result<Self> {
         let mut ws = Self {
+            reads: Default::default(),
             meta: meta::MetaStore::new(&root),
             tags: tag::TagStore::new(&root),
             presets: preset::PresetStore::new(&root),
@@ -89,17 +96,29 @@ impl Workspace {
     }
 
     pub fn load_config(&self) -> Result<config::Config> {
+        self.load_config_with_cache(None)
+    }
+
+    /// Reuse unchanged documents for display; writers use load_config instead.
+    pub fn load_config_cached(&self) -> Result<config::Config> {
+        self.load_config_with_cache(Some(&self.reads))
+    }
+
+    fn load_config_with_cache(
+        &self,
+        cache: Option<&read_cache::ReadCache>,
+    ) -> Result<config::Config> {
         // Rejects a layout newer than this build, e.g. after a root-sync pull.
         migration::version::read(&self.root)?;
         let Some(project) = &self.project else {
-            return config::Config::load(&self.root);
+            return config::Config::load_with_cache(&self.root, cache);
         };
         let exists = config::Config::exists(&self.root);
         let mut config = if exists {
-            config::Config::load(&self.root)?
+            config::Config::load_with_cache(&self.root, cache)?
         } else {
             let mut config = config::Config::local_default();
-            config.tags = self.tags.list()?;
+            config.tags = self.tags.list_with_cache(cache)?;
             config
         };
         // An omitted agents table also means local defaults.
@@ -125,9 +144,11 @@ impl Workspace {
         reconcile::scan(&self.root, &self.config)
     }
 
-    /// Read the current filesystem without verifying repository baselines.
+    /// Read inventory without verifying repository baselines. Reuse unchanged
+    /// documents after checking file signatures; never persist cached hashes.
     pub fn inventory(&self) -> Result<reconcile::Snapshot> {
-        reconcile::inventory(&self.root, &self.config)
+        self.reads.begin_inventory();
+        reconcile::inventory_cached(&self.root, &self.config, &self.reads)
     }
 
     /// Verify selected repository skills while leaving all others unchecked.

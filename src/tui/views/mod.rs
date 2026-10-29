@@ -112,3 +112,6 @@ mod navigation_tests;
 
 #[cfg(test)]
 mod presentation_tests;
+
+#[cfg(test)]
+mod cache_tests;

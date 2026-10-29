@@ -460,7 +460,7 @@ impl Modal {
                 lines.push(format!("link       {}/{old} → {}/{new}", a.key, a.key));
             }
         }
-        for p in ctx.ws.presets.list().unwrap_or_default() {
+        for p in ctx.snap.presets.by_name.values() {
             if p.members().iter().any(|s| s == old) {
                 lines.push(format!("preset     {}: {old} → {new}", p.name));
             }
