@@ -109,7 +109,7 @@ pub enum Command {
     /// Query upstream for newer revisions
     Check {
         skill: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "skill")]
         all: bool,
         #[arg(long, conflicts_with_all = ["skill", "all"])]
         repo: Option<String>,
@@ -332,7 +332,7 @@ pub struct UpdateArgs {
     #[arg(long, conflicts_with_all = ["skill", "all"])]
     pub repo: Option<String>,
     pub skill: Option<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "skill")]
     pub all: bool,
     /// Which side wins for a locally modified skill: local | upstream
     #[arg(long)]
@@ -341,7 +341,7 @@ pub struct UpdateArgs {
     #[arg(long = "take-file", value_name = "PATH=SIDE", hide = true)]
     pub take_file: Vec<String>,
     /// Alias for --take upstream
-    #[arg(long)]
+    #[arg(long, conflicts_with = "take")]
     pub force: bool,
     /// Show what would change without touching the root
     #[arg(long)]
@@ -761,33 +761,7 @@ fn run_command(cli: Cli) -> Result<()> {
                 )
             })
         }
-        Command::Check { skill, all, repo } => {
-            if let Some(alias) = repo {
-                let snap = ctx.ws.inventory()?;
-                let mut session = update::UpdateSession::default();
-                let results: Vec<_> = snap
-                    .skills
-                    .iter()
-                    .filter(|s| skills::repository::alias_of(&s.key) == Some(alias.as_str()))
-                    .map(|s| session.check(&ctx.ws, &s.key, &mut |message| eprintln!("{message}")))
-                    .collect::<Result<_>>()?;
-                ctx.out(&results, || {
-                    for result in &results {
-                        println!(
-                            "{}: {}",
-                            result.skill,
-                            if result.update_available {
-                                "update available"
-                            } else {
-                                "up to date"
-                            }
-                        );
-                    }
-                })
-            } else {
-                cmd_check(&ctx, skill, all)
-            }
-        }
+        Command::Check { skill, all, repo } => cmd_check(&ctx, skill, all, repo),
         Command::Repos {
             command: Some(ReposCommand::Rename { alias, name }),
         } => {
@@ -1430,8 +1404,19 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
     )
 }
 
-fn cmd_check(ctx: &Ctx, skill: Option<String>, all: bool) -> Result<()> {
-    let keys: Vec<String> = if all {
+fn cmd_check(ctx: &Ctx, skill: Option<String>, all: bool, repo: Option<String>) -> Result<()> {
+    let keys: Vec<String> = if let Some(alias) = repo {
+        let snap = ctx.ws.inventory()?;
+        anyhow::ensure!(
+            snap.repositories.contains_key(&alias),
+            "source not found: {alias}"
+        );
+        snap.skills
+            .iter()
+            .filter(|s| skills::repository::alias_of(&s.key) == Some(alias.as_str()))
+            .map(|s| s.key.clone())
+            .collect()
+    } else if all {
         let snap = ctx.ws.inventory()?;
         snap.skills
             .iter()
@@ -1447,11 +1432,12 @@ fn cmd_check(ctx: &Ctx, skill: Option<String>, all: bool) -> Result<()> {
     };
     let mut results = Vec::new();
     let mut errors = Vec::new();
-    let mut session = update::UpdateSession::default();
-    for k in keys {
-        match session.check(&ctx.ws, &k, &mut |message| eprintln!("{message}")) {
+    for item in update::check_batch(&ctx.ws, &keys, &mut |message| eprintln!("{message}")) {
+        match item.result {
             Ok(r) => results.push(r),
-            Err(e) => errors.push(serde_json::json!({"skill": k, "error": format!("{e:#}")})),
+            Err(e) => {
+                errors.push(serde_json::json!({"skill": item.key, "error": format!("{e:#}")}))
+            }
         }
     }
     ctx.out(
@@ -1481,13 +1467,19 @@ fn cmd_check(ctx: &Ctx, skill: Option<String>, all: bool) -> Result<()> {
                 );
             }
         },
-    )
+    )?;
+    anyhow::ensure!(errors.is_empty(), "{} skill check(s) failed", errors.len());
+    Ok(())
 }
 
 fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
     eprintln!("Scanning installed skills …");
     let snap = ctx.ws.inventory()?;
     let keys: Vec<String> = if let Some(alias) = &a.repo {
+        anyhow::ensure!(
+            snap.repositories.contains_key(alias),
+            "source not found: {alias}"
+        );
         snap.skills
             .iter()
             .filter(|s| skills::repository::alias_of(&s.key) == Some(alias.as_str()))
@@ -1550,6 +1542,7 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
             prepared.cleanup();
         } else if prepared.needs_resolution() && take.is_none() {
             entry["result"] = "needs-resolution".into();
+            failed += 1;
             prepared.cleanup();
         } else {
             match update::apply(&ctx.ws, &prepared, take.unwrap_or_default(), &per_file) {
@@ -1615,7 +1608,10 @@ fn cmd_update(ctx: &Ctx, a: UpdateArgs) -> Result<()> {
             }
         }
     })?;
-    anyhow::ensure!(failed == 0, "{failed} skill update(s) failed");
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} skill update(s) failed or need a resolution choice"
+    );
     Ok(())
 }
 

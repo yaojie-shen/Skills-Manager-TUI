@@ -23,6 +23,54 @@ pub struct CheckResult {
     pub update_available: bool,
 }
 
+pub struct CheckOutput {
+    pub key: String,
+    pub source: Option<crate::meta::Source>,
+    pub result: Result<CheckResult>,
+}
+
+impl CheckOutput {
+    pub fn matches(&self, record: &crate::reconcile::SkillRecord) -> bool {
+        match (&self.source, record.source.as_ref()) {
+            (Some(checked), Some(current)) => {
+                checked.same_location(current) && checked.revision() == current.revision()
+            }
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Check every selected skill, retaining failures and sharing source lookups.
+/// Both front ends consume this result; one failed source never hides siblings.
+pub fn check_batch(
+    ws: &Workspace,
+    keys: &[String],
+    progress: &mut dyn FnMut(&str),
+) -> Vec<CheckOutput> {
+    let mut session = UpdateSession::default();
+    let total = keys.len();
+    keys.iter()
+        .enumerate()
+        .map(|(done, key)| {
+            progress(&format!("{done}/{total} complete · querying {key}…"));
+            let source = ws
+                .meta
+                .load(key)
+                .ok()
+                .flatten()
+                .and_then(|meta| meta.source);
+            let result = session.check(ws, key, progress);
+            progress(&format!("{}/{total} complete", done + 1));
+            CheckOutput {
+                key: key.clone(),
+                source,
+                result,
+            }
+        })
+        .collect()
+}
+
 /// Compare the tracked Git revision or archive content hash with the installed version.
 pub fn check(ws: &Workspace, key: &str) -> Result<CheckResult> {
     UpdateSession::default().check(ws, key, &mut |_| {})

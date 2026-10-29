@@ -63,3 +63,9 @@ skills set-source KEY REFERENCE --subpath PATH
 Remote skills store an installed revision and a content hash. Git sources use repository revisions; archives use content hashes. A newer repository revision does not imply that every installed skill changed.
 
 The hash covers relative paths, file contents, and symlink targets. It ignores timestamps, permissions, `.git`, `__pycache__`, `.DS_Store`, and `*.pyc`. The hash detects changes but cannot restore files. Local skills have no remote baseline until a source is recorded.
+
+## Batch results and exit status
+
+Single-skill, `--repo` and `--all` checks all return `{"results": [...], "errors": [...]}` with `--json`. A failure does not stop the remaining checks. Any check error makes the command exit nonzero, after printing the report. An available update is not an error.
+
+An actual update exits nonzero if any item fails or remains `needs-resolution`; successful items are retained. `--dry-run` succeeds when a choice is needed because it is only a preview (inspection or download errors still fail). Choose either `--force` or `--take`, not both. Unknown repository aliases fail instead of silently returning an empty report.

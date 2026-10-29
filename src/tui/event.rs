@@ -3,7 +3,7 @@
 use anyhow::Result;
 use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseEvent};
 use skills::Workspace;
-use skills::ops::update::{self, CheckResult, Prepared};
+use skills::ops::update::{self, Prepared};
 use skills::reconcile::Snapshot;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -117,23 +117,7 @@ impl Task {
     }
 }
 
-pub struct CheckOutput {
-    pub key: String,
-    pub source: Option<skills::meta::Source>,
-    pub result: Result<CheckResult>,
-}
-
-impl CheckOutput {
-    pub fn matches(&self, record: &skills::reconcile::SkillRecord) -> bool {
-        match (&self.source, record.source.as_ref()) {
-            (Some(checked), Some(current)) => {
-                checked.same_location(current) && checked.revision() == current.revision()
-            }
-            (None, None) => true,
-            _ => false,
-        }
-    }
-}
+pub use skills::ops::update::CheckOutput;
 
 pub enum TaskOutput {
     RepairPlan(
@@ -405,29 +389,7 @@ pub fn spawn_task(mut ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                     TaskOutput::RootStamp(skills::reconcile::watch::stamp(&ws.root, &ws.config))
                 }
                 Task::Check(keys) => {
-                    let mut session = update::UpdateSession::default();
-                    let total = keys.len();
-                    TaskOutput::Check(
-                        keys.into_iter()
-                            .enumerate()
-                            .map(|(done, key)| {
-                                progress(&format!("{done}/{total} complete · querying {key}…"));
-                                let source = ws
-                                    .meta
-                                    .load(&key)
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|meta| meta.source);
-                                let result = session.check(&ws, &key, &mut progress);
-                                progress(&format!("{}/{total} complete", done + 1));
-                                CheckOutput {
-                                    key,
-                                    source,
-                                    result,
-                                }
-                            })
-                            .collect(),
-                    )
+                    TaskOutput::Check(update::check_batch(&ws, &keys, &mut progress))
                 }
                 Task::Install { reference, subpath } => {
                     progress("Install: preparing source files…");

@@ -1333,3 +1333,81 @@ fn explicit_scopes_share_content_without_registering_or_installing_new_upstream_
         );
     }
 }
+
+#[test]
+fn cli_check_preserves_partial_results_and_update_requires_resolution() {
+    let f = Fixture::new();
+    f.put("one", "one", "original");
+    f.commit();
+    let fetched = f.fetch("example");
+    let keys = fetched
+        .install(&f.ws, &["one".into()], &BTreeMap::new())
+        .unwrap();
+    fetched.cleanup();
+    let key = &keys[0];
+    let cli = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_skills"))
+            .env("HOME", f.dir.join("fake-home"))
+            .arg("--root")
+            .arg(&f.ws.root)
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for args in [
+        vec!["check", key],
+        vec!["check", "--repo", "example"],
+        vec!["check", "--all"],
+    ] {
+        let out = cli(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["results"].as_array().unwrap().len(), 1);
+        assert!(report["errors"].as_array().unwrap().is_empty());
+    }
+    let outputs = update::check_batch(&f.ws, &["missing".into(), key.clone()], &mut |_| {});
+    assert!(outputs[0].result.is_err());
+    assert!(outputs[1].result.is_ok());
+    assert!(outputs[1].matches(f.ws.inventory().unwrap().get(key).unwrap()));
+    let mut bad = f.ws.meta.load(key).unwrap().unwrap();
+    bad.source = Some(skills::meta::Source::Git {
+        url: f.dir.join("missing-upstream").display().to_string(),
+        branch: None,
+        subpath: None,
+        revision: None,
+    });
+    std::fs::create_dir_all(f.ws.root.join("unavailable")).unwrap();
+    std::fs::write(
+        f.ws.root.join("unavailable/SKILL.md"),
+        "---\nname: unavailable\n---\nbody",
+    )
+    .unwrap();
+    f.ws.meta.save("unavailable", &bad).unwrap();
+    let out = cli(&["check", "--all"]);
+    assert!(!out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["results"].as_array().unwrap().len(), 1);
+    assert_eq!(report["errors"][0]["skill"], "unavailable");
+    for command in ["check", "update"] {
+        assert!(!cli(&[command, "--repo", "unknown"]).status.success());
+        assert!(!cli(&[command, key, "--all"]).status.success());
+    }
+    std::fs::write(f.ws.skill_path(key).join("mine.txt"), "local edit").unwrap();
+    let out = cli(&["update", key]);
+    assert!(!out.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report[0]["result"], "needs-resolution");
+    assert!(cli(&["update", key, "--dry-run"]).status.success());
+    assert!(
+        !cli(&["update", key, "--force", "--take", "local"])
+            .status
+            .success()
+    );
+    assert!(cli(&["update", key, "--take", "local"]).status.success());
+    assert!(f.ws.skill_path(key).join("mine.txt").exists());
+}
