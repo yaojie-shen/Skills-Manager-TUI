@@ -43,6 +43,17 @@ pub struct Cli {
     /// Resolve duplicate frontmatter names when deploying
     #[arg(long, global = true, value_parser = ["replace"])]
     pub same_name: Option<String>,
+    /// Choose each deployment conflict (use --dry-run to list selectors and values)
+    #[arg(
+        long = "choose",
+        global = true,
+        value_name = "AGENT/NAME=VALUE",
+        conflicts_with = "same_name"
+    )]
+    pub choices: Vec<String>,
+    /// Allow explicitly excluded Agent-owned entries to be archived
+    #[arg(long, global = true, requires = "choices")]
+    pub archive_conflicts: bool,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -497,6 +508,8 @@ pub struct Ctx {
     pub ws: Workspace,
     pub project: Option<PathBuf>,
     pub same_name: Option<String>,
+    pub choices: Vec<String>,
+    pub archive_conflicts: bool,
     pub json: bool,
 }
 
@@ -582,6 +595,20 @@ impl Cli {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    if !cli.choices.is_empty() {
+        let supported = match &cli.command {
+            Some(Command::Deploy(_) | Command::Undeploy(_)) => true,
+            Some(Command::Preset(PresetArgs {
+                command: PresetCommand::Deploy { .. } | PresetCommand::Undeploy { .. },
+            })) => true,
+            Some(Command::Install(args)) => !args.list && !args.deploy_to.is_empty(),
+            _ => false,
+        };
+        anyhow::ensure!(
+            supported,
+            "--choose requires deploy, undeploy, preset deployment, or install --deploy"
+        );
+    }
     let scope = cli.mutation_scope();
 
     let ws = if scope.is_some() {
@@ -654,6 +681,8 @@ fn run_command(cli: Cli) -> Result<()> {
         project,
         json: cli.json,
         same_name: cli.same_name,
+        choices: cli.choices,
+        archive_conflicts: cli.archive_conflicts,
     };
     match command {
         Command::Init => unreachable!(),
@@ -1357,17 +1386,15 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
                 }
             })?;
 
-            let actions = if a.deploy_to.is_empty() {
-                vec![]
+            let deployment = if a.deploy_to.is_empty() {
+                None
             } else {
                 let snap = ctx.ws.scan_for_links()?;
                 let plan = deploy::plan_deploy(&ctx.ws, &snap, &keys, &a.deploy_to)?;
-                let actions = deploy::resolve_names(&snap, &plan, ctx.same_name.as_deref())?;
-                deploy::apply(&actions)?;
-                actions
+                Some(execute_actions(ctx, &snap, &plan, false)?)
             };
             ctx.out(
-                &serde_json::json!({"installed": keys, "actions": actions, "notices": notices}),
+                &serde_json::json!({"installed": keys, "actions": deployment.as_ref().map(|r| &r.actions).cloned().unwrap_or_default(), "deployment": deployment, "notices": notices}),
                 || {
                     for notice in &notices {
                         println!("{notice}");
@@ -1375,6 +1402,7 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
                     for key in &keys {
                         println!("installed {key}");
                     }
+                    if let Some(report) = &deployment { print_deployment(report); }
                 },
             )
         })();
@@ -1386,20 +1414,19 @@ fn cmd_install(ctx: &Ctx, a: InstallArgs) -> Result<()> {
         "--source-name applies to Git repositories and URL packages, not local skills"
     );
     let key = install::install(&ctx.ws, &r, a.name.as_deref())?;
-    let mut actions = Vec::new();
-    if !a.deploy_to.is_empty() {
+    let deployment = if a.deploy_to.is_empty() {
+        None
+    } else {
         let snap = ctx.ws.scan_for_links()?;
-        actions = deploy::plan_deploy(&ctx.ws, &snap, std::slice::from_ref(&key), &a.deploy_to)?;
-        actions = deploy::resolve_names(&snap, &actions, ctx.same_name.as_deref())?;
-        deploy::apply(&actions)?;
-    }
+        let actions =
+            deploy::plan_deploy(&ctx.ws, &snap, std::slice::from_ref(&key), &a.deploy_to)?;
+        Some(execute_actions(ctx, &snap, &actions, false)?)
+    };
     ctx.out(
-        &serde_json::json!({"installed": key, "actions": actions}),
+        &serde_json::json!({"installed": key, "actions": deployment.as_ref().map(|r| &r.actions).cloned().unwrap_or_default(), "deployment": deployment}),
         || {
             println!("installed {key}");
-            for a in &actions {
-                println!("{}", a.describe());
-            }
+            if let Some(report) = &deployment { print_deployment(report); }
         },
     )
 }
@@ -1639,12 +1666,22 @@ fn cmd_deploy(ctx: &Ctx, a: DeployArgs, on: bool) -> Result<()> {
     run_actions(ctx, &snap, &actions, a.dry_run)
 }
 
-fn run_actions(
+#[derive(Debug, Serialize)]
+struct DeploymentReport {
+    dry_run: bool,
+    applied: Option<usize>,
+    actions: Vec<Action>,
+    name_conflicts: Vec<deploy::NameConflict>,
+    choices: Vec<serde_json::Value>,
+    message: Option<String>,
+}
+
+fn execute_actions(
     ctx: &Ctx,
     planning_snap: &Snapshot,
     actions: &[Action],
     dry_run: bool,
-) -> Result<()> {
+) -> Result<DeploymentReport> {
     let fresh_snap;
     let snap = if dry_run {
         planning_snap
@@ -1658,32 +1695,154 @@ fn run_actions(
         }
     }
     let conflicts = deploy::name_conflicts(snap, actions);
+    let mut pending = skills::ops::name_choices::Pending::for_actions(&ctx.ws, snap, actions)?;
+    let mut rows = Vec::new();
+    let mut selected = Vec::new();
+    if let Some(pending) = &mut pending {
+        for change in &mut pending.changes {
+            change.project = ctx.project.clone();
+        }
+        let mut supplied = BTreeMap::new();
+        for input in &ctx.choices {
+            let (selector, value) = input
+                .split_once('=')
+                .context("expected --choose AGENT/NAME=VALUE")?;
+            anyhow::ensure!(
+                supplied.insert(selector, value).is_none(),
+                "duplicate choice: {selector}"
+            );
+        }
+        for group in &pending.groups {
+            let agent = pending
+                .changes
+                .iter()
+                .find(|c| {
+                    std::fs::canonicalize(c.agent.skills_path())
+                        .unwrap_or_else(|_| c.agent.skills_path())
+                        == group.directory
+                })
+                .context("conflict target is unavailable")?;
+            let selector = format!("{}/{}", agent.agent.key, group.name);
+            let options: Vec<_> = group.candidates.iter().map(|candidate| {
+                let value = match &candidate.key {
+                    Some(key) => format!("skill:{key}"),
+                    None => format!("entry:{}", candidate.path.file_name().unwrap().to_string_lossy()),
+                };
+                serde_json::json!({"value": value, "skill": candidate.key, "path": candidate.path, "agent_owned": candidate.archive_hash.is_some()})
+            }).collect();
+            let choice = supplied.remove(selector.as_str());
+            let index = if let Some(value) = choice {
+                if value == "none" {
+                    None
+                } else {
+                    Some(options.iter().position(|option| option["value"] == value)
+                        .with_context(|| format!("invalid choice for {selector}: {value}; use --dry-run to list values"))?)
+                }
+            } else {
+                None
+            };
+            if !ctx.choices.is_empty() {
+                anyhow::ensure!(
+                    choice.is_some(),
+                    "missing --choose {selector}=VALUE; choose every conflict"
+                );
+                let archives = group
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .any(|(i, c)| c.archive_hash.is_some() && index != Some(i));
+                anyhow::ensure!(
+                    dry_run || !archives || ctx.archive_conflicts,
+                    "{selector} excludes Agent-owned content; pass --archive-conflicts to move it into .skills-manager-backups"
+                );
+            }
+            selected.push(index);
+            rows.push(serde_json::json!({"selector": selector, "directory": group.directory, "candidates": options, "none": "none", "selected": choice}));
+        }
+        anyhow::ensure!(
+            supplied.is_empty(),
+            "unknown conflict selector(s): {}",
+            supplied.keys().copied().collect::<Vec<_>>().join(", ")
+        );
+        if !dry_run && !ctx.choices.is_empty() {
+            let (message, _) = pending.apply(&ctx.ws, &selected)?;
+            return Ok(DeploymentReport {
+                dry_run,
+                applied: None,
+                actions: vec![],
+                name_conflicts: conflicts,
+                choices: rows,
+                message: Some(message),
+            });
+        }
+    } else {
+        anyhow::ensure!(
+            ctx.choices.is_empty(),
+            "no matching deployment conflicts; remove --choose and review the current plan"
+        );
+    }
     let resolved = if dry_run && ctx.same_name.is_none() {
         actions.to_vec()
     } else {
         deploy::resolve_names(snap, actions, ctx.same_name.as_deref())?
     };
-    let actions = resolved.as_slice();
     let applied = if dry_run {
-        deploy::preflight(actions)?;
+        if pending.is_none() {
+            deploy::preflight(&resolved)?;
+        }
         0
     } else {
-        deploy::apply(actions)?
+        deploy::apply(&resolved)?
     };
-    let changes = actions.iter().filter(|a| a.is_change()).count();
-    ctx.out(
-        &serde_json::json!({"dry_run": dry_run, "applied": applied, "actions": actions, "name_conflicts": conflicts}),
-        || {
-            for a in actions {
-                println!("{}", a.describe());
-            }
-            if dry_run {
-                println!("dry run: {changes} change(s) not applied");
-            } else {
-                println!("applied {applied} change(s)");
-            }
-        },
-    )
+    Ok(DeploymentReport {
+        dry_run,
+        applied: Some(applied),
+        actions: resolved,
+        name_conflicts: conflicts,
+        choices: rows,
+        message: None,
+    })
+}
+
+fn print_deployment(report: &DeploymentReport) {
+    if let Some(message) = &report.message {
+        println!("{message}");
+        return;
+    }
+    for action in &report.actions {
+        println!("{}", action.describe());
+    }
+    for group in &report.choices {
+        println!(
+            "conflict {}: choose {} or none",
+            group["selector"].as_str().unwrap_or(""),
+            group["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|c| c["value"].as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+    }
+    if report.dry_run {
+        println!(
+            "dry run: {} change(s) not applied",
+            report.actions.iter().filter(|a| a.is_change()).count()
+        );
+    } else {
+        println!("applied {} change(s)", report.applied.unwrap_or_default());
+    }
+}
+
+fn run_actions(
+    ctx: &Ctx,
+    planning_snap: &Snapshot,
+    actions: &[Action],
+    dry_run: bool,
+) -> Result<()> {
+    let report = execute_actions(ctx, planning_snap, actions, dry_run)?;
+    ctx.out(&report, || print_deployment(&report))
 }
 
 fn cmd_agents(ctx: &Ctx, c: Option<AgentsCommand>) -> Result<()> {
@@ -2035,6 +2194,8 @@ mod tui_library_tests {
             project: None,
             ws: Workspace::open(&root).unwrap(),
             same_name: None,
+            choices: vec![],
+            archive_conflicts: false,
             json: false,
         };
         (temp, ctx, agent)
@@ -2126,6 +2287,86 @@ mod tui_library_tests {
             "Agent directory became a symlink; refresh before undeploying"
         );
         assert!(redirected.join("shared").is_symlink());
+    }
+
+    #[test]
+    fn explicit_choices_match_tui_keep_archive_and_keep_none() {
+        let (_temp, mut ctx, agent) = deploy_fixture("cli-explicit-choices");
+        std::fs::create_dir_all(agent.join("owned")).unwrap();
+        std::fs::write(
+            agent.join("owned/SKILL.md"),
+            "---\nname: shared\n---\nowned",
+        )
+        .unwrap();
+        let snap = ctx.ws.scan_for_links().unwrap();
+        let actions =
+            deploy::plan_deploy(&ctx.ws, &snap, &["one".into()], &["agent".into()]).unwrap();
+        let report = execute_actions(&ctx, &snap, &actions, true).unwrap();
+        assert_eq!(report.choices[0]["selector"], "agent/shared");
+        assert!(agent.join("owned/SKILL.md").exists());
+        ctx.choices = vec!["agent/shared=entry:owned".into()];
+        execute_actions(&ctx, &snap, &actions, false).unwrap();
+        assert!(!agent.join("shared").exists());
+        ctx.choices = vec!["agent/shared=skill:one".into()];
+        assert!(
+            execute_actions(&ctx, &snap, &actions, false)
+                .unwrap_err()
+                .to_string()
+                .contains("--archive-conflicts")
+        );
+        assert!(agent.join("owned/SKILL.md").exists());
+        ctx.archive_conflicts = true;
+        execute_actions(&ctx, &snap, &actions, false).unwrap();
+        assert!(!agent.join("owned").exists());
+        assert_eq!(
+            agent.join("shared").canonicalize().unwrap(),
+            ctx.ws.root.join("one")
+        );
+        assert!(
+            agent
+                .parent()
+                .unwrap()
+                .join(".skills-manager-backups")
+                .exists()
+        );
+        std::fs::create_dir(ctx.ws.root.join("two")).unwrap();
+        std::fs::copy(
+            ctx.ws.root.join("one/SKILL.md"),
+            ctx.ws.root.join("two/SKILL.md"),
+        )
+        .unwrap();
+        let snap = ctx.ws.scan_for_links().unwrap();
+        let actions =
+            deploy::plan_deploy(&ctx.ws, &snap, &["two".into()], &["agent".into()]).unwrap();
+        ctx.choices = vec!["agent/shared=none".into()];
+        execute_actions(&ctx, &snap, &actions, false).unwrap();
+        assert!(!agent.join("shared").exists());
+        assert!(ctx.ws.root.join("one/SKILL.md").exists());
+        assert!(ctx.ws.root.join("two/SKILL.md").exists());
+    }
+
+    #[test]
+    fn incomplete_or_unknown_conflict_choices_make_no_changes() {
+        let (_temp, mut ctx, agent) = deploy_fixture("cli-invalid-choices");
+        std::fs::create_dir_all(agent.join("owned")).unwrap();
+        std::fs::write(
+            agent.join("owned/SKILL.md"),
+            "---\nname: shared\n---\nowned",
+        )
+        .unwrap();
+        let snap = ctx.ws.scan_for_links().unwrap();
+        let actions =
+            deploy::plan_deploy(&ctx.ws, &snap, &["one".into()], &["agent".into()]).unwrap();
+        for choice in [
+            "unknown/shared=none",
+            "agent/shared=skill:missing",
+            "invalid",
+        ] {
+            ctx.choices = vec![choice.into()];
+            assert!(execute_actions(&ctx, &snap, &actions, false).is_err());
+            assert!(agent.join("owned/SKILL.md").exists());
+            assert!(!agent.join("shared").exists());
+        }
     }
 
     #[test]

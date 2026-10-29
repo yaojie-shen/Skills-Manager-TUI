@@ -80,3 +80,18 @@ skills --local install ./source --deploy codex
 在 TUI 的 Agents 页面中，依次选择 Agent、作用域和部署组。激活尚未部署或只部署了部分成员的组，会部署其中所有成员。激活已全部部署的组，则会取消所有成员的部署。`0/0` 不执行操作，展开 `+N` 只显示隐藏的组。
 
 只改变 Agent 部署状态不会触发根目录 Git 备份。[健康检查与修复](../health/)说明断链、副本遮挡和外部条目；[根目录备份与同步](../sync/)说明 Library 写入策略。
+
+## 选择部署冲突
+
+CLI 与 TUI 使用相同选择：保留某个 Library 技能、保留 Agent 自有内容，或全部不保留。先预览：
+
+```sh
+skills deploy review --agent claude --dry-run --json
+skills deploy review --agent claude --choose claude/review=skill:review --archive-conflicts
+```
+
+预览的 `choices` 数组列出每组的 `selector` 和候选 `value`。为每组重复传入 `--choose SELECTOR=VALUE`，使用列出的原值（`skill:KEY`、`entry:FILENAME` 或 `none`）。共享物理目录只需一个选择。未知、遗漏或重复的选择在写入前报错。排除 Agent 自有内容时必须加 `--archive-conflicts`，内容会移动到 Agent 技能目录旁的 `.skills-manager-backups`；Library 技能目录始终保留。执行前与 TUI 一样重新校验状态。
+
+preset 部署和 `install --deploy` 同样支持这些选择。若安装成功但后续部署失败，已安装的技能保留；用 `deploy --dry-run` 预览后再部署。`--same-name replace` 仍只处理托管链接替换，不能与 `--choose` 混用。
+
+显式解决冲突时，JSON 包含选择值和完成 `message`，`applied` 为 null、`actions` 为空，因为共享流程会重新推导执行计划。普通部署继续提供动作列表和数量。

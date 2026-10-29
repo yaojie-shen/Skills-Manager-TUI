@@ -80,3 +80,18 @@ A deployment is a live link to the Library. Edits made through the link change t
 On the TUI Agents page, select an Agent, a scope, and a deployment group. Activating an empty or partially deployed group deploys all its members. Activating a fully deployed group undeploys them. A `0/0` group does nothing, and expanding `+N` only reveals hidden groups.
 
 Agent-only deployment changes do not trigger root Git backup. [Health and repair](../health/) covers broken, shadow, and foreign entries; [root backup and sync](../sync/) covers Library mutations.
+
+## Choose deployment conflicts
+
+The CLI uses the same conflict choices as the TUI: keep a Library skill, keep an Agent-owned entry, or keep none. First preview:
+
+```sh
+skills deploy review --agent claude --dry-run --json
+skills deploy review --agent claude --choose claude/review=skill:review --archive-conflicts
+```
+
+The preview's `choices` array gives each `selector` and candidate `value`. Repeat `--choose SELECTOR=VALUE` for every group, using exactly the values shown (`skill:KEY`, `entry:FILENAME`, or `none`). Shared physical destinations have one selector. Unknown, missing or duplicate choices fail before writing. Excluding Agent-owned content requires `--archive-conflicts`; it moves to `.skills-manager-backups` beside the Agent skills directory. Library skill directories are retained. Changes are revalidated before applying, as in the TUI.
+
+These choices also work for preset deployment and `install --deploy`. Installation is retained if its later deployment fails. Preview the installed keys with `deploy --dry-run` and retry deployment. `--same-name replace` retains its narrower managed-link behavior and cannot be combined with `--choose`.
+
+For an explicit conflict resolution, JSON includes the chosen values and a completion `message`; `applied` is null and `actions` is empty because the reviewed plan is re-derived by the shared workflow. Ordinary deployments retain their action list and numeric count.
