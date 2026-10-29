@@ -75,13 +75,7 @@ impl PresetsView {
                             return vec![Action::Error("Use a colour name or #rrggbb".into())];
                         };
                         vec![Action::Write(Box::new(move |ws| {
-                            let mut preset = ws
-                                .presets
-                                .load(&name)?
-                                .ok_or_else(|| anyhow::anyhow!("no such preset: {name}"))?;
-                            preset.color = color;
-                            ws.presets.save(&preset)?;
-                            Ok(format!("Updated colour of {name}"))
+                            skills::ops::edit::preset_color(ws, &name, color.as_deref())
                         }))]
                     }
                 };

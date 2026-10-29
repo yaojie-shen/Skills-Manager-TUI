@@ -233,6 +233,20 @@ pub struct TagArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum TagCommand {
+    /// Create an empty tag
+    Create {
+        name: String,
+    },
+    /// Set a description; empty or omitted text clears it
+    Describe {
+        name: String,
+        text: Option<String>,
+    },
+    /// Set a colour name or #rrggbb; empty or omitted text clears it
+    Color {
+        name: String,
+        color: Option<String>,
+    },
     Add {
         skill: String,
         tags: Vec<String>,
@@ -437,6 +451,11 @@ pub struct PresetArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum PresetCommand {
+    /// Set a colour name or #rrggbb; empty or omitted text clears it
+    Color {
+        name: String,
+        color: Option<String>,
+    },
     List,
     Show {
         name: String,
@@ -1175,6 +1194,29 @@ fn entry_detail(s: &skills::reconcile::EntryState) -> String {
 fn cmd_tag(ctx: &Ctx, c: TagCommand) -> Result<()> {
     anyhow::ensure!(ctx.ws.config.tags_enabled, "Tags are disabled in settings");
     match c {
+        TagCommand::Create { name } => {
+            let message = edit::tag_create(&ctx.ws, &name)?;
+            ctx.out(
+                &serde_json::json!({"tag": ctx.ws.tags.load(name.trim())?, "message": message}),
+                || println!("{message}"),
+            )
+        }
+        TagCommand::Describe { name, text } => {
+            let message = edit::tag_description(&ctx.ws, &name, text.as_deref())?;
+            ctx.out(
+                &serde_json::json!({"tag": ctx.ws.tags.load(&name)?, "message": message}),
+                || println!("{message}"),
+            )
+        }
+        TagCommand::Color { name, color } => {
+            anyhow::ensure!(ctx.ws.tags.load(&name)?.is_some(), "no such tag: {name}");
+            skills::config::Config::set_tag_color(&ctx.ws.root, &name, color.as_deref())?;
+            ctx.out(
+                &serde_json::json!({"tag": ctx.ws.tags.load(&name)?}),
+                || println!("Updated colour of {name}"),
+            )
+        }
+
         TagCommand::Add { skill, tags } => {
             let m = edit::tag_add(&ctx.ws, &skill, &tags)?;
             ctx.out(&m, || println!("{skill}: {}", m.join(", ")))
@@ -2012,9 +2054,16 @@ fn gate(actions: &[Action], dry_run: bool, yes: bool, what: &str) -> Result<()> 
 }
 
 fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
-    use skills::preset::Preset;
     let store = &ctx.ws.presets;
     match c {
+        PresetCommand::Color { name, color } => {
+            let message = edit::preset_color(&ctx.ws, &name, color.as_deref())?;
+            ctx.out(
+                &serde_json::json!({"preset": store.load(&name)?, "message": message}),
+                || println!("{message}"),
+            )
+        }
+
         PresetCommand::List => {
             let list = store.list()?;
             ctx.out(&list, || {
@@ -2037,52 +2086,35 @@ fn cmd_preset(ctx: &Ctx, c: PresetCommand) -> Result<()> {
             skills,
             tags,
         } => {
-            if store.load(&name)?.is_some() {
-                bail!("preset {name} already exists");
-            }
-            skills::ops::require_existing_keys(&ctx.ws, &skills)?;
-            let mut skills = skills;
-            skills.extend(skills::preset::tag_members(&ctx.ws.config, &tags)?);
-            let mut p = Preset {
-                name: name.clone(),
-                description,
-                skills,
-                color: None,
-            };
-            p.skills = p.members();
-            store.save(&p)?;
+            let mut selected = skills;
+            selected.extend(skills::preset::tag_members(&ctx.ws.load_config()?, &tags)?);
+            history::preset_create_with(&ctx.ws, &name, description.as_deref(), selected)?;
+            let p = store.load(&name)?.context("preset was not saved")?;
             ctx.out(&p, || println!("created preset {name}"))
         }
         PresetCommand::Delete { name, yes } => {
             if !yes {
                 bail!("refusing to delete preset {name} without --yes");
             }
-            store.remove(&name)?;
+            history::preset_delete(&ctx.ws, &name)?;
             ctx.out(&serde_json::json!({"deleted": name}), || {
                 println!("deleted preset {name}")
             })
         }
         PresetCommand::Add { name, skills, tags } => {
-            let mut p = store
-                .load(&name)?
-                .with_context(|| format!("no such preset: {name}"))?;
-            skills::ops::require_existing_keys(&ctx.ws, &skills)?;
-            p.skills
-                .extend(skills::preset::tag_members(&ctx.ws.config, &tags)?);
-            p.skills.extend(skills);
-            p.skills = p.members();
-            store.save(&p)?;
+            let mut selected = skills;
+            selected.extend(skills::preset::tag_members(&ctx.ws.load_config()?, &tags)?);
+            history::preset_edit(&ctx.ws, &name, |members| members.extend(selected))?;
+            let p = store.load(&name)?.context("preset was not saved")?;
             ctx.out(&p, || println!("{name}: {}", p.skills.join(", ")))
         }
         PresetCommand::Remove { name, skills, tags } => {
-            let mut p = store
-                .load(&name)?
-                .with_context(|| format!("no such preset: {name}"))?;
             let mut selected = skills;
-            selected.extend(skills::preset::tag_members(&ctx.ws.config, &tags)?);
-            p.skills.retain(|s| !selected.contains(s));
-            p.skills = p.members();
-            store.save(&p)?;
+            selected.extend(skills::preset::tag_members(&ctx.ws.load_config()?, &tags)?);
+            history::preset_edit(&ctx.ws, &name, |members| {
+                members.retain(|s| !selected.contains(s))
+            })?;
+            let p = store.load(&name)?.context("preset was not saved")?;
             ctx.out(&p, || println!("{name}: {}", p.skills.join(", ")))
         }
         PresetCommand::Deploy {

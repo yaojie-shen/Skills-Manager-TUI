@@ -12,6 +12,21 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
+/// Normalize and validate a colour accepted by the shared terminal palette.
+/// Blank text clears the override in either front end.
+pub fn group_color(color: Option<&str>) -> Result<Option<String>> {
+    color
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|text| {
+            text.parse::<ratatui::style::Color>().map_err(|_| {
+                anyhow::anyhow!("invalid colour: {text}; use a colour name or #rrggbb")
+            })?;
+            Ok(text.to_string())
+        })
+        .transpose()
+}
+
 pub const CONFIG_FILE: &str = "config.toml";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -684,7 +699,7 @@ impl Config {
 
     pub fn set_tag_color(root: &Path, name: &str, color: Option<&str>) -> Result<()> {
         let name = name.to_owned();
-        let color = color.map(str::to_owned);
+        let color = group_color(color)?;
         Self::edit_tags(root, |tags| {
             match tags.iter_mut().find(|tag| tag.name == name) {
                 Some(tag) => {

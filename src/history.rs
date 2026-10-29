@@ -792,13 +792,32 @@ pub fn source_edit(
 
 /// Create a preset and record its initial contents for undo.
 pub fn preset_create(ws: &Workspace, name: &str) -> Result<(String, Option<Intent>)> {
-    if ws.presets.load(name)?.is_some() {
-        anyhow::bail!("preset {name} already exists");
-    }
-    let preset = crate::preset::Preset {
+    preset_create_with(ws, name, None, vec![])
+}
+
+/// Create the complete definition in one write; CLI initial members and TUI
+/// empty presets follow the same validation and normalization rules.
+pub fn preset_create_with(
+    ws: &Workspace,
+    name: &str,
+    description: Option<&str>,
+    skills: Vec<String>,
+) -> Result<(String, Option<Intent>)> {
+    anyhow::ensure!(
+        ws.presets.load(name)?.is_none(),
+        "preset {name} already exists"
+    );
+    crate::ops::require_existing_keys(ws, &skills)?;
+    let mut preset = crate::preset::Preset {
         name: name.to_string(),
+        description: description
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        skills,
         ..Default::default()
     };
+    preset.skills = preset.members();
     ws.presets.save(&preset)?;
     Ok((
         format!("created {name} — open Actions to edit skills or description"),
@@ -839,6 +858,13 @@ pub fn preset_edit(
     let before = p.skills.clone();
     change(&mut p.skills);
     p.skills = p.members();
+    let new_keys: Vec<_> = p
+        .skills
+        .iter()
+        .filter(|key| !before.contains(key))
+        .cloned()
+        .collect();
+    crate::ops::require_existing_keys(ws, &new_keys)?;
     ws.presets.save(&p)?;
     let added: Vec<String> = p
         .skills

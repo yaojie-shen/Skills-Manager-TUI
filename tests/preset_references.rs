@@ -892,3 +892,70 @@ fn cli_group_rename_requires_merge_flag_for_an_existing_target() {
         ["one", "two"]
     );
 }
+
+#[test]
+fn cli_group_properties_share_tui_writes_and_preserve_other_fields() {
+    let f = Fixture::new("cli-properties");
+    f.cli(&["tag", "create", "empty-new"]);
+    f.cli(&["tag", "describe", "work", "  Work skills  "]);
+    f.cli(&["tag", "color", "work", "#ff8855"]);
+    let tag = f.ws.tags.load("work").unwrap().unwrap();
+    assert_eq!(tag.skills, ["one", "two"]);
+    assert_eq!(tag.description.as_deref(), Some("Work skills"));
+    assert_eq!(tag.color.as_deref(), Some("#ff8855"));
+    f.cli(&[
+        "preset",
+        "create",
+        "daily",
+        "--description",
+        "  Daily work  ",
+        "--tag",
+        "work",
+    ]);
+    f.cli(&["preset", "color", "daily", "lightblue"]);
+    let p = f.preset();
+    assert_eq!(p.description.as_deref(), Some("Daily work"));
+    assert_eq!(p.color.as_deref(), Some("lightblue"));
+    f.cli(&["preset", "add", "daily", "three", "three"]);
+    f.cli(&["preset", "remove", "daily", "two"]);
+    assert_eq!(f.preset().members(), ["one", "three"]);
+    assert_eq!(f.preset().description, p.description);
+    assert_eq!(f.preset().color, p.color);
+    let (_, intent) =
+        history::preset_edit(&f.ws, "daily", |members| members.push("four".into())).unwrap();
+    history_step(&f.ws, &intent.unwrap(), true);
+    assert_eq!(f.preset().members(), ["one", "three"]);
+    let before = std::fs::read(f.ws.presets.path("daily")).unwrap();
+    assert!(
+        history::preset_edit(&f.ws, "daily", |members| members.push("missing".into())).is_err()
+    );
+    assert_eq!(std::fs::read(f.ws.presets.path("daily")).unwrap(), before);
+    for args in [
+        vec!["preset", "color", "daily", "invalid-color"],
+        vec!["tag", "color", "work", "invalid-color"],
+        vec!["tag", "describe", "missing", "text"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_skills"))
+            .arg("--root")
+            .arg(&f.ws.root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+    }
+    assert_eq!(f.ws.tags.load("work").unwrap().unwrap(), tag);
+    assert_eq!(std::fs::read(f.ws.presets.path("daily")).unwrap(), before);
+    f.cli(&["tag", "describe", "work"]);
+    f.cli(&["tag", "color", "work"]);
+    f.cli(&["preset", "color", "daily"]);
+    assert!(
+        f.ws.tags
+            .load("work")
+            .unwrap()
+            .unwrap()
+            .description
+            .is_none()
+    );
+    assert!(f.ws.tags.load("work").unwrap().unwrap().color.is_none());
+    assert!(f.preset().color.is_none());
+}

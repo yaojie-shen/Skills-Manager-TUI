@@ -59,3 +59,16 @@ skills preset undeploy writing-kit --all-agents
 每个标签单独保存在 `.skills-meta/tags/<tag>.toml`。预设保存在 `.skills-meta/presets/<name>.toml`，其中明确记录技能；重复的技能 key 会被去重。
 
 打开旧版本写入的标签或预设时，程序会先升级格式：标签从 `config.toml` 移到各自的文件中，按标签列出成员的预设会改为以这些标签的技能作为固定成员。Skills Manager 会报告备份目录，确认升级结果前请保留该备份。详见[元数据格式升级](../configuration/#元数据格式升级)。
+
+## 编辑分组属性
+
+```sh
+skills tag create writing
+skills tag describe writing "写作助手"
+skills tag color writing '#ff8855'
+skills preset describe writing-kit "日常写作工具"
+skills preset color writing-kit lightblue
+skills preset color writing-kit
+```
+
+省略文字或颜色可清空对应属性。颜色与 TUI 使用相同的名称及 `#rrggbb` 格式；描述会去除首尾空白，空文字表示清空。成员修改保留描述、颜色和手写注释。新加入 preset 的技能必须存在于 Library；已失效的成员仍可移除。CLI 和 TUI 使用同一组存储操作，TUI 额外提供会话内撤销。

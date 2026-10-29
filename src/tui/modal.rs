@@ -2198,22 +2198,7 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
             let selected = name.clone();
             vec![
                 Action::WriteMeta(Box::new(move |ws| {
-                    history::tag_edit(ws, |ws| {
-                        let mut exists = false;
-                        skills::config::Config::edit_tags(&ws.root, |tags| {
-                            exists = tags.iter().any(|t| t.name == name);
-                            if !exists {
-                                tags.push(skills::config::TagConfig {
-                                    name: name.clone(),
-                                    skills: vec![],
-                                    color: None,
-                                    description: None,
-                                });
-                            }
-                        })?;
-                        anyhow::ensure!(!exists, "tag {name} already exists");
-                        Ok(format!("created {name} — open Actions to edit skills"))
-                    })
+                    history::tag_edit(ws, |ws| edit::tag_create(ws, &name))
                 })),
                 Action::SelectTag(selected),
             ]
@@ -2223,12 +2208,7 @@ fn submit(kind: &InputKind, value: String, ctx: &Ctx) -> Vec<Action> {
             let description = value.trim().to_string();
             vec![Action::WriteMeta(Box::new(move |ws| {
                 history::tag_edit(ws, |ws| {
-                    skills::config::Config::edit_tags(&ws.root, |tags| {
-                        if let Some(tag) = tags.iter_mut().find(|t| t.name == name) {
-                            tag.description = (!description.is_empty()).then_some(description);
-                        }
-                    })?;
-                    Ok(format!("updated description of {name}"))
+                    edit::tag_description(ws, &name, Some(&description))
                 })
             }))]
         }

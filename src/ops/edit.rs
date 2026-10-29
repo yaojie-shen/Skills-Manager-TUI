@@ -23,6 +23,42 @@ pub fn load_or_init(ws: &Workspace, key: &str) -> Result<SkillMeta> {
     })
 }
 
+/// Create an empty tag through the same store used by the TUI.
+pub fn tag_create(ws: &Workspace, name: &str) -> Result<String> {
+    let name = name.trim();
+    anyhow::ensure!(ws.tags.load(name)?.is_none(), "tag {name} already exists");
+    ws.tags.save(&crate::tag::Tag {
+        name: name.into(),
+        skills: vec![],
+        color: None,
+        description: None,
+    })?;
+    Ok(format!("created {name} — open Actions to edit skills"))
+}
+
+pub fn tag_description(ws: &Workspace, name: &str, text: Option<&str>) -> Result<String> {
+    let mut tag = ws
+        .tags
+        .load(name)?
+        .with_context(|| format!("no such tag: {name}"))?;
+    tag.description = text
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    ws.tags.save(&tag)?;
+    Ok(format!("updated description of {name}"))
+}
+
+pub fn preset_color(ws: &Workspace, name: &str, color: Option<&str>) -> Result<String> {
+    let mut preset = ws
+        .presets
+        .load(name)?
+        .with_context(|| format!("no such preset: {name}"))?;
+    preset.color = crate::config::group_color(color)?;
+    ws.presets.save(&preset)?;
+    Ok(format!("Updated colour of {name}"))
+}
+
 pub fn tag_add(ws: &Workspace, key: &str, tags: &[String]) -> Result<Vec<String>> {
     let mut current = Config::load(&ws.root)?.skill_tags(key);
     current.extend_from_slice(tags);

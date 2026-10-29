@@ -382,7 +382,7 @@ impl Prompt {
     pub fn color_text(&self) -> Option<Option<String>> {
         match self.chosen() {
             Some(NO_COLOR) => Some(None),
-            Some(name) => name.parse::<Color>().ok().map(|_| Some(name.to_string())),
+            Some(name) => skills::config::group_color(Some(name)).ok(),
             None => None,
         }
     }

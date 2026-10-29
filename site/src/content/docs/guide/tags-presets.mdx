@@ -59,3 +59,16 @@ Set `tags_enabled = false` to hide tag classification and disable tag commands w
 Each tag lives in its own `.skills-meta/tags/<tag>.toml` file. Presets live in `.skills-meta/presets/<name>.toml` and store their skills explicitly. Duplicate skill keys are deduplicated.
 
 Opening tags or presets written by an older version upgrades them first: tags move out of `config.toml` into their own files, and presets that list tags get those tags' skills as fixed members. Skills Manager reports the backup directory; keep that backup until the resulting membership is confirmed. See [metadata format upgrades](../configuration/#metadata-format-upgrades).
+
+## Edit group properties
+
+```sh
+skills tag create writing
+skills tag describe writing "Writing helpers"
+skills tag color writing '#ff8855'
+skills preset describe writing-kit "Daily writing tools"
+skills preset color writing-kit lightblue
+skills preset color writing-kit
+```
+
+Omitting the text or colour clears that property. Colours accept the same names and `#rrggbb` values as the TUI. Description text is trimmed; blank text clears it. Membership edits preserve the group's description, colour and hand-written comments. Newly added preset members must exist in the Library; removing stale members remains possible. CLI and TUI use the same store operations; session undo is a TUI feature.
