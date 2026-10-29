@@ -85,6 +85,26 @@ pub struct Repository {
 }
 
 impl Repository {
+    /// Refresh available and installed upstream entries without writing the Library.
+    pub fn refresh_inventory(
+        ws: &Workspace,
+        alias: &str,
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<RepositoryInventory> {
+        let repository = Self::list(&ws.root)?
+            .into_iter()
+            .find(|r| r.alias == alias)
+            .with_context(|| format!("source not found: {alias}"))?;
+        let reference = crate::ops::install::InstallRef::from_source(&repository.source("", None))?;
+        let fetched =
+            FetchedRepository::fetch_with_progress(ws, &reference, Some(alias), progress)?;
+        let result = ws
+            .inventory()
+            .and_then(|snapshot| fetched.inventory(&snapshot));
+        fetched.cleanup();
+        result
+    }
+
     pub fn display_name(&self) -> String {
         self.name
             .as_deref()
@@ -389,7 +409,8 @@ pub struct RepositoryInventoryEntry {
     pub state: RepositoryInventoryState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum RepositoryInventoryState {
     Installed {
         key: String,

@@ -230,7 +230,7 @@ pub fn rename(ws: &Workspace, snap: &Snapshot, old: &str, new: &str) -> Result<V
     Ok(log)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RepositoryRemoveSummary {
     pub alias: String,
     pub keys: Vec<String>,
@@ -277,10 +277,37 @@ impl RepositoryRemoveSummary {
     }
 }
 
+/// Review only the selected repository's content, refusing unreadable baselines.
+/// The same review feeds both front ends and is repeated before deletion.
+pub fn review_repository_removal(ws: &Workspace, alias: &str) -> Result<RepositoryRemoveSummary> {
+    RepositoryRemoveSummary::from_snapshot(&repository_removal_snapshot(ws, alias)?, alias)
+}
+
+fn repository_removal_snapshot(ws: &Workspace, alias: &str) -> Result<Snapshot> {
+    let inventory = ws.inventory()?;
+    let summary = RepositoryRemoveSummary::from_snapshot(&inventory, alias)?;
+    let verified = ws.scan_selected(&summary.keys)?;
+    let unreadable: Vec<_> = verified
+        .skills
+        .iter()
+        .filter(|record| {
+            crate::repository::alias_of(&record.key) == Some(alias)
+                && record.status == SkillStatus::Unchecked
+        })
+        .map(|record| record.key.as_str())
+        .collect();
+    anyhow::ensure!(
+        unreadable.is_empty(),
+        "could not verify local changes for: {}",
+        unreadable.join(", ")
+    );
+    Ok(verified)
+}
+
 pub fn remove_repository(ws: &Workspace, alias: &str) -> Result<RepositoryRemoveSummary> {
     let mut current = ws.clone();
     current.config = current.load_config()?;
-    let snap = current.scan()?;
+    let snap = repository_removal_snapshot(&current, alias)?;
     let summary = RepositoryRemoveSummary::from_snapshot(&snap, alias)?;
 
     let storage = current.root.join("repos").join(alias);

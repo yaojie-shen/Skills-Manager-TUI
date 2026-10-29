@@ -100,3 +100,15 @@ skills remove KEY --yes
 ```
 
 `skills set-source` changes the recorded source without replacing content or accepting a baseline. `skills remove` deletes managed deployments, content, and metadata. `--keep-meta` preserves metadata but deletes the content. Use [undeploy](../deployment/) to remove an Agent link while retaining the skill.
+
+## Refresh or remove a whole source
+
+```sh
+skills repos refresh toolbox --json
+skills repos remove toolbox
+skills repos remove toolbox --yes
+```
+
+`repos refresh` uses the TUI Repos refresh workflow: fetch upstream and report installed, available, changed, missing, invalid or possibly moved skills. It neither installs nor updates skills and does not save the temporary inventory.
+
+`repos remove` previews the skill count and local modifications. Only `--yes` without `--dry-run` executes removal. The shared workflow verifies content again and removes local source files, registration, metadata and tag/preset references. Unreadable content blocks the operation. As in the TUI, existing Global and Local deployment links are left unchanged; links to removed skills become broken and can be cleaned explicitly in Agents or Health. The upstream repository is untouched. This differs from single-skill `remove`, which also undeploys the skill from scanned targets.

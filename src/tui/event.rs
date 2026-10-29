@@ -314,56 +314,15 @@ pub fn spawn_task(mut ws: Workspace, task: Task, id: u64, tx: Sender<Msg>) {
                     TaskOutput::RepositoryFetched(label, result)
                 }
                 Task::RefreshRepository(alias) => {
-                    let result = (|| {
-                        let repository = skills::repository::Repository::list(&ws.root)?
-                            .into_iter()
-                            .find(|repository| repository.alias == alias)
-                            .ok_or_else(|| anyhow::anyhow!("source not found: {alias}"))?;
-                        let reference = skills::ops::install::InstallRef::from_source(
-                            &repository.source("", None),
-                        )?;
-                        let fetched = skills::repository::FetchedRepository::fetch_with_progress(
-                            &ws,
-                            &reference,
-                            Some(&alias),
-                            &mut progress,
-                        )?;
-                        let inventory = ws
-                            .inventory()
-                            .and_then(|snapshot| fetched.inventory(&snapshot));
-                        fetched.cleanup();
-                        inventory
-                    })();
+                    let result = skills::repository::Repository::refresh_inventory(
+                        &ws,
+                        &alias,
+                        &mut progress,
+                    );
                     TaskOutput::RepositoryRefreshed(alias, result)
                 }
                 Task::ReviewRepositoryRemoval { alias, name } => {
-                    let result = (|| {
-                        let inventory = ws.inventory()?;
-                        let keys: Vec<_> = inventory
-                            .skills
-                            .iter()
-                            .filter(|record| {
-                                skills::repository::alias_of(&record.key) == Some(alias.as_str())
-                            })
-                            .map(|record| record.key.clone())
-                            .collect();
-                        let verified = ws.scan_selected(&keys)?;
-                        let unreadable: Vec<_> = verified
-                            .skills
-                            .iter()
-                            .filter(|record| {
-                                skills::repository::alias_of(&record.key) == Some(alias.as_str())
-                                    && record.status == skills::reconcile::SkillStatus::Unchecked
-                            })
-                            .map(|record| record.key.as_str())
-                            .collect();
-                        anyhow::ensure!(
-                            unreadable.is_empty(),
-                            "could not verify local changes for: {}",
-                            unreadable.join(", ")
-                        );
-                        skills::ops::edit::RepositoryRemoveSummary::from_snapshot(&verified, &alias)
-                    })();
+                    let result = skills::ops::edit::review_repository_removal(&ws, &alias);
                     TaskOutput::RepositoryRemovalReviewed {
                         alias,
                         name,

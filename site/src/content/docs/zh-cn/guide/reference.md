@@ -19,6 +19,7 @@ skills --json status
 | `--local`、`--project DIR` | 选择项目部署目的地；CLI 和 TUI 都保留中心 Library。 |
 | `--json` | 输出机器可读的 CLI 结果；进度和顶层错误仍可能写入 stderr。 |
 | `--same-name replace` | 允许替换声明名冲突的部署。 |
+| `--choose SELECTOR=VALUE`、`--archive-conflicts` | 使用[共享选择流程](../deployment/#选择部署冲突)预览并解决部署冲突。 |
 
 错误返回非零状态码。
 
@@ -30,9 +31,9 @@ skills --json status
 | --- | --- |
 | 初始化 | `init` 在所选 root 中创建 `.skills-meta/config.toml` |
 | 检查 | `list [QUERY…]`、`show KEY`、`status`（别名 `rescan`） |
-| 导入与重命名 | `install REFERENCE`、`adopt PATH`、`repos`、`repos rename ALIAS NAME`、`rename OLD NEW`、`set-source KEY REFERENCE` |
+| 导入与重命名 | `install REFERENCE`、`adopt PATH`、`repos`、`repos rename ALIAS NAME`、`repos refresh ALIAS`、`repos remove ALIAS [--yes]`、`rename OLD NEW`、`set-source KEY REFERENCE` |
 | 删除 | `remove KEY --yes`；`--keep-meta` 保留元数据，不保留文件 |
-| 标签 | `tag add/remove/set KEY [TAGS…]`、`tag list [KEY]`、`tag rename OLD NEW [--merge]`、`tag delete TAG --yes` |
+| 标签 | `tag add/remove/set KEY [TAGS…]`、`tag list [KEY]`、`tag create NAME`、`tag describe NAME [TEXT]`、`tag color NAME [COLOR]`、`tag rename OLD NEW [--merge]`、`tag delete TAG --yes` |
 | 备注 | `note get/set/clear/edit`；set 接受 `KEY TEXT` 或 `KEY -`；edit 使用 `$EDITOR`；仅支持远程技能 |
 | 上游 | `accept KEY`、`check KEY/--all/--repo ALIAS`、`update KEY/--all/--repo ALIAS` |
 | 部署 | `deploy/undeploy KEYS… --agent AGENT`（可重复），或 `--all-agents`；`--dry-run` 用于预览 |

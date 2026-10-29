@@ -13,7 +13,7 @@ skills check --repo toolbox
 skills check --all
 ```
 
-Repository-wide and all-skills checks update the status of installed skills only. They may report newly discovered upstream skills, but do not install them.
+Repository-wide and all-skills checks report upstream revisions for installed skills only. Use `repos refresh ALIAS` to discover new upstream skills; neither command installs them.
 
 ## 2. Preview
 

@@ -13,7 +13,7 @@ skills check --repo toolbox
 skills check --all
 ```
 
-按仓库或全部技能检查时，只更新已安装技能的状态。检查可能报告新发现的上游技能，但不会安装它们。
+按仓库或全部技能检查时，只报告已安装技能的上游 revision。发现新的上游技能请使用 `repos refresh ALIAS`；两个命令都不会安装技能。
 
 ## 2. 预览
 

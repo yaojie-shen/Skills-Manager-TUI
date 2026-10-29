@@ -19,6 +19,7 @@ skills --json status
 | `--local`, `--project DIR` | Select project deployment destinations; keep the central Library in both CLI and TUI. |
 | `--json` | Writes machine-readable CLI output; progress and top-level errors may still use stderr. |
 | `--same-name replace` | Authorizes replacement for a declared deployment-name conflict. |
+| `--choose SELECTOR=VALUE`, `--archive-conflicts` | Review and resolve deployment conflicts using the [shared choices](../deployment/#choose-deployment-conflicts). |
 
 Errors return a nonzero status.
 
@@ -30,7 +31,7 @@ Uppercase terms are placeholders. Prefix each command in the table with `skills`
 | --- | --- |
 | Initialize | `init` creates `.skills-meta/config.toml` in the selected root |
 | Inspect | `list [QUERY…]`, `show KEY`, `status` (alias `rescan`) |
-| Import and rename | `install REFERENCE`, `adopt PATH`, `repos`, `repos rename ALIAS NAME`, `rename OLD NEW`, `set-source KEY REFERENCE` |
+| Import and rename | `install REFERENCE`, `adopt PATH`, `repos`, `repos rename ALIAS NAME`, `repos refresh ALIAS`, `repos remove ALIAS [--yes]`, `rename OLD NEW`, `set-source KEY REFERENCE` |
 | Remove | `remove KEY --yes`; `--keep-meta` retains metadata, not files |
 | Tags | `tag add/remove/set KEY [TAGS…]`, `tag list [KEY]`, `tag create NAME`, `tag describe NAME [TEXT]`, `tag color NAME [COLOR]`, `tag rename OLD NEW [--merge]`, `tag delete TAG --yes` |
 | Notes | `note get/set/clear/edit`; set accepts `KEY TEXT` or `KEY -`; edit uses `$EDITOR`; remote skills only |

@@ -100,3 +100,15 @@ skills remove KEY --yes
 ```
 
 `skills set-source` 只修改记录的来源，不替换内容，也不接受基线。`skills remove` 删除受管理的部署、内容和元数据。`--keep-meta` 保留元数据，但仍会删除内容。只需移除 Agent 链接时，使用[取消部署](../deployment/)保留技能。
+
+## 刷新或删除整个来源
+
+```sh
+skills repos refresh toolbox --json
+skills repos remove toolbox
+skills repos remove toolbox --yes
+```
+
+`repos refresh` 使用 TUI Repos 相同的刷新流程：获取上游后报告已安装、可安装、已修改、已缺失、无效或可能移动的技能。它不会安装或更新技能，也不会保存临时清单。
+
+`repos remove` 默认预览技能数量及本地修改；只有 `--yes` 且不带 `--dry-run` 才执行。共享流程再次校验内容，然后删除本地来源文件、注册信息、元数据及 tag/preset 引用；无法读取的内容会阻止操作。与 TUI 一样，现有 Global/Local 部署链接保留，指向被删技能的链接会失效，可在 Agents 或 Health 中显式清理。上游仓库不受影响。单技能 `remove` 则还会解除已扫描目标中的部署链接。

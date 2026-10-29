@@ -1411,3 +1411,89 @@ fn cli_check_preserves_partial_results_and_update_requires_resolution() {
     assert!(cli(&["update", key, "--take", "local"]).status.success());
     assert!(f.ws.skill_path(key).join("mine.txt").exists());
 }
+
+#[test]
+fn cli_repository_refresh_and_removal_match_tui_workflows() {
+    let f = Fixture::new();
+    f.put("one", "one", "original");
+    f.put("two", "two", "available");
+    f.commit();
+    let fetched = f.fetch("example");
+    let keys = fetched
+        .install(&f.ws, &["one".into()], &BTreeMap::new())
+        .unwrap();
+    fetched.cleanup();
+    let key = &keys[0];
+    let actions = deploy::plan_deploy(
+        &f.ws,
+        &f.ws.scan_for_links().unwrap(),
+        &keys,
+        &["sample".into()],
+    )
+    .unwrap();
+    deploy::apply(&actions).unwrap();
+    std::fs::write(f.ws.skill_path(key).join("mine.txt"), "local").unwrap();
+    edit::tag_add(&f.ws, key, &["work".into()]).unwrap();
+    skills::history::preset_create_with(&f.ws, "daily", None, keys.clone()).unwrap();
+    let cli = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_skills"))
+            .env("HOME", f.dir.join("fake-home"))
+            .arg("--root")
+            .arg(&f.ws.root)
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    let inventory = cli(&["repos", "refresh", "example"]);
+    assert!(
+        inventory["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["path"] == "two" && e["state"]["kind"] == "available")
+    );
+    assert!(
+        inventory["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["path"] == "one" && e["state"]["kind"] == "changed")
+    );
+    assert!(!f.ws.root.join("repos/example/two").exists());
+    for args in [
+        vec!["repos", "remove", "example"],
+        vec!["repos", "remove", "example", "--yes", "--dry-run"],
+    ] {
+        let report = cli(&args);
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["summary"]["modified"], 1);
+        assert_eq!(
+            report["summary"],
+            serde_json::to_value(edit::review_repository_removal(&f.ws, "example").unwrap())
+                .unwrap()
+        );
+        assert!(f.ws.skill_path(key).exists());
+    }
+    let report = cli(&["repos", "remove", "example", "--yes"]);
+    assert_eq!(report["dry_run"], false);
+    assert!(!f.ws.skill_path(key).exists());
+    assert!(f.dir.join("agent/one").is_symlink());
+    assert!(
+        f.ws.presets
+            .load("daily")
+            .unwrap()
+            .unwrap()
+            .skills
+            .is_empty()
+    );
+    assert!(f.ws.load_config().unwrap().skill_tags(key).is_empty());
+    assert!(Repository::list(&f.ws.root).unwrap().is_empty());
+    assert!(f.repo.join("one/SKILL.md").exists());
+}

@@ -94,7 +94,7 @@ pub enum Command {
         long_about = "Install skills from a Git repository, archive URL, or local path.\n\nArchive URLs use curl to download and follow HTTP(S) redirects. ZIP, TAR, TAR.GZ, TAR.BZ2, and TAR.XZ are detected from the downloaded content. Paths inside the archive are preserved, including any top-level directory: use --list to discover paths, then --select or --subpath to choose skills.\n\nUse --source-name NAME to name a URL package before installing. Git sources default to owner/repo. Source names are independent of --repo-alias (storage directory) and --name (one skill's local name)."
     )]
     Install(InstallArgs),
-    /// List or rename Git repositories and URL packages
+    /// Inspect, rename or remove Git repositories and URL packages
     Repos {
         #[command(subcommand)]
         command: Option<ReposCommand>,
@@ -338,6 +338,17 @@ pub struct InstallArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ReposCommand {
+    /// Refresh upstream inventory without installing or updating skills
+    Refresh { alias: String },
+    /// Preview source removal; --yes deletes Library files and references, retaining Agent links
+    Remove {
+        alias: String,
+        #[arg(long, short)]
+        yes: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Change a source's display name without moving directories or skill links
     Rename { alias: String, name: String },
 }
@@ -588,7 +599,17 @@ impl Cli {
             Some(Command::Update(a)) if !a.dry_run => Some(Library),
             Some(Command::Deploy(a) | Command::Undeploy(a)) if !a.dry_run => Some(Deployment),
             Some(Command::Repair { apply: true, .. }) => Some(Deployment),
-            Some(Command::Repos { command: Some(_) }) => Some(Library),
+            Some(Command::Repos {
+                command:
+                    Some(
+                        ReposCommand::Rename { .. }
+                        | ReposCommand::Remove {
+                            yes: true,
+                            dry_run: false,
+                            ..
+                        },
+                    ),
+            }) => Some(Library),
             Some(Command::Preset(a)) => match &a.command {
                 PresetCommand::List | PresetCommand::Show { .. } => None,
                 PresetCommand::Deploy { dry_run, .. } | PresetCommand::Undeploy { dry_run, .. } => {
@@ -810,6 +831,47 @@ fn run_command(cli: Cli) -> Result<()> {
             })
         }
         Command::Check { skill, all, repo } => cmd_check(&ctx, skill, all, repo),
+        Command::Repos {
+            command: Some(ReposCommand::Refresh { alias }),
+        } => {
+            let inventory =
+                skills::repository::Repository::refresh_inventory(&ctx.ws, &alias, &mut |m| {
+                    eprintln!("{m}")
+                })?;
+            let entries: Vec<_> = inventory.entries.iter().map(|e| serde_json::json!({"path": e.path, "name": e.skill.as_ref().map(|s| &s.name), "description": e.skill.as_ref().map(|s| &s.description), "state": e.state})).collect();
+            ctx.out(
+                &serde_json::json!({"alias": alias, "entries": entries}),
+                || {
+                    for entry in &entries {
+                        println!(
+                            "{}: {}",
+                            plain_text(entry["path"].as_str().unwrap_or("."), true),
+                            entry["state"]["kind"].as_str().unwrap_or("")
+                        );
+                    }
+                },
+            )
+        }
+        Command::Repos {
+            command:
+                Some(ReposCommand::Remove {
+                    alias,
+                    yes,
+                    dry_run,
+                }),
+        } => {
+            let preview = dry_run || !yes;
+            let summary = if preview {
+                edit::review_repository_removal(&ctx.ws, &alias)?
+            } else {
+                edit::remove_repository(&ctx.ws, &alias)?
+            };
+            ctx.out(&serde_json::json!({"dry_run": preview, "summary": summary}), || {
+                println!("{} source {}: {} skill(s), {} modified, {} missing, {} needing attention", if preview { "Would remove" } else { "Removed" }, alias, summary.keys.len(), summary.modified, summary.missing, summary.attention);
+                println!("Existing Agent links are retained; links to removed skills become broken. Remote content is unchanged.");
+                if preview { println!("Pass --yes without --dry-run to remove source files, metadata and group references."); }
+            })
+        }
         Command::Repos {
             command: Some(ReposCommand::Rename { alias, name }),
         } => {
@@ -1848,21 +1910,22 @@ fn execute_actions(
 
 fn print_deployment(report: &DeploymentReport) {
     if let Some(message) = &report.message {
-        println!("{message}");
+        println!("{}", plain_text(message, true));
         return;
     }
     for action in &report.actions {
-        println!("{}", action.describe());
+        println!("{}", plain_text(&action.describe(), true));
     }
     for group in &report.choices {
         println!(
             "conflict {}: choose {} or none",
-            group["selector"].as_str().unwrap_or(""),
+            plain_text(group["selector"].as_str().unwrap_or(""), true),
             group["candidates"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .filter_map(|c| c["value"].as_str())
+                .map(|value| plain_text(value, true))
                 .collect::<Vec<_>>()
                 .join(" | ")
         );
