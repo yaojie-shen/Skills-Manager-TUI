@@ -21,7 +21,7 @@ skills init
 
 When neither `--root` nor `SKILLS_HOME` is set, the program reads the pointer file. `init` creates `.skills-meta/config.toml` with commented defaults and refuses to overwrite it. Environment variables and the pointer file may contain paths that start with `~`. For a shell `--root` argument, use `"$HOME/path"` rather than a quoted tilde.
 
-In the CLI, `--local` and `--project DIR` use `<project>/.agents/skills` as a separate project store. Init, install, and Agent registration may create this directory. Read commands require it to exist. In the TUI, the same flags select the deployment context while the central Library remains in use. See [Agent deployment](../deployment/) for the scope rules.
+CLI and TUI both keep the central Library selected above. `--local` (current directory) and `--project DIR` only select project deployment destinations. You can combine either with `--root`. Install, tags, presets and backup still use the central Library. See [Agent deployment](../deployment/), including the migration note for older CLI project stores.
 
 ## Files in the Library
 

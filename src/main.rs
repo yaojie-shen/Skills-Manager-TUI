@@ -12,8 +12,10 @@ fn main() {
     let args = cli::Cli::parse();
     let json = args.json;
     let result = if args.command.is_none() {
-        args.tui_workspace()
-            .and_then(|ws| tui::run(ws, args.project.as_deref()))
+        args.tui_workspace().and_then(|ws| {
+            let project = args.deployment_project()?;
+            tui::run(ws, project.as_deref())
+        })
     } else {
         cli::run(args)
     };

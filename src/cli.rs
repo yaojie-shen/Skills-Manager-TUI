@@ -1,4 +1,4 @@
-//! Command-line interface. Every TUI action has a subcommand here; output is
+//! Command-line interface over shared Library workflows. Output is
 //! human-readable by default and JSON with `--json`.
 
 use anyhow::{Context, Result, bail};
@@ -31,11 +31,11 @@ pub struct Cli {
     /// Skills root (overrides $SKILLS_HOME)
     #[arg(long, global = true, value_name = "DIR")]
     pub root: Option<PathBuf>,
-    /// CLI: use the project store; TUI: use the current directory for deployment scopes
-    #[arg(long, global = true, conflicts_with = "root")]
+    /// Use the current directory for project deployment targets; keep the central Library
+    #[arg(long, global = true, conflicts_with = "project")]
     pub local: bool,
-    /// CLI: use <DIR>/.agents/skills; TUI: discover deployment scopes from <DIR>
-    #[arg(long, global = true, value_name = "DIR", conflicts_with = "root")]
+    /// Use DIR for project deployment targets; keep the central Library
+    #[arg(long, global = true, value_name = "DIR")]
     pub project: Option<PathBuf>,
     /// Machine-readable JSON output
     #[arg(long, global = true)]
@@ -134,6 +134,47 @@ pub enum Command {
     Agents(AgentsArgs),
     /// Preset packages with fixed skill members
     Preset(PresetArgs),
+}
+
+impl Command {
+    /// Only destination-facing commands scope Agent directories. Library edits,
+    /// configuration and backup always retain the central Library context.
+    fn deployment_agents(&self) -> Option<Vec<String>> {
+        match self {
+            Self::List(args) => {
+                let mut agents = args.agent.clone();
+                agents.extend(Query::parse(&args.query.join(" ")).agents);
+                Some(agents)
+            }
+            Self::Show { .. } | Self::Status => Some(vec![]),
+            Self::Repair { deployments, .. } => Some(
+                deployments
+                    .iter()
+                    .filter_map(|mapping| {
+                        mapping.split_once('/').map(|(agent, _)| agent.to_string())
+                    })
+                    .collect(),
+            ),
+            Self::Deploy(args) | Self::Undeploy(args) => Some(args.agents.clone()),
+            Self::Install(args) if !args.deploy_to.is_empty() => Some(args.deploy_to.clone()),
+            Self::Preset(PresetArgs {
+                command:
+                    PresetCommand::Deploy { agents, .. } | PresetCommand::Undeploy { agents, .. },
+            }) => Some(agents.clone()),
+            Self::Agents(AgentsArgs { command }) => match command {
+                None | Some(AgentsCommand::List) => Some(vec![]),
+                Some(AgentsCommand::Status { agent }) => Some(agent.iter().cloned().collect()),
+                Some(
+                    AgentsCommand::Clean { agent, .. }
+                    | AgentsCommand::Relink { agent, .. }
+                    | AgentsCommand::RemoveLink { agent, .. }
+                    | AgentsCommand::AdoptLink { agent, .. },
+                ) => Some(vec![agent.clone()]),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -312,7 +353,7 @@ pub struct DeployArgs {
     pub skills: Vec<String>,
     #[arg(long = "agent", short = 'a', value_name = "AGENT")]
     pub agents: Vec<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "agents")]
     pub all_agents: bool,
     #[arg(long)]
     pub dry_run: bool,
@@ -422,7 +463,7 @@ pub enum PresetCommand {
         name: String,
         #[arg(long = "agent", value_name = "AGENT")]
         agents: Vec<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "agents")]
         all_agents: bool,
         #[arg(long)]
         dry_run: bool,
@@ -431,7 +472,7 @@ pub enum PresetCommand {
         name: String,
         #[arg(long = "agent", value_name = "AGENT")]
         agents: Vec<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "agents")]
         all_agents: bool,
         #[arg(long)]
         dry_run: bool,
@@ -454,6 +495,7 @@ pub enum PresetCommand {
 
 pub struct Ctx {
     pub ws: Workspace,
+    pub project: Option<PathBuf>,
     pub same_name: Option<String>,
     pub json: bool,
 }
@@ -474,13 +516,24 @@ impl Cli {
         Workspace::open(&paths::resolve_root(self.root.as_deref())?)
     }
 
-    pub fn workspace(&self, create: bool) -> Result<Workspace> {
-        if self.local || self.project.is_some() {
-            let project = self.project.clone().unwrap_or(std::env::current_dir()?);
-            Workspace::open_local(&project, create)
-        } else {
-            Workspace::open(&paths::resolve_root(self.root.as_deref())?)
-        }
+    pub fn workspace(&self) -> Result<Workspace> {
+        self.tui_workspace()
+    }
+
+    pub fn deployment_project(&self) -> Result<Option<PathBuf>> {
+        let project = match &self.project {
+            Some(path) => Some(path.clone()),
+            None if self.local => Some(std::env::current_dir()?),
+            None => None,
+        };
+        project
+            .map(|path| {
+                let path =
+                    std::fs::canonicalize(path).context("project directory does not exist")?;
+                anyhow::ensure!(path.is_dir(), "project is not a directory");
+                Ok(path)
+            })
+            .transpose()
     }
 
     fn mutation_scope(&self) -> Option<skills::ops::MutationScope> {
@@ -530,18 +583,9 @@ impl Cli {
 
 pub fn run(cli: Cli) -> Result<()> {
     let scope = cli.mutation_scope();
-    let create = matches!(
-        &cli.command,
-        Some(
-            Command::Init
-                | Command::Install(_)
-                | Command::Agents(AgentsArgs {
-                    command: Some(AgentsCommand::Add { .. })
-                })
-        )
-    );
+
     let ws = if scope.is_some() {
-        Some(cli.workspace(create)?)
+        Some(cli.workspace()?)
     } else {
         None
     };
@@ -592,26 +636,22 @@ fn run_command(cli: Cli) -> Result<()> {
         }
         return Ok(());
     }
-    let create = matches!(
-        &cli.command,
-        Some(
-            Command::Init
-                | Command::Install(_)
-                | Command::Agents(AgentsArgs {
-                    command: Some(AgentsCommand::Add { .. })
-                })
-        )
-    );
-    let ws = cli.workspace(create)?;
+
+    let mut ws = cli.workspace()?;
+    let project = cli.deployment_project()?;
+    if let Some(requested) = cli.command.as_ref().and_then(Command::deployment_agents) {
+        ws = skills::ops::targets::deployment_workspace(&ws, project.as_deref(), &requested)?;
+    }
     print_migration_notice(ws.migration.as_ref());
     let command = cli
         .command
         .expect("dispatcher only calls run with a subcommand");
     if let Command::Init = command {
-        return cmd_init(&ws.root, cli.json, ws.project.is_some());
+        return cmd_init(&ws.root, cli.json, false);
     }
     let ctx = Ctx {
         ws,
+        project,
         json: cli.json,
         same_name: cli.same_name,
     };
@@ -624,7 +664,7 @@ fn run_command(cli: Cli) -> Result<()> {
             apply, deployments, ..
         } => {
             let mut ws = ctx.ws.clone();
-            if ws.project.is_none() {
+            if ctx.project.is_none() {
                 skills::ops::targets::discover(&mut ws, &std::env::current_dir()?)?;
             }
             let mut options = skills::ops::repair::Options::default();
@@ -1056,7 +1096,7 @@ fn deploy_label(s: &DeployState) -> &'static str {
 
 fn cmd_status(ctx: &Ctx) -> Result<()> {
     let mut ws = ctx.ws.clone();
-    if ws.project.is_none() {
+    if ctx.project.is_none() {
         skills::ops::targets::discover(&mut ws, &std::env::current_dir()?)?;
     }
     let snap = ws.scan()?;
@@ -1616,6 +1656,11 @@ fn run_actions(
         fresh_snap = ctx.ws.scan_for_links()?;
         &fresh_snap
     };
+    if let Some(project) = &ctx.project {
+        for agent in &ctx.ws.config.agents {
+            paths::ensure_local_path(project, &agent.skills_path())?;
+        }
+    }
     let conflicts = deploy::name_conflicts(snap, actions);
     let resolved = if dry_run && ctx.same_name.is_none() {
         actions.to_vec()
@@ -1653,25 +1698,36 @@ fn cmd_agents(ctx: &Ctx, c: Option<AgentsCommand>) -> Result<()> {
             }
         }),
         AgentsCommand::Add { agent, dir } => {
-            let local = ctx.ws.project.is_some();
-            let entry = match dir {
-                Some(skills_dir) => skills::config::AgentConfig {
+            let entry = match (&ctx.project, dir) {
+                (Some(project), Some(dir)) => {
+                    let path = project.join(paths::expand_tilde(&dir));
+                    paths::ensure_local_path(project, &path)?;
+                    skills::config::AgentConfig {
+                        key: agent.clone(),
+                        name: agent,
+                        skills_dir: path.display().to_string(),
+                    }
+                }
+                (Some(project), None) => skills::ops::targets::candidates(&ctx.ws, Some(project))?
+                    .into_iter()
+                    .find(|a| skills::ops::targets::product_key(a) == agent)
+                    .with_context(|| {
+                        format!("unknown built-in agent: {agent}; use agents catalog or --dir")
+                    })?,
+                (None, Some(skills_dir)) => skills::config::AgentConfig {
                     key: agent.clone(),
                     name: agent,
                     skills_dir,
                 },
-                None => skills::agents::BUILTINS
+                (None, None) => skills::agents::BUILTINS
                     .iter()
                     .find(|a| a.key == agent)
                     .with_context(|| {
                         format!("unknown built-in agent: {agent}; use agents catalog or --dir")
                     })?
-                    .config(local),
+                    .config(false),
             };
-            if let Some(project) = &ctx.ws.project {
-                paths::ensure_local_path(project, &project.join(entry.skills_path()))?;
-            }
-            skills::config::Config::add_agent(&ctx.ws.root, &entry, local)?;
+            skills::config::Config::add_agent(&ctx.ws.root, &entry, false)?;
             ctx.out(&entry, || {
                 println!("added {}: {}", entry.key, entry.skills_dir)
             })
@@ -1980,6 +2036,7 @@ mod tui_library_tests {
         std::fs::create_dir(&skill).unwrap();
         std::fs::write(skill.join("SKILL.md"), "---\nname: shared\n---\n").unwrap();
         let ctx = Ctx {
+            project: None,
             ws: Workspace::open(&root).unwrap(),
             same_name: None,
             json: false,
@@ -2088,11 +2145,14 @@ mod tui_library_tests {
         }
         .save(&root)
         .unwrap();
-        let mut cli = Cli::parse_from(["skills", "--root", root.to_str().unwrap()]);
-        // These fields are deliberately set directly to keep the test independent
-        // of process-wide SKILLS_HOME while checking project launch semantics.
-        cli.project = Some(project.clone());
-        cli.local = true;
+        let cli = Cli::parse_from([
+            "skills",
+            "--root",
+            root.to_str().unwrap(),
+            "--project",
+            project.to_str().unwrap(),
+        ]);
+        assert_eq!(cli.workspace().unwrap().root, root.canonicalize().unwrap());
         let ws = cli.tui_workspace().unwrap();
         assert_eq!(ws.root, root.canonicalize().unwrap());
         assert!(ws.project.is_none());

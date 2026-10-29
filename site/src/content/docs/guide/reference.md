@@ -16,7 +16,7 @@ skills --json status
 | --- | --- |
 | no subcommand | Opens the TUI. |
 | `--root DIR` | Overrides global root resolution. |
-| `--local`, `--project DIR` | Select a CLI project store or TUI deployment context; [deployment](../deployment/) details the difference. |
+| `--local`, `--project DIR` | Select project deployment destinations; keep the central Library in both CLI and TUI. |
 | `--json` | Writes machine-readable CLI output; progress and top-level errors may still use stderr. |
 | `--same-name replace` | Authorizes replacement for a declared deployment-name conflict. |
 

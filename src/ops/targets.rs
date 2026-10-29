@@ -394,6 +394,89 @@ pub fn candidates(ws: &Workspace, project: Option<&Path>) -> Result<Vec<AgentCon
     Ok(out)
 }
 
+/// Resolve explicitly selected products exactly like the deployment picker.
+/// Unregistered built-ins are transient; all-agent operations still use only
+/// configured entries. Custom paths always retain their configured identity.
+pub fn deployment_workspace(
+    ws: &Workspace,
+    project: Option<&Path>,
+    requested: &[String],
+) -> Result<Workspace> {
+    if let Some(project) = project {
+        return project_workspace(ws, project, requested);
+    }
+    let mut scoped = ws.clone();
+    if requested
+        .iter()
+        .any(|key| scoped.config.agent(key).is_none())
+    {
+        let available = candidates(ws, None)?;
+        for key in requested {
+            if scoped.config.agent(key).is_some() {
+                continue;
+            }
+            let mut agent = available
+                .iter()
+                .find(|a| &a.key == key || product_key(a) == key)
+                .with_context(|| {
+                    format!("unknown agent: {key}; use agents add --dir for a custom target")
+                })?
+                .clone();
+            agent.key = key.clone();
+            scoped.config.agents.push(agent);
+        }
+    }
+    Ok(scoped)
+}
+
+/// Select project destinations without changing the source Library or saving
+/// transient targets. Bare built-in names use the same primary destination as
+/// the TUI picker. Configured custom targets are included only in this project;
+/// explicit built-in selections need no persistent registration.
+pub fn project_workspace(
+    ws: &Workspace,
+    project: &Path,
+    requested: &[String],
+) -> Result<Workspace> {
+    let project = std::fs::canonicalize(project).context("project directory does not exist")?;
+    ensure!(project.is_dir(), "project is not a directory");
+    let candidates = candidates(ws, Some(&project))?;
+    let mut agents = Vec::new();
+    for configured in &ws.config.agents {
+        if crate::agents::BUILTINS
+            .iter()
+            .any(|d| d.key == configured.key)
+        {
+            let mut target = candidates
+                .iter()
+                .find(|a| product_key(a) == configured.key)
+                .context("built-in project destination unavailable")?
+                .clone();
+            target.key = configured.key.clone();
+            agents.push(target);
+        } else if configured.skills_path().starts_with(&project) {
+            paths::ensure_local_path(&project, &configured.skills_path())?;
+            agents.push(configured.clone());
+        }
+    }
+    for key in requested {
+        if agents.iter().any(|a| &a.key == key) {
+            continue;
+        }
+        let mut target = candidates.iter().find(|a| &a.key == key || product_key(a) == key)
+            .with_context(|| format!("agent {key} has no destination in this project; register a project directory with agents add --dir"))?.clone();
+        target.key = key.clone();
+        agents.push(target);
+    }
+    for agent in &agents {
+        paths::ensure_local_path(&project, &agent.skills_path())?;
+    }
+    let mut scoped = ws.clone();
+    scoped.config.agents = agents;
+    scoped.inventory_project = Some(project);
+    Ok(scoped)
+}
+
 pub fn apply(
     ws: &Workspace,
     keys: &[String],

@@ -14,11 +14,11 @@ cat "$HOME/.config/skills-tui/root"
 
 **Cause**
 
-Global commands could not resolve an existing Library from `--root`, `SKILLS_HOME`, or the pointer file. CLI `--local` commands instead require a project store at `<project>/.agents/skills`.
+No existing Library could be resolved from `--root`, `SKILLS_HOME`, or the pointer file. Project flags do not change Library resolution.
 
 **Fix**
 
-Create the directory, select it with `--root`, `SKILLS_HOME`, or the pointer file, then run `skills init`. Edit an existing configuration instead of deleting it. Use `--local init` only for a separate project store. In the TUI, `--project DIR` selects the deployment context while retaining the central Library. See [Configuration](../configuration/) for the complete resolution rules.
+Create the directory, select it with `--root`, `SKILLS_HOME`, or the pointer file, then run `skills init`. Edit an existing configuration instead of deleting it. To open an older project store, explicitly pass `--root /path/to/project/.agents/skills`. See [Configuration](../configuration/).
 
 ## Installation lists choices but adds nothing
 

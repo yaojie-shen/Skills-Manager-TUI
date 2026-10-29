@@ -47,7 +47,7 @@ link   claude/hello-skill -> /path/to/library/hello-skill
 applied 1 change(s)
 ```
 
-Use at least one `--agent`, or use `--all-agents` for every configured Agent. Catalog entries that have not been configured are excluded.
+Use at least one `--agent`, or use `--all-agents` for every configured Agent. These options cannot be combined. Explicit built-in Agent names use the same destination as the TUI picker without requiring registration. `--all-agents` excludes unconfigured catalog entries.
 
 Remove a managed link without deleting the Library skill:
 
@@ -58,21 +58,16 @@ skills undeploy hello-skill --agent claude
 
 ## How `--local` and `--project` change scope
 
-| Launch | Library | Project scope |
-| --- | --- | --- |
-| `skills` | Explicit root, environment, or pointer | Current directory supplies deployment context. |
-| `skills --project /path/to/project` | Central Library | TUI discovers scopes from that project. |
-| `skills --local` | Central Library | TUI discovers scopes from the current directory. |
-| `skills --project /path/to/project list` | `<project>/.agents/skills` | CLI uses an isolated project store. |
-| `skills --local init` | `<cwd>/.agents/skills` | CLI creates that project store. |
+Both front ends keep the Library selected by `--root`, `$SKILLS_HOME`, or the saved pointer. `--project DIR` selects a project for deployment; `--local` uses the current directory. Library commands such as install, tag and preset still edit that same central Library.
 
-### Default project paths
+```sh
+skills --root /path/to/library --project /path/to/project deploy hello-skill --agent claude
+skills --local install ./source --deploy codex
+```
 
-For a CLI project store, Claude defaults to `<project>/.claude/skills`. Codex's default `.agents/skills` is the store itself.
+Project targets use the same primary directories as the TUI picker: Claude uses `<project>/.claude/skills`, Codex uses `<project>/.agents/skills`. These contain links to the central Library. An explicitly named built-in Agent needs no registration in project scope. `--all-agents` uses configured targets only, mapped into the selected project; custom targets outside it are excluded. `agents add` with project scope saves a project target in the central configuration. Project paths must remain inside the project, including existing symlink ancestors. `--local` and `--project` are mutually exclusive.
 
-### Constraints
-
-Project paths must remain inside the project, including paths reached through existing symlink ancestors. `--root` conflicts with `--local` and `--project`.
+**Compatibility:** earlier CLI versions opened a separate `<project>/.agents/skills` store with these flags. That is no longer automatic. To keep using such a store, pass `--root /path/to/project/.agents/skills` explicitly. Existing files are not moved or deleted.
 
 <DocsTuiCapture frame="agents" caption="The Agents view groups deployment targets by Agent and scope." />
 

@@ -16,7 +16,7 @@ skills --json status
 | --- | --- |
 | 不带子命令 | 打开 TUI。 |
 | `--root DIR` | 覆盖全局 root 解析。 |
-| `--local`、`--project DIR` | 选择 CLI 项目 store 或 TUI 部署上下文；差异见[部署](../deployment/)。 |
+| `--local`、`--project DIR` | 选择项目部署目的地；CLI 和 TUI 都保留中心 Library。 |
 | `--json` | 输出机器可读的 CLI 结果；进度和顶层错误仍可能写入 stderr。 |
 | `--same-name replace` | 允许替换声明名冲突的部署。 |
 

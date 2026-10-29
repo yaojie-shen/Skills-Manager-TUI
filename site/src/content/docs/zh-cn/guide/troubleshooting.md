@@ -14,11 +14,11 @@ cat "$HOME/.config/skills-tui/root"
 
 **原因**
 
-全局命令无法通过 `--root`、`SKILLS_HOME` 或指针文件解析出已存在的 Library。CLI 的 `--local` 命令则要求 `<project>/.agents/skills` 项目 store 已存在。
+无法通过 `--root`、`SKILLS_HOME` 或指针文件解析出已存在的 Library。项目参数不会改变 Library 的解析规则。
 
 **修复**
 
-创建目录，通过 `--root`、`SKILLS_HOME` 或指针文件选中它，再运行 `skills init`。已有配置应直接编辑，不要删除后重建。只有需要独立项目 store 时才运行 `--local init`。TUI 的 `--project DIR` 只选择部署上下文，仍使用中心 Library。完整解析规则见[配置与路径](../configuration/)。
+创建目录，通过 `--root`、`SKILLS_HOME` 或指针文件选中它，再运行 `skills init`。已有配置直接编辑。若要打开旧项目库，显式传入 `--root /path/to/project/.agents/skills`。详见[配置与路径](../configuration/)。
 
 ## 安装只列出选项，没有新增技能
 

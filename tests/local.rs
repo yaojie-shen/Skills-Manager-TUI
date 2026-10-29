@@ -11,13 +11,14 @@ impl Fixture {
         let path = std::env::temp_dir().join(format!("skills-local-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir(path.join("central")).unwrap();
         Self(path.canonicalize().unwrap())
     }
     fn cli(&self, args: &[&str]) -> std::process::Output {
         Command::new(env!("CARGO_BIN_EXE_skills"))
             .current_dir(&self.0)
             .env("HOME", self.0.join("fake-home"))
-            .env("SKILLS_HOME", self.0.join("wrong-global-root"))
+            .env("SKILLS_HOME", self.0.join("central"))
             .args(args)
             .output()
             .unwrap()
@@ -46,9 +47,9 @@ fn success(output: std::process::Output) -> String {
 }
 
 #[test]
-fn configless_local_tags_survive_reopening() {
+fn project_tags_use_central_library() {
     let f = Fixture::new("configless-tags");
-    let root = f.0.join(".agents/skills");
+    let root = f.0.join("central");
     skill(&root.join("sample"));
     success(f.cli(&["--local", "tag", "add", "sample", "work"]));
     let local = success(f.cli(&["--local", "--json", "tag", "list"]));
@@ -59,7 +60,7 @@ fn configless_local_tags_survive_reopening() {
 }
 
 #[test]
-fn local_cli_installs_into_standard_directory_and_deploys_to_project_agents() {
+fn local_cli_installs_centrally_and_deploys_to_project_agents() {
     let f = Fixture::new("cli");
     skill(&f.0.join("source"));
     success(f.cli(&["--local", "init"]));
@@ -68,7 +69,7 @@ fn local_cli_installs_into_standard_directory_and_deploys_to_project_agents() {
         "--local", "install", "./source", "--name", "sample", "--deploy", "cursor", "--deploy",
         "codex",
     ]));
-    assert!(f.0.join(".agents/skills/sample/SKILL.md").is_file());
+    assert!(f.0.join("central/sample/SKILL.md").is_file());
     assert!(
         std::fs::symlink_metadata(f.0.join(".cursor/skills/sample"))
             .unwrap()
@@ -88,12 +89,15 @@ fn local_cli_installs_into_standard_directory_and_deploys_to_project_agents() {
         "--agent",
         "codex",
     ]));
-    assert!(f.0.join(".agents/skills/sample/SKILL.md").is_file());
-    assert!(
-        !f.cli(&["--local", "--root", f.0.to_str().unwrap(), "status"])
-            .status
-            .success()
-    );
+    assert!(f.0.join("central/sample/SKILL.md").is_file());
+    assert!(!f.0.join(".agents/skills/sample").exists());
+    assert!(!f.0.join(".agents/skills/.skills-meta").exists());
+    success(f.cli(&[
+        "--local",
+        "--root",
+        f.0.join("central").to_str().unwrap(),
+        "status",
+    ]));
 }
 
 #[test]
@@ -295,7 +299,7 @@ fn catalog_needs_no_root_and_agent_registration_preserves_global_config() {
 }
 
 #[test]
-fn git_repository_install_keeps_local_shared_root_read_only() {
+fn git_repository_install_uses_central_library_and_project_links() {
     let f = Fixture::new("git");
     let repo = f.0.join("upstream");
     skill(&repo.join("sample"));
@@ -323,20 +327,135 @@ fn git_repository_install_keeps_local_shared_root_read_only() {
     }
     let url = format!("file://{}", repo.display());
     success(f.cli(&["--local", "install", &url, "--all", "--deploy", "codex"]));
-    let ws = Workspace::open_local(&f.0, false).unwrap();
-    let snap = ws.scan().unwrap();
+    let ws = Workspace::open(&f.0.join("central")).unwrap();
+    let snap = ws.inventory().unwrap();
     assert_eq!(snap.skills.len(), 1);
     assert!(snap.skills[0].key.starts_with("repos/"));
-    assert!(snap.skills[0].deployed_to().is_empty());
-    assert!(matches!(
-        snap.agent("codex").unwrap().mode,
-        AgentDirMode::ReadOnly { .. }
-    ));
-    assert!(
-        std::fs::symlink_metadata(
-            ws.root
-                .join(snap.skills[0].deployment_name().expect("valid name"))
-        )
-        .is_err()
+    let link = f.0.join(".agents/skills/sample");
+    assert_eq!(
+        link.canonicalize().unwrap(),
+        ws.root.join(&snap.skills[0].key)
     );
+    assert!(!f.0.join(".agents/skills/.skills-meta").exists());
+}
+
+#[test]
+fn project_scope_is_transient_and_presets_use_central_members() {
+    let f = Fixture::new("central-preset");
+    let root = f.0.join("central");
+    skill(&root.join("sample"));
+    success(f.cli(&["init"]));
+    let before = std::fs::read(Config::path(&root)).unwrap();
+    success(f.cli(&["--local", "preset", "create", "work", "--skill", "sample"]));
+    success(f.cli(&[
+        "--local",
+        "preset",
+        "deploy",
+        "work",
+        "--agent",
+        "cursor",
+        "--dry-run",
+    ]));
+    assert!(!f.0.join(".cursor").exists());
+    success(f.cli(&["--local", "preset", "deploy", "work", "--agent", "cursor"]));
+    assert_eq!(
+        f.0.join(".cursor/skills/sample").canonicalize().unwrap(),
+        root.join("sample")
+    );
+    let by_query = success(f.cli(&["--local", "--json", "list", "agent:cursor"]));
+    let by_flag = success(f.cli(&["--local", "--json", "list", "--agent", "cursor"]));
+    assert_eq!(by_query, by_flag);
+    assert!(by_query.contains("sample"));
+    success(f.cli(&["--local", "preset", "undeploy", "work", "--agent", "cursor"]));
+    assert!(!f.0.join(".cursor/skills/sample").exists());
+    assert_eq!(std::fs::read(Config::path(&root)).unwrap(), before);
+    assert!(
+        Workspace::open(&root)
+            .unwrap()
+            .presets
+            .load("work")
+            .unwrap()
+            .is_some()
+    );
+    assert!(!f.0.join("fake-home").exists());
+}
+
+#[test]
+fn project_all_agents_uses_configured_products_and_confines_custom_paths() {
+    let f = Fixture::new("central-targets");
+    let root = f.0.join("central");
+    skill(&root.join("sample"));
+    success(f.cli(&["init"]));
+    success(
+        f.cli(&[
+            "agents",
+            "add",
+            "outside",
+            "--dir",
+            f.0.parent()
+                .unwrap()
+                .join("outside-agent")
+                .to_str()
+                .unwrap(),
+        ]),
+    );
+    success(f.cli(&[
+        "--local",
+        "agents",
+        "add",
+        "inside",
+        "--dir",
+        ".custom/skills",
+    ]));
+    success(f.cli(&["--local", "deploy", "sample", "--all-agents"]));
+    for dir in [".claude", ".agents", ".custom"] {
+        assert_eq!(
+            f.0.join(dir).join("skills/sample").canonicalize().unwrap(),
+            root.join("sample")
+        );
+    }
+    assert!(!f.0.join(".cursor").exists());
+    let output = f.cli(&["--local", "deploy", "sample", "--agent", "outside"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no destination in this project"));
+    assert!(!f.0.join("fake-home").exists());
+}
+
+#[test]
+fn project_does_not_fallback_to_legacy_store_when_central_root_is_missing() {
+    let f = Fixture::new("no-fallback");
+    skill(&f.0.join(".agents/skills/sample"));
+    std::fs::remove_dir(f.0.join("central")).unwrap();
+    assert!(!f.cli(&["--local", "list"]).status.success());
+    success(f.cli(&[
+        "--root",
+        f.0.join(".agents/skills").to_str().unwrap(),
+        "list",
+    ]));
+}
+
+#[test]
+fn explicit_global_builtin_uses_picker_target_without_registration() {
+    let f = Fixture::new("global-explicit");
+    let root = f.0.join("central");
+    skill(&root.join("sample"));
+    success(f.cli(&["init"]));
+    let before = std::fs::read(Config::path(&root)).unwrap();
+    success(f.cli(&["deploy", "sample", "--agent", "cursor"]));
+    assert_eq!(
+        f.0.join("fake-home/.cursor/skills/sample")
+            .canonicalize()
+            .unwrap(),
+        root.join("sample")
+    );
+    let rows = success(f.cli(&["--json", "list", "agent:cursor"]));
+    assert!(rows.contains("sample"));
+    assert!(
+        !f.cli(&["deploy", "sample", "--agent", "cursor", "--all-agents"])
+            .status
+            .success()
+    );
+    success(f.cli(&["undeploy", "sample", "--agent", "cursor"]));
+    assert!(!f.0.join("fake-home/.cursor/skills/sample").exists());
+    assert_eq!(std::fs::read(Config::path(&root)).unwrap(), before);
 }

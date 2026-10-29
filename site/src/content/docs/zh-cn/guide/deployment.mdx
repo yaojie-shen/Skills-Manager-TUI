@@ -47,7 +47,7 @@ link   claude/hello-skill -> /path/to/library/hello-skill
 applied 1 change(s)
 ```
 
-部署时至少指定一个 `--agent`；也可以用 `--all-agents` 选择所有已配置的 Agent。尚未配置的 catalog 条目不会包含在内。
+至少指定一个 `--agent`，或使用 `--all-agents` 选择所有已配置 Agent，两者不能混用。显式指定内置 Agent 时无需注册，使用与 TUI 选择器相同的目的地；`--all-agents` 不包含尚未配置的目录条目。
 
 删除受管理的链接，同时保留 Library 技能：
 
@@ -58,21 +58,16 @@ skills undeploy hello-skill --agent claude
 
 ## `--local` 与 `--project` 如何改变作用域
 
-| 启动方式 | Library | 项目作用域 |
-| --- | --- | --- |
-| `skills` | 显式 root、环境变量或指针文件 | 当前目录提供部署上下文。 |
-| `skills --project /path/to/project` | 中心 Library | TUI 从指定项目发现作用域。 |
-| `skills --local` | 中心 Library | TUI 从当前目录发现作用域。 |
-| `skills --project /path/to/project list` | `<project>/.agents/skills` | CLI 使用独立的项目 store。 |
-| `skills --local init` | `<cwd>/.agents/skills` | CLI 创建该项目 store。 |
+CLI 和 TUI 都按 `--root` → `$SKILLS_HOME` → 指针文件选择同一个 Library。`--project DIR` 只选择项目部署目的地，`--local` 使用当前目录。安装、tag 和 preset 仍修改中心 Library。
 
-### 默认项目路径
+```sh
+skills --root /path/to/library --project /path/to/project deploy hello-skill --agent claude
+skills --local install ./source --deploy codex
+```
 
-使用 CLI 项目 store 时，Claude 默认部署到 `<project>/.claude/skills`；Codex 的默认目录 `.agents/skills` 就是 store 本身。
+项目目标与 TUI 选择器使用相同的首选目录：Claude 为 `<project>/.claude/skills`，Codex 为 `<project>/.agents/skills`，其中保存指向中心 Library 的链接。在项目范围显式指定内置 Agent 无需先注册。`--all-agents` 仅使用配置中的目标，并映射到项目；项目外的自定义目标会被排除。项目范围下 `agents add` 将项目目标注册到中心配置。所有路径（包括已有符号链接的祖先）必须在项目内部。`--local` 与 `--project` 不能同时指定。
 
-### 限制
-
-项目路径即使经过已有符号链接的上级目录，也不得超出项目范围。`--root` 不能与 `--local` 或 `--project` 同时使用。
+**兼容说明：**旧版 CLI 会通过这两个参数打开独立的 `<project>/.agents/skills` 库，现在不再自动切换。若要继续使用旧库，请显式指定 `--root /path/to/project/.agents/skills`。现有文件不会被移动或删除。
 
 <DocsTuiCapture frame="agents" caption="Agents 页面按 Agent 和作用域显示部署目标。" />
 

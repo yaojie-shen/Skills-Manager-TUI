@@ -21,7 +21,7 @@ skills init
 
 未设置 `--root` 或 `SKILLS_HOME` 时，程序读取指针文件。`init` 创建带注释说明默认值的 `.skills-meta/config.toml`，且不会覆盖已有配置。环境变量和指针文件中的路径可以用 `~` 开头。在 shell 的 `--root` 参数中，应使用 `"$HOME/path"`，不要引用波浪号字面量。
 
-在 CLI 中，`--local` 和 `--project DIR` 将 `<project>/.agents/skills` 作为独立项目 store。Init、install 和 Agent 注册可以创建这个目录，读取命令则要求它已经存在。在 TUI 中，同名参数只选择部署上下文，程序仍使用中心 Library。作用域规则见 [Agent 部署](../deployment/)。
+CLI 和 TUI 都使用上述规则选中的中心 Library。`--local`（当前目录）和 `--project DIR` 仅选择项目部署目的地，可与 `--root` 组合使用。安装、tag、preset 和备份仍操作中心 Library。旧 CLI 项目库的兼容方式见 [Agent 部署](../deployment/)。
 
 ## Library 中的文件
 
