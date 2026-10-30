@@ -84,7 +84,7 @@ fn project_cli_reviews_conflicts_and_archives_only_after_explicit_choice() {
     assert!(report["message"].as_str().unwrap().contains("Archived"));
     assert_eq!(
         agent.join("sample").canonicalize().unwrap(),
-        root.join("sample")
+        root.join("sample").canonicalize().unwrap()
     );
     assert!(!agent.join("owned").exists());
     assert!(project.join(".cursor/.skills-manager-backups").is_dir());
